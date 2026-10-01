@@ -1,0 +1,3 @@
+# Cloned source repositories are run inputs, never committed.
+*
+!.gitignore

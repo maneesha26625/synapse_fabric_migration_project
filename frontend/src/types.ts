@@ -1,0 +1,437 @@
+// Shapes shared by the UI, the real API client and the mock layer.
+// They mirror what the Python API returns (src/discovery_agent/api).
+
+export type AuthMethod = "azure_cli" | "service_principal" | "managed_identity";
+export type ApiMode = "real" | "mock";
+
+/** What the operator types. Never persisted; the secret never leaves the form. */
+export interface ConnectionConfig {
+  method: AuthMethod;
+  tenantId: string;
+  subscriptionId: string;
+  resourceGroup: string;
+  workspace: string;
+  workspaceUrl: string;
+  sqlPool: string;
+  clientId: string;
+  clientSecret: string;
+  resource: string;
+}
+
+export type ConnectionStatus = "disconnected" | "not_connected" | "connected";
+
+export interface ConnectionCheck {
+  name: string;
+  status: "ok" | "failed" | "skipped";
+  message: string;
+  category: string | null;
+}
+
+export interface ConnectionError {
+  code: string;
+  title: string;
+  hint: string;
+  message: string;
+}
+
+/** Safe connection facts. Contains no token, secret or header. */
+export interface ConnectionState {
+  status: ConnectionStatus;
+  ok: boolean;
+  /** An Azure identity has been proven on the backend for `method`. */
+  signedIn?: boolean;
+  signingIn?: boolean;
+  method?: AuthMethod;
+  sourcePlatform?: string;
+  workspace?: string;
+  resourceGroup?: string;
+  subscriptionId?: string;
+  subscriptionName?: string | null;
+  tenantId?: string | null;
+  sqlPool?: string | null;
+  testedAt?: string | null;
+  checks: ConnectionCheck[];
+  error?: ConnectionError;
+}
+
+export interface Health {
+  status: "ok";
+  capabilities: { authMethods: AuthMethod[]; discoveryScope: string[] };
+}
+
+export type DiscoveryState =
+  | "idle"
+  | "running"
+  | "completed"
+  | "completed_with_warnings"
+  | "failed";
+
+export interface ProgressStep {
+  label: string;
+  state: "done" | "active" | "pending";
+}
+
+/** Counts come from the discovery result, never from the UI. */
+export interface DiscoverySummary {
+  total: number;
+  byCategory: Record<string, number>;
+  byType: Record<string, number>;
+  byWorkstream: Record<string, number>;
+  byClassification: Record<string, number>;
+  byPath: Record<string, number>;
+  byFabricTarget: Record<string, number>;
+  /** A named Fabric component exists for the path. Says nothing about whether it will migrate. */
+  withFabricMapping: number;
+  requiringAssessment: number;
+  manualOrAssessment: number;
+  failedCategories: { name: string; reason: string }[];
+  warnings: string[];
+  warningCount: number;
+  coverage: {
+    discoveredTypes: string[];
+    notDiscovered: { type: string; reason: string }[];
+  };
+}
+
+export interface DiscoveryStatus {
+  state: DiscoveryState;
+  startedAt: string | null;
+  finishedAt: string | null;
+  error: string | null;
+  workspace: string | null;
+  progress: ProgressStep[] | null;
+  summary: DiscoverySummary | null;
+}
+
+/** Discovery status: factual, never evaluative. */
+export type ObjectStatus = "Discovered" | "Warning" | "Partial" | "Failed";
+
+/** How far the *mapping* got. It is not a migration verdict. */
+export type MappingStatus =
+  | "Mapped"
+  | "Mapped with Transformation"
+  | "Requires Assessment"
+  | "No Automatic Mapping";
+
+/** Display codes for the preliminary classification. Owned by the backend. */
+export type Classification = "DIRECT" | "RECONFIGURE" | "TRANSFORM" | "MANUAL" | "REVIEW" | "NOT SUPPORTED";
+
+export type MigrationPath =
+  | "Direct Target"
+  | "Target With Transformation"
+  | "Target With Refactoring"
+  | "Requires Reconfiguration"
+  | "Requires Assessment"
+  | "Manual / Special Handling";
+
+export interface ObjectRow {
+  id: string;
+  name: string;
+  /** The Synapse object type. */
+  type: string;
+  category: string;
+  workspace: string;
+  status: ObjectStatus;
+  dependencyCount: number;
+  sources: string[];
+  fabricTarget: string;
+  targetType: string;
+  migrationPath: MigrationPath;
+  automationPotential: string;
+  assessmentRequired: boolean;
+  mappingStatus: MappingStatus;
+  workstream: string;
+  classification: Classification;
+  action: string;
+  /** Schema name where the object has one, else "". */
+  schema: string;
+  /** Columns, activities, cells... or "". */
+  size: string;
+  /** The Synapse component the object belongs to, e.g. "Dedicated SQL Pool". */
+  component: string;
+  /** Suggested migration wave (dependency ordered). */
+  wave: number;
+}
+
+export interface DependencyRef {
+  name: string;
+  kind: string;
+  type: string | null;
+  /** Set only when the target is another object in this discovery run. */
+  objectId: string | null;
+  location: string;
+  /** The Fabric component this dependency conceptually lands on. A label, not an object. */
+  fabricTarget: string | null;
+}
+
+export interface ReferencedBy {
+  name: string;
+  type: string;
+  objectId: string;
+}
+
+export interface ObjectIssue {
+  code: string;
+  message: string;
+  source: string | null;
+  facet: string | null;
+}
+
+export interface ActivityMapping {
+  name: string;
+  type: string;
+  parent: string | null;
+  source: string | null;
+  sink: string | null;
+  dependsOn: string[];
+  references: string[];
+  expressionCount: number;
+  fabricEquivalent: string;
+  equivalence: "Known equivalent" | "Requires Assessment";
+  requiresTransformation: boolean;
+  requiresManualReview: boolean;
+  note: string;
+}
+
+export interface ObjectDetail extends ObjectRow {
+  discoveredAt: string | null;
+  target: { platform: string; component: string; componentType: string };
+  migration: {
+    path: MigrationPath;
+    route: string;
+    assessmentRequired: boolean;
+    automationPotential: string;
+    mappingStatus: MappingStatus;
+    workstream: string;
+    classification: Classification;
+    action: string;
+  };
+  notes: string[];
+  steps: string[];
+  actions: { label: string; state: "ok" | "warn" }[];
+  overview: Record<string, unknown>;
+  configuration: Record<string, unknown> | null;
+  dependencies: DependencyRef[];
+  referencedBy: ReferencedBy[];
+  activities: ActivityMapping[];
+  issues: ObjectIssue[];
+  rawMetadata: unknown;
+}
+
+export type SortKey =
+  | "name"
+  | "type"
+  | "category"
+  | "status"
+  | "dependencies"
+  | "workspace"
+  | "target"
+  | "targetType"
+  | "path"
+  | "automation"
+  | "assessment"
+  | "mappingStatus"
+  | "classification"
+  | "wave";
+
+export interface ResultsQuery {
+  search: string;
+  categories: string[];
+  types: string[];
+  statuses: string[];
+  fabricTargets: string[];
+  paths: string[];
+  workstreams: string[];
+  mappingStatuses: string[];
+  classifications: string[];
+  /** "" = either, "yes" or "no". */
+  assessment: "" | "yes" | "no";
+  sort: SortKey;
+  dir: "asc" | "desc";
+  page: number;
+  pageSize: number;
+}
+
+export interface ResultsPage {
+  items: ObjectRow[];
+  total: number;
+  page: number;
+  pageSize: number;
+  facets: {
+    categories: Record<string, number>;
+    types: Record<string, number>;
+    statuses: Record<string, number>;
+    fabricTargets: Record<string, number>;
+    paths: Record<string, number>;
+    workstreams: Record<string, number>;
+    mappingStatuses: Record<string, number>;
+    classifications: Record<string, number>;
+    assessment: Record<string, number>;
+  };
+  discoveredAt: string | null;
+}
+
+// ---- dependency graph & waves ---------------------------------------------------
+
+export interface GraphNode {
+  id: string;
+  name: string;
+  type: string;
+  category: string;
+  classification: Classification;
+  fabricTarget: string;
+  wave: number;
+  dependsOn: number;
+  dependedOnBy: number;
+}
+export interface DependencyGraph {
+  nodes: GraphNode[];
+  /** `source` needs `target`. */
+  edges: { source: string; target: string }[];
+  waves: { wave: number; count: number; types: Record<string, number> }[];
+  discoveredAt: string | null;
+}
+
+export interface ComponentRow {
+  sourceType: string;
+  fabricTarget: string;
+  targetType: string;
+  migrationPath: MigrationPath;
+  classification: Classification;
+  action: string;
+  workstream: string;
+  notes: string[];
+}
+
+export interface MetadataExport {
+  platform: string;
+  workspace: string | null;
+  discoveredAt: string | null;
+  summary: DiscoverySummary | null;
+  objects: (ObjectRow & { dependsOn: string[] })[];
+}
+
+// ---- Fabric target ----------------------------------------------------------------
+
+export type FabricAuthMethod = "azure_cli" | "fabric_cli" | "service_principal";
+export interface FabricConfig {
+  method: FabricAuthMethod;
+  tenantId: string;
+  workspaceId: string;
+  workspaceName: string;
+  clientId: string;
+  clientSecret: string;
+}
+export type FabricStatus = "disconnected" | "authenticated" | "connected" | "failed";
+export interface FabricTarget {
+  status: FabricStatus;
+  method?: FabricAuthMethod;
+  tenantId?: string;
+  workspaceId?: string;
+  workspaceName?: string;
+  message?: string;
+}
+
+// ---- plan, execution, validation ----------------------------------------------------
+
+export type PlanStatus = "NOT STARTED" | "READY" | "IN PROGRESS" | "COMPLETED" | "FAILED" | "BLOCKED";
+export interface PlanItem { id: string; wave: number }
+
+export type ExecState = "idle" | "running" | "paused" | "completed";
+export interface ExecItem {
+  id: string;
+  name: string;
+  type: string;
+  step: string;
+  status: "PENDING" | "IN PROGRESS" | "COMPLETED" | "FAILED";
+  startedAt: string | null;
+  completedAt: string | null;
+  error: string | null;
+}
+export interface ExecutionRun {
+  runId: string;
+  state: ExecState;
+  total: number;
+  completed: number;
+  inProgress: number;
+  failed: number;
+  pending: number;
+  items: ExecItem[];
+  logs: string[];
+}
+
+export type ValidationStatus = "MATCH" | "REVIEW" | "MISMATCH";
+export interface ValidationRow {
+  category: string;
+  object: string;
+  source: string;
+  target: string;
+  status: ValidationStatus;
+}
+
+/** The single seam between the UI and whatever supplies data. */
+export interface MigrationApi {
+  readonly mode: ApiMode;
+  health(): Promise<Health>;
+  getConnection(): Promise<ConnectionState>;
+  authenticate(config: ConnectionConfig): Promise<ConnectionState>;
+  testConnection(config: ConnectionConfig): Promise<ConnectionState>;
+  disconnect(): Promise<ConnectionState>;
+  startDiscovery(): Promise<DiscoveryStatus>;
+  getDiscoveryStatus(): Promise<DiscoveryStatus>;
+  getResults(query: ResultsQuery): Promise<ResultsPage>;
+  getObject(id: string): Promise<ObjectDetail>;
+  /** Dropdown contents. Each needs a completed sign-in. */
+  listResourceGroups(): Promise<string[]>;
+  listWorkspaces(resourceGroup: string): Promise<string[]>;
+  listSqlPools(resourceGroup: string, workspace: string): Promise<string[]>;
+  getDependencies(): Promise<DependencyGraph>;
+  getComponents(): Promise<ComponentRow[]>;
+  exportMetadata(): Promise<MetadataExport>;
+  // The calls below have no backend yet. The real client rejects them with a
+  // "not_implemented" error; only the demo client simulates them.
+  getFabricTarget(): Promise<FabricTarget>;
+  authenticateFabric(config: FabricConfig): Promise<FabricTarget>;
+  testFabric(config: FabricConfig): Promise<FabricTarget>;
+  disconnectFabric(): Promise<FabricTarget>;
+  startExecution(items: PlanItem[]): Promise<ExecutionRun>;
+  getExecution(): Promise<ExecutionRun>;
+  controlExecution(action: "pause" | "resume" | "retry"): Promise<ExecutionRun>;
+  runValidation(): Promise<ValidationRow[]>;
+}
+
+export class ApiRequestError extends Error {
+  constructor(
+    public readonly code: string,
+    message: string,
+    public readonly status = 0,
+  ) {
+    super(message);
+    this.name = "ApiRequestError";
+  }
+}
+
+/** Categories in display order. */
+export const CLASSIFICATIONS: Classification[] = ["DIRECT", "RECONFIGURE", "TRANSFORM", "MANUAL", "REVIEW", "NOT SUPPORTED"];
+
+export const CATEGORIES = ["SQL", "Spark", "Integration", "Storage", "Security", "Networking", "Other"] as const;
+
+export const MIGRATION_PATHS: MigrationPath[] = [
+  "Direct Target",
+  "Target With Transformation",
+  "Target With Refactoring",
+  "Requires Reconfiguration",
+  "Requires Assessment",
+  "Manual / Special Handling",
+];
+
+/** Workstreams in display order (the backend assigns each object to one). */
+export const WORKSTREAMS = [
+  "Data Warehouse",
+  "Data Engineering",
+  "Data Factory",
+  "OneLake / Storage",
+  "Connections",
+  "Security & Governance",
+  "Unassigned",
+] as const;

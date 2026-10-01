@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "discovery-agent"
+version = "0.1.0"
+description = "Discovery Agent: read-only inventory and dependency scanner for Synapse Git-integrated repositories."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+# Live Dedicated SQL Pool discovery. Optional: a repository-only run needs
+# no driver, no network and no credentials.
+sql = ["pyodbc>=5.0"]
+# Azure authentication and the management-plane calls the connection layer
+# makes. Optional for the same reason: an offline repository run acquires no
+# credential and must not need the SDK to be installed.
+azure = ["azure-identity>=1.19", "requests>=2.32"]
+# Everything the live connection chain needs, in one extra.
+live = ["pyodbc>=5.0", "azure-identity>=1.19", "requests>=2.32"]
+
+[project.scripts]
+discovery-agent = "discovery_agent.cli:main"
+discovery-agent-api = "discovery_agent.api.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
