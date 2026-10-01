@@ -84,6 +84,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Entra tenant id, for a machine signed in to more than one.",
     )
     live.add_argument(
+        "--credential-method",
+        choices=("azure_cli", "interactive_browser"),
+        default="azure_cli",
+        help="How to sign in to Azure: the existing `az login` (default), or "
+        "an interactive browser sign-in that leaves the Azure CLI session "
+        "untouched. Needs --subscription.",
+    )
+    live.add_argument(
+        "--client-id",
+        help="Application (client) id for interactive_browser, only for a "
+        "tenant that has not consented to Microsoft's default sign-in app. "
+        "An identifier, not a secret.",
+    )
+    live.add_argument(
         "--sql-pool",
         help="Dedicated SQL pool to read tables, views and stored procedures "
         "from. Requires --workspace.",
@@ -207,6 +221,7 @@ def connections_for(args: argparse.Namespace):
     from discovery_agent.connections.models import (
         AzureConnectionConfig,
         ConnectionSettings,
+        CredentialMethod,
         GitRepositoryConfig,
         SynapseConnectionConfig,
     )
@@ -217,7 +232,12 @@ def connections_for(args: argparse.Namespace):
         else None
     )
     azure = (
-        AzureConnectionConfig(subscription_id=args.subscription, tenant_id=args.tenant)
+        AzureConnectionConfig(
+            subscription_id=args.subscription,
+            tenant_id=args.tenant,
+            credential_method=CredentialMethod(args.credential_method),
+            client_id=args.client_id,
+        )
         if args.subscription
         else None
     )

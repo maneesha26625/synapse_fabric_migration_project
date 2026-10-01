@@ -76,9 +76,15 @@ ENV_REPOSITORY_REF = "DISCOVERY_REPOSITORY_REF"
 class CredentialMethod(str, Enum):
     """How the application obtains an Azure identity.
 
-    One is implemented. The rest are declared so configuration can already
-    name them and so the seam is visible -- adding one means one more
-    ``AzureCredentialProvider`` subclass, not a change of shape here.
+    * ``AZURE_CLI`` -- inherit whoever ran ``az login`` on this machine.
+    * ``INTERACTIVE_BROWSER`` -- a Microsoft sign-in window, opened on the
+      machine running the application, against the tenant named. Leaves the
+      Azure CLI session untouched: it neither reads nor writes the CLI's
+      cache. One sign-in serves every audience, and an authentication record
+      (no token) lets a restarted process sign in silently.
+
+    Adding a method means one more ``AzureCredentialProvider`` subclass, not a
+    change of shape here.
     """
 
     AZURE_CLI = "azure_cli"
@@ -93,12 +99,19 @@ class AzureConnectionConfig:
 
     ``tenant_id`` is optional because ``az login`` already selected one; it is
     accepted so a machine signed in to several tenants can be pinned to the
-    right one rather than picking whichever is default.
+    right one rather than picking whichever is default. The interactive
+    browser sign-in needs it in practice -- the window must open against the
+    operator's tenant -- and the UI requires it for that method.
+
+    ``client_id`` is an application id, a public identifier rather than a
+    secret. It is needed only for a tenant that has not consented to
+    Microsoft's default developer sign-in application.
     """
 
     subscription_id: str
     tenant_id: Optional[str] = None
     credential_method: CredentialMethod = CredentialMethod.AZURE_CLI
+    client_id: Optional[str] = None
 
     def validate(self) -> None:
         if not self.subscription_id:
@@ -120,6 +133,7 @@ class AzureConnectionConfig:
             "subscription_id": self.subscription_id,
             "tenant_id": self.tenant_id,
             "credential_method": self.credential_method.value,
+            "client_id": self.client_id,
         }
 
 

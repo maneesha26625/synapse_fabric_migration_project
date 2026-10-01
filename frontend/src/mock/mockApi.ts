@@ -247,7 +247,17 @@ export const mockApi: MigrationApi = {
     return {
       status: "ok",
       capabilities: {
-        authMethods: ["azure_cli", "service_principal", "managed_identity"],
+        authMethods: ["azure_cli", "interactive_browser"],
+        authMethodDetails: [
+          { id: "azure_cli", label: "Azure CLI", detail: "Opens a sign-in window each time; nothing is kept between sign-ins.", takesClientId: false },
+          {
+            id: "interactive_browser", label: "Interactive browser",
+            detail: "Opens a sign-in window against the tenant you name, and leaves your Azure CLI session untouched.",
+            bestFor: "A tenant your `az login` cannot reach.",
+            caveat: "The window opens on the machine running this server. If the tenant answers access_denied, register an application there and enter its id as Client ID.",
+            takesClientId: true,
+          },
+        ],
         discoveryScope: ["Tables", "Views", "Stored Procedures", "SQL Scripts", "Pipelines", "Datasets", "Linked Services", "Notebooks", "Spark Job Definitions"],
       },
     };
@@ -260,9 +270,8 @@ export const mockApi: MigrationApi = {
   async authenticate(c) {
     // Stands in for the browser sign-in window.
     await sleep(c.method === "azure_cli" ? 1500 : 800);
-    if (c.method === "service_principal" && (!c.clientId.trim() || !c.clientSecret))
-      throw new ApiRequestError("invalid_configuration", "Client ID and client secret are required.");
     if (!c.subscriptionId.trim()) throw new ApiRequestError("invalid_configuration", "Subscription ID is required.");
+    if (c.method === "interactive_browser" && !c.tenantId.trim()) throw new ApiRequestError("invalid_configuration", "Tenant ID is required.");
     s.signedIn = { subscriptionId: c.subscriptionId.trim(), tenantId: c.tenantId.trim() || "00000000-0000-0000-0000-000000000000" };
     s.connection = { status: "disconnected", ok: true, signedIn: true, method: c.method, subscriptionId: s.signedIn.subscriptionId, subscriptionName: "Demo subscription", tenantId: s.signedIn.tenantId, checks: [] };
     return s.connection;

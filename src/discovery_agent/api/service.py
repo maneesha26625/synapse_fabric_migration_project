@@ -4,14 +4,17 @@ A single-operator, single-process model on purpose. The migration accelerator
 is a local tool today; the connection lives in this process's memory and is
 gone when the process ends. Nothing here writes a credential anywhere.
 
-Three ways to prove an identity, all built by the connection layer:
+Two ways to prove an identity, both built by the connection layer:
 
 * **Azure CLI** -- an interactive browser sign-in (not the ambient `az
-  login` session); the operator authenticates each time.
-* **Service principal** -- the client secret arrives in the request body, is
-  popped out of it, handed straight to the credential provider (which keeps
-  the only copy, in memory) and never stored, logged or returned.
-* **Managed identity** -- the platform supplies the identity; no secret exists.
+  login` session); the operator authenticates each time and nothing is kept.
+* **Interactive browser** -- a Microsoft sign-in window against the tenant
+  named. The connection layer holds the signed-in identity for the process
+  and keeps an authentication record (no token), so a restarted server signs
+  in silently. Disconnecting forgets both. The Azure CLI session is never
+  read or written.
+
+No request field can carry a secret: an unknown field is refused.
 
 After any of them the same flow follows: list resource groups, workspaces and
 SQL pools from that identity, then test the connection.
@@ -38,6 +41,8 @@ from discovery_agent.connections.azure import (
     AzureCredentialProvider,
     credential_provider,
     discover_tenant_id,
+    forget_auth_record,
+    reset_credentials,
 )
 from discovery_agent.connections.manager import ConnectionManager
 from discovery_agent.connections.models import (
@@ -79,16 +84,41 @@ _WORKSPACE_URL = re.compile(
     r"^https://(?P<name>[A-Za-z0-9-]+)\.dev\.azuresynapse\.net/?$", re.IGNORECASE
 )
 
-METHODS = ("azure_cli", "service_principal", "managed_identity")
+METHODS = ("azure_cli", "interactive_browser")
+
+#: What the UI shows for each method. ``takesClientId`` drives the optional
+#: Client ID field. Plain language, no secret anywhere.
+METHOD_NOTES = {
+    "azure_cli": {
+        "label": "Azure CLI",
+        "detail": "Opens a sign-in window each time; nothing is kept between sign-ins.",
+        "takesClientId": False,
+    },
+    "interactive_browser": {
+        "label": "Interactive browser",
+        "detail": "Opens a sign-in window against the tenant you name, and leaves your Azure CLI session untouched.",
+        "bestFor": "A tenant your `az login` cannot reach.",
+        "caveat": (
+            "The window opens on the machine running this server. If the tenant answers "
+            "access_denied, register an application there and enter its id as Client ID."
+        ),
+        "takesClientId": True,
+    },
+}
+
+#: Everything an authenticate request may contain. Anything else -- a secret
+#: above all -- is refused rather than silently dropped.
+_AUTHENTICATE_FIELDS = frozenset(
+    {"method", "tenantId", "subscriptionId", "clientId", "resourceGroup", "workspace", "workspaceUrl", "sqlPool"}
+)
 
 #: What an operator should do about each failure category. Plain language; the
 #: technical message from the connection layer is shown beneath it.
 _CATEGORY_HELP = {
     ErrorCategory.AUTHENTICATION: (
         "Authentication failed",
-        "The identity could not be authenticated. For Azure CLI, finish the sign-in "
-        "window; for a service principal, check the tenant, client ID and secret; "
-        "for a managed identity, it only exists on Azure compute that has one assigned.",
+        "The identity could not be authenticated. Finish the sign-in window on the "
+        "machine running the server, within the time allowed.",
     ),
     ErrorCategory.AUTHORIZATION: (
         "Insufficient permissions",
@@ -227,6 +257,7 @@ class Session:
             "capabilities": {
                 # Only what ``credential_provider`` actually implements.
                 "authMethods": list(METHODS),
+                "authMethodDetails": [{"id": m, **METHOD_NOTES[m]} for m in METHODS],
                 "discoveryScope": [
                     f"{t}s" if not t.endswith("s") else t
                     for t, _ in mapping.ARTIFACT_INFO.values()
@@ -241,7 +272,9 @@ class Session:
             return self._connection_payload(self._connection)
 
     def disconnect(self) -> dict:
-        """Forget the connection and the sign-in. The next use asks again."""
+        """Sign out: forget the connection, the sign-in, every held identity and
+        the authentication record. The next sign-in opens a window again. The
+        Azure CLI session is not touched."""
         with self._lock:
             if self._job.state == "running":
                 raise ApiError(409, "discovery_running", "Discovery is running; wait for it to finish.")
@@ -249,7 +282,11 @@ class Session:
             self._signin = None
             self._job = _Job()
             self._detail_cache.clear()
-            return self._connection_payload(None)
+            reset_credentials()
+            forget_auth_record()
+            payload = self._connection_payload(None)
+        payload["note"] = "Signed out of this accelerator. Your Azure CLI session is untouched."
+        return payload
 
     def authenticate(self, body: dict) -> dict:
         """Prove an Azure identity for one subscription.
@@ -257,21 +294,19 @@ class Session:
         * ``azure_cli`` opens a sign-in window on the machine running the API
           and blocks until the operator finishes. It deliberately does not
           reuse an existing ``az login`` session: every call asks.
-        * ``service_principal`` authenticates with the client id and secret in
-          the request. The secret goes straight into the credential provider
-          (memory only) and is never stored, logged or returned.
-        * ``managed_identity`` asks the platform for the identity assigned to
-          the compute this API runs on.
+        * ``interactive_browser`` signs in against the named tenant through
+          the identity the connection layer holds, so a repeat -- or a
+          restarted server with a stored record -- does not prompt again.
         """
+        unknown = sorted(set(body) - _AUTHENTICATE_FIELDS)
+        if unknown:
+            # Names only, never values: a refused field may be a secret.
+            raise ApiError(400, "invalid_configuration", f"Unexpected field(s): {', '.join(unknown)}.")
         method = self._method(body)
+        browser = method == "interactive_browser"
         subscription = _clean(body.get("subscriptionId"), "Subscription ID", _GUID)
-        tenant = _clean(body.get("tenantId"), "Tenant ID", _GUID, required=False)
-        client_id = _clean(body.get("clientId"), "Client ID", _GUID, required=method == "service_principal")
-        client_secret = str(body.pop("clientSecret", "") or "")
-        if method == "service_principal" and not client_secret:
-            raise ApiError(400, "invalid_configuration", "Client secret is required.")
-        if len(client_secret) > 512:
-            raise ApiError(400, "invalid_configuration", "Client secret is not in a valid format.")
+        tenant = _clean(body.get("tenantId"), "Tenant ID", _GUID, required=browser)
+        client_id = _clean(body.get("clientId"), "Client ID", _GUID, required=False) if browser else None
         with self._lock:
             if self._signing_in:
                 raise ApiError(409, "sign_in_in_progress", "A sign-in is already waiting for you in a browser window.")
@@ -282,28 +317,26 @@ class Session:
             # Sending the operator to the right tenant's sign-in page is what
             # lets a subscription id alone be enough.
             tenant = tenant or discover_tenant_id(subscription)
-            credential_method = {
-                "azure_cli": CredentialMethod.INTERACTIVE_BROWSER,
-                "service_principal": CredentialMethod.SERVICE_PRINCIPAL,
-                "managed_identity": CredentialMethod.MANAGED_IDENTITY,
-            }[method]
+            # Both are a browser sign-in. "azure_cli" keeps nothing, as it
+            # always has; "interactive_browser" uses the held identity.
+            credential_method = CredentialMethod.INTERACTIVE_BROWSER
             try:
                 config = AzureConnectionConfig(
                     subscription_id=subscription,
                     tenant_id=tenant,
                     credential_method=credential_method,
+                    client_id=client_id,
                 )
                 provider = credential_provider(
                     method=credential_method,
                     tenant_id=tenant,
                     client_id=client_id,
-                    client_secret=client_secret or None,
+                    remember=browser,
                 )
+                provider.start_attempt()  # an explicit attempt retries a refused one
                 azure = AzureConnection(config, credential=provider)
             except (ConfigError, AzureAuthenticationError) as exc:
                 raise ApiError(400, "invalid_configuration", redact(str(exc))) from exc
-            finally:
-                client_secret = ""  # the provider holds the only copy
             result = azure.validate()  # for azure_cli, this call opens the browser
         finally:
             with self._lock:

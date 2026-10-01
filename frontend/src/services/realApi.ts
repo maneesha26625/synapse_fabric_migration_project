@@ -95,12 +95,9 @@ export const realApi: MigrationApi = {
   authenticate: (c) =>
     request<ConnectionState>("/api/connections/authenticate", {
       method: "POST",
-      // The only request that carries a secret: sent once, over localhost,
-      // straight into the backend credential. Never stored by the UI.
       body: JSON.stringify({
         ...connectionBody(c),
-        ...(c.method !== "azure_cli" ? { clientId: c.clientId.trim() } : {}),
-        ...(c.method === "service_principal" ? { clientSecret: c.clientSecret } : {}),
+        ...(c.method === "interactive_browser" && c.clientId.trim() ? { clientId: c.clientId.trim() } : {}),
       }),
     }),
   testConnection: (c) =>

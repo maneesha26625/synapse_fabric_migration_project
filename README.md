@@ -157,7 +157,7 @@ never clone a repository.
 
 | Concern | Module | Notes |
 | --- | --- | --- |
-| Azure authentication | `connections/azure.py` — `AzureCredentialProvider`, `AzureCliCredentialProvider` | The **only** use of `azure.identity` in the repository |
+| Azure authentication | `connections/azure.py` — `AzureCredentialProvider`, `AzureCliCredentialProvider`, `InteractiveBrowserCredentialProvider` | The **only** use of `azure.identity` in the repository. Signed-in browser identities are held per (method, tenant, client id) by `credential_provider()`; `reset_credentials()` drops them |
 | Token acquisition + caching | `connections/azure.py` — `credential_provider()`, `AccessToken` | Per-audience cache, 5-minute expiry margin |
 | Azure ARM | `connections/azure.py` — `AzureConnection`, `ArmTransport` | The only HTTP client; GET only, so this layer cannot mutate anything |
 | Synapse workspace | `connections/synapse.py` — `SynapseWorkspaceConnection` | Workspace metadata, workspace id, SQL pool status, and which repository the workspace is Git-integrated with. The only Synapse ARM client |
@@ -206,6 +206,42 @@ Token handling is automatic and invisible:
 `ConnectionSettings` cannot carry a secret. There is no field for a password,
 access token, refresh token or client secret, and a repository URL with
 credentials embedded in it is rejected at construction.
+
+### Sign-in methods: Azure CLI and Interactive browser
+
+The UI offers two ways to sign in to Azure.
+
+| Method | What happens | Use it when |
+| --- | --- | --- |
+| **Azure CLI** (`azure_cli`) | A sign-in window opens each time you authenticate. Nothing is kept between sign-ins. | The default. |
+| **Interactive browser** (`interactive_browser`) | A Microsoft sign-in window opens against the **tenant you name**. You pick or type your own account there (MFA included); no account is pre-selected. One sign-in serves every audience: ARM, Synapse, SQL and Fabric. | A tenant your `az login` cannot reach, or when you want to leave your Azure CLI session alone. |
+
+Interactive browser never runs `az` and never reads or writes the Azure CLI's
+token cache: `az account show` reports the same account before and after.
+
+* **The window opens on the machine running the server**, not necessarily the
+  one your browser is on. If the API runs elsewhere (a VM, a container,
+  headless), use Azure CLI instead. You have 120 seconds to finish the sign-in.
+* **Tenant ID is required** for this method. **Client ID** is optional. It is an
+  application id (an identifier, not a secret), needed only when the tenant has
+  not consented to Microsoft's default developer sign-in app and answers
+  `access_denied`. Register an application in that tenant, add
+  `http://localhost` as a redirect URI under *Mobile and desktop
+  applications*, and enter its id.
+* **It survives a server restart without a new window.** Tokens go into the
+  SDK's encrypted token cache (`synapse-discovery-agent`; DPAPI on Windows,
+  Keychain on macOS, libsecret on Linux), never in plaintext. If no keyring is
+  available, the cache stays in memory only. An *authentication record*
+  (username, home account id, authority, tenant, client id; **no token**) is
+  kept at `~/.synapse-discovery/authentication-record.json`, or under
+  `$SYNAPSE_DISCOVERY_HOME`. azure-identity needs that record to sign in
+  silently from its cache.
+* **Signing out** (Disconnect in the UI, `DELETE /api/connections`) drops the
+  identities the server holds and deletes the record, so the next sign-in
+  opens the window again. The Azure CLI session is untouched.
+
+From the command line: `--credential-method interactive_browser --tenant <id>
+[--client-id <id>]`.
 
 ### Git: providers, transports and credentials
 

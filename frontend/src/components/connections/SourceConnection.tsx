@@ -1,4 +1,4 @@
-import { CheckCircle2, CircleSlash, KeyRound, ServerCog, SquareTerminal, XCircle, type LucideIcon } from "lucide-react";
+import { AppWindow, CheckCircle2, CircleSlash, SquareTerminal, XCircle, type LucideIcon } from "lucide-react";
 import { Fragment, useEffect, useState, type ReactNode } from "react";
 import { useAppState } from "../../state/AppState";
 import type { AuthMethod, ConnectionConfig, ConnectionState } from "../../types";
@@ -8,8 +8,7 @@ import { Banner, Button, Card, SelectField, StatusBadge, TextField } from "../sh
 
 const METHODS: { id: AuthMethod; title: string; desc: string; icon: LucideIcon }[] = [
   { id: "azure_cli", title: "Azure CLI", desc: "Authenticate using Azure CLI", icon: SquareTerminal },
-  { id: "service_principal", title: "Service Principal", desc: "Application-based Azure authentication", icon: KeyRound },
-  { id: "managed_identity", title: "Managed Identity", desc: "Authenticate using Azure Managed Identity", icon: ServerCog },
+  { id: "interactive_browser", title: "Interactive browser", desc: "Sign in through a Microsoft window; your Azure CLI session is untouched", icon: AppWindow },
 ];
 
 export function AuthenticationSelector({ value, onChange }: { value: AuthMethod; onChange: (m: AuthMethod) => void }) {
@@ -31,13 +30,12 @@ export function AuthenticationSelector({ value, onChange }: { value: AuthMethod;
 const GUID = /^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$/;
 const EMPTY: ConnectionConfig = {
   method: "azure_cli", tenantId: "", subscriptionId: "", resourceGroup: "", workspace: "",
-  workspaceUrl: "", sqlPool: "", clientId: "", clientSecret: "", resource: "",
+  workspaceUrl: "", sqlPool: "", clientId: "", resource: "",
 };
 
-// Kept in memory so the form survives navigation. Identifiers only: the client
-// secret is deliberately not part of what is remembered, and nothing here is
-// written to browser storage.
-let remembered: Omit<ConnectionConfig, "clientSecret"> | null = null;
+// Kept in memory so the form survives navigation. Identifiers only, and
+// nothing here is written to browser storage.
+let remembered: ConnectionConfig | null = null;
 
 export function configFromConnection(c: ConnectionState): ConnectionConfig {
   return {
@@ -60,13 +58,13 @@ function validate(c: ConnectionConfig, action: "authenticate" | "test"): Errors 
   need("subscriptionId", "Subscription ID"); guid("subscriptionId", "Subscription ID");
   guid("tenantId", "Tenant ID");
   if (action === "authenticate") {
-    // Every method proves an identity first, from the subscription alone (plus
-    // its own credentials); the group, workspace and pool are chosen afterwards.
-    if (c.method === "service_principal") {
-      need("tenantId", "Tenant ID"); need("clientId", "Client ID"); need("clientSecret", "Client secret");
+    // Every method proves an identity first, from the subscription alone; the
+    // group, workspace and pool are chosen afterwards.
+    if (c.method === "interactive_browser") {
+      // The window must open against the operator's own tenant.
+      need("tenantId", "Tenant ID");
       guid("clientId", "Client ID");
     }
-    if (c.method === "managed_identity") guid("clientId", "Identity client ID");
   } else {
     need("resourceGroup", "Resource group");
     need("workspace", "Synapse workspace");
@@ -156,28 +154,24 @@ function AzureCliForm(p: FormProps) {
   );
 }
 
-function ServicePrincipalForm(p: FormProps) {
-  return (
-    <div className="stack" style={{ gap: 16 }}>
-      <div className="form-grid">
-        <TextField label="Tenant ID" value={p.config.tenantId} onChange={(e) => p.set({ tenantId: e.target.value })} error={p.errors.tenantId} />
-        <TextField label="Client ID" value={p.config.clientId} onChange={(e) => p.set({ clientId: e.target.value })} error={p.errors.clientId} />
-        <TextField label="Client Secret" secret value={p.config.clientSecret} onChange={(e) => p.set({ clientSecret: e.target.value })} error={p.errors.clientSecret} hint="Sent once to the backend and cleared from this form. Never stored in the browser." full />
-        <SubscriptionField {...p} />
-      </div>
-      <ScopeSelectors {...p} />
-    </div>
-  );
-}
+/** Shown while a browser sign-in is pending, so the operator is not left watching a spinner. */
+const WAITING_FOR_WINDOW = "A sign-in window should open on this machine — complete it there. Waiting…";
 
-function ManagedIdentityForm(p: FormProps) {
+function InteractiveBrowserForm(p: FormProps) {
+  const { health } = useAppState();
+  const note = health?.capabilities.authMethodDetails?.find((d) => d.id === "interactive_browser");
+  const takesClientId = note?.takesClientId ?? true;
   return (
     <div className="stack" style={{ gap: 16 }}>
-      <p className="muted">Authenticate using an Azure Managed Identity assigned to the application or compute environment running the migration accelerator. This only works when the accelerator runs on Azure compute that has an identity assigned.</p>
+      {note?.caveat && <p className="muted">{note.caveat}</p>}
       <div className="form-grid">
+        <TextField label="Tenant ID" value={p.config.tenantId} onChange={(e) => p.set({ tenantId: e.target.value })} error={p.errors.tenantId} placeholder="00000000-0000-0000-0000-000000000000" hint="The tenant the sign-in window opens against." />
         <SubscriptionField {...p} />
-        <TextField label="Identity client ID" optional value={p.config.clientId} onChange={(e) => p.set({ clientId: e.target.value })} error={p.errors.clientId} hint="Only for a user-assigned identity. Leave blank for the system-assigned one." />
+        {takesClientId && (
+          <TextField id="client-id" label="Client ID" optional value={p.config.clientId} onChange={(e) => p.set({ clientId: e.target.value })} error={p.errors.clientId} placeholder="Application (client) ID" hint="Only if the tenant has not consented to Microsoft's default sign-in app. An identifier, not a secret." />
+        )}
       </div>
+      {p.authenticating && <Banner tone="info" title="Waiting for you to sign in">{WAITING_FOR_WINDOW}</Banner>}
       <ScopeSelectors {...p} />
     </div>
   );
@@ -185,7 +179,7 @@ function ManagedIdentityForm(p: FormProps) {
 
 /* ---- Connection status --------------------------------------------------------------- */
 
-const METHOD_LABEL: Record<AuthMethod, string> = { azure_cli: "Azure CLI", service_principal: "Service Principal", managed_identity: "Managed Identity" };
+const METHOD_LABEL: Record<AuthMethod, string> = { azure_cli: "Azure CLI", interactive_browser: "Interactive browser" };
 
 export function ConnectionStatus({ connection, busy, onTest, onChange, onDisconnect }: { connection: ConnectionState; busy: boolean; onTest: () => void; onChange: () => void; onDisconnect: () => void }) {
   const rows: [string, ReactNode][] = [
@@ -231,8 +225,7 @@ function CheckList({ checks }: { checks: ConnectionState["checks"] }) {
 
 const HELP: Record<AuthMethod, string> = {
   azure_cli: "Enter the subscription ID and sign in. A browser window opens asking you to authenticate with your Azure account.",
-  service_principal: "Enter the application credentials and subscription ID, then authenticate.",
-  managed_identity: "Enter the subscription ID, then authenticate with the identity of this environment.",
+  interactive_browser: "Enter the tenant and subscription IDs, then authenticate. A Microsoft sign-in window opens on the machine running the server; choose your account there.",
 };
 
 /**
@@ -279,28 +272,22 @@ export function SourceConnection({ hideStatus = false, forceForm = false }: { hi
   const selectMethod = (method: AuthMethod) => {
     setErrors({});
     app.clearConnectionError();
-    setConfig((c) => ({ ...c, method, clientId: "", clientSecret: "", resourceGroup: "", workspace: "", sqlPool: "" }));
+    setConfig((c) => ({ ...c, method, clientId: "", resourceGroup: "", workspace: "", sqlPool: "" }));
   };
 
   const submit = async (action: "authenticate" | "test") => {
     const found = validate(config, action);
     setErrors(found);
     if (Object.keys(found).length) return;
-    const { clientSecret: _drop, ...safe } = config;
-    void _drop;
-    remembered = safe;
-    try {
-      await (action === "test" ? app.testConnection(config) : app.authenticate(config));
-    } finally {
-      set({ clientSecret: "" }); // the secret never outlives the request
-    }
+    remembered = config;
+    await (action === "test" ? app.testConnection(config) : app.authenticate(config));
     if (action === "test") setChanging(false);
   };
 
   const retest = () => app.testConnection(configFromConnection(connection));
 
   const formProps: FormProps = { config, errors, set, signedIn: signedInHere, authenticating: connectionBusy === "authenticate" };
-  const Form = azure ? AzureCliForm : config.method === "service_principal" ? ServicePrincipalForm : ManagedIdentityForm;
+  const Form = azure ? AzureCliForm : InteractiveBrowserForm;
 
   return (
     <div className="stack" style={{ gap: 16 }}>

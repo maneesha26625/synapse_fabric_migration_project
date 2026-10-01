@@ -116,6 +116,7 @@ class ConnectionManager:
             self._credential = credential_provider(
                 method=config.credential_method if config else CredentialMethod.AZURE_CLI,
                 tenant_id=config.tenant_id if config else None,
+                client_id=config.client_id if config else None,
             )
         return self._credential
 

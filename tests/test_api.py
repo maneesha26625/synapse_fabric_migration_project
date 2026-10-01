@@ -64,10 +64,22 @@ VALID = {
 }
 
 
-def test_health_advertises_the_three_source_methods(server):
+def test_health_advertises_the_two_source_methods(server):
     status, body = call(server, "GET", "/api/health")
     assert status == 200
-    assert body["capabilities"]["authMethods"] == ["azure_cli", "service_principal", "managed_identity"]
+    assert body["capabilities"]["authMethods"] == ["azure_cli", "interactive_browser"]
+
+
+def test_the_catalog_lists_interactive_browser_and_only_it_takes_a_client_id(server):
+    _, body = call(server, "GET", "/api/health")
+    details = {d["id"]: d for d in body["capabilities"]["authMethodDetails"]}
+    browser = details["interactive_browser"]
+    assert browser["label"] == "Interactive browser"
+    assert "Azure CLI session untouched" in browser["detail"]
+    assert "server" in browser["caveat"] and "Client ID" in browser["caveat"]
+    assert browser["takesClientId"] is True
+    assert details["azure_cli"]["takesClientId"] is False
+    assert "managed_identity" not in details
 
 
 def test_starts_disconnected(server):
@@ -90,20 +102,13 @@ def test_results_before_discovery_are_refused_not_empty(server):
 SP = {**VALID, "method": "service_principal", "tenantId": "8a24d8ed-7a4b-45b3-b56b-d781dd225aa1", "clientId": "11111111-2222-3333-4444-555555555555"}
 
 
-def test_service_principal_needs_a_secret_and_never_echoes_one(server):
-    status, body = call(server, "POST", "/api/connections/authenticate", SP)
-    assert status == 400 and "secret" in body["error"]["message"].lower()
-    status, body = call(server, "POST", "/api/connections/authenticate", {**SP, "clientId": "bad", "clientSecret": "s3cr3t-value"})
-    assert status == 400
+def test_service_principal_is_not_offered_and_never_echoes_a_secret(server):
+    status, body = call(server, "POST", "/api/connections/authenticate", {**SP, "clientSecret": "s3cr3t-value"})
+    assert status == 400 and body["error"]["code"] == "invalid_configuration"
     assert "s3cr3t-value" not in json.dumps(body)
 
 
-def test_service_principal_client_id_must_be_a_guid(server):
-    status, _ = call(server, "POST", "/api/connections/authenticate", {**SP, "clientId": "", "clientSecret": "x"})
-    assert status == 400
-
-
-@pytest.mark.parametrize("method", ["service_principal", "managed_identity"])
+@pytest.mark.parametrize("method", ["interactive_browser"])
 def test_testing_with_any_method_requires_authenticating_first(server, method):
     status, body = call(server, "POST", "/api/connections/test", {**VALID, "method": method})
     assert status == 409 and body["error"]["code"] == "sign_in_required"
@@ -114,6 +119,86 @@ def test_sign_in_input_is_validated_before_anything_is_contacted(server, patch):
     status, body = call(server, "POST", "/api/connections/authenticate", {**VALID, **patch})
     assert status == 400
     assert body["error"]["code"] == "invalid_configuration"
+
+
+BROWSER = {**VALID, "method": "interactive_browser", "tenantId": "8a24d8ed-7a4b-45b3-b56b-d781dd225aa1"}
+
+
+def test_managed_identity_is_no_longer_offered(server):
+    status, body = call(server, "POST", "/api/connections/authenticate", {**VALID, "method": "managed_identity"})
+    assert status == 400 and body["error"]["code"] == "invalid_configuration"
+
+
+def test_interactive_browser_needs_the_tenant_it_opens_against(server):
+    status, body = call(server, "POST", "/api/connections/authenticate", {**BROWSER, "tenantId": ""})
+    assert status == 400 and "Tenant ID" in body["error"]["message"]
+
+
+def test_the_sign_in_body_accepts_a_client_id_and_checks_its_shape(server):
+    status, body = call(server, "POST", "/api/connections/authenticate", {**BROWSER, "clientId": "not-a-guid"})
+    assert status == 400 and "Client ID" in body["error"]["message"]
+
+
+@pytest.mark.parametrize("field", ["clientSecret", "password", "accessToken", "username", "loginHint", "anything"])
+def test_the_sign_in_body_refuses_unknown_and_secret_fields_without_echoing_them(server, field):
+    status, body = call(server, "POST", "/api/connections/authenticate", {**BROWSER, field: "s3cr3t-value"})
+    assert status == 400 and body["error"]["code"] == "invalid_configuration"
+    assert field in body["error"]["message"]
+    assert "s3cr3t-value" not in json.dumps(body)
+
+
+class _FakeAzure:
+    """Stands in for AzureConnection so a sign-in completes with no network."""
+
+    providers = []
+
+    def __init__(self, config, credential=None):
+        self.config = config
+        self.credential = credential
+        _FakeAzure.providers.append(credential)
+
+    def validate(self):
+        from discovery_agent.connections.validation import ok
+
+        return ok(SourceType.AZURE, "signed in", tenant_id=self.config.tenant_id, subscription_name="Demo")
+
+
+def test_interactive_browser_reuses_the_held_identity_and_azure_cli_keeps_nothing(monkeypatch):
+    from discovery_agent.api import service as service_module
+
+    monkeypatch.setattr(service_module, "AzureConnection", _FakeAzure)
+    _FakeAzure.providers = []
+    session = Session()
+    for _ in range(2):
+        assert session.authenticate(dict(BROWSER))["signedIn"] is True
+    assert _FakeAzure.providers[0] is _FakeAzure.providers[1]
+    assert _FakeAzure.providers[0].remember is True
+
+    _FakeAzure.providers = []
+    for _ in range(2):
+        session.authenticate({**VALID, "tenantId": BROWSER["tenantId"]})
+    assert _FakeAzure.providers[0] is not _FakeAzure.providers[1]
+    assert _FakeAzure.providers[0].remember is False
+
+
+def test_sign_out_forgets_the_record_and_the_held_identity_but_not_the_cli(monkeypatch):
+    from discovery_agent.api import service as service_module
+    from discovery_agent.connections.azure import auth_record_path
+
+    monkeypatch.setattr(service_module, "AzureConnection", _FakeAzure)
+    _FakeAzure.providers = []
+    session = Session()
+    session.authenticate(dict(BROWSER))
+    record = auth_record_path()
+    record.parent.mkdir(parents=True, exist_ok=True)
+    record.write_text("{}", encoding="utf-8")
+
+    payload = session.disconnect()
+
+    assert not record.exists()
+    assert "Azure CLI session is untouched" in payload["note"]
+    session.authenticate(dict(BROWSER))
+    assert _FakeAzure.providers[0] is not _FakeAzure.providers[1]  # a fresh identity, so a fresh window
 
 
 def test_testing_a_workspace_requires_a_sign_in_first(server):

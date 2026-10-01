@@ -59,11 +59,11 @@ No secret is read from, or written to, any environment variable or storage.
 
 ## Security notes
 
-- Only Azure CLI is implemented by the backend's connection layer. The UI reads
-  `/api/health` and disables Service Principal / Managed Identity in Live mode
-  rather than sending credentials to a backend that would ignore them.
-- The client-secret field is masked, non-autofilled, cleared after every submit,
-  excluded from the in-memory form memory and never written to any storage.
+- The Synapse source offers **Azure CLI** and **Interactive browser**. Its form
+  has no secret field: the optional Client ID is an application identifier,
+  and the backend refuses any sign-in field it does not expect.
+- The UI reads `/api/health` (`authMethods`, `authMethodDetails`) and disables a
+  method the running backend does not support.
 - Tokens never reach the browser: the backend holds them, and its responses are
   redacted.
 - Only the API mode preference is kept in `localStorage`.

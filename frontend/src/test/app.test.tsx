@@ -7,7 +7,7 @@ import type { ConnectionConfig, FabricConfig, ResultsQuery } from "../types";
 
 const CONFIG: ConnectionConfig = {
   method: "azure_cli", tenantId: "", subscriptionId: "10eb96c3-ba3c-492e-b95b-e9f1d6d85d70",
-  resourceGroup: "rg-demo-migration", workspace: "demo-synapse-ws", workspaceUrl: "", sqlPool: "", clientId: "", clientSecret: "", resource: "",
+  resourceGroup: "rg-demo-migration", workspace: "demo-synapse-ws", workspaceUrl: "", sqlPool: "", clientId: "", resource: "",
 };
 const FABRIC: FabricConfig = { method: "azure_cli", workspaceId: "", workspaceName: "Fabric_practice" };
 const Q: ResultsQuery = {
@@ -126,22 +126,43 @@ describe("synapse source", () => {
     expect(screen.queryByLabelText(/fabric/i)).toBeNull();
   });
 
-  it("masks the client secret and swaps the form with the selected method", async () => {
+  it("offers Azure CLI and Interactive browser only, and swaps the form with the method", async () => {
     const user = userEvent.setup();
     go("/synapse");
     await user.click((await screen.findAllByRole("button", { name: /Add Synapse Workspace/ }))[0]);
-    await user.click(await screen.findByRole("radio", { name: /Service Principal/ }));
-    expect(screen.getByLabelText("Client Secret")).toHaveAttribute("type", "password");
-    await user.click(screen.getByRole("radio", { name: /Managed Identity/ }));
-    expect(screen.queryByLabelText("Client Secret")).toBeNull();
-    expect(screen.getByLabelText(/Identity client ID/)).toBeInTheDocument();
+    expect(await screen.findAllByRole("radio")).toHaveLength(2);
+    for (const gone of [/Service Principal/, /Managed Identity/]) expect(screen.queryByRole("radio", { name: gone })).toBeNull();
+    expect(screen.queryByLabelText(/Client ID/)).toBeNull(); // Azure CLI takes none
+    await user.click(screen.getByRole("radio", { name: /Interactive browser/ }));
+    expect(screen.queryByLabelText(/secret/i)).toBeNull();
+    const clientId = screen.getByLabelText(/Client ID/);
+    for (const attr of ["id", "placeholder"]) {
+      expect(clientId.getAttribute(attr) ?? "").not.toMatch(/secret|password|token|key|credential/i);
+    }
+    expect(screen.getByLabelText("Tenant ID")).toBeInTheDocument();
   });
+
+  it("requires the tenant for the browser sign-in and says where the window opens", async () => {
+    const user = userEvent.setup();
+    go("/synapse");
+    await user.click((await screen.findAllByRole("button", { name: /Add Synapse Workspace/ }))[0]);
+    await user.click(await screen.findByRole("radio", { name: /Interactive browser/ }));
+    await user.type(screen.getByLabelText("Subscription ID"), CONFIG.subscriptionId);
+    await user.click(screen.getByRole("button", { name: "Authenticate" }));
+    expect(await screen.findByText("Tenant ID is required.")).toBeInTheDocument();
+    await user.type(screen.getByLabelText("Tenant ID"), "8a24d8ed-7a4b-45b3-b56b-d781dd225aa1");
+    await user.click(screen.getByRole("button", { name: "Authenticate" }));
+    expect(await screen.findByText(/A sign-in window should open on this machine — complete it there. Waiting…/)).toBeInTheDocument();
+    await screen.findByLabelText("Resource group", {}, { timeout: 4000 });
+  }, 15000);
 
   it("keeps Discover Workspace disabled until the connection test passes", async () => {
     const user = userEvent.setup();
     go("/synapse");
     await user.click((await screen.findAllByRole("button", { name: /Add Synapse Workspace/ }))[0]);
+    await user.click(screen.getByRole("radio", { name: /^Azure CLI/ })); // the form remembers the last method
     expect(screen.getByRole("button", { name: "Test Connection" })).toBeDisabled();
+    await user.clear(screen.getByLabelText("Subscription ID"));
     await user.type(screen.getByLabelText("Subscription ID"), CONFIG.subscriptionId);
     await user.click(screen.getByRole("button", { name: "Sign in with Azure" }));
     const group = await screen.findByLabelText("Resource group", {}, { timeout: 4000 });

@@ -50,8 +50,12 @@ from discovery_agent.connections.azure import (
     AzureCliCredentialProvider,
     AzureConnection,
     AzureCredentialProvider,
+    InteractiveBrowserCredentialProvider,
     RequestsArmTransport,
+    auth_record_path,
     credential_provider_for,
+    forget_auth_record,
+    reset_credentials,
 )
 from discovery_agent.connections.git import GitConnection, connection_from_url
 from discovery_agent.connections.manager import ConnectionManager
@@ -94,6 +98,7 @@ __all__ = [
     "ErrorCategory",
     "GitConnection",
     "GitRepositoryConfig",
+    "InteractiveBrowserCredentialProvider",
     "RequestsArmTransport",
     "SQL_SCOPE",
     "SYNAPSE_SCOPE",
@@ -104,8 +109,11 @@ __all__ = [
     "SynapseWorkspaceMetadata",
     "ValidationReport",
     "ValidationStatus",
+    "auth_record_path",
     "connection_from_url",
     "credential_provider_for",
+    "forget_auth_record",
     "redact",
+    "reset_credentials",
     "settings_from_environment",
 ]

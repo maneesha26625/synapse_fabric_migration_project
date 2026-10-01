@@ -1,10 +1,10 @@
 // Shapes shared by the UI, the real API client and the mock layer.
 // They mirror what the Python API returns (src/discovery_agent/api).
 
-export type AuthMethod = "azure_cli" | "service_principal" | "managed_identity";
+export type AuthMethod = "azure_cli" | "interactive_browser";
 export type ApiMode = "real" | "mock";
 
-/** What the operator types. Never persisted; the secret never leaves the form. */
+/** What the operator types. Identifiers only; no field can hold a secret. */
 export interface ConnectionConfig {
   method: AuthMethod;
   tenantId: string;
@@ -14,7 +14,6 @@ export interface ConnectionConfig {
   workspaceUrl: string;
   sqlPool: string;
   clientId: string;
-  clientSecret: string;
   resource: string;
 }
 
@@ -56,7 +55,17 @@ export interface ConnectionState {
 
 export interface Health {
   status: "ok";
-  capabilities: { authMethods: AuthMethod[]; discoveryScope: string[] };
+  capabilities: { authMethods: AuthMethod[]; authMethodDetails?: AuthMethodDetail[]; discoveryScope: string[] };
+}
+
+/** What the backend says about one sign-in method. Drives the optional Client ID field. */
+export interface AuthMethodDetail {
+  id: AuthMethod;
+  label: string;
+  detail: string;
+  bestFor?: string;
+  caveat?: string;
+  takesClientId: boolean;
 }
 
 export type DiscoveryState =

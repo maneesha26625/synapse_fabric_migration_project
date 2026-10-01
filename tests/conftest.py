@@ -27,6 +27,18 @@ SMOKE_REPOSITORY_NAME = "Test-Drive-Azure-Synapse-with-a-1-click-POC"
 SMOKE_REPOSITORY = SMOKE_INPUT_ROOT / SMOKE_REPOSITORY_NAME
 SMOKE_REPOSITORY_URL = f"https://github.com/Azure/{SMOKE_REPOSITORY_NAME}"
 
+@pytest.fixture(autouse=True)
+def _isolated_sign_in_state(tmp_path, monkeypatch):
+    """No test reads, writes or deletes the operator's real authentication
+    record, and no held identity leaks from one test into the next."""
+    from discovery_agent.connections.azure import ENV_HOME, reset_credentials
+
+    monkeypatch.setenv(ENV_HOME, str(tmp_path / "sign-in-home"))
+    reset_credentials()
+    yield
+    reset_credentials()
+
+
 #: Every smoke module skips on this: the snapshot is gitignored, so a fresh
 #: checkout has none until acquisition has been run once.
 requires_snapshot = pytest.mark.skipif(
