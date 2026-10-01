@@ -184,6 +184,17 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
       setFabricBusy(null);
     }
   }, []);
+  // A browser sign-in finishes on its own time: poll until the backend settles.
+  useEffect(() => {
+    if (fabric.status !== "signing_in") return;
+    const timer = setInterval(() => {
+      api.getFabricTarget().then((next) => {
+        setFabric(next);
+        if (next.status === "failed") setFabricError(next.message ?? "The sign-in failed.");
+      }, () => undefined);
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [api, fabric.status]);
   const authenticateFabric = useCallback((c: FabricConfig) => fabricCall("authenticate", () => api.authenticateFabric(c)), [api, fabricCall]);
   const testFabric = useCallback((c: FabricConfig) => fabricCall("test", () => api.testFabric(c)), [api, fabricCall]);
   const disconnectFabric = useCallback(async () => { setFabric(await api.disconnectFabric()); setFabricError(null); }, [api]);

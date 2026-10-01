@@ -6,6 +6,7 @@ import {
   type ConnectionConfig,
   type ConnectionState,
   type DiscoveryStatus,
+  type FabricTarget,
   type Health,
   type MigrationApi,
   type ObjectDetail,
@@ -119,10 +120,15 @@ export const realApi: MigrationApi = {
   getDependencies: () => request<DependencyGraph>("/api/dependencies"),
   getComponents: async () => (await request<{ components: ComponentRow[] }>("/api/mapping/components")).components,
   exportMetadata: () => request<MetadataExport>("/api/discovery/export"),
-  getFabricTarget: async () => ({ status: "disconnected" as const }),
-  authenticateFabric: notImplemented("Connecting to a Fabric target"),
-  testFabric: notImplemented("Connecting to a Fabric target"),
-  disconnectFabric: async () => ({ status: "disconnected" as const }),
+  getFabricTarget: () => request<FabricTarget>("/api/fabric/connection"),
+  authenticateFabric: (c) =>
+    request<FabricTarget>("/api/fabric/authenticate", { method: "POST", body: JSON.stringify({ method: c.method }) }),
+  testFabric: (c) =>
+    request<FabricTarget>("/api/fabric/test", {
+      method: "POST",
+      body: JSON.stringify({ method: c.method, workspaceId: c.workspaceId.trim() }),
+    }),
+  disconnectFabric: () => request<FabricTarget>("/api/fabric/connection", { method: "DELETE" }),
   startExecution: notImplemented("Migration execution"),
   getExecution: async () => ({ runId: "", state: "idle" as const, total: 0, completed: 0, inProgress: 0, failed: 0, pending: 0, items: [], logs: [] }),
   controlExecution: notImplemented("Migration execution"),

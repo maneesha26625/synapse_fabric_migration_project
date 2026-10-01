@@ -15,6 +15,11 @@ web framework would be the first. The surface is small and fixed.
     GET    /api/dependencies              dependency graph + suggested waves
     GET    /api/mapping/components        Synapse -> Fabric component table
     GET    /api/discovery/export          the whole inventory, for download
+    GET    /api/fabric/connection         Fabric target state (never a token)
+    POST   /api/fabric/authenticate       Azure CLI / Fabric CLI login + workspace list
+    POST   /api/fabric/workspaces         refresh the workspace list
+    POST   /api/fabric/test               verify the selected workspace
+    DELETE /api/fabric/connection         forget the Fabric target
 
 Security posture, in order of importance:
 
@@ -40,6 +45,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qsl, unquote, urlsplit
 
+from discovery_agent.api.fabric import FabricError, FabricTarget
 from discovery_agent.api.service import ApiError, Session
 
 MAX_BODY_BYTES = 64 * 1024
@@ -47,7 +53,9 @@ _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 RESULTS_PREFIX = "/api/discovery/results/"
 
 
-def make_handler(session: Session, static_root: Optional[Path]):
+def make_handler(session: Session, static_root: Optional[Path], fabric: Optional[FabricTarget] = None):
+    fabric = fabric or FabricTarget()
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "MigrationAcceleratorAPI"
         sys_version = ""
@@ -98,7 +106,7 @@ def make_handler(session: Session, static_root: Optional[Path]):
                 return
             try:
                 self._send(200, handler())
-            except ApiError as exc:
+            except (ApiError, FabricError) as exc:
                 self._error(exc.status, exc.code, exc.message)
             except Exception:  # noqa: BLE001 - never surface a traceback to a browser
                 self._error(500, "internal_error", "The server hit an unexpected problem.")
@@ -116,6 +124,8 @@ def make_handler(session: Session, static_root: Optional[Path]):
                 self._dispatch(session.health)
             elif path == "/api/connections":
                 self._dispatch(session.connection_state)
+            elif path == "/api/fabric/connection":
+                self._dispatch(fabric.state)
             elif path.startswith("/api/azure/"):
                 self._dispatch(lambda: session.azure_options(path[len("/api/azure/"):], query))
             elif path == "/api/dependencies":
@@ -139,6 +149,9 @@ def make_handler(session: Session, static_root: Optional[Path]):
             routes = {
                 "/api/connections/authenticate": lambda: session.authenticate(self._json_body()),
                 "/api/connections/test": lambda: session.test(self._json_body()),
+                "/api/fabric/authenticate": lambda: fabric.authenticate(self._json_body()),
+                "/api/fabric/workspaces": lambda: fabric.refresh_workspaces(self._json_body()),
+                "/api/fabric/test": lambda: fabric.test(self._json_body()),
                 "/api/discovery/start": session.start_discovery,
             }
             handler = routes.get(path)
@@ -150,6 +163,8 @@ def make_handler(session: Session, static_root: Optional[Path]):
         def do_DELETE(self) -> None:  # noqa: N802
             if urlsplit(self.path).path == "/api/connections":
                 self._dispatch(session.disconnect)
+            elif urlsplit(self.path).path == "/api/fabric/connection":
+                self._dispatch(fabric.disconnect)
             else:
                 self._error(404, "not_found", "No such endpoint.")
 

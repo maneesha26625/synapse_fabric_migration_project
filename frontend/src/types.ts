@@ -313,23 +313,26 @@ export interface MetadataExport {
 
 // ---- Fabric target ----------------------------------------------------------------
 
-export type FabricAuthMethod = "azure_cli" | "fabric_cli" | "service_principal";
+export type FabricAuthMethod = "azure_cli" | "fabric_cli";
+/** No token or secret ever travels through the UI: the backend holds the session. */
 export interface FabricConfig {
   method: FabricAuthMethod;
-  tenantId: string;
   workspaceId: string;
   workspaceName: string;
-  clientId: string;
-  clientSecret: string;
 }
-export type FabricStatus = "disconnected" | "authenticated" | "connected" | "failed";
+export interface FabricWorkspace { id: string; name: string }
+export interface FabricCheck { label: string; ok: boolean; detail?: string }
+export type FabricStatus = "disconnected" | "signing_in" | "authenticated" | "connected" | "failed";
 export interface FabricTarget {
   status: FabricStatus;
   method?: FabricAuthMethod;
-  tenantId?: string;
-  workspaceId?: string;
-  workspaceName?: string;
-  message?: string;
+  account?: string | null;
+  tenantId?: string | null;
+  workspaces?: FabricWorkspace[];
+  workspaceId?: string | null;
+  workspaceName?: string | null;
+  checks?: FabricCheck[];
+  message?: string | null;
 }
 
 // ---- plan, execution, validation ----------------------------------------------------

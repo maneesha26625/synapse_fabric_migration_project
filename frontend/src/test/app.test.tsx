@@ -9,7 +9,7 @@ const CONFIG: ConnectionConfig = {
   method: "azure_cli", tenantId: "", subscriptionId: "10eb96c3-ba3c-492e-b95b-e9f1d6d85d70",
   resourceGroup: "rg-demo-migration", workspace: "demo-synapse-ws", workspaceUrl: "", sqlPool: "", clientId: "", clientSecret: "", resource: "",
 };
-const FABRIC: FabricConfig = { method: "azure_cli", tenantId: "", workspaceId: "", workspaceName: "Fabric_practice", clientId: "", clientSecret: "" };
+const FABRIC: FabricConfig = { method: "azure_cli", workspaceId: "", workspaceName: "Fabric_practice" };
 const Q: ResultsQuery = {
   search: "", categories: [], types: [], statuses: [], fabricTargets: [], paths: [], workstreams: [], mappingStatuses: [],
   classifications: [], assessment: "", sort: "name", dir: "asc", page: 1, pageSize: 200,
@@ -157,13 +157,15 @@ describe("synapse source", () => {
 });
 
 describe("fabric target", () => {
-  it("is a separate page with its own three methods", async () => {
+  it("is a separate page with exactly two methods", async () => {
     const user = userEvent.setup();
     go("/fabric");
     await screen.findByRole("heading", { level: 1, name: "Fabric Target" });
-    for (const m of ["Azure CLI", "Fabric CLI", "Service Principal"]) expect(screen.getByRole("radio", { name: new RegExp(m) })).toBeInTheDocument();
-    await user.click(screen.getByRole("radio", { name: /Service Principal/ }));
-    expect(screen.getByLabelText("Client Secret")).toHaveAttribute("type", "password");
+    for (const m of ["Azure CLI", "Fabric CLI"]) expect(screen.getByRole("radio", { name: new RegExp(m) })).toBeInTheDocument();
+    expect(screen.queryByRole("radio", { name: /Service Principal/ })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("radio", { name: /Fabric CLI/ }));
+    expect(screen.getByRole("button", { name: "Login with Fabric CLI" })).toBeInTheDocument();
+    expect(screen.queryByLabelText(/token/i)).not.toBeInTheDocument();
   });
 
   it("authenticates and tests in separate steps", async () => {
@@ -173,10 +175,10 @@ describe("fabric target", () => {
     expect(screen.getByRole("button", { name: "Test Connection" })).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "Login with Azure CLI" }));
     await screen.findAllByText("AUTHENTICATED", {}, { timeout: 3000 });
-    await user.type(screen.getByLabelText("Workspace name"), "Fabric_practice");
+    await user.selectOptions(screen.getByLabelText("Fabric Workspace"), "Fabric_practice");
     await user.click(screen.getByRole("button", { name: "Test Connection" }));
     await screen.findAllByText("CONNECTED", {}, { timeout: 3000 });
-    expect(screen.getByText("Fabric_practice", { selector: "h2" })).toBeInTheDocument();
+    expect(screen.getByText("Workspace accessible")).toBeInTheDocument();
   }, 15000);
 });
 

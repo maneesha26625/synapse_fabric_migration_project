@@ -22,7 +22,7 @@ export function Projects() {
         <MetricCard label="Source" value={isConnected ? "Connected" : "Not connected"} hint={isConnected ? connection.workspace : "Connect a Synapse workspace"} />
         <MetricCard label="Objects discovered" value={done && discovery.summary ? discovery.summary.total.toLocaleString() : "—"} hint={done ? undefined : "Run discovery"} />
         <MetricCard label="Objects in plan" value={plan.length ? plan.length.toLocaleString() : "—"} hint="Migration Plan" />
-        <MetricCard label="Fabric target" value={fabric.status === "connected" ? "Connected" : "Not connected"} hint={fabric.workspaceName} />
+        <MetricCard label="Fabric target" value={fabric.status === "connected" ? "Connected" : "Not connected"} hint={fabric.workspaceName ?? undefined} />
       </div>
 
       <Card title="Projects" subtitle="Select the project you are working on. Use New Project in the header to add one.">

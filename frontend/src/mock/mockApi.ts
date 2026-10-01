@@ -429,23 +429,30 @@ export const mockApi: MigrationApi = {
 
   async authenticateFabric(c: FabricConfig) {
     await sleep(900);
-    const missing = c.method === "service_principal" && (!c.tenantId.trim() || !c.clientId.trim() || !c.clientSecret);
-    if (missing) throw new ApiRequestError("invalid_configuration", "Tenant ID, client ID and client secret are required.");
-    fabric = { status: "authenticated", method: c.method, tenantId: c.tenantId.trim() || "00000000-0000-0000-0000-000000000000", message: "Authenticated (demo)." };
+    fabric = {
+      status: "authenticated", method: c.method, account: "demo.user@contoso.com", tenantId: "00000000-0000-0000-0000-000000000000",
+      workspaces: [{ id: "3f2a9c1e-7b64-4d0a-9a55-1c2e8b7d4f10", name: "Fabric_practice" }, { id: "9b1d5e22-0c3a-4f7e-8d11-6a4c2e9f0b33", name: "My workspace" }],
+      message: "Authenticated (demo).",
+    };
     return fabric;
   },
 
   async testFabric(c: FabricConfig) {
     await sleep(800);
-    if (!c.workspaceId.trim() && !c.workspaceName.trim()) throw new ApiRequestError("invalid_configuration", "A workspace name or ID is required.");
+    if (!c.workspaceId.trim() && !c.workspaceName.trim()) throw new ApiRequestError("invalid_configuration", "Select a Fabric workspace first.");
     if ((c.workspaceName + c.workspaceId).toLowerCase().includes("denied")) {
       fabric = { ...fabric, status: "failed", message: "The identity has no access to this Fabric workspace (demo)." };
       return fabric;
     }
     fabric = {
-      status: "connected", method: c.method, tenantId: fabric.tenantId ?? c.tenantId.trim(),
+      ...fabric, status: "connected", method: c.method,
       workspaceName: c.workspaceName.trim() || "Fabric_practice",
-      workspaceId: c.workspaceId.trim() || "3f2a9c1e-7b64-4d0a-9a55-1c2e8b7d4f10", message: "Workspace reachable (demo).",
+      workspaceId: c.workspaceId.trim() || "3f2a9c1e-7b64-4d0a-9a55-1c2e8b7d4f10", message: null,
+      checks: [
+        { label: c.method === "azure_cli" ? "Azure CLI authenticated" : "Fabric CLI authenticated", ok: true },
+        { label: c.method === "azure_cli" ? "Fabric API accessible" : "Fabric workspace discovered", ok: true },
+        { label: "Workspace accessible", ok: true },
+      ],
     };
     return fabric;
   },
