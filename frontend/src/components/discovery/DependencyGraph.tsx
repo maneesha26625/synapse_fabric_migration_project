@@ -1,4 +1,4 @@
-import { Maximize2, Minus, Plus } from "lucide-react";
+import { Maximize2, Minimize2, Minus, Plus, ScanSearch } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GraphNode } from "../../types";
 import { Button } from "../shared/Shared";
@@ -27,6 +27,7 @@ interface Placed extends GraphNode { x: number; y: number }
 export function DependencyGraph({ nodes, edges, selectedId, onSelect }: Props) {
   const box = useRef<HTMLDivElement>(null);
   const [view, setView] = useState({ x: 16, y: 16, k: 1 });
+  const [full, setFull] = useState(false);
   const drag = useRef<{ x: number; y: number; vx: number; vy: number } | null>(null);
 
   const { placed, waves, width, height } = useMemo(() => {
@@ -68,7 +69,27 @@ export function DependencyGraph({ nodes, edges, selectedId, onSelect }: Props) {
     return () => el.removeEventListener("wheel", onWheel);
   }, []);
 
-  const zoom = (factor: number) => setView((v) => ({ ...v, k: Math.max(0.15, Math.min(2.5, v.k * factor)) }));
+  // Zoom about the centre of the visible area so the graph does not drift away.
+  const zoom = (factor: number) => {
+    const el = box.current;
+    const cx = (el?.clientWidth ?? 0) / 2, cy = (el?.clientHeight ?? 0) / 2;
+    setView((v) => {
+      const k = Math.max(0.15, Math.min(2.5, v.k * factor));
+      return { k, x: cx - ((cx - v.x) / v.k) * k, y: cy - ((cy - v.y) / v.k) * k };
+    });
+  };
+
+  const toggleFull = () => {
+    const el = box.current;
+    if (!el) return;
+    if (document.fullscreenElement) void document.exitFullscreen();
+    else void el.requestFullscreen?.();
+  };
+  useEffect(() => {
+    const onChange = () => { setFull(document.fullscreenElement === box.current); setTimeout(fit, 50); };
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, [fit]);
 
   const visibleEdges = edges.filter((e) => placed.has(e.source) && placed.has(e.target));
   const connected = new Set<string>();
@@ -91,15 +112,16 @@ export function DependencyGraph({ nodes, edges, selectedId, onSelect }: Props) {
     <div
       className="graph"
       ref={box}
-      onPointerDown={(e) => { if ((e.target as Element).closest(".gn")) return; drag.current = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y }; (e.currentTarget as Element).setPointerCapture(e.pointerId); }}
+      onPointerDown={(e) => { if ((e.target as Element).closest(".gn, .graph-controls")) return; drag.current = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y }; (e.currentTarget as Element).setPointerCapture(e.pointerId); }}
       onPointerMove={(e) => { const d = drag.current; if (d) setView((v) => ({ ...v, x: d.vx + e.clientX - d.x, y: d.vy + e.clientY - d.y })); }}
       onPointerUp={() => { drag.current = null; }}
-      onClick={(e) => { if (!(e.target as Element).closest(".gn")) onSelect(null); }}
+      onClick={(e) => { if (!(e.target as Element).closest(".gn, .graph-controls")) onSelect(null); }}
     >
       <div className="graph-controls">
         <Button size="small" icon aria-label="Zoom in" onClick={() => zoom(1.25)}><Plus size={15} /></Button>
         <Button size="small" icon aria-label="Zoom out" onClick={() => zoom(0.8)}><Minus size={15} /></Button>
-        <Button size="small" icon aria-label="Fit to view" onClick={fit}><Maximize2 size={14} /></Button>
+        <Button size="small" icon aria-label="Fit to view" onClick={fit}><ScanSearch size={15} /></Button>
+        <Button size="small" icon aria-label={full ? "Exit full screen" : "Full screen"} onClick={toggleFull}>{full ? <Minimize2 size={14} /> : <Maximize2 size={14} />}</Button>
       </div>
       <svg width="100%" height="100%" role="img" aria-label="Dependency graph. Columns are migration waves; arrows point to what an object needs.">
         <defs>
