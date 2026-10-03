@@ -86,30 +86,24 @@ _WORKSPACE_URL = re.compile(
 
 METHODS = ("azure_cli", "interactive_browser")
 
-#: What the UI shows for each method. ``takesClientId`` drives the optional
-#: Client ID field. Plain language, no secret anywhere.
+#: What the UI shows for each method. Plain language, no secret anywhere.
 METHOD_NOTES = {
     "azure_cli": {
         "label": "Azure CLI",
         "detail": "Opens a sign-in window each time; nothing is kept between sign-ins.",
-        "takesClientId": False,
     },
     "interactive_browser": {
         "label": "Interactive browser",
         "detail": "Opens a sign-in window against the tenant you name, and leaves your Azure CLI session untouched.",
         "bestFor": "A tenant your `az login` cannot reach.",
-        "caveat": (
-            "The window opens on the machine running this server. If the tenant answers "
-            "access_denied, register an application there and enter its id as Client ID."
-        ),
-        "takesClientId": True,
+        "caveat": "The window opens on the machine running this server.",
     },
 }
 
-#: Everything an authenticate request may contain. Anything else -- a secret
-#: above all -- is refused rather than silently dropped.
+#: Everything an authenticate request may contain: only what the sign-in
+#: needs. Anything else -- a secret above all -- is refused, not dropped.
 _AUTHENTICATE_FIELDS = frozenset(
-    {"method", "tenantId", "subscriptionId", "clientId", "resourceGroup", "workspace", "workspaceUrl", "sqlPool"}
+    {"method", "tenantId", "subscriptionId", "resourceGroup", "workspace", "workspaceUrl", "sqlPool"}
 )
 
 #: What an operator should do about each failure category. Plain language; the
@@ -306,7 +300,6 @@ class Session:
         browser = method == "interactive_browser"
         subscription = _clean(body.get("subscriptionId"), "Subscription ID", _GUID)
         tenant = _clean(body.get("tenantId"), "Tenant ID", _GUID, required=browser)
-        client_id = _clean(body.get("clientId"), "Client ID", _GUID, required=False) if browser else None
         with self._lock:
             if self._signing_in:
                 raise ApiError(409, "sign_in_in_progress", "A sign-in is already waiting for you in a browser window.")
@@ -325,12 +318,10 @@ class Session:
                     subscription_id=subscription,
                     tenant_id=tenant,
                     credential_method=credential_method,
-                    client_id=client_id,
                 )
                 provider = credential_provider(
                     method=credential_method,
                     tenant_id=tenant,
-                    client_id=client_id,
                     remember=browser,
                 )
                 provider.start_attempt()  # an explicit attempt retries a refused one

@@ -364,7 +364,7 @@ def test_the_config_carries_a_client_id_and_it_is_not_a_secret():
     "message, expected",
     [
         ("AADSTS50020: User account from identity provider does not exist in tenant", "Use another account"),
-        ("access_denied: the user cancelled", "put its id in Client ID"),
+        ("access_denied: the user cancelled", "ask the tenant's administrator"),
         ("AADSTS50011: The redirect URI specified in the request does not match", "Mobile and desktop applications"),
         ("Timed out waiting for authentication", "machine running the server"),
         ("Failed to open a browser", "headless host"),

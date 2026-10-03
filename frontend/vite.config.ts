@@ -6,7 +6,7 @@ import { defineConfig, loadEnv } from "vite";
 // talks to one origin and the backend needs no CORS configuration.
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, ".", "VITE_");
-  const backend = env.VITE_BACKEND_URL || "http://127.0.0.1:8000";
+  const backend = env.VITE_BACKEND_URL || "http://127.0.0.1:8001";
   return {
     plugins: [react()],
     server: {

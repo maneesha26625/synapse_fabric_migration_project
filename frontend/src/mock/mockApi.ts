@@ -249,13 +249,12 @@ export const mockApi: MigrationApi = {
       capabilities: {
         authMethods: ["azure_cli", "interactive_browser"],
         authMethodDetails: [
-          { id: "azure_cli", label: "Azure CLI", detail: "Opens a sign-in window each time; nothing is kept between sign-ins.", takesClientId: false },
+          { id: "azure_cli", label: "Azure CLI", detail: "Opens a sign-in window each time; nothing is kept between sign-ins." },
           {
             id: "interactive_browser", label: "Interactive browser",
             detail: "Opens a sign-in window against the tenant you name, and leaves your Azure CLI session untouched.",
             bestFor: "A tenant your `az login` cannot reach.",
-            caveat: "The window opens on the machine running this server. If the tenant answers access_denied, register an application there and enter its id as Client ID.",
-            takesClientId: true,
+            caveat: "The window opens on the machine running this server.",
           },
         ],
         discoveryScope: ["Tables", "Views", "Stored Procedures", "SQL Scripts", "Pipelines", "Datasets", "Linked Services", "Notebooks", "Spark Job Definitions"],

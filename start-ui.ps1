@@ -1,4 +1,4 @@
-# Starts the API (port 8000) and the UI dev server (port 5173), then opens the UI.
+# Starts the API (port 8001) and the UI dev server (port 5173), then opens the UI.
 # Usage:  .\start-ui.ps1
 $root = $PSScriptRoot
 $env:PYTHONPATH = Join-Path $root "src"
@@ -12,7 +12,7 @@ foreach ($candidate in @($venvPy, "py", "python")) {
 if (-not $python) { Write-Error "No working Python found."; exit 1 }
 
 Write-Host "Starting API with: $python"
-Start-Process -FilePath $python -ArgumentList "-m", "discovery_agent.api", "--port", "8000" -WorkingDirectory $root
+Start-Process -FilePath $python -ArgumentList "-m", "discovery_agent.api", "--port", "8001" -WorkingDirectory $root
 Start-Sleep 2
 
 Push-Location (Join-Path $root "frontend")

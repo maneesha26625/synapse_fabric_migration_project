@@ -7,7 +7,7 @@ import type { ConnectionConfig, FabricConfig, ResultsQuery } from "../types";
 
 const CONFIG: ConnectionConfig = {
   method: "azure_cli", tenantId: "", subscriptionId: "10eb96c3-ba3c-492e-b95b-e9f1d6d85d70",
-  resourceGroup: "rg-demo-migration", workspace: "demo-synapse-ws", workspaceUrl: "", sqlPool: "", clientId: "", resource: "",
+  resourceGroup: "rg-demo-migration", workspace: "demo-synapse-ws", workspaceUrl: "", sqlPool: "", resource: "",
 };
 const FABRIC: FabricConfig = { method: "azure_cli", workspaceId: "", workspaceName: "Fabric_practice" };
 const Q: ResultsQuery = {
@@ -132,14 +132,13 @@ describe("synapse source", () => {
     await user.click((await screen.findAllByRole("button", { name: /Add Synapse Workspace/ }))[0]);
     expect(await screen.findAllByRole("radio")).toHaveLength(2);
     for (const gone of [/Service Principal/, /Managed Identity/]) expect(screen.queryByRole("radio", { name: gone })).toBeNull();
-    expect(screen.queryByLabelText(/Client ID/)).toBeNull(); // Azure CLI takes none
     await user.click(screen.getByRole("radio", { name: /Interactive browser/ }));
-    expect(screen.queryByLabelText(/secret/i)).toBeNull();
-    const clientId = screen.getByLabelText(/Client ID/);
-    for (const attr of ["id", "placeholder"]) {
-      expect(clientId.getAttribute(attr) ?? "").not.toMatch(/secret|password|token|key|credential/i);
-    }
+    // Only the two fields the sign-in needs: no optional extras, no secret.
     expect(screen.getByLabelText("Tenant ID")).toBeInTheDocument();
+    expect(screen.getByLabelText("Subscription ID")).toBeInTheDocument();
+    expect(screen.queryByLabelText(/Client ID/)).toBeNull();
+    expect(screen.queryByLabelText(/secret/i)).toBeNull();
+    expect(screen.queryByText("(optional)")).toBeNull();
   });
 
   it("requires the tenant for the browser sign-in and says where the window opens", async () => {

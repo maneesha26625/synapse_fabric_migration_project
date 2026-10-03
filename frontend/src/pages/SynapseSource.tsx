@@ -50,7 +50,7 @@ export function SynapseSource() {
         <ConnectionStatus
           connection={connection}
           busy={connectionBusy === "test"}
-          onTest={() => void testConnection({ method: connection.method ?? "azure_cli", tenantId: connection.tenantId ?? "", subscriptionId: connection.subscriptionId ?? "", resourceGroup: connection.resourceGroup ?? "", workspace: connection.workspace ?? "", workspaceUrl: "", sqlPool: connection.sqlPool ?? "", clientId: "", resource: "" })}
+          onTest={() => void testConnection({ method: connection.method ?? "azure_cli", tenantId: connection.tenantId ?? "", subscriptionId: connection.subscriptionId ?? "", resourceGroup: connection.resourceGroup ?? "", workspace: connection.workspace ?? "", workspaceUrl: "", sqlPool: connection.sqlPool ?? "", resource: "" })}
           onChange={() => setAdding(true)}
           onDisconnect={() => { setAdding(false); void disconnect(); }}
         />

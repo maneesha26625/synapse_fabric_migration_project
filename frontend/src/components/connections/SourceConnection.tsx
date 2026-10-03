@@ -30,7 +30,7 @@ export function AuthenticationSelector({ value, onChange }: { value: AuthMethod;
 const GUID = /^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$/;
 const EMPTY: ConnectionConfig = {
   method: "azure_cli", tenantId: "", subscriptionId: "", resourceGroup: "", workspace: "",
-  workspaceUrl: "", sqlPool: "", clientId: "", resource: "",
+  workspaceUrl: "", sqlPool: "", resource: "",
 };
 
 // Kept in memory so the form survives navigation. Identifiers only, and
@@ -63,7 +63,6 @@ function validate(c: ConnectionConfig, action: "authenticate" | "test"): Errors 
     if (c.method === "interactive_browser") {
       // The window must open against the operator's own tenant.
       need("tenantId", "Tenant ID");
-      guid("clientId", "Client ID");
     }
   } else {
     need("resourceGroup", "Resource group");
@@ -160,16 +159,12 @@ const WAITING_FOR_WINDOW = "A sign-in window should open on this machine — com
 function InteractiveBrowserForm(p: FormProps) {
   const { health } = useAppState();
   const note = health?.capabilities.authMethodDetails?.find((d) => d.id === "interactive_browser");
-  const takesClientId = note?.takesClientId ?? true;
   return (
     <div className="stack" style={{ gap: 16 }}>
       {note?.caveat && <p className="muted">{note.caveat}</p>}
       <div className="form-grid">
         <TextField label="Tenant ID" value={p.config.tenantId} onChange={(e) => p.set({ tenantId: e.target.value })} error={p.errors.tenantId} placeholder="00000000-0000-0000-0000-000000000000" hint="The tenant the sign-in window opens against." />
         <SubscriptionField {...p} />
-        {takesClientId && (
-          <TextField id="client-id" label="Client ID" optional value={p.config.clientId} onChange={(e) => p.set({ clientId: e.target.value })} error={p.errors.clientId} placeholder="Application (client) ID" hint="Only if the tenant has not consented to Microsoft's default sign-in app. An identifier, not a secret." />
-        )}
       </div>
       {p.authenticating && <Banner tone="info" title="Waiting for you to sign in">{WAITING_FOR_WINDOW}</Banner>}
       <ScopeSelectors {...p} />
@@ -272,7 +267,7 @@ export function SourceConnection({ hideStatus = false, forceForm = false }: { hi
   const selectMethod = (method: AuthMethod) => {
     setErrors({});
     app.clearConnectionError();
-    setConfig((c) => ({ ...c, method, clientId: "", resourceGroup: "", workspace: "", sqlPool: "" }));
+    setConfig((c) => ({ ...c, method, resourceGroup: "", workspace: "", sqlPool: "" }));
   };
 
   const submit = async (action: "authenticate" | "test") => {

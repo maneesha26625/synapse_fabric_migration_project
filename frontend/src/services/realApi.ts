@@ -95,10 +95,7 @@ export const realApi: MigrationApi = {
   authenticate: (c) =>
     request<ConnectionState>("/api/connections/authenticate", {
       method: "POST",
-      body: JSON.stringify({
-        ...connectionBody(c),
-        ...(c.method === "interactive_browser" && c.clientId.trim() ? { clientId: c.clientId.trim() } : {}),
-      }),
+      body: JSON.stringify(connectionBody(c)),
     }),
   testConnection: (c) =>
     request<ConnectionState>("/api/connections/test", {

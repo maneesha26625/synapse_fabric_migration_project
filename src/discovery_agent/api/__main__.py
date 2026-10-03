@@ -7,7 +7,7 @@ from pathlib import Path
 
 from discovery_agent.api.server import create_server
 
-DEFAULT_PORT = 8000
+DEFAULT_PORT = 8001
 DEFAULT_STATIC = Path(__file__).resolve().parents[3] / "frontend" / "dist"
 
 

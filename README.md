@@ -222,12 +222,11 @@ token cache: `az account show` reports the same account before and after.
 * **The window opens on the machine running the server**, not necessarily the
   one your browser is on. If the API runs elsewhere (a VM, a container,
   headless), use Azure CLI instead. You have 120 seconds to finish the sign-in.
-* **Tenant ID is required** for this method. **Client ID** is optional. It is an
-  application id (an identifier, not a secret), needed only when the tenant has
-  not consented to Microsoft's default developer sign-in app and answers
-  `access_denied`. Register an application in that tenant, add
-  `http://localhost` as a redirect URI under *Mobile and desktop
-  applications*, and enter its id.
+* **The form asks for two things only: Tenant ID and Subscription ID**, both
+  required. There are no optional fields. If the tenant answers
+  `access_denied`, it has not consented to Microsoft's default developer
+  sign-in app; its administrator needs to allow that app. (The command line
+  still accepts `--client-id` for a tenant that requires its own app.)
 * **It survives a server restart without a new window.** Tokens go into the
   SDK's encrypted token cache (`synapse-discovery-agent`; DPAPI on Windows,
   Keychain on macOS, libsecret on Linux), never in plaintext. If no keyring is

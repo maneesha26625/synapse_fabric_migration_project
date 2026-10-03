@@ -17,12 +17,14 @@ written to disk by this module.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -82,6 +84,13 @@ def _run(args: List[str], timeout: int = CALL_TIMEOUT, raw: bool = False) -> Tup
 
 def _require(cli: str, install: str) -> str:
     path = shutil.which(cli)
+    if not path and cli == "az" and sys.platform == "win32":
+        for program_files in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+            if program_files:
+                candidate = Path(program_files) / "Microsoft SDKs" / "Azure" / "CLI2" / "wbin" / "az.cmd"
+                if candidate.is_file():
+                    path = str(candidate)
+                    break
     if not path:
         raise FabricError(400, "cli_not_installed", f"{install} is not installed (or not on PATH) on the machine running the API.")
     return path

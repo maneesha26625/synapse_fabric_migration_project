@@ -70,15 +70,13 @@ def test_health_advertises_the_two_source_methods(server):
     assert body["capabilities"]["authMethods"] == ["azure_cli", "interactive_browser"]
 
 
-def test_the_catalog_lists_interactive_browser_and_only_it_takes_a_client_id(server):
+def test_the_catalog_lists_interactive_browser_without_a_client_id(server):
     _, body = call(server, "GET", "/api/health")
     details = {d["id"]: d for d in body["capabilities"]["authMethodDetails"]}
     browser = details["interactive_browser"]
     assert browser["label"] == "Interactive browser"
     assert "Azure CLI session untouched" in browser["detail"]
-    assert "server" in browser["caveat"] and "Client ID" in browser["caveat"]
-    assert browser["takesClientId"] is True
-    assert details["azure_cli"]["takesClientId"] is False
+    assert "server" in browser["caveat"] and "Client ID" not in browser["caveat"]
     assert "managed_identity" not in details
 
 
@@ -134,9 +132,9 @@ def test_interactive_browser_needs_the_tenant_it_opens_against(server):
     assert status == 400 and "Tenant ID" in body["error"]["message"]
 
 
-def test_the_sign_in_body_accepts_a_client_id_and_checks_its_shape(server):
-    status, body = call(server, "POST", "/api/connections/authenticate", {**BROWSER, "clientId": "not-a-guid"})
-    assert status == 400 and "Client ID" in body["error"]["message"]
+def test_the_sign_in_body_refuses_a_client_id(server):
+    status, body = call(server, "POST", "/api/connections/authenticate", {**BROWSER, "clientId": "11111111-2222-3333-4444-555555555555"})
+    assert status == 400 and "clientId" in body["error"]["message"]
 
 
 @pytest.mark.parametrize("field", ["clientSecret", "password", "accessToken", "username", "loginHint", "anything"])
@@ -204,6 +202,19 @@ def test_sign_out_forgets_the_record_and_the_held_identity_but_not_the_cli(monke
 def test_testing_a_workspace_requires_a_sign_in_first(server):
     status, body = call(server, "POST", "/api/connections/test", VALID)
     assert status == 409 and body["error"]["code"] == "sign_in_required"
+
+
+def test_azure_cli_is_found_in_standard_windows_install_location(monkeypatch, tmp_path):
+    from discovery_agent.api import fabric
+
+    cli_path = tmp_path / "Microsoft SDKs" / "Azure" / "CLI2" / "wbin" / "az.cmd"
+    cli_path.parent.mkdir(parents=True)
+    cli_path.touch()
+    monkeypatch.setattr(fabric.shutil, "which", lambda _: None)
+    monkeypatch.setattr(fabric.sys, "platform", "win32")
+    monkeypatch.setenv("ProgramFiles", str(tmp_path))
+
+    assert fabric._require("az", "Azure CLI") == str(cli_path)
 
 
 @pytest.mark.parametrize("kind", ["resource-groups", "workspaces", "sql-pools"])

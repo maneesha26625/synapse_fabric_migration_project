@@ -13,7 +13,6 @@ export interface ConnectionConfig {
   workspace: string;
   workspaceUrl: string;
   sqlPool: string;
-  clientId: string;
   resource: string;
 }
 
@@ -58,14 +57,13 @@ export interface Health {
   capabilities: { authMethods: AuthMethod[]; authMethodDetails?: AuthMethodDetail[]; discoveryScope: string[] };
 }
 
-/** What the backend says about one sign-in method. Drives the optional Client ID field. */
+/** What the backend says about one sign-in method. */
 export interface AuthMethodDetail {
   id: AuthMethod;
   label: string;
   detail: string;
   bestFor?: string;
   caveat?: string;
-  takesClientId: boolean;
 }
 
 export type DiscoveryState =

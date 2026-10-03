@@ -374,7 +374,7 @@ class InteractiveBrowserCredentialProvider(_CachingCredentialProvider):
     remedy = (
         "A browser must be available on the machine running this server, and you must "
         f"complete the sign-in within {INTERACTIVE_TIMEOUT_SECONDS} seconds. If the directory "
-        "answers access_denied, register an application in that tenant and put its id in Client ID."
+        "answers access_denied, ask that tenant's administrator to allow Microsoft's sign-in app."
     )
     _sign_in = threading.Lock()
 
@@ -535,8 +535,7 @@ class InteractiveBrowserCredentialProvider(_CachingCredentialProvider):
         if "access_denied" in lower:
             return (
                 "The sign-in was cancelled, or this tenant has not consented to Microsoft's default "
-                "sign-in app. Register an application in the tenant, add http://localhost as a "
-                "redirect URI, and put its id in Client ID."
+                "sign-in app. Try again, or ask the tenant's administrator to allow that app."
             )
         if "redirect" in lower:
             return (
