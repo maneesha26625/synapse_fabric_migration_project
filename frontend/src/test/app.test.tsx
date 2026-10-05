@@ -212,6 +212,26 @@ describe("fabric target", () => {
   }, 15000);
 });
 
+describe("validation page", () => {
+  it("compares both sides in demo mode, shows why each check landed where it did, and filters by status", async () => {
+    await discovered();
+    await mockApi.authenticateFabric(FABRIC);
+    await mockApi.testFabric(FABRIC);
+    const items = (await mockApi.getDependencies()).nodes.filter((n) => n.type === "Notebook").slice(0, 2).map((n) => ({ id: n.id, wave: n.wave }));
+    await mockApi.startExecution(items);
+    await new Promise((r) => setTimeout(r, 2500));
+    const user = userEvent.setup();
+    go("/validate");
+    await screen.findByRole("heading", { level: 1, name: "Migration Validation" });
+    expect(screen.queryByText(/not implemented in the backend/i)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Run Validation" }));
+    await screen.findByRole("table", { name: "Validation results" }, { timeout: 5000 });
+    expect(screen.getByRole("columnheader", { name: "Details" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^Match/ }));
+    expect(screen.getAllByText(/MATCH/).length).toBeGreaterThan(0);
+  }, 20000);
+});
+
 describe("discovery page", () => {
   it("shows the inventory with Fabric equivalents and opens an object", async () => {
     await discovered();

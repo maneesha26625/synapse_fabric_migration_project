@@ -295,7 +295,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   const runValidation = useCallback(async () => {
     setValidationBusy(true);
     setValidationError(null);
-    try { setValidation(await api.runValidation()); } catch (e) { setValidationError(messageOf(e)); } finally { setValidationBusy(false); }
+    try { setValidation(await api.runValidation([...plan].sort((a, b) => a.wave - b.wave))); } catch (e) { setValidationError(messageOf(e)); } finally { setValidationBusy(false); }
   }, [api]);
 
   // ---- plan status

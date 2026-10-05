@@ -473,6 +473,8 @@ export interface ValidationRow {
   source: string;
   target: string;
   status: ValidationStatus;
+  /** Why it matched, differs or could not be checked. */
+  detail?: string;
 }
 
 /** The single seam between the UI and whatever supplies data. */
@@ -505,7 +507,8 @@ export interface MigrationApi {
   startExecution(items: PlanItem[], options?: RunOptions, credentials?: ConnectionCredentials): Promise<ExecutionRun>;
   getExecution(): Promise<ExecutionRun>;
   controlExecution(action: "pause" | "resume" | "retry"): Promise<ExecutionRun>;
-  runValidation(): Promise<ValidationRow[]>;
+  /** Compares Synapse with Fabric. With no items, every discovered object is checked. */
+  runValidation(items?: PlanItem[]): Promise<ValidationRow[]>;
 }
 
 export class ApiRequestError extends Error {

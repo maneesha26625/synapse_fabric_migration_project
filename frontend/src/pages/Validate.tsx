@@ -8,28 +8,28 @@ import type { ValidationStatus } from "../types";
 
 const TONE: Record<ValidationStatus, Tone> = { MATCH: "success", REVIEW: "warning", MISMATCH: "error" };
 const MARK: Record<ValidationStatus, string> = { MATCH: "✓", REVIEW: "⚠", MISMATCH: "✕" };
-const CATEGORIES = ["Schema", "Tables", "Columns", "Data Count", "Data Types", "Views", "Stored Procedures", "Pipelines", "Notebooks", "Security", "Dependencies"];
+const CATEGORIES = ["Warehouse", "Schema", "Tables", "Columns", "Data Count", "Data Types", "Views", "Stored Procedures", "Spark", "Notebooks", "Connections", "Pipelines", "Spark Jobs", "SQL Scripts", "Schedules", "Shortcuts", "Security", "Dependencies", "Manual"];
 
 export function Validate() {
-  const { mode } = useAppState();
-  const { validation, validationError, validationBusy, runValidation, execution } = useMigration();
+  const { mode, discovery } = useAppState();
+  const { validation, validationError, validationBusy, runValidation, execution, fabric } = useMigration();
   const [category, setCategory] = useState("");
-  const rows = useMemo(() => (validation ?? []).filter((r) => !category || r.category === category), [validation, category]);
+  const [status, setStatus] = useState<ValidationStatus | "">("");
+  const rows = useMemo(() => (validation ?? []).filter((r) => (!category || r.category === category) && (!status || r.status === status)), [validation, category, status]);
+  const discovered = discovery.state === "completed" || discovery.state === "completed_with_warnings";
+  const ready = discovered && fabric.status === "connected";
+  const why = !discovered ? "Run Discovery first." : fabric.status !== "connected" ? "Connect the Fabric target first." : "";
   const count = (s: ValidationStatus) => (validation ?? []).filter((r) => r.status === s).length;
   const present = new Set((validation ?? []).map((r) => r.category));
 
   return (
     <div className="page wide">
       <PageHead icon={ShieldCheck} title="Migration Validation" badge={mode === "mock" ? <StatusBadge tone="warning">DEMO DATA</StatusBadge> : undefined}
-        actions={<Button variant="primary" onClick={() => void runValidation()} loading={validationBusy}>Run Validation</Button>}>
+        actions={<Button variant="primary" onClick={() => void runValidation()} loading={validationBusy} disabled={mode === "real" && !ready} title={why || undefined}>Run Validation</Button>}>
         Compare the source Synapse environment with the migrated Fabric environment, object by object.
       </PageHead>
 
-      {mode === "real" && (
-        <Banner tone="info" title="Migration validation is not implemented in the backend yet">
-          Run Validation will report "not implemented". Nothing is compared or counted without a backend. Switch to Demo data to preview the page.
-        </Banner>
-      )}
+      {mode === "real" && !ready && <Banner tone="warning" title="Not ready to validate">{why} Validation reads both sides: the discovered Synapse objects and the Fabric workspace.</Banner>}
       {validationError && <Banner tone="error" title="Validation">{validationError}</Banner>}
 
       {!validation ? (
@@ -41,10 +41,10 @@ export function Validate() {
       ) : (
         <>
           <div className="grid cols-4">
-            <MetricCard label="Checks" value={validation.length} />
-            <MetricCard label="Match" value={count("MATCH")} />
-            <MetricCard label="Review" value={count("REVIEW")} />
-            <MetricCard label="Mismatch" value={count("MISMATCH")} />
+            <MetricCard label="Checks" value={validation.length} onClick={() => setStatus("")} active={status === ""} hint="Show every check" />
+            <MetricCard label="Match" value={count("MATCH")} onClick={() => setStatus(status === "MATCH" ? "" : "MATCH")} active={status === "MATCH"} hint="Both sides agree" />
+            <MetricCard label="Review" value={count("REVIEW")} onClick={() => setStatus(status === "REVIEW" ? "" : "REVIEW")} active={status === "REVIEW"} hint="Differs by design, or could not be checked" />
+            <MetricCard label="Mismatch" value={<span className={count("MISMATCH") ? "tone-error" : undefined}>{count("MISMATCH")}</span>} onClick={() => setStatus(status === "MISMATCH" ? "" : "MISMATCH")} active={status === "MISMATCH"} hint="Missing from Fabric, or the two sides disagree" />
           </div>
           <Card title="Source Synapse vs target Fabric">
             <div className="tabs tabs-pill" role="tablist" aria-label="Validation categories" style={{ marginBottom: 12 }}>
@@ -54,9 +54,9 @@ export function Validate() {
               ))}
             </div>
             <div className="table-wrap">
-              <table className="data" style={{ minWidth: 760 }}>
+              <table className="data" style={{ minWidth: 980 }}>
                 <caption className="sr-only">Validation results</caption>
-                <thead><tr>{["Object", "Category", "Synapse", "Fabric", "Status"].map((h) => <th key={h} scope="col" className="static">{h}</th>)}</tr></thead>
+                <thead><tr>{["Object", "Category", "Synapse", "Fabric", "Status", "Details"].map((h) => <th key={h} scope="col" className="static">{h}</th>)}</tr></thead>
                 <tbody>
                   {rows.slice(0, 500).map((r, i) => (
                     <tr key={`${r.object}-${r.category}-${i}`}>
@@ -65,8 +65,10 @@ export function Validate() {
                       <td>{r.source}</td>
                       <td>{r.target}</td>
                       <td><StatusBadge tone={TONE[r.status]}>{MARK[r.status]} {r.status}</StatusBadge></td>
+                      <td className="muted" style={{ whiteSpace: "normal", maxWidth: 420 }}>{r.detail || "—"}</td>
                     </tr>
                   ))}
+                  {rows.length === 0 && <tr><td colSpan={6} className="muted">Nothing in this view.</td></tr>}
                 </tbody>
               </table>
             </div>

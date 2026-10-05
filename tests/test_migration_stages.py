@@ -55,7 +55,7 @@ class StageRest:
 
     def list(self, path):
         if "/jobs/Pipeline/schedules" in path:
-            return list(self.schedules.get(path.split("/")[5], []))
+            return list(self.schedules.get(path.split("/")[4], []))
         return list(self.store.get(self._collection(path), []))
 
     def get(self, path):
@@ -72,7 +72,7 @@ class StageRest:
                 raise error
         self.created.append((path, body))
         if "/jobs/Pipeline/schedules" in path:
-            self.schedules.setdefault(path.split("/")[5], []).append(body)
+            self.schedules.setdefault(path.split("/")[4], []).append(body)
             return {}
         if "/shortcuts" in path:
             return {}

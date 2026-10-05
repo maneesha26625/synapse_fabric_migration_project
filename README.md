@@ -521,8 +521,28 @@ Integration runtimes are always set up by hand.
   Fabric's documented request bodies; Fabric validates each create, and its own
   error message is shown if it disagrees.
 
+### Validation
+
+The **Validation** page (`POST /api/migration/validate`) compares the discovered
+Synapse objects with what is now in Fabric, object by object, and reads both
+sides without writing to either. Each row says what it saw on each side:
+
+| Category | What is compared |
+|---|---|
+| Warehouse, Schema | The Warehouse and each schema exist. |
+| Tables | Column names and types (a type changed by design is a REVIEW that names it). |
+| Data Count | Rows in Synapse against rows in the Warehouse; zero loaded is a REVIEW, a difference a MISMATCH. |
+| Views, Stored Procedures | Present, and the definition text agrees (ignoring comments and whitespace). |
+| Spark | The custom Spark pool and Environment exist with the same node size and scale. |
+| Notebooks, Pipelines | Present, with the same number of cells / activities (nested activities included). |
+| Connections, Spark Jobs, SQL Scripts, Schedules, Shortcuts | Present in Fabric. |
+| Manual | Integration runtimes and anything else set up by hand, listed for review. |
+
+A check that could not run is a REVIEW with the reason, never a match. Row
+counts need the Synapse connection; without it they are reported as unread.
+
 API: `GET /api/migration/capabilities`, `POST /api/migration/plan`,
-`POST /api/migration/start` (`{items, options: {scope, stages, dataMode,
+`POST /api/migration/validate`, `POST /api/migration/start` (`{items, options: {scope, stages, dataMode,
 maxRows, stopOnFailure}, credentials}`), `GET /api/migration/run` and
 `POST /api/migration/control` (`pause|resume|retry`). Code:
 `src/discovery_agent/migration/` (`runner.py`, `stages.py`, `stages_fabric.py`,

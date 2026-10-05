@@ -23,6 +23,7 @@ web framework would be the first. The surface is small and fixed.
     GET    /api/migration/capabilities    the migration stages, their options and the linked services
     GET    /api/migration/run             the current migration run
     POST   /api/migration/plan            planner: strategy, risks, effort, checks (read-only)
+    POST   /api/migration/validate        compare Synapse with Fabric, object by object (read-only)
     POST   /api/migration/start           start a run from the migration plan
     POST   /api/migration/control         pause | resume | retry
 
@@ -169,6 +170,7 @@ def make_handler(
                 "/api/fabric/workspaces": lambda: fabric.refresh_workspaces(self._json_body()),
                 "/api/fabric/test": lambda: fabric.test(self._json_body()),
                 "/api/migration/plan": lambda: migration.analyze(self._json_body()),
+                "/api/migration/validate": lambda: migration.validate(self._json_body()),
                 "/api/migration/start": lambda: migration.start(self._json_body()),
                 "/api/migration/control": lambda: migration.control(self._json_body()),
                 "/api/discovery/start": session.start_discovery,

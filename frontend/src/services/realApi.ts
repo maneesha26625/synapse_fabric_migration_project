@@ -15,6 +15,7 @@ import {
   type ObjectDetail,
   type ResultsPage,
   type ResultsQuery,
+  type ValidationRow,
 } from "../types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -87,10 +88,6 @@ function toQueryString(q: ResultsQuery): string {
   return p.toString();
 }
 
-/** For phases the backend does not implement yet. Never fakes a result. */
-const notImplemented = (what: string) => () =>
-  Promise.reject(new ApiRequestError("not_implemented", `${what} is not implemented in the backend yet. Switch to Demo data to preview this page.`, 501));
-
 export const realApi: MigrationApi = {
   mode: "real",
   health: () => request<Health>("/api/health"),
@@ -141,7 +138,8 @@ export const realApi: MigrationApi = {
   getExecution: () => request<ExecutionRun>("/api/migration/run"),
   controlExecution: (action) =>
     request<ExecutionRun>("/api/migration/control", { method: "POST", body: JSON.stringify({ action }) }),
-  runValidation: notImplemented("Migration validation"),
+  runValidation: async (items) =>
+    (await request<{ rows: ValidationRow[] }>("/api/migration/validate", { method: "POST", body: JSON.stringify(items?.length ? { items } : {}) })).rows,
   listSqlPools: async (rg, ws) =>
     (await request<{ items: string[] }>(
       `/api/azure/sql-pools?resourceGroup=${encodeURIComponent(rg)}&workspace=${encodeURIComponent(ws)}`,

@@ -22,6 +22,7 @@ from discovery_agent.migration import planner as planning
 from discovery_agent.migration.fabric_rest import NO_CAPACITY, FabricApiError, FabricRestClient
 from discovery_agent.migration.preflight import content_findings, environment_checks
 from discovery_agent.migration import capabilities, fabric_connections, pipelines
+from discovery_agent.migration.validation import Validator, summarize
 from discovery_agent.migration.runner import (
     CONNECTION,
     DATA,
@@ -57,6 +58,9 @@ MAX_ROWS_CEILING = 10_000_000
 MAX_CREDENTIALS = 100
 MAX_CREDENTIAL_FIELD = 2048
 MAX_HISTORY = 20
+#: How the validation report groups its rows.
+VALIDATION_ORDER = ("Warehouse", "Schema", "Tables", "Data Count", "Views", "Stored Procedures", "Spark", "Notebooks", "Connections",
+                    "Pipelines", "Spark Jobs", "SQL Scripts", "Schedules", "Shortcuts", "Manual")
 SCOPES = ("automated", "all")
 
 
@@ -425,6 +429,25 @@ class MigrationService:
 
     def _busy(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def validate(self, body: dict) -> dict:
+        """Compare the discovered Synapse objects with what is now in Fabric. Reads both sides, writes neither."""
+        plan = body.get("items")
+        if plan is not None and (not isinstance(plan, list) or not all(isinstance(p, dict) for p in plan) or len(plan) > MAX_ITEMS):
+            raise ApiError(400, "invalid_plan", "The list of objects to validate is not in a valid format.")
+        job, pool = self._session.migration_snapshot()
+        workspace_id, workspace_name, _ = self._fabric.migration_target()
+        plan = plan or [{"id": i["id"], "wave": 1} for i in job.items]
+        sources = apply_stages(sources_for(plan, job, pool), {"stages": list(capabilities.STAGE_KEYS), "scope": "all"})
+        factory = self._source_factory or getattr(self._session, "source_sql_factory", lambda: None)()
+        warehouse = warehouse_name_for(pool)
+        validator = Validator(
+            self._rest_factory(), workspace_id, workspace_name, warehouse, self._sql_factory, factory,
+            artifacts={"pipelines": _artifacts(job).get(P0Artifact.PIPELINE, {})})
+        rows = validator.run(sources)
+        order = {c: n for n, c in enumerate(VALIDATION_ORDER)}
+        rows.sort(key=lambda r: (order.get(r["category"], len(order)), r["object"].lower()))
+        return {"rows": rows, "summary": summarize(rows), "workspace": workspace_name, "warehouse": warehouse}
 
     def _source_available(self) -> bool:
         return self._source_factory is not None or getattr(self._session, "source_sql_factory", lambda: None)() is not None
