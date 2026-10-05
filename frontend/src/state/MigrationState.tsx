@@ -13,8 +13,12 @@ import {
   type ExecutionRun,
   type FabricConfig,
   type FabricTarget,
+  type Capabilities,
+  type ConnectionCredentials,
+  type PlanAnalysis,
   type PlanItem,
   type PlanStatus,
+  type RunOptions,
   type ValidationRow,
 } from "../types";
 import { useAppState } from "./AppState";
@@ -75,9 +79,25 @@ interface MigrationStateValue {
   testFabric: (c: FabricConfig) => Promise<void>;
   disconnectFabric: () => Promise<void>;
 
+  /** The planner's strategy, risks and checks for the current plan. Recomputed when the plan or target changes. */
+  analysis: PlanAnalysis | null;
+  analysisBusy: boolean;
+  analysisError: string | null;
+  /** `record` also adds the result to the planner-run history. */
+  analyze: (record?: boolean) => Promise<void>;
+  options: RunOptions;
+  setOptions: (patch: Partial<RunOptions>) => void;
+  /** The migration stages, their strategies and the linked services that need credentials. Null until loaded. */
+  capabilities: Capabilities | null;
+  /** Connection credentials typed on this page. Memory only. */
+  credentials: ConnectionCredentials;
+  setCredential: (name: string, patch: Record<string, string>) => void;
+  clearCredentials: () => void;
+
   execution: ExecutionRun;
   executionError: string | null;
-  startExecution: () => Promise<boolean>;
+  /** Starts a run. `only` runs a single stage, leaving the others off for that run. */
+  startExecution: (only?: string) => Promise<boolean>;
   controlExecution: (action: "pause" | "resume" | "retry") => Promise<void>;
 
   validation: ValidationRow[] | null;
@@ -199,6 +219,47 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   const testFabric = useCallback((c: FabricConfig) => fabricCall("test", () => api.testFabric(c)), [api, fabricCall]);
   const disconnectFabric = useCallback(async () => { setFabric(await api.disconnectFabric()); setFabricError(null); }, [api]);
 
+  // ---- planner (read-only analysis of the plan)
+  const [analysis, setAnalysis] = useState<PlanAnalysis | null>(null);
+  const [analysisBusy, setAnalysisBusy] = useState(false);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [options, setOptionsState] = useState<RunOptions>({ scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", maxRows: 1_000_000 });
+  const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
+  const [credentials, setCredentials] = useState<ConnectionCredentials>({});
+  const setCredential = useCallback((name: string, patch: Record<string, string>) => setCredentials((c) => ({ ...c, [name]: { ...(c[name] ?? {}), ...patch } })), []);
+  const clearCredentials = useCallback(() => setCredentials({}), []);
+  // The stage list comes from the backend, so the page can never offer one it cannot run.
+  useEffect(() => {
+    let live = true;
+    setCapabilities(null);
+    api.getCapabilities().then((c) => {
+      if (!live) return;
+      setCapabilities(c);
+      setOptionsState((o) => ({ ...o, stages: o.stages.length ? o.stages : c.stages.map((s) => s.key), maxRows: c.maxRowsDefault }));
+    }, () => { if (live) setCapabilities(null); });
+    return () => { live = false; };
+  }, [api, discovery.state]);
+  const setOptions = useCallback((patch: Partial<RunOptions>) => setOptionsState((o) => ({ ...o, ...patch })), []);
+  const analyze = useCallback(async (record = false) => {
+    if (!plan.length) { setAnalysis(null); setAnalysisError(null); return; }
+    setAnalysisBusy(true);
+    setAnalysisError(null);
+    try {
+      setAnalysis(await api.analyzePlan([...plan].sort((a, b) => a.wave - b.wave), record, options, credentials));
+    } catch (e) {
+      setAnalysisError(messageOf(e));
+    } finally {
+      setAnalysisBusy(false);
+    }
+  }, [api, plan, options, credentials]);
+  // Re-analyse (debounced) whenever the plan or the Fabric target changes, once discovery has results.
+  const discovered = discovery.state === "completed" || discovery.state === "completed_with_warnings";
+  useEffect(() => {
+    if (!discovered || !plan.length) { setAnalysis(null); return; }
+    const t = setTimeout(() => { void analyze(false); }, 350);
+    return () => clearTimeout(t);
+  }, [discovered, plan, fabric.status, options.stages, analyze]);
+
   // ---- execution (polls only while running)
   const [execution, setExecution] = useState<ExecutionRun>(EMPTY_RUN);
   const [executionError, setExecutionError] = useState<string | null>(null);
@@ -209,17 +270,18 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     return () => clearInterval(id);
   }, [api, execution.state]);
 
-  const startExecution = useCallback(async () => {
+  const startExecution = useCallback(async (only?: string) => {
     setExecutionError(null);
     try {
       const ordered = [...plan].sort((a, b) => a.wave - b.wave);
-      setExecution(await api.startExecution(ordered));
+      const run = only ? { ...options, stages: [only] } : options;
+      setExecution(await api.startExecution(ordered, run, credentials));
       return true;
     } catch (e) {
       setExecutionError(messageOf(e));
       return false;
     }
-  }, [api, plan]);
+  }, [api, plan, options, credentials]);
   const controlExecution = useCallback(async (action: "pause" | "resume" | "retry") => {
     setExecutionError(null);
     try { setExecution(await api.controlExecution(action)); } catch (e) { setExecutionError(messageOf(e)); }
@@ -261,6 +323,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     graph, graphError, graphLoading, reloadGraph: () => setGraphEpoch((n) => n + 1),
     plan, addToPlan, addAllToPlan, removeFromPlan, setPlanWave, movePlanItem, clearPlan, inPlan, planStatus,
     fabric, fabricBusy, fabricError, authenticateFabric, testFabric, disconnectFabric,
+    analysis, analysisBusy, analysisError, analyze, options, setOptions, capabilities, credentials, setCredential, clearCredentials,
     execution, executionError, startExecution, controlExecution,
     validation, validationError, validationBusy, runValidation,
   };

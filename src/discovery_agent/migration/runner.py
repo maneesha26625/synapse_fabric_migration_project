@@ -24,24 +24,34 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from discovery_agent.migration import notebooks, warehouse_ddl
+from discovery_agent.migration import environments, notebooks, warehouse_ddl
+from discovery_agent.migration.common import (  # noqa: F401 - re-exported: tests and the API import these from here
+    COMPLETED, CONNECTION, DATA, DATASET, DEFERRED, DEFERRED_STATUS, ENVIRONMENT, FAILED, IN_PROGRESS, MISSING,
+    NOTEBOOK, PENDING, PIPELINE, POOL, PROCEDURE, SCHEDULE, SCHEMA, SCRIPT, SHORTCUT, SKIPPED, SPARKJOB, TABLE,
+    VIEW, WORKSPACE_ERRORS, MigrationError, Source,
+)
+from discovery_agent.migration.datacopy import DEFAULT_MAX_ROWS
+from discovery_agent.migration.stages import StageMixin
+from discovery_agent.migration.stages_fabric import FabricStageMixin
 from discovery_agent.migration.fabric_rest import FabricApiError, FabricRestClient
 
-NOTEBOOK, TABLE, VIEW, PROCEDURE, DEFERRED, MISSING = "notebook", "table", "view", "procedure", "deferred", "missing"
-POOL, SCHEMA = "pool", "schema"
 #: The UI types this build can migrate, and the kind each becomes.
 MIGRATABLE = {
     "Dedicated SQL Pool": POOL, "Schema": SCHEMA, "Table": TABLE, "View": VIEW,
-    "Stored Procedure": PROCEDURE, "Notebook": NOTEBOOK,
+    "Stored Procedure": PROCEDURE, "Notebook": NOTEBOOK, "Spark Pool": ENVIRONMENT,
+    "Linked Service": CONNECTION, "Pipeline": PIPELINE, "Dataset": DATASET,
+    "Spark Job Definition": SPARKJOB, "SQL Script": SCRIPT, "Trigger": SCHEDULE, "External Table": SHORTCUT,
 }
 MIGRATABLE_TYPES = tuple(MIGRATABLE)
-#: Within one wave: the warehouse, then schemas, tables, the views that read
-#: them, then procedures.
-_KIND_ORDER = {POOL: -2, SCHEMA: -1, TABLE: 0, VIEW: 1, PROCEDURE: 2, NOTEBOOK: 3, MISSING: 4, DEFERRED: 5}
-#: Fabric errors about the workspace itself, not one object: after the first,
-#: the rest of the run fails fast with the same message instead of repeating it.
-WORKSPACE_ERRORS = {"FeatureNotAvailable", "WorkspaceNotFound", "CapacityNotActive", "CapacityLimitExceeded"}
-_FABRIC_KINDS = {NOTEBOOK, POOL, SCHEMA, TABLE, VIEW, PROCEDURE}
+#: Within one wave, in the order things must exist: the warehouse, schemas and connections, tables,
+#: the views and procedures that read them, their rows, then notebooks, jobs, pipelines and schedules.
+_KIND_ORDER = {
+    POOL: -2, SCHEMA: -1, CONNECTION: -0.5, TABLE: 0, VIEW: 1, PROCEDURE: 2, DATA: 2.2, DATASET: 2.3,
+    ENVIRONMENT: 2.5, NOTEBOOK: 3, SCRIPT: 3.2, SPARKJOB: 3.5, PIPELINE: 4, SHORTCUT: 4.5, SCHEDULE: 5,
+    MISSING: 6, DEFERRED: 7,
+}
+_FABRIC_KINDS = {NOTEBOOK, ENVIRONMENT, POOL, SCHEMA, TABLE, VIEW, PROCEDURE, DATA, CONNECTION, PIPELINE,
+                 SPARKJOB, SCRIPT, SCHEDULE, SHORTCUT}
 
 _DEFERRED_REASONS = {
     "Pipeline": "Pipelines move in a later session: their datasets and linked services need Fabric connections first.",
@@ -51,11 +61,6 @@ _DEFERRED_REASONS = {
     "SQL Script": "SQL scripts move in a later session.",
     "External Table": "External tables move in a later session, as OneLake shortcuts.",
 }
-
-#: Statuses an item can have.
-PENDING, IN_PROGRESS, COMPLETED, FAILED, SKIPPED, DEFERRED_STATUS = (
-    "PENDING", "IN PROGRESS", "COMPLETED", "FAILED", "SKIPPED", "DEFERRED")
-
 
 SCHEMA_EXISTS_QUERY = "SELECT SCHEMA_ID(?)"
 
@@ -68,25 +73,6 @@ def warehouse_name_for(pool: Optional[str]) -> str:
     """A valid Fabric Warehouse name derived from the dedicated SQL pool's name."""
     name = re.sub(r"[^A-Za-z0-9_]", "_", pool or "") or "SynapseMigration"
     return name if name[0].isalpha() else "wh_" + name
-
-
-class MigrationError(Exception):
-    """One object could not be migrated; the message says why, in plain words."""
-
-
-@dataclass
-class Source:
-    """What the run needs to know about one plan item."""
-
-    id: str
-    name: str
-    type: str
-    wave: int
-    kind: str
-    payload: Any = None  # a notebook resource, or a SqlTable / SqlView / SqlProcedure
-    schema: Optional[str] = None
-    object_name: Optional[str] = None
-    reason: Optional[str] = None
 
 
 @dataclass
@@ -127,6 +113,15 @@ class MigrationRun:
         self.logs: List[str] = []
         self.state = "running"  # running | paused | completed
         self.pause = threading.Event()
+        #: Run options: ``scope`` is what was asked for, ``stop_on_failure`` halts at a wave boundary.
+        self.scope = "all"
+        self.stop_on_failure = False
+        self.halt_waived = False  # set when the operator resumes past a halt
+        #: Strategy settings for the stages (data mode, row ceiling, ...). Never credentials.
+        self.settings: Dict[str, Any] = {"dataMode": "if_empty", "maxRows": DEFAULT_MAX_ROWS}
+        self.stages: List[str] = []
+        self.pool_name: str = ""  # the Synapse pool being migrated, for retargeting pipelines
+        self.halted_reason: Optional[str] = None
         for item in self.items:
             if item.source.kind == DEFERRED:
                 item.status, item.step, item.error = DEFERRED_STATUS, "Not migrated in this session", item.source.reason
@@ -145,11 +140,13 @@ class MigrationRun:
                 "completed": counts[COMPLETED], "inProgress": counts[IN_PROGRESS], "failed": counts[FAILED],
                 "pending": counts[PENDING], "skipped": counts[SKIPPED], "deferred": counts[DEFERRED_STATUS],
                 "workspace": self.workspace_name, "warehouse": self.warehouse,
+                "options": {"scope": self.scope, "stopOnFailure": self.stop_on_failure, "stages": list(self.stages), **self.settings},
+                "haltedReason": self.halted_reason,
                 "items": [i.to_dict() for i in self.items], "logs": list(self.logs[-2000:]),
             }
 
 
-class Migrator:
+class Migrator(StageMixin, FabricStageMixin):
     """One pass over a run's PENDING items. A retry is a new pass."""
 
     def __init__(
@@ -158,8 +155,15 @@ class Migrator:
         rest_factory: Callable[[], FabricRestClient],
         sql_factory: Callable[[str, str], Any],
         sleep: Callable[[float], None] = lambda s: None,
+        source_factory: Optional[Callable[[], Any]] = None,
+        credentials: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> None:
         self.run = run
+        self._source_factory = source_factory
+        self._source: Any = None
+        self._item: Optional["Item"] = None
+        #: Secrets for connections, by linked-service name. In memory for the run's life; never logged or returned.
+        self._credentials = credentials or {}
         self._rest_factory = rest_factory
         self._sql_factory = sql_factory
         self._sleep = sleep
@@ -184,24 +188,45 @@ class Migrator:
                 run.log("PAUSED", "run", "paused before the next object")
                 self._close()
                 return
+            reason = self._halt_reason(item)
+            if reason:
+                with run.lock:
+                    run.state, run.halted_reason = "paused", reason
+                run.log("HALTED", "run", reason)
+                self._close()
+                return
             self._one(item)
         with run.lock:
             run.state = "completed"
         run.log("DONE", "run", "every pending object was processed")
         self._close()
 
+    def _halt_reason(self, item: Item) -> Optional[str]:
+        """Stop-on-failure: do not start a wave while an earlier one has failures."""
+        run = self.run
+        if not run.stop_on_failure or run.halt_waived:
+            return None
+        wave = item.source.wave
+        failed = sorted({i.source.wave for i in run.items if i.status == FAILED and i.source.wave < wave})
+        if not failed:
+            return None
+        return f"Stopped before wave {wave}: wave {failed[0]} has failed objects. Fix them and Retry Failed, or Resume to continue anyway."
+
     def _one(self, item: Item) -> None:
         run, source = self.run, item.source
         with run.lock:
             item.status, item.started_at, item.error, item.notes = IN_PROGRESS, _now(), None, []
             item.step = "Creating in Fabric"
+        self._item = item
         run.log("START", source.name, f"{source.type} ({source.kind})")
         try:
             if self._fatal and source.kind in _FABRIC_KINDS:
                 raise MigrationError(self._fatal)
             handler = {
                 NOTEBOOK: self._notebook, POOL: self._pool, SCHEMA: self._schema,
-                TABLE: self._table, VIEW: self._module, PROCEDURE: self._module,
+                TABLE: self._table, VIEW: self._module, PROCEDURE: self._module, ENVIRONMENT: self._environment,
+                DATA: self._data, CONNECTION: self._connection, DATASET: self._dataset, PIPELINE: self._pipeline,
+                SPARKJOB: self._sparkjob, SCRIPT: self._script, SCHEDULE: self._schedule, SHORTCUT: self._shortcut,
             }.get(source.kind)
             if handler is None:
                 raise MigrationError(source.reason or "This object is not in the current discovery results. Run discovery again.")
@@ -258,6 +283,51 @@ class Migrator:
             raise
         self._notebook_names.add(source.name.lower())
         return COMPLETED, "Created as a Fabric notebook", target, notes
+
+    # -- spark pool -> custom pool + environment ---------------------------
+
+    def _environment(self, source: Source):
+        client, wid = self._client(), self.run.workspace_id
+        target = f"{self.run.workspace_name} / {source.name}"
+        existing = {str(e.get("displayName", "")).lower() for e in client.list(f"/workspaces/{wid}/environments")}
+        if source.name.lower() in existing:
+            return SKIPPED, "Environment already in the Fabric workspace; left unchanged", target, []
+        wanted = environments.plan(source.payload if isinstance(source.payload, dict) else {}, source.name)
+        notes = list(wanted.notes)
+        compute = dict(wanted.compute)
+
+        pool_names = {str(p.get("name", "")).lower() for p in client.list(f"/workspaces/{wid}/spark/pools")}
+        try:
+            if source.name.lower() not in pool_names:
+                client.create(f"/workspaces/{wid}/spark/pools", wanted.pool)
+                scale = wanted.pool["autoScale"]
+                notes.append(f"Created Fabric Spark pool '{source.name}' ({wanted.pool['nodeSize']}, "
+                             f"{scale['minNodeCount']}-{scale['maxNodeCount']} nodes).")
+            compute["instancePool"] = {"name": source.name, "type": "Workspace"}
+        except FabricApiError as exc:
+            if exc.code in WORKSPACE_ERRORS:
+                raise
+            notes.append(f"A custom Spark pool could not be created ({exc.message[:160]}); the Environment uses the Starter Pool.")
+            compute = environments.starter_compute(wanted.compute)
+            compute["instancePool"] = dict(environments.STARTER_POOL)
+
+        created = client.create(f"/workspaces/{wid}/environments", {
+            "displayName": source.name, "description": "Migrated from an Azure Synapse Spark pool",
+        })
+        env_id = str(created.get("id") or "")
+        if not env_id:
+            for env in client.list(f"/workspaces/{wid}/environments"):
+                if str(env.get("displayName", "")).lower() == source.name.lower():
+                    env_id = str(env.get("id") or "")
+        if not env_id:
+            raise MigrationError("The Environment was created but Fabric did not return its id. Check the workspace.")
+        base = f"/workspaces/{wid}/environments/{env_id}/staging"
+        try:
+            client.patch(f"{base}/sparkcompute", compute)
+            client.create(f"{base}/publish", {})
+        except FabricApiError as exc:
+            raise MigrationError(f"The Environment was created but its compute settings were not applied or published: {exc.message} Finish it in Fabric.") from exc
+        return COMPLETED, "Created as a Fabric Environment and published", target, notes
 
     # -- warehouse ---------------------------------------------------------
 
@@ -377,6 +447,12 @@ class Migrator:
             raise MigrationError(f"Fabric Warehouse rejected the {what}: {str(exc)[:400]}. Review it by hand.") from exc
 
     def _close(self) -> None:
+        if self._source is not None:
+            try:
+                self._source.close()
+            except Exception:  # noqa: BLE001 - closing is best effort
+                pass
+            self._source = None
         if self._sql is not None:
             try:
                 self._sql.close()

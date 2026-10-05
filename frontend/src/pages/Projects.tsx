@@ -21,7 +21,7 @@ export function Projects() {
       <div className="grid cols-4">
         <MetricCard label="Source" value={isConnected ? "Connected" : "Not connected"} hint={isConnected ? connection.workspace : "Connect a Synapse workspace"} />
         <MetricCard label="Objects discovered" value={done && discovery.summary ? discovery.summary.total.toLocaleString() : "—"} hint={done ? undefined : "Run discovery"} />
-        <MetricCard label="Objects in plan" value={plan.length ? plan.length.toLocaleString() : "—"} hint="Migration Plan" />
+        <MetricCard label="Objects in plan" value={plan.length ? plan.length.toLocaleString() : "—"} hint="Plan & Migrate" />
         <MetricCard label="Fabric target" value={fabric.status === "connected" ? "Connected" : "Not connected"} hint={fabric.workspaceName ?? undefined} />
       </div>
 
@@ -46,7 +46,7 @@ export function Projects() {
           ? <p>Start by connecting your Synapse workspace. <Link to="/synapse"><Plus size={13} aria-hidden="true" /> Open Synapse Source</Link></p>
           : !done
             ? <p>Workspace connected. Discovery has not been executed. <Link to="/discovery">Open Discovery</Link></p>
-            : <p>Discovery is complete. Review the <Link to="/assessment">Assessment</Link> and the <Link to="/dependencies">Dependencies &amp; Waves</Link>, then build the <Link to="/plan">Migration Plan</Link>.</p>}
+            : <p>Discovery is complete. Review the <Link to="/assessment">Assessment</Link> and the <Link to="/dependencies">Dependencies &amp; Waves</Link>, then build the <Link to="/migrate">Plan &amp; Migrate</Link>.</p>}
       </Card>
     </div>
   );

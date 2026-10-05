@@ -31,7 +31,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from discovery_agent import discovery
 from discovery_agent.api import mapping
@@ -831,6 +831,16 @@ class Session:
             if job.state not in ("completed", "completed_with_warnings"):
                 raise ApiError(409, "no_results", "There are no discovery results yet.")
             return job
+
+    def source_sql_factory(self) -> Optional[Callable[[], Any]]:
+        """Opens a read-only session on the connected Synapse pool, for copying table data. None if not connected.
+
+        The session reuses the sign-in discovery used; nothing here holds a credential."""
+        with self._lock:
+            conn = self._connection
+        if conn is None:
+            return None
+        return lambda: conn.manager.sql().connect()
 
     def migration_snapshot(self) -> Tuple["_Job", Optional[str]]:
         """The finished discovery and the SQL pool it read, for a migration run.

@@ -465,3 +465,42 @@ span.cls { display: inline-block; padding: 2px 10px; border-radius: 999px; font-
   .mapping-arrow.wide { display: none; } .mapping-arrow.narrow { display: block; }
   .step-label { display: none; } .step.active .step-label { display: inline; }
 }
+/* ================= plan & migrate ================= */
+.planner-io { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.planner-io > div { display: flex; flex-direction: column; gap: 4px; }
+.planner-io .eyebrow { font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-faint); font-weight: 700; }
+.planner-io code { font-size: 13.5px; color: var(--accent); }
+.planner-io code.out { color: var(--success); }
+.tone-success { color: var(--success); } .tone-warning { color: var(--warning); } .tone-error { color: var(--error); }
+.risk-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; max-height: 460px; overflow: auto; }
+.risk { border: 1px solid var(--border); border-left-width: 4px; border-radius: var(--radius); padding: 12px 14px; background: var(--surface-2); }
+.risk p { margin: 6px 0 0; color: var(--text-muted); font-size: 14.5px; }
+.risk .sev { font-size: 12px; letter-spacing: .06em; }
+.risk .code { font-family: var(--mono, ui-monospace, monospace); font-size: 12px; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--border-strong, var(--border)); color: var(--accent); }
+.risk.sev-blocking { border-left-color: var(--error); } .risk.sev-blocking .sev { color: var(--error); }
+.risk.sev-high { border-left-color: var(--warning); } .risk.sev-high .sev { color: var(--warning); }
+.risk.sev-medium { border-left-color: var(--accent); } .risk.sev-medium .sev { color: var(--accent); }
+.risk.sev-low { border-left-color: var(--border-strong, var(--border)); } .risk.sev-low .sev { color: var(--text-faint); }
+.check-row { display: flex; gap: 10px; align-items: flex-start; margin-top: 16px; cursor: pointer; }
+.check-row input { margin-top: 4px; }
+.steps { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+.step { border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; background: var(--surface-2); }
+.step header { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+.step h3 { margin: 0; font-size: 16px; } .step p { margin: 0; font-size: 13px; }
+.step-num { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 13px; background: var(--surface); border: 1px solid var(--border); }
+.step-done { border-color: color-mix(in srgb, var(--success) 45%, transparent); } .step-done .step-num { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success); }
+.step-failed { border-color: color-mix(in srgb, var(--error) 55%, transparent); } .step-failed .step-num { color: var(--error); }
+.step-active { border-color: color-mix(in srgb, var(--accent) 55%, transparent); } .step-active .step-num { color: var(--accent); }
+.stage-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
+.stage-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; background: var(--surface-2); display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.stage-card.off { opacity: .6; }
+.stage-card header { display: flex; align-items: center; gap: 10px; }
+.stage-card p { margin: 0; font-size: 14.5px; }
+.stage-card footer { display: flex; align-items: center; gap: 8px; margin-top: auto; padding-top: 6px; }
+.stage-toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; }
+.stage-option { display: flex; flex-direction: column; gap: 6px; }
+.stage-rows { display: flex; flex-direction: column; gap: 4px; }
+.stage-warn { display: flex; gap: 6px; align-items: flex-start; color: var(--warning); }
+.stage-run-options { margin-top: 18px; }
+.cred { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; margin-bottom: 10px; background: var(--surface); }
+@media (max-width: 720px) { .planner-io { grid-template-columns: 1fr; } .stage-grid { grid-template-columns: 1fr; } }

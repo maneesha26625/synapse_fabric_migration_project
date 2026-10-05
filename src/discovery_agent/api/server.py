@@ -20,7 +20,9 @@ web framework would be the first. The surface is small and fixed.
     POST   /api/fabric/workspaces         refresh the workspace list
     POST   /api/fabric/test               verify the selected workspace
     DELETE /api/fabric/connection         forget the Fabric target
+    GET    /api/migration/capabilities    the migration stages, their options and the linked services
     GET    /api/migration/run             the current migration run
+    POST   /api/migration/plan            planner: strategy, risks, effort, checks (read-only)
     POST   /api/migration/start           start a run from the migration plan
     POST   /api/migration/control         pause | resume | retry
 
@@ -136,6 +138,8 @@ def make_handler(
                 self._dispatch(session.connection_state)
             elif path == "/api/fabric/connection":
                 self._dispatch(fabric.state)
+            elif path == "/api/migration/capabilities":
+                self._dispatch(migration.capabilities)
             elif path == "/api/migration/run":
                 self._dispatch(migration.state)
             elif path.startswith("/api/azure/"):
@@ -164,6 +168,7 @@ def make_handler(
                 "/api/fabric/authenticate": lambda: fabric.authenticate(self._json_body()),
                 "/api/fabric/workspaces": lambda: fabric.refresh_workspaces(self._json_body()),
                 "/api/fabric/test": lambda: fabric.test(self._json_body()),
+                "/api/migration/plan": lambda: migration.analyze(self._json_body()),
                 "/api/migration/start": lambda: migration.start(self._json_body()),
                 "/api/migration/control": lambda: migration.control(self._json_body()),
                 "/api/discovery/start": session.start_discovery,

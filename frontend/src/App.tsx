@@ -3,9 +3,8 @@ import { Layout } from "./components/layout/Layout";
 import { Assessment } from "./pages/Assessment";
 import { Dependencies } from "./pages/Dependencies";
 import { Discovery } from "./pages/Discovery";
-import { Execute } from "./pages/Execute";
 import { FabricTarget } from "./pages/FabricTarget";
-import { Plan } from "./pages/Plan";
+import { PlanMigrate } from "./pages/PlanMigrate";
 import { Projects } from "./pages/Projects";
 import { SynapseSource } from "./pages/SynapseSource";
 import { Validate } from "./pages/Validate";
@@ -26,12 +25,13 @@ export function App() {
               <Route path="discovery" element={<Discovery />} />
               <Route path="assessment" element={<Assessment />} />
               <Route path="dependencies" element={<Dependencies />} />
-              <Route path="plan" element={<Plan />} />
-              <Route path="execute" element={<Execute />} />
+              <Route path="migrate" element={<PlanMigrate />} />
               <Route path="validate" element={<Validate />} />
               {/* The earlier names keep working. */}
               <Route path="connections" element={<Navigate to="/synapse" replace />} />
-              <Route path="execution" element={<Navigate to="/execute" replace />} />
+              <Route path="plan" element={<Navigate to="/migrate" replace />} />
+              <Route path="execute" element={<Navigate to="/migrate" replace />} />
+              <Route path="execution" element={<Navigate to="/migrate" replace />} />
               <Route path="validation" element={<Navigate to="/validate" replace />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Route>

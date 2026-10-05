@@ -6,7 +6,9 @@ import {
   type ConnectionConfig,
   type ConnectionState,
   type DiscoveryStatus,
+  type Capabilities,
   type ExecutionRun,
+  type PlanAnalysis,
   type FabricTarget,
   type Health,
   type MigrationApi,
@@ -124,8 +126,18 @@ export const realApi: MigrationApi = {
       body: JSON.stringify({ method: c.method, workspaceId: c.workspaceId.trim() }),
     }),
   disconnectFabric: () => request<FabricTarget>("/api/fabric/connection", { method: "DELETE" }),
-  startExecution: (items) =>
-    request<ExecutionRun>("/api/migration/start", { method: "POST", body: JSON.stringify({ items }) }),
+  getCapabilities: () => request<Capabilities>("/api/migration/capabilities"),
+  analyzePlan: (items, record, options, credentials) =>
+    request<PlanAnalysis>("/api/migration/plan", {
+      method: "POST",
+      body: JSON.stringify({ items, record: !!record, ...(options ? { options } : {}), ...(credentials ? { credentials } : {}) }),
+    }),
+  startExecution: (items, options, credentials) =>
+    request<ExecutionRun>("/api/migration/start", {
+      method: "POST",
+      // Credentials travel once, over localhost, into the backend's memory. Never stored by the UI.
+      body: JSON.stringify({ items, ...(options ? { options } : {}), ...(credentials ? { credentials } : {}) }),
+    }),
   getExecution: () => request<ExecutionRun>("/api/migration/run"),
   controlExecution: (action) =>
     request<ExecutionRun>("/api/migration/control", { method: "POST", body: JSON.stringify({ action }) }),

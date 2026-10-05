@@ -11,7 +11,9 @@
 
 import {
   ApiRequestError,
+  type Capabilities,
   type ConnectionConfig,
+  type ConnectionCredentials,
   type ConnectionState,
   type DependencyGraph,
   type DiscoveryStatus,
@@ -19,7 +21,14 @@ import {
   type ExecutionRun,
   type FabricConfig,
   type FabricTarget,
+  type PlanAnalysis,
   type PlanItem,
+  type PlanRisk,
+  type PlannerRun,
+  type RiskSeverity,
+  type RunOptions,
+  type Strategy,
+  type TypeStrategy,
   type ValidationRow,
   type DiscoverySummary,
   type MigrationApi,
@@ -34,7 +43,7 @@ import { mockComponents } from "./mockMapping";
 
 const STEP_MS = 700;
 /** What a migration run moves in this build; mirrors the backend's list. */
-const MIGRATABLE_TYPES = ["Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure", "Notebook"];
+const MIGRATABLE_TYPES = ["Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure", "Notebook", "Spark Pool", "Linked Service", "Pipeline", "Dataset", "Spark Job Definition", "SQL Script", "Trigger", "External Table"];
 const STEPS = [
   "Discovering SQL objects",
   "Discovering pipelines",
@@ -218,12 +227,12 @@ function runNow(): ExecutionRun {
     const o = objects.get(pi.id);
     // Like the real backend: only these types move in this session.
     if (!MIGRATABLE_TYPES.includes(o?.type ?? "")) {
-      return { id: pi.id, name: o?.name ?? pi.id, type: o?.type ?? "", step: "Not migrated in this session", status: "DEFERRED", startedAt: null, completedAt: null, error: `${o?.type ?? "This type"} objects move in a later session (demo).` };
+      return { id: pi.id, name: o?.name ?? pi.id, type: o?.type ?? "", wave: pi.wave, step: "Not migrated in this session", status: "DEFERRED", startedAt: null, completedAt: null, error: `${o?.type ?? "This type"} objects move in a later session (demo).` };
     }
     const begin = slot * PER, end = begin + DUR;
     slot += 1;
     const failing = !sim.retried && hash(pi.id) % 11 === 0;
-    const base: ExecItem = { id: pi.id, name: o?.name ?? pi.id, type: o?.type ?? "", step: "Waiting", status: "PENDING", startedAt: null, completedAt: null, error: null };
+    const base: ExecItem = { id: pi.id, name: o?.name ?? pi.id, type: o?.type ?? "", wave: pi.wave, step: "Waiting", status: "PENDING", startedAt: null, completedAt: null, error: null };
     if (elapsed < begin) return base;
     const at = (ms: number) => new Date(started + ms).toISOString();
     if (elapsed < end) {
@@ -247,6 +256,79 @@ function runNow(): ExecutionRun {
     items, logs,
   };
 }
+
+let plannerHistory: PlannerRun[] = [];
+
+/** A small stand-in for the backend planner so the demo page is fully populated. */
+function demoAnalysis(items: PlanItem[], record: boolean, options?: RunOptions): PlanAnalysis {
+  const byId = new Map(completedObjects().map((o) => [o.id, o]));
+  const rows = items.flatMap((pi) => { const o = byId.get(pi.id); return o ? [{ o, wave: pi.wave }] : []; });
+  const on = (type: string) => !options?.stages?.length || options.stages.includes(stageOfType(type) ?? "");
+  const strategyOf = (type: string, cls: string): Strategy =>
+    MIGRATABLE_TYPES.includes(type) ? (on(type) ? "automated" : "deselected") : cls === "MANUAL" ? "manual" : cls === "REVIEW" ? "assess" : "later";
+  const objectStrategies: PlanAnalysis["objectStrategies"] = {};
+  const label: Record<Strategy, string> = { automated: "Automated", manual: "Manual setup", assess: "Assess first", later: "Later session", deselected: "Not selected" };
+  const counts: Record<Strategy, number> = { automated: 0, manual: 0, assess: 0, later: 0, deselected: 0 };
+  let hours = 0, reviewHours = 0;
+  for (const { o, wave } of rows) {
+    const st = strategyOf(o.type, o.classification);
+    const h = st === "deselected" ? 0 : st === "automated" ? 0.5 : st === "manual" ? 3 : 2;
+    objectStrategies[o.id] = { strategy: st, label: label[st], effortHours: h };
+    counts[st] += 1; hours += h;
+    if (st === "manual" || st === "assess") reviewHours += h;
+    void wave;
+  }
+  const risks: PlanRisk[] = [];
+  if (fabric.status !== "connected") risks.push({ id: "", code: "TARGET_NOT_READY", severity: "BLOCKING", title: "Fabric target connected", message: "Connect the Fabric target and pass its connection test.", objects: [] });
+  const later = rows.filter(({ o }) => !["automated", "deselected"].includes(objectStrategies[o.id].strategy));
+  if (later.length) risks.push({ id: "", code: "NOT_AUTOMATED", severity: "LOW", title: "Not migrated by this build", message: `${later.length} object(s) are in the plan but not created by this run (demo).`, objects: later.map(({ o }) => o.id) });
+  risks.forEach((r, i) => { r.id = `R${String(i + 1).padStart(3, "0")}`; });
+  const riskCounts = { BLOCKING: 0, HIGH: 0, MEDIUM: 0, LOW: 0 } as Record<RiskSeverity, number>;
+  for (const r of risks) riskCounts[r.severity] += 1;
+  const readiness = Math.max(0, Math.round(100 - riskCounts.BLOCKING * 25 - riskCounts.HIGH * 6 - riskCounts.MEDIUM * 2 - riskCounts.LOW * 0.5));
+  const waveNumbers = [...new Set(rows.map((r) => r.wave))].sort((a, b) => a - b);
+  const waves = waveNumbers.map((w) => {
+    const m = rows.filter((r) => r.wave === w);
+    const types: Record<string, number> = {};
+    for (const { o } of m) types[o.type] = (types[o.type] ?? 0) + 1;
+    return { wave: w, count: m.length, automated: m.filter(({ o }) => objectStrategies[o.id].strategy === "automated").length, types, effortDays: +(m.reduce((a, { o }) => a + objectStrategies[o.id].effortHours, 0) / 8).toFixed(2) };
+  });
+  const types = [...new Set(rows.map((r) => r.o.type))];
+  const typeStrategies: TypeStrategy[] = types.map((t) => {
+    const m = rows.filter((r) => r.o.type === t);
+    const st = objectStrategies[m[0].o.id].strategy;
+    return { type: t, count: m.length, strategy: st, strategyLabel: label[st], target: m[0].o.fabricTarget, firstWave: Math.min(...m.map((r) => r.wave)), lastWave: Math.max(...m.map((r) => r.wave)), effortDays: +(m.reduce((a, { o }) => a + objectStrategies[o.id].effortHours, 0) / 8).toFixed(2) };
+  }).sort((a, b) => a.firstWave - b.firstWave || a.type.localeCompare(b.type));
+  const fingerprint = (hash(items.map((i) => `${i.id}@${i.wave}`).sort().join("|")) >>> 0).toString(16).padStart(8, "0").padEnd(12, "0");
+  const effortDays = +(hours / 8).toFixed(2);
+  if (record) {
+    plannerHistory = [{ id: `P${String(plannerHistory.length + 1).padStart(3, "0")}`, plannerVersion: "1.0.0", fingerprint, objects: rows.length, effortDays, waves: waves.length, readiness, blocking: riskCounts.BLOCKING, createdAt: new Date().toISOString(), status: "COMPLETED" }, ...plannerHistory].slice(0, 20);
+  }
+  return {
+    plannerVersion: "1.0.0", fingerprint, readiness, objects: rows.length, strategyCounts: counts, effortDays,
+    needsReview: { count: counts.manual + counts.assess, effortDays: +(reviewHours / 8).toFixed(2) }, blocking: riskCounts.BLOCKING,
+    waves, typeStrategies, risks, riskCounts,
+    checks: [
+      { label: "Fabric target connected", status: fabric.status === "connected" ? "ok" : "fail", detail: fabric.status === "connected" ? "Demo workspace" : "Connect the Fabric target first." },
+      { label: "SQL driver for the Warehouse", status: "ok", detail: "Demo" },
+    ],
+    objectStrategies, history: plannerHistory,
+  };
+}
+
+const DEMO_STAGES: Capabilities["stages"] = [
+  { key: "warehouse", label: "Warehouse & schema", summary: "The SQL pool becomes a Fabric Warehouse; its schemas, tables (empty), views and stored procedures are created in it.", types: ["Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure"], needs: [], needsInput: null, creates: "Warehouse, schemas, tables, views, procedures", options: [] },
+  { key: "data", label: "Table data", summary: "Copies the rows of each migrated table from the Synapse pool into the Warehouse, then checks the row counts match.", types: ["Table"], needs: ["warehouse"], needsInput: null, creates: "Rows in the Warehouse tables", options: [{ key: "dataMode", label: "If a table already has rows", default: "if_empty", choices: [{ value: "if_empty", description: "Skip it. Never touches data that is already there (safe re-runs)." }, { value: "replace", description: "Replace it. Clears the table, then loads it again." }] }] },
+  { key: "spark", label: "Spark pool & environment", summary: "A Spark pool becomes a custom Fabric Spark pool plus a published Environment.", types: ["Spark Pool"], needs: [], needsInput: null, creates: "Spark pool, Environment", options: [] },
+  { key: "notebooks", label: "Notebooks", summary: "Synapse notebooks become Fabric notebooks.", types: ["Notebook"], needs: [], needsInput: null, creates: "Notebooks", options: [] },
+  { key: "connections", label: "Connections", summary: "Linked services become Fabric connections. Fabric needs their credentials, which Synapse does not give up.", types: ["Linked Service"], needs: [], needsInput: "credentials", creates: "Fabric connections", options: [] },
+  { key: "pipelines", label: "Pipelines & datasets", summary: "Pipelines become Fabric data pipelines. Datasets are folded into the pipelines that use them.", types: ["Pipeline", "Dataset"], needs: ["connections", "notebooks", "warehouse"], needsInput: null, creates: "Data pipelines", options: [] },
+  { key: "spark_jobs", label: "Spark job definitions", summary: "Spark job definitions are recreated as Fabric Spark job definitions.", types: ["Spark Job Definition"], needs: [], needsInput: null, creates: "Spark job definitions", options: [] },
+  { key: "sql_scripts", label: "SQL scripts", summary: "Each SQL script becomes a notebook with a T-SQL cell, bound to the Warehouse. Review them before running.", types: ["SQL Script"], needs: ["warehouse"], needsInput: null, creates: "Notebooks (T-SQL)", options: [] },
+  { key: "schedules", label: "Schedules", summary: "Triggers become pipeline schedules, created switched off so nothing runs before you are ready.", types: ["Trigger"], needs: ["pipelines"], needsInput: null, creates: "Pipeline schedules", options: [] },
+  { key: "shortcuts", label: "External tables", summary: "External tables become OneLake shortcuts in a Lakehouse, pointing at the same storage.", types: ["External Table"], needs: ["connections"], needsInput: null, creates: "Lakehouse, shortcuts", options: [] },
+];
+const stageOfType = (type: string) => DEMO_STAGES.find((st) => st.types.includes(type))?.key;
 
 export const mockApi: MigrationApi = {
   mode: "mock",
@@ -480,11 +562,34 @@ export const mockApi: MigrationApi = {
     return fabric;
   },
 
-  async startExecution(items: PlanItem[]) {
+  async getCapabilities() {
+    await sleep(60);
+    const linked = (s.objects ?? []).filter((o) => o.type === "Linked Service").slice(0, 3).map((o) => ({
+      name: o.name, type: "AzureSqlDW", fabricType: "SQL", needsPath: false, unsupported: null,
+      authTypes: [
+        { value: "basic", label: "SQL login", fields: ["username", "password"] },
+        { value: "servicePrincipal", label: "Service principal", fields: ["tenantId", "clientId", "clientSecret"] },
+      ],
+    }));
+    return { stages: DEMO_STAGES, defaults: { dataMode: "if_empty" }, linkedServices: linked, maxRowsDefault: 1_000_000, maxRowsCeiling: 10_000_000 };
+  },
+
+  async analyzePlan(items: PlanItem[], record?: boolean, options?: RunOptions, credentials?: ConnectionCredentials) {
+    await sleep(120);
+    void credentials;
+    return demoAnalysis(items, !!record, options);
+  },
+
+  async startExecution(items: PlanItem[], options?: RunOptions, credentials?: ConnectionCredentials) {
+    void credentials;
     await sleep(200);
     if (fabric.status !== "connected") throw new ApiRequestError("target_not_connected", "Connect the Fabric target first.", 409);
     if (!items.length) throw new ApiRequestError("empty_plan", "The migration plan is empty.", 400);
-    execSim = { runId: "001", items, base: 0, resumedAt: Date.now(), retried: false };
+    const typeOf = (id: string) => (s.objects ?? []).find((o) => o.id === id)?.type ?? "";
+    const staged = (i: PlanItem) => !options?.stages?.length || options.stages.includes(stageOfType(typeOf(i.id)) ?? "");
+    const kept = options?.scope === "automated" ? items.filter((i) => MIGRATABLE_TYPES.includes(typeOf(i.id)) && staged(i)) : items.filter(staged);
+    if (!kept.length) throw new ApiRequestError("nothing_to_migrate", "No object in the plan can be created by this build.", 400);
+    execSim = { runId: "001", items: kept, base: 0, resumedAt: Date.now(), retried: false };
     return runNow();
   },
 

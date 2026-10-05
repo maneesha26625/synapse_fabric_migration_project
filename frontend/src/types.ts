@@ -349,11 +349,93 @@ export interface FabricTarget {
 export type PlanStatus = "NOT STARTED" | "READY" | "IN PROGRESS" | "COMPLETED" | "FAILED" | "BLOCKED";
 export interface PlanItem { id: string; wave: number }
 
+// ---- planner: strategy, risks, effort -------------------------------------------------
+
+export type Strategy = "automated" | "manual" | "assess" | "later" | "deselected";
+export type RiskSeverity = "BLOCKING" | "HIGH" | "MEDIUM" | "LOW";
+export interface PlanRisk { id: string; code: string; severity: RiskSeverity; title: string; message: string; objects: string[] }
+export interface PlanCheck { label: string; status: "ok" | "warn" | "fail"; detail?: string }
+export interface PlanWaveSummary { wave: number; count: number; automated: number; types: Record<string, number>; effortDays: number }
+export interface TypeStrategy {
+  type: string; count: number; strategy: Strategy; strategyLabel: string; target: string;
+  firstWave: number; lastWave: number; effortDays: number;
+}
+export interface PlannerRun {
+  id: string; plannerVersion: string; fingerprint: string; objects: number; effortDays: number;
+  waves: number; readiness: number; blocking: number; createdAt: string; status: string;
+}
+export interface PlanAnalysis {
+  plannerVersion: string;
+  /** Same plan over the same estate always gives the same fingerprint. */
+  fingerprint: string;
+  readiness: number;
+  objects: number;
+  strategyCounts: Record<Strategy, number>;
+  effortDays: number;
+  needsReview: { count: number; effortDays: number };
+  blocking: number;
+  waves: PlanWaveSummary[];
+  typeStrategies: TypeStrategy[];
+  risks: PlanRisk[];
+  riskCounts: Record<RiskSeverity, number>;
+  checks: PlanCheck[];
+  objectStrategies: Record<string, { strategy: Strategy; label: string; effortHours: number }>;
+  history: PlannerRun[];
+}
+/** How a run is carried out. `automated` runs only what this build creates; `all` also lists the deferred. */
+export interface RunOptions {
+  scope: "automated" | "all";
+  stopOnFailure: boolean;
+  /** The migration stages switched on for this run. */
+  stages: string[];
+  /** Table data: what to do with a table that already has rows. */
+  dataMode: "if_empty" | "replace";
+  /** Table data: the direct copy leaves tables over this many rows for a pipeline Copy activity. */
+  maxRows: number;
+}
+
+// ---- migration stages ------------------------------------------------------------------
+
+export interface StageOption { key: string; label: string; default: string; choices: { value: string; description: string }[] }
+export interface StageDef {
+  key: string;
+  label: string;
+  summary: string;
+  /** Plan object types this stage migrates. */
+  types: string[];
+  /** Stages that must have run first. */
+  needs: string[];
+  needsInput: string | null;
+  creates: string;
+  options: StageOption[];
+}
+export interface CredentialAuth { value: string; label: string; fields: string[] }
+export interface LinkedServiceInput {
+  name: string;
+  type: string;
+  fabricType: string | null;
+  authTypes: CredentialAuth[];
+  needsPath: boolean;
+  /** Set when this linked service has no Fabric connection type this tool can create. */
+  unsupported: string | null;
+}
+export interface Capabilities {
+  stages: StageDef[];
+  defaults: Record<string, string>;
+  linkedServices: LinkedServiceInput[];
+  maxRowsDefault: number;
+  maxRowsCeiling: number;
+}
+/** Credentials by linked-service name. Held in memory only: never stored in the browser, never shown again. */
+export type ConnectionCredentials = Record<string, Record<string, string>>;
+
 export type ExecState = "idle" | "running" | "paused" | "completed";
 export interface ExecItem {
   id: string;
   name: string;
   type: string;
+  /** The wave it was planned in. */
+  wave?: number;
   step: string;
   /** SKIPPED: already in Fabric, left unchanged. DEFERRED: not migrated in this session; error says why. */
   status: "PENDING" | "IN PROGRESS" | "COMPLETED" | "FAILED" | "SKIPPED" | "DEFERRED";
@@ -377,6 +459,9 @@ export interface ExecutionRun {
   deferred: number;
   workspace?: string | null;
   warehouse?: string | null;
+  options?: RunOptions;
+  /** Set when a stop-on-failure run paused itself, with the reason. */
+  haltedReason?: string | null;
   items: ExecItem[];
   logs: string[];
 }
@@ -415,7 +500,9 @@ export interface MigrationApi {
   authenticateFabric(config: FabricConfig): Promise<FabricTarget>;
   testFabric(config: FabricConfig): Promise<FabricTarget>;
   disconnectFabric(): Promise<FabricTarget>;
-  startExecution(items: PlanItem[]): Promise<ExecutionRun>;
+  getCapabilities(): Promise<Capabilities>;
+  analyzePlan(items: PlanItem[], record?: boolean, options?: RunOptions, credentials?: ConnectionCredentials): Promise<PlanAnalysis>;
+  startExecution(items: PlanItem[], options?: RunOptions, credentials?: ConnectionCredentials): Promise<ExecutionRun>;
   getExecution(): Promise<ExecutionRun>;
   controlExecution(action: "pause" | "resume" | "retry"): Promise<ExecutionRun>;
   runValidation(): Promise<ValidationRow[]>;

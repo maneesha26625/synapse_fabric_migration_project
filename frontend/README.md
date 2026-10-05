@@ -1,9 +1,10 @@
 # Migration Accelerator UI
 
 Dark enterprise UI for the Synapse → Fabric accelerator: connect Synapse and
-Fabric, discover, assess, plan and run the migration. In Live mode the Execute
-page migrates notebooks and SQL schema (tables, views, procedures) into Fabric
-and marks everything else as deferred to a later session; see "Migration" in
+Fabric, discover, assess, plan and run the migration. In Live mode the Plan &
+Migrate page scores the plan and runs the stages you switch on (warehouse and
+schema, table data, Spark, notebooks, connections, pipelines, jobs, scripts,
+schedules, shortcuts); see "Migration" in
 the root README. Validation works in Demo data only.
 
 Stack: React 18 + TypeScript + Vite, `react-router-dom`, `lucide-react`. Plain

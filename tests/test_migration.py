@@ -307,6 +307,18 @@ def test_a_link_outside_fabric_is_never_followed():
     assert len(sender.requests) == 1
 
 
+def test_a_regional_redirect_link_is_polled_on_the_fabric_host_instead():
+    op = "11111111-2222-3333-4444-555555555555"
+    sender = FakeSender([
+        (202, {"location": f"https://wabi-india-central-a-primary-redirect.analysis.windows.net/v1/operations/{op}"}, {}),
+        (200, {}, {"status": "Succeeded"}),
+        (200, {}, {"id": "wh-1"}),
+    ])
+    assert client(sender).create("/workspaces/w/warehouses", {}) == {"id": "wh-1"}
+    assert all(url.startswith("https://api.fabric.microsoft.com/v1/") for _, url, _, _ in sender.requests)
+    assert sender.requests[1][1].endswith(f"/operations/{op}")
+
+
 def test_listing_follows_continuation_tokens():
     sender = FakeSender([(200, {}, {"value": [{"id": 1}], "continuationToken": "a b"}), (200, {}, {"value": [{"id": 2}]})])
     assert [i["id"] for i in client(sender).list("/workspaces/w/notebooks")] == [1, 2]
@@ -416,7 +428,10 @@ def test_an_unexpected_error_on_one_object_does_not_stop_the_run():
 
 
 def test_the_migratable_types_are_the_ones_chosen_for_this_session():
-    assert set(MIGRATABLE_TYPES) == {"Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure", "Notebook"}
+    assert set(MIGRATABLE_TYPES) == {
+        "Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure", "Notebook", "Spark Pool", "Linked Service",
+        "Pipeline", "Dataset", "Spark Job Definition", "SQL Script", "Trigger", "External Table"}
+    assert "Integration Runtime" not in MIGRATABLE_TYPES  # always by hand
 
 
 def test_the_pool_becomes_the_warehouse_and_schemas_are_created_once():
@@ -480,6 +495,14 @@ def fake_job():
         records_by_id={"synapse://notebook/LoadSales": nb_record, "sql://ws/pool/sales/Orders": tb_record,
                        "synapse://pipeline/Copy": SimpleNamespace(identity=SimpleNamespace(name="Copy", schema=None), content=None)},
         run=SimpleNamespace(synapse=SimpleNamespace(artifacts=(artifact,))),
+        graph={
+            "nodes": [
+                {"id": "synapse://notebook/LoadSales", "name": "LoadSales", "type": "Notebook", "classification": "DIRECT", "fabricTarget": "Fabric Notebook", "wave": 4, "dependedOnBy": 0},
+                {"id": "sql://ws/pool/sales/Orders", "name": "sales.Orders", "type": "Table", "classification": "TRANSFORM", "fabricTarget": "Warehouse table", "wave": 2, "dependedOnBy": 1},
+                {"id": "synapse://pipeline/Copy", "name": "Copy", "type": "Pipeline", "classification": "RECONFIGURE", "fabricTarget": "Data pipeline", "wave": 5, "dependedOnBy": 0},
+            ],
+            "edges": [{"source": "synapse://notebook/LoadSales", "target": "sql://ws/pool/sales/Orders"}],
+        },
     )
 
 
@@ -490,7 +513,7 @@ def test_plan_entries_become_sources_with_their_definitions():
     assert sources["synapse://notebook/LoadSales"].kind == NOTEBOOK and sources["synapse://notebook/LoadSales"].payload["name"] == "LoadSales"
     orders = sources["sql://ws/pool/sales/Orders"]
     assert orders.kind == TABLE and orders.schema == "sales" and orders.object_name == "Orders" and orders.wave == 2
-    assert sources["synapse://pipeline/Copy"].kind == DEFERRED and "connections" in sources["synapse://pipeline/Copy"].reason
+    assert sources["synapse://pipeline/Copy"].kind == "pipeline"
     assert sources["gone"].kind == "missing"
 
 
@@ -507,6 +530,9 @@ class FakeSession:
 class FakeFabric:
     def __init__(self, ready=True):
         self.ready = ready
+
+    def state(self):
+        return {"status": "connected" if self.ready else "disconnected", "workspaceName": "Sales WS", "capacityAssigned": True}
 
     def migration_target(self):
         from discovery_agent.api.fabric import FabricError
@@ -546,7 +572,7 @@ def test_a_run_needs_a_plan_a_discovery_and_a_connected_fabric_target():
 def test_a_started_run_finishes_in_the_background_and_reports_every_object():
     svc = service(fake_job())
     first = svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 4}, {"id": "sql://ws/pool/sales/Orders", "wave": 1},
-                                 {"id": "synapse://pipeline/Copy", "wave": 5}]})
+                                 {"id": "synapse://pipeline/Copy", "wave": 5}], "options": {"stages": ["warehouse", "notebooks"]}})
     assert first["runId"] == "001" and first["warehouse"] == "pool01"
     assert wait_until(lambda: svc.state()["state"] == "completed")
     state = svc.state()
@@ -565,7 +591,8 @@ def test_pause_stops_before_the_next_object_and_resume_continues():
 
     rest = SlowRest()
     svc = service(fake_job(), rest=rest)
-    svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}, {"id": "sql://ws/pool/sales/Orders", "wave": 2}]})
+    svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}, {"id": "sql://ws/pool/sales/Orders", "wave": 2}],
+               "options": {"stages": ["warehouse", "notebooks"]}})
     svc.control({"action": "pause"})
     gate.set()
     assert wait_until(lambda: svc.state()["state"] == "paused")
@@ -578,7 +605,8 @@ def test_pause_stops_before_the_next_object_and_resume_continues():
 def test_retry_runs_only_the_failed_objects_again():
     db = FakeDb(reject="CREATE TABLE")
     svc = service(fake_job(), db=db)
-    svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}, {"id": "sql://ws/pool/sales/Orders", "wave": 1}]})
+    svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}, {"id": "sql://ws/pool/sales/Orders", "wave": 1}],
+               "options": {"stages": ["warehouse", "notebooks"]}})
     assert wait_until(lambda: svc.state()["state"] == "completed")
     assert svc.state()["failed"] == 1
     db.reject = None
@@ -667,3 +695,247 @@ def test_the_idle_state_has_every_field_the_page_reads():
     state = service(fake_job()).state()
     assert state["state"] == "idle" and state["items"] == [] and "deferred" in state and "skipped" in state
     assert PENDING == "PENDING"
+
+
+# --- spark pool -> custom pool + environment ------------------------------------
+
+from discovery_agent.migration import environments  # noqa: E402
+from discovery_agent.migration.runner import ENVIRONMENT  # noqa: E402
+
+#: The real dedicated pool from the sample workspace, as discovery records it.
+SPARK_POOL = {
+    "sparkVersion": "3.5", "nodeSize": "Small", "nodeSizeFamily": "MemoryOptimized", "nodeCount": 10,
+    "autoScale": {"enabled": True, "minNodeCount": 3, "maxNodeCount": 3},
+    "autoPause": {"enabled": True, "delayInMinutes": 15},
+    "dynamicExecutorAllocation": {"enabled": False},
+}
+
+
+class EnvRest(FakeRest):
+    def __init__(self, environments_=(), pools=(), fail_pool=None, fail_publish=None, **kw):
+        super().__init__(**kw)
+        self.environments = list(environments_)
+        self.pools = list(pools)
+        self.fail_pool = fail_pool
+        self.fail_publish = fail_publish
+        self.patched = []
+
+    def list(self, path):
+        if path.endswith("/environments"):
+            return [{"id": "env-1", "displayName": n} for n in self.environments]
+        if path.endswith("/spark/pools"):
+            return [{"name": n} for n in self.pools]
+        return super().list(path)
+
+    def create(self, path, body):
+        if path.endswith("/spark/pools"):
+            if self.fail_pool:
+                raise self.fail_pool
+            self.created.append((path, body))
+            self.pools.append(body["name"])
+            return {}
+        if path.endswith("/environments"):
+            self.created.append((path, body))
+            self.environments.append(body["displayName"])
+            return {"id": "env-1"}
+        if path.endswith("/publish"):
+            if self.fail_publish:
+                raise self.fail_publish
+            self.created.append((path, body))
+            return {}
+        return super().create(path, body)
+
+    def patch(self, path, body):
+        self.patched.append((path, body))
+        return {}
+
+
+def test_the_spark_pool_settings_carry_over_to_fabric():
+    wanted = environments.plan(SPARK_POOL, "transportation")
+    assert wanted.pool["nodeSize"] == "Small" and wanted.pool["nodeFamily"] == "MemoryOptimized"
+    assert wanted.pool["autoScale"] == {"enabled": True, "minNodeCount": 3, "maxNodeCount": 3}
+    assert wanted.pool["dynamicExecutorAllocation"] == {"enabled": False}
+    assert wanted.compute["runtimeVersion"] == "1.3"
+    assert (wanted.compute["driverCores"], wanted.compute["executorMemory"]) == (4, "28g")
+    assert any("Auto-pause" in n for n in wanted.notes)
+
+
+def test_an_unknown_size_or_version_falls_back_and_says_so():
+    wanted = environments.plan({"nodeSize": "Weird", "sparkVersion": "2.4"}, "p")
+    assert wanted.pool["nodeSize"] == "Medium" and wanted.compute["runtimeVersion"] == "1.3"
+    assert sum("used" in n for n in wanted.notes) == 2
+
+
+def test_a_pool_without_autoscale_uses_its_node_count():
+    wanted = environments.plan({"nodeSize": "Large", "nodeCount": 5}, "p")
+    assert wanted.pool["autoScale"] == {"enabled": True, "minNodeCount": 5, "maxNodeCount": 5}
+
+
+def test_a_spark_pool_becomes_a_pool_an_environment_and_is_published():
+    rest = EnvRest()
+    run, rest, _, _ = run_with([Source("sp", "transportation", "Spark Pool", 1, ENVIRONMENT, payload=SPARK_POOL)], rest=rest)
+    item = run.items[0]
+    assert item.status == COMPLETED and "published" in item.step
+    paths = [p for p, _ in rest.created]
+    assert paths == [f"/workspaces/{WS}/spark/pools", f"/workspaces/{WS}/environments",
+                     f"/workspaces/{WS}/environments/env-1/staging/publish"]
+    patch_path, compute = rest.patched[0]
+    assert patch_path.endswith("/environments/env-1/staging/sparkcompute")
+    assert compute["instancePool"] == {"name": "transportation", "type": "Workspace"}
+
+
+def test_an_existing_environment_is_left_alone():
+    run, rest, _, _ = run_with([Source("sp", "transportation", "Spark Pool", 1, ENVIRONMENT, payload=SPARK_POOL)],
+                               rest=EnvRest(environments_=["Transportation"]))
+    assert run.items[0].status == SKIPPED and not rest.created and not rest.patched
+
+
+def test_a_refused_custom_pool_falls_back_to_the_starter_pool():
+    rest = EnvRest(fail_pool=FabricApiError(403, "InsufficientPrivileges", "needs admin"))
+    run, rest, _, _ = run_with([Source("sp", "transportation", "Spark Pool", 1, ENVIRONMENT, payload=SPARK_POOL)], rest=rest)
+    item = run.items[0]
+    assert item.status == COMPLETED and any("Starter Pool" in n for n in item.notes)
+    assert rest.patched[0][1]["instancePool"]["name"] == "Starter Pool"
+    assert rest.patched[0][1]["driverCores"] == 8
+
+
+def test_a_publish_failure_is_reported_not_hidden():
+    rest = EnvRest(fail_publish=FabricApiError(400, "PublishFailed", "bad config"))
+    run, _, _, _ = run_with([Source("sp", "transportation", "Spark Pool", 1, ENVIRONMENT, payload=SPARK_POOL)], rest=rest)
+    assert run.items[0].status == FAILED and "bad config" in run.items[0].error
+
+
+# --- the planner ----------------------------------------------------------------
+
+from discovery_agent.migration import planner as planning  # noqa: E402
+from discovery_agent.migration.preflight import content_findings, environment_checks  # noqa: E402
+
+
+def po(id_, type_, wave, kind=None, deps=(), hub=0, cls="DIRECT"):
+    return planning.PlanObject(id_, id_, type_, wave, cls, "Target", kind, tuple(deps), hub)
+
+
+def test_the_planner_is_deterministic_and_fingerprints_its_input():
+    objs = [po("t1", "Table", 2, TABLE), po("v1", "View", 3, VIEW, ["t1"]), po("p1", "Pipeline", 4)]
+    a, b = planning.analyze(objs), planning.analyze(list(reversed(objs)))
+    assert a == b and len(a["fingerprint"]) == 12
+    assert planning.analyze(objs[:2])["fingerprint"] != a["fingerprint"]
+
+
+def test_strategy_follows_what_the_build_can_create_then_the_classification():
+    result = planning.analyze([po("t", "Table", 2, TABLE), po("ir", "Integration Runtime", 1, cls="MANUAL"),
+                               po("d", "Dataset", 3, cls="REVIEW"), po("pl", "Pipeline", 4)])
+    got = {k: v["strategy"] for k, v in result["objectStrategies"].items()}
+    assert got == {"t": "automated", "ir": "manual", "d": "assess", "pl": "later"}
+    assert result["needsReview"]["count"] == 2
+
+
+def test_a_dependency_planned_later_blocks_and_lowers_readiness():
+    ok = planning.analyze([po("t", "Table", 2, TABLE), po("v", "View", 3, VIEW, ["t"])])
+    bad = planning.analyze([po("t", "Table", 4, TABLE), po("v", "View", 3, VIEW, ["t"])])
+    assert ok["blocking"] == 0 and ok["readiness"] == 100
+    assert bad["blocking"] == 1 and bad["readiness"] == 75
+    assert bad["risks"][0]["code"] == "DEPENDENCY_LATER"
+
+
+def test_a_missing_dependency_is_high_and_a_hub_is_flagged():
+    result = planning.analyze([po("v", "View", 3, VIEW, ["gone"]), po("t", "Table", 2, TABLE, hub=6)])
+    codes = {r["code"] for r in result["risks"]}
+    assert {"DEPENDENCY_NOT_PLANNED", "HIGH_BLAST_RADIUS"} <= codes
+
+
+def test_a_failed_target_check_blocks():
+    result = planning.analyze([po("t", "Table", 2, TABLE)], checks=[{"label": "Fabric target connected", "status": "fail", "detail": "x"}])
+    assert result["blocking"] == 1 and result["risks"][0]["code"] == "TARGET_NOT_READY"
+
+
+def test_effort_is_a_review_allowance_for_automated_and_more_for_manual():
+    auto = planning.analyze([po("t", "Pipeline", 1, PROCEDURE)])["effortDays"]
+    later = planning.analyze([po("t", "Pipeline", 1)])["effortDays"]
+    manual = planning.analyze([po("t", "Pipeline", 1, cls="MANUAL")])["effortDays"]
+    assert auto < later < manual
+
+
+def test_preflight_reads_the_content_the_run_will_translate():
+    bad_col = SqlColumn(1, "Shape", "sql_variant", 8, 0, 0, True, False)
+    findings = content_findings([
+        src("sales.Orders", TABLE, payload=table()),
+        src("sales.Odd", TABLE, payload=table(name="Odd", columns=(bad_col,))),
+        src("sales.vOk", VIEW, payload=view()),
+        src("sales.vOpaque", VIEW, payload=view(name="vOpaque", text="")),
+        src("sales.vCtas", VIEW, payload=view(name="vCtas", text="CREATE TABLE x WITH (DISTRIBUTION = ROUND_ROBIN) AS SELECT 1")),
+    ])
+    by = {(f.object_id, f.code): f.severity for f in findings}
+    assert by[("sales.Orders", "TYPE_CONVERSION")] in ("LOW", "MEDIUM")
+    assert by[("sales.Odd", "UNSUPPORTED_TYPE")] == "BLOCKING"
+    assert by[("sales.vOpaque", "DEFINITION_UNREADABLE")] == "BLOCKING"
+    assert by[("sales.vCtas", "SYNAPSE_TSQL")] == "MEDIUM"
+    assert not [f for f in findings if f.object_id == "sales.vOk"]
+
+
+def test_environment_checks_explain_each_failure():
+    off = environment_checks({"status": "disconnected"}, "")
+    assert [c["status"] for c in off] == ["fail", "fail"]
+    on = environment_checks({"status": "connected", "workspaceName": "W", "capacityAssigned": False}, "ODBC Driver 18 for SQL Server")
+    assert [c["status"] for c in on] == ["ok", "fail", "ok"]
+
+
+def test_stop_on_failure_halts_at_the_wave_boundary_and_resume_waives_it():
+    class Failing(FakeRest):
+        def create(self, path, body):
+            raise FabricApiError(400, "Bad", "nope")
+    sources = [src("A", NOTEBOOK, wave=1, payload=notebook_payload()), src("sales.Orders", TABLE, wave=2, payload=table())]
+    run = MigrationRun("001", sources, WS, "W", "pool01")
+    run.stop_on_failure = True
+    Migrator(run, lambda: Failing(), lambda h, d: FakeDb()).execute()
+    assert run.state == "paused" and "wave 2" in run.halted_reason
+    assert [i.status for i in run.items] == [FAILED, PENDING]
+    run.halt_waived, run.halted_reason = True, None
+    Migrator(run, lambda: Failing(), lambda h, d: FakeDb()).execute()
+    assert run.state == "completed" and run.items[1].status != PENDING
+
+
+ALL_THREE = [{"id": "synapse://notebook/LoadSales", "wave": 4}, {"id": "sql://ws/pool/sales/Orders", "wave": 2},
+             {"id": "synapse://pipeline/Copy", "wave": 5}]
+
+
+def test_the_planner_endpoint_reports_strategy_checks_and_a_history_of_recorded_runs():
+    svc = service(fake_job())
+    first = svc.analyze({"items": ALL_THREE})
+    assert first["strategyCounts"] == {"automated": 3, "manual": 0, "assess": 0, "later": 0, "deselected": 0}
+    off = svc.analyze({"items": ALL_THREE, "options": {"stages": ["warehouse"]}})
+    assert off["strategyCounts"]["deselected"] == 2 and off["strategyCounts"]["automated"] == 1
+    assert first["history"] == []  # an unrecorded look leaves no history
+    assert [c["status"] for c in first["checks"]][:2] == ["ok", "ok"]
+    again = svc.analyze({"items": ALL_THREE, "record": True})
+    assert again["fingerprint"] == first["fingerprint"]
+    assert len(again["history"]) == 1 and again["history"][0]["id"] == "P001"
+    assert len(svc.analyze({"items": ALL_THREE, "record": True})["history"]) == 2
+
+
+def test_the_planner_rejects_a_malformed_plan():
+    with pytest.raises(ApiError) as exc:
+        service(fake_job()).analyze({"items": "nope"})
+    assert exc.value.code == "invalid_plan"
+
+
+def test_scope_automated_leaves_deferred_objects_out_of_the_run():
+    svc = service(fake_job())
+    svc.start({"items": ALL_THREE, "options": {"scope": "automated", "stages": ["warehouse", "notebooks"]}})
+    assert wait_until(lambda: svc.state()["state"] == "completed")
+    state = svc.state()
+    assert state["total"] == 2 and state["deferred"] == 0 and state["options"]["scope"] == "automated"
+    allscope = service(fake_job())
+    allscope.start({"items": ALL_THREE, "options": {"scope": "all", "stages": ["warehouse", "notebooks"]}})
+    assert wait_until(lambda: allscope.state()["state"] == "completed")
+    assert allscope.state()["total"] == 3 and allscope.state()["deferred"] == 1  # the pipeline: its stage is off
+
+
+def test_a_plan_with_nothing_automated_is_refused_and_bad_options_are_rejected():
+    svc = service(fake_job())
+    with pytest.raises(ApiError) as nothing:
+        svc.start({"items": [{"id": "not-in-discovery", "wave": 1}], "options": {"scope": "automated"}})
+    assert nothing.value.code == "nothing_to_migrate"
+    with pytest.raises(ApiError) as bad:
+        svc.start({"items": ALL_THREE, "options": {"scope": "everything"}})
+    assert bad.value.code == "invalid_options"

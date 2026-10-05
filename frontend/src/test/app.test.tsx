@@ -76,19 +76,20 @@ describe("demo api", () => {
     const graph = await mockApi.getDependencies();
     const movable = ["Notebook", "Table", "View", "Stored Procedure"];
     const now = graph.nodes.filter((n) => movable.includes(n.type)).slice(0, 3);
-    const later = graph.nodes.filter((n) => n.type === "Pipeline").slice(0, 2);
+    // An integration runtime is always set up by hand, so it is the one thing a run never creates.
+    const later = graph.nodes.filter((n) => n.type === "Integration Runtime").slice(0, 2);
     const items = [...now, ...later].map((n) => ({ id: n.id, wave: n.wave }));
     await expect(mockApi.startExecution(items)).rejects.toMatchObject({ code: "target_not_connected" });
     await mockApi.authenticateFabric(FABRIC);
     await mockApi.testFabric(FABRIC);
     const run = await mockApi.startExecution(items);
-    expect(run.total).toBe(5);
+    expect(run.total).toBe(now.length + later.length);
     await new Promise((r) => setTimeout(r, 3000));
     const done = await mockApi.getExecution();
     expect(done.state).toBe("completed");
-    expect(done.completed + done.failed).toBe(3);
-    expect(done.deferred).toBe(2);
-    expect(done.items.filter((i) => i.status === "DEFERRED").every((i) => i.type === "Pipeline" && !!i.error)).toBe(true);
+    expect(done.completed + done.failed).toBe(now.length);
+    expect(done.deferred).toBe(later.length);
+    expect(done.items.filter((i) => i.status === "DEFERRED").every((i) => i.type === "Integration Runtime" && !!i.error)).toBe(true);
   }, 20000);
 });
 
@@ -100,13 +101,17 @@ describe("routes", () => {
     ["/discovery", "Discovery"],
     ["/assessment", "Migration Assessment"],
     ["/dependencies", "Dependencies & Migration Waves"],
-    ["/plan", "Migration Plan"],
-    ["/execute", "Migration Execution"],
+    ["/migrate", "Plan & Migrate"],
     ["/validate", "Migration Validation"],
   ];
   it.each(routes)("renders %s with its empty state when nothing is connected", async (path, title) => {
     go(path);
     expect(await screen.findByRole("heading", { level: 1, name: title })).toBeInTheDocument();
+  });
+
+  it.each(["/plan", "/execute", "/execution"])("sends the old %s URL to Plan & Migrate", async (path) => {
+    go(path);
+    expect(await screen.findByRole("heading", { level: 1, name: "Plan & Migrate" })).toBeInTheDocument();
   });
 
   it("keeps the earlier URLs working", async () => {
@@ -117,7 +122,7 @@ describe("routes", () => {
   it("shows the sidebar sections and the workflow stepper", async () => {
     go("/");
     const nav = await screen.findByRole("navigation", { name: "Primary" });
-    for (const label of ["Projects", "Synapse Source", "Fabric Target", "Discovery", "Assessment", "Dependencies & Waves", "Migration Plan", "Execute Migration", "Validation"]) {
+    for (const label of ["Projects", "Synapse Source", "Fabric Target", "Discovery", "Assessment", "Dependencies & Waves", "Plan & Migrate", "Validation"]) {
       expect(within(nav).getByRole("link", { name: label })).toBeInTheDocument();
     }
     expect(screen.getByRole("list", { name: "Migration workflow" })).toBeInTheDocument();
@@ -238,14 +243,50 @@ describe("assessment and plan", () => {
     expect(await screen.findByText("Serverless SQL", {}, { timeout: 4000 })).toBeInTheDocument();
   }, 20000);
 
-  it("builds a plan from suggested waves", async () => {
+  it("builds a plan, then offers every stage with its strategy and says why the run cannot start yet", async () => {
     await discovered();
     const user = userEvent.setup();
-    go("/plan");
+    go("/migrate");
     // Re-query: the card re-renders when the graph arrives, replacing the element.
     await waitFor(() => expect(screen.getByRole("button", { name: /Add all objects/ })).toBeEnabled(), { timeout: 8000 });
     await user.click(screen.getByRole("button", { name: /Add all objects/ }));
-    await screen.findByRole("heading", { name: "Wave 1" }, { timeout: 4000 });
-    expect(screen.getAllByText(/^(READY|BLOCKED|NOT STARTED)$/).length).toBeGreaterThan(0);
-  }, 20000);
+    await screen.findByText("DETERMINISTIC");
+    expect(await screen.findByText("Readiness", {}, { timeout: 4000 })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /Risks \(/ })).toBeInTheDocument();
+    expect(screen.getByRole("table", { name: "Migration strategy by object type" })).toBeInTheDocument();
+    // Every stage is offered, on by default, with its own run button.
+    for (const label of ["Warehouse & schema", "Table data", "Spark pool & environment", "Notebooks", "Connections", "Pipelines & datasets", "Spark job definitions", "SQL scripts", "Schedules", "External tables"]) {
+      expect(await screen.findByRole("checkbox", { name: `Include ${label}` })).toBeChecked();
+    }
+    expect(screen.getAllByRole("button", { name: /Run this stage/ })).toHaveLength(10);
+    // The Fabric target is not connected in this test, so the planner blocks and nothing can start.
+    expect(screen.getByRole("button", { name: /Start migration/ })).toBeDisabled();
+    expect(screen.getAllByRole("button", { name: /Run this stage/ }).every((b) => (b as HTMLButtonElement).disabled)).toBe(true);
+    expect(screen.getByText("Not ready to start")).toBeInTheDocument();
+    // The run strategy is a choice, and stop-on-failure is off by default.
+    expect(screen.getByRole("radio", { name: /Automated objects only/ })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: /Stop at the end of a wave/ })).not.toBeChecked();
+  }, 25000);
+
+  it("switching a stage off marks its objects Not selected, and credentials never reach browser storage", async () => {
+    await discovered();
+    const user = userEvent.setup();
+    go("/migrate");
+    await waitFor(() => expect(screen.getByRole("button", { name: /Add all objects/ })).toBeEnabled(), { timeout: 8000 });
+    await user.click(screen.getByRole("button", { name: /Add all objects/ }));
+    const pipelines = await screen.findByRole("checkbox", { name: "Include Pipelines & datasets" });
+    await user.click(pipelines);
+    expect(pipelines).not.toBeChecked();
+    // Data load options are a strategy the user can change.
+    const mode = screen.getByLabelText("If a table already has rows");
+    await user.selectOptions(mode, "replace");
+    expect(mode).toHaveValue("replace");
+    // Credentials: typed into a password field, kept out of localStorage and sessionStorage.
+    await user.click(screen.getByText(/Credentials/, { selector: "summary span" }));
+    const secret = (await screen.findAllByLabelText(/^Password for /))[0];
+    expect(secret).toHaveAttribute("type", "password");
+    await user.type(secret, "S3CRET-NEVER-STORED");
+    const stored = JSON.stringify({ ...localStorage }) + JSON.stringify({ ...sessionStorage });
+    expect(stored).not.toContain("S3CRET-NEVER-STORED");
+  }, 30000);
 });

@@ -13,12 +13,14 @@ with a long-running operation to poll. Both are handled here, as are paging
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
+_OPERATION_ID = re.compile(r"/operations/([0-9a-fA-F-]{36})")
 FABRIC_HOST = "https://api.fabric.microsoft.com"
 FABRIC_API = FABRIC_HOST + "/v1"
 CALL_TIMEOUT_SECONDS = 60
@@ -152,12 +154,24 @@ class FabricRestClient:
         _, _, payload = self.request("GET", path)
         return payload if isinstance(payload, dict) else {}
 
+    def patch(self, path: str, body: dict) -> dict:
+        _, _, payload = self.request("PATCH", path, body)
+        return payload if isinstance(payload, dict) else {}
+
     def create(self, path: str, body: dict) -> dict:
         """POST a new item and wait for it. Returns the created item when Fabric reports it."""
         status, headers, payload = self.request("POST", path, body)
         if status != 202:
             return payload if isinstance(payload, dict) else {}
         location = headers.get("location")
+        if location and not location.startswith(FABRIC_HOST + "/"):
+            # Fabric may answer with a regional redirect host. Never send the token
+            # there: poll the same operation on api.fabric.microsoft.com instead.
+            match = _OPERATION_ID.search(urllib.parse.urlsplit(location).path)
+            operation = match.group(1) if match else headers.get("x-ms-operation-id")
+            if not operation:
+                raise FabricApiError(0, "unexpected_host", "Fabric returned a link outside api.fabric.microsoft.com; it was not followed.")
+            location = f"{FABRIC_API}/operations/{operation}"
         if not location:
             operation = headers.get("x-ms-operation-id")
             if not operation:

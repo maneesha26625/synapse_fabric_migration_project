@@ -5,9 +5,8 @@ import {
   Database,
   Download,
   FolderKanban,
-  ListChecks,
   Network,
-  Play,
+  Rocket,
   Plus,
   Radar,
   RefreshCw,
@@ -46,8 +45,7 @@ const NAV: { section: string; items: NavEntry[] }[] = [
   {
     section: "Migrate",
     items: [
-      { to: "/plan", label: "Migration Plan", icon: ListChecks },
-      { to: "/execute", label: "Execute Migration", icon: Play },
+      { to: "/migrate", label: "Plan & Migrate", icon: Rocket },
       { to: "/validate", label: "Validation", icon: ShieldCheck },
     ],
   },
@@ -83,7 +81,7 @@ type StepState = "done" | "active" | "pending";
 export function useWorkflow(): { to: string; label: string; state: StepState }[] {
   const { pathname } = useLocation();
   const { isConnected, discovery } = useAppState();
-  const { fabric, plan, execution, validation, project } = useMigration();
+  const { fabric, execution, validation, project } = useMigration();
   const discovered = discovery.state === "completed" || discovery.state === "completed_with_warnings";
   const steps: { to: string; label: string; done: boolean }[] = [
     { to: "/", label: "Project", done: !!project },
@@ -92,8 +90,7 @@ export function useWorkflow(): { to: string; label: string; state: StepState }[]
     { to: "/assessment", label: "Assessment", done: false },
     { to: "/dependencies", label: "Dependencies & Waves", done: false },
     { to: "/fabric", label: "Fabric Target", done: fabric.status === "connected" },
-    { to: "/plan", label: "Migration Plan", done: plan.length > 0 },
-    { to: "/execute", label: "Execute", done: execution.state === "completed" },
+    { to: "/migrate", label: "Plan & Migrate", done: execution.state === "completed" },
     { to: "/validate", label: "Validate", done: !!validation },
   ];
   return steps.map((s) => ({
