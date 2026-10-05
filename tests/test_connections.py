@@ -1636,13 +1636,18 @@ def test_only_the_sql_package_opens_an_odbc_connection():
     assert not offenders, f"these modules call the ODBC driver directly: {offenders}"
 
 
+# The Fabric target (api/fabric.py) drives the `az` and `fab` CLIs for sign-in and is
+# the one sanctioned non-git subprocess user. These guards are about git only.
+_FABRIC_CLI_MODULE = "fabric.py"
+
+
 def test_only_the_acquisition_package_runs_a_git_subprocess():
     """One git implementation, wrapped by one connection."""
     offenders = [
         str(path)
         for path in repository_python_files()
         if "subprocess.run(" in path.read_text(encoding="utf-8")
-        and path.name != "git.py"
+        and path.name not in ("git.py", _FABRIC_CLI_MODULE)
     ]
 
     assert not offenders, f"these modules shell out to git directly: {offenders}"
@@ -2264,6 +2269,7 @@ def test_git_has_exactly_one_execution_boundary():
         str(path)
         for path in repository_python_files()
         if "subprocess.run(" in path.read_text(encoding="utf-8")
+        and path.name != _FABRIC_CLI_MODULE
     ]
     assert subprocess_sites == [str(inspect_module.getfile(git_module))]
 
