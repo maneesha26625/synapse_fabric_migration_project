@@ -6,6 +6,7 @@ import {
   type ConnectionConfig,
   type ConnectionState,
   type DiscoveryStatus,
+  type ExecutionRun,
   type FabricTarget,
   type Health,
   type MigrationApi,
@@ -123,9 +124,11 @@ export const realApi: MigrationApi = {
       body: JSON.stringify({ method: c.method, workspaceId: c.workspaceId.trim() }),
     }),
   disconnectFabric: () => request<FabricTarget>("/api/fabric/connection", { method: "DELETE" }),
-  startExecution: notImplemented("Migration execution"),
-  getExecution: async () => ({ runId: "", state: "idle" as const, total: 0, completed: 0, inProgress: 0, failed: 0, pending: 0, items: [], logs: [] }),
-  controlExecution: notImplemented("Migration execution"),
+  startExecution: (items) =>
+    request<ExecutionRun>("/api/migration/start", { method: "POST", body: JSON.stringify({ items }) }),
+  getExecution: () => request<ExecutionRun>("/api/migration/run"),
+  controlExecution: (action) =>
+    request<ExecutionRun>("/api/migration/control", { method: "POST", body: JSON.stringify({ action }) }),
   runValidation: notImplemented("Migration validation"),
   listSqlPools: async (rg, ws) =>
     (await request<{ items: string[] }>(

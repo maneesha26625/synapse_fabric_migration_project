@@ -12,7 +12,9 @@ const TONE: Record<PlanStatus, Tone> = {
 };
 
 export function Plan() {
-  const { discovery, isConnected } = useAppState();
+  const { discovery, isConnected, health } = useAppState();
+  // What a run moves now; everything else in the plan is deferred to a later session.
+  const migratable = useMemo(() => new Set(health?.capabilities.migratableTypes ?? ["Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure", "Notebook"]), [health]);
   const { graph, graphLoading, graphError, reloadGraph, plan, addToPlan, addAllToPlan, removeFromPlan, setPlanWave, movePlanItem, clearPlan, planStatus, fabric } = useMigration();
   const navigate = useNavigate();
   const [pick, setPick] = useState("");
@@ -76,15 +78,15 @@ export function Plan() {
         </Card>
 
         {visible.length === 0 ? (
-          <Card><EmptyState icon={<ListChecks size={22} />} title="The migration plan is empty.">Add objects above, or open any object in Discovery and choose Add to Migration Plan.</EmptyState></Card>
+          <Card><EmptyState icon={<ListChecks size={22} />} title="The migration plan is empty." actions={<Button variant="primary" onClick={addAllToPlan} disabled={!graph?.nodes.length}><ListPlus size={14} aria-hidden="true" />Build plan from suggested waves</Button>}>Build a plan with every discovered object in its suggested wave, then adjust it. Or add single objects above, or from any object in Discovery with Add to Migration Plan.</EmptyState></Card>
         ) : waves.map((w) => {
           const items = visible.filter((p) => p.wave === w);
           return (
             <Card key={w} title={`Wave ${w}`} subtitle={`${items.length} object${items.length === 1 ? "" : "s"}`}>
               <div className="table-wrap">
-                <table className="data" style={{ minWidth: 900 }}>
+                <table className="data" style={{ minWidth: 1020 }}>
                   <caption className="sr-only">Wave {w} objects</caption>
-                  <thead><tr>{["Object", "Source", "Target", "Classification", "Dependencies", "Status", ""].map((h) => <th key={h || "actions"} scope="col" className="static">{h || <span className="sr-only">Actions</span>}</th>)}</tr></thead>
+                  <thead><tr>{["Object", "Source", "Target", "Classification", "Dependencies", "This session", "Status", ""].map((h) => <th key={h || "actions"} scope="col" className="static">{h || <span className="sr-only">Actions</span>}</th>)}</tr></thead>
                   <tbody>
                     {items.map((p) => {
                       const n = nodes.get(p.id)!;
@@ -96,6 +98,7 @@ export function Plan() {
                           <td className="ws" title={n.fabricTarget}>{n.fabricTarget}</td>
                           <td><ClassificationBadge value={n.classification} /></td>
                           <td className="num">{n.dependsOn}</td>
+                          <td>{migratable.has(n.type) ? <StatusBadge tone="success">Migrates now</StatusBadge> : <StatusBadge tone="neutral">Later session</StatusBadge>}</td>
                           <td><StatusBadge tone={TONE[st]}>{st}</StatusBadge></td>
                           <td>
                             <div className="row" style={{ flexWrap: "nowrap", gap: 4 }}>

@@ -64,6 +64,7 @@ from discovery_agent.errors import (
     SynapseConnectionError,
 )
 from discovery_agent.mapping import component_table
+from discovery_agent.migration.runner import MIGRATABLE_TYPES
 from discovery_agent.mapping.waves import assign_waves, summarise_waves
 from discovery_agent.mapping.synapse_fabric_mapping import (
     ASSESSMENT,
@@ -256,6 +257,9 @@ class Session:
                     f"{t}s" if not t.endswith("s") else t
                     for t, _ in mapping.ARTIFACT_INFO.values()
                 ],
+                # What a migration run moves into Fabric today; the rest of
+                # a plan is reported as deferred to a later session.
+                "migratableTypes": list(MIGRATABLE_TYPES),
             },
         }
 
@@ -827,6 +831,16 @@ class Session:
             if job.state not in ("completed", "completed_with_warnings"):
                 raise ApiError(409, "no_results", "There are no discovery results yet.")
             return job
+
+    def migration_snapshot(self) -> Tuple["_Job", Optional[str]]:
+        """The finished discovery and the SQL pool it read, for a migration run.
+
+        The job is replaced, never mutated, once it has finished, so handing it
+        out is safe while a new discovery starts."""
+        job = self._completed_job()
+        with self._lock:
+            pool = self._connection.sql_pool if self._connection else None
+        return job, pool
 
     def dependency_graph(self) -> dict:
         """The dependency graph and suggested migration waves."""

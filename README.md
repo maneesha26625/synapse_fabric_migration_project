@@ -466,6 +466,48 @@ The two Synapse permissions are independent, and the tool validates them
 separately: Reader on the resource group satisfies ARM and grants nothing on
 the data plane.
 
+## Migration
+
+The Execute page runs the migration plan against the connected Fabric
+workspace. It is the one part of the application that writes, and it writes
+only to Fabric: nothing in Synapse is changed.
+
+| Synapse object | Becomes in Fabric | How |
+|---|---|---|
+| Dedicated SQL pool | A Fabric Warehouse of the same name | Created if missing, reused if it already exists. Only the pool you connected; other pools are deferred. |
+| Schema | Schema in that Warehouse | `CREATE SCHEMA`, skipped if it exists. |
+| Notebook | Fabric Notebook | Fabric REST API. Cells and their languages are kept; the Spark pool binding, session size settings, saved outputs and the Synapse folder are dropped, each noted. Code is never rewritten: Synapse-only calls (TokenLibrary, synapsesql, linked-service credentials) are flagged for review. .NET (C#) notebooks have no Fabric equivalent and are deferred. |
+| Table | Table in a Fabric Warehouse, **empty** | Rebuilt from the discovered columns. Storage clauses (distribution, columnstore, partitions) are dropped; unsupported types are mapped (`datetime` to `datetime2(3)`, `money` to `decimal(19,4)`, `nvarchar(n)` to UTF-8 `varchar(4n)`, and so on) and each change is noted. IDENTITY is dropped. Data moves in a later session. |
+| View, stored procedure | Same object in the Warehouse | Created from its own definition text, unchanged. If Fabric's T-SQL rejects it, the object fails with the server's message for a manual review. |
+| Everything else | Nothing yet | Marked **Deferred** with the reason: pipelines, datasets and linked services need Fabric connections first; Spark job definitions, SQL scripts and external tables follow in later sessions. |
+
+* **Safe to re-run.** An object that already exists in Fabric is **Skipped**,
+  never overwritten. Retry Failed runs only the failed objects again.
+* **One Warehouse per SQL pool,** named after the pool (`SalesDW`, or a
+  cleaned-up form of the name). It is created if it is missing and reused if it
+  exists.
+* **Order.** Objects run wave by wave; within a wave, tables before views
+  before procedures. Pause stops after the current object.
+* **A Fabric capacity is required.** Fabric only creates notebooks and
+  warehouses in a workspace on a Fabric (F) or Trial capacity. Test Connection
+  on the Fabric Target page reports it ("Fabric capacity assigned"), and a run
+  is refused up front without one. Fix: workspace settings, License info,
+  assign a capacity. If Fabric still answers `FeatureNotAvailable` mid-run, the
+  run stops trying further Fabric objects and reports that once.
+* **Sign-in: either CLI.** With **Azure CLI**, the run gets tokens from `az`
+  for the Fabric API and the Warehouse SQL endpoint (`database.windows.net`).
+  With **Fabric CLI**, Fabric API calls go through `fab api` (request bodies in
+  a temporary `.json` file, removed afterwards). The Fabric CLI cannot issue a
+  SQL token, so the first SQL object opens one Microsoft sign-in window
+  (the accelerator's Interactive browser sign-in, for the same tenant); later
+  runs are silent. The account needs Contributor (or higher) on the workspace.
+* **Needs** ODBC Driver 18 on the machine running the server, as discovery does.
+
+`GET /api/migration/run`, `POST /api/migration/start` (`{items: [{id, wave}]}`)
+and `POST /api/migration/control` (`{action: pause|resume|retry}`) drive it. The
+code lives in `src/discovery_agent/migration/` (`runner.py`, `notebooks.py`,
+`warehouse_ddl.py`, `fabric_rest.py`) and `api/migration.py`.
+
 ## Tests
 
 ```

@@ -1,9 +1,10 @@
 # Migration Accelerator UI
 
-Dark enterprise UI for the Synapse → Fabric accelerator. **Scope: Connections and
-Discovery only.** Assessment, Execution and Validation are visible in the
-navigation as *Coming soon* and have no logic behind them. There is no Fabric
-(target) connection anywhere in this UI; it belongs to a later phase.
+Dark enterprise UI for the Synapse → Fabric accelerator: connect Synapse and
+Fabric, discover, assess, plan and run the migration. In Live mode the Execute
+page migrates notebooks and SQL schema (tables, views, procedures) into Fabric
+and marks everything else as deferred to a later session; see "Migration" in
+the root README. Validation works in Demo data only.
 
 Stack: React 18 + TypeScript + Vite, `react-router-dom`, `lucide-react`. Plain
 CSS with design tokens (`src/styles/global.css`). No state library and no UI kit.

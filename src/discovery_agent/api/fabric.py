@@ -22,10 +22,12 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -127,6 +129,7 @@ class FabricTarget:
         self.workspace_name: Optional[str] = None
         self.checks: List[dict] = []
         self.message: Optional[str] = None
+        self.capacity_id: Optional[str] = None
 
     # -- public --------------------------------------------------------
 
@@ -137,6 +140,7 @@ class FabricTarget:
                 "tenantId": self.tenant, "workspaces": list(self.workspaces),
                 "workspaceId": self.workspace_id, "workspaceName": self.workspace_name,
                 "checks": list(self.checks), "message": self.message,
+                "capacityAssigned": bool(self.capacity_id) if self.status == "connected" else None,
             }
 
     def disconnect(self) -> dict:
@@ -241,6 +245,100 @@ class FabricTarget:
             self.status = "connected"
             self.message = None
             return self.state()
+
+    # -- for the migration run ----------------------------------------
+
+    def migration_target(self) -> Tuple[str, str, str]:
+        """(workspace id, workspace name, sign-in method) the migration writes with."""
+        with self._lock:
+            if self.status != "connected" or not self.workspace_id or not self.method:
+                raise FabricError(409, "target_not_connected", "Connect the Fabric target and pass its connection test first.")
+            return self.workspace_id, self.workspace_name or self.workspace_id, self.method
+
+    def rest_client(self) -> Any:
+        """A Fabric REST client signed in the way the operator chose.
+
+        Azure CLI: plain HTTPS with a token from ``az``. Fabric CLI: every call
+        goes through ``fab api``, which holds its own token."""
+        from discovery_agent.migration.fabric_rest import FabricRestClient  # noqa: PLC0415
+
+        if self.method == "fabric_cli":
+            return FabricRestClient(lambda: "", send=self._fab_send)
+        return FabricRestClient(self.token_provider(FABRIC_RESOURCE))
+
+    def sql_token_provider(self) -> Callable[[], str]:
+        """Tokens for the Warehouse SQL endpoint (audience database.windows.net).
+
+        The Azure CLI can issue those. The Fabric CLI cannot (its audiences are
+        fabric, storage, azure and powerbi), so with it the accelerator's own
+        interactive browser sign-in is used against the same tenant: one
+        Microsoft window the first time, silent afterwards."""
+        if self.method == "azure_cli":
+            return self.token_provider("https://database.windows.net/")
+        from discovery_agent.connections.azure import SQL_SCOPE, credential_provider  # noqa: PLC0415
+        from discovery_agent.connections.models import CredentialMethod  # noqa: PLC0415
+
+        provider = credential_provider(CredentialMethod.INTERACTIVE_BROWSER, tenant_id=self.tenant)
+        return provider.token_provider_for(SQL_SCOPE)
+
+    def _fab_send(self, method: str, url: str, headers: Any, body: Optional[bytes]) -> Tuple[int, Dict[str, str], bytes]:
+        """``fab api`` as a transport: (status, lower-cased headers, body bytes)."""
+        fab = _require("fab", "Fabric CLI")
+        parsed = urllib.parse.urlsplit(url)
+        endpoint = parsed.path[len("/v1/"):] if parsed.path.startswith("/v1/") else parsed.path.lstrip("/")
+        args = [fab, "api", endpoint, "-X", method.lower(), "--show_headers"]
+        params = urllib.parse.parse_qsl(parsed.query)
+        if params:
+            args += ["-P", ",".join(f"{k}={v}" for k, v in params)]
+        temp = None
+        try:
+            if body:
+                # A notebook body is too large for a command line; fab reads a .json path.
+                fd, temp = tempfile.mkstemp(suffix=".json", prefix="fabric-migration-")
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(body)
+                args += ["-i", temp]
+            code, out = _run(args, raw=True)
+        finally:
+            if temp:
+                try:
+                    os.unlink(temp)
+                except OSError:
+                    pass
+        try:
+            data = _json_in(out)
+        except ValueError:
+            return 401, {}, json.dumps({"errorCode": "FabricCliNotSignedIn", "message": "The Fabric CLI did not answer. Log in with the Fabric CLI again on the Fabric Target page."}).encode()
+        status = int(data.get("status_code") or (500 if code else 200))
+        response_headers = {str(k).lower(): str(v) for k, v in (data.get("headers") or {}).items()}
+        text = data.get("text")
+        return status, response_headers, (json.dumps(text).encode() if isinstance(text, (dict, list)) else b"")
+
+    def token_provider(self, resource: str) -> Callable[[], str]:
+        """A callable returning a token for ``resource`` from the Azure CLI, cached until
+        five minutes before it expires. The token stays in this process."""
+        az = _require("az", "Azure CLI")
+        cache: Dict[str, Any] = {"token": None, "until": 0.0}
+        guard = threading.Lock()
+
+        def provide() -> str:
+            with guard:
+                if cache["token"] and time.time() < cache["until"]:
+                    return cache["token"]
+                code, out = _run([az, "account", "get-access-token", "--resource", resource, "-o", "json"], raw=True)
+                try:
+                    data = json.loads(out)
+                except ValueError:
+                    data = {}
+                token = data.get("accessToken")
+                if code != 0 or not token:
+                    raise FabricError(401, "token_unavailable", "Could not get a token from the Azure CLI. Log in again on the Fabric Target page.")
+                expires = data.get("expires_on")
+                cache["token"] = token
+                cache["until"] = (float(expires) - 300) if expires else time.time() + 1800
+                return token
+
+        return provide
 
     # -- helpers -------------------------------------------------------
 
@@ -358,3 +456,9 @@ class FabricTarget:
         self.workspaces = listed
         self.workspace_id = wid
         self.workspace_name = ws.get("displayName") or next((w["name"] for w in listed if w["id"].lower() == wid.lower()), wid)
+        # Not a connection failure, but migration cannot create items without it.
+        self.capacity_id = ws.get("capacityId")
+        if self.capacity_id:
+            ok("Fabric capacity assigned", "")
+        else:
+            checks.append({"label": "Fabric capacity assigned", "ok": False, "detail": "No Fabric capacity: migration cannot create items here until one is assigned (Workspace settings, License info)."})

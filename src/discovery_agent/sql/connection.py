@@ -99,11 +99,19 @@ class PyodbcConnector(Connector):
     """
 
     def __init__(
-        self, config: SqlConnectionConfig, authentication: EntraAuthentication
+        self,
+        config: SqlConnectionConfig,
+        authentication: EntraAuthentication,
+        *,
+        readonly: bool = True,
     ) -> None:
         config.validate()
         self.config = config
         self.authentication = authentication
+        #: Discovery always reads. Only the migration writer opens a session
+        #: that can change anything, and it asks for that explicitly; a
+        #: writable session commits each statement on its own.
+        self.readonly = readonly
 
     def describe(self) -> str:
         return f"{self.config.safe_description()} via {self.config.driver}"
@@ -124,7 +132,8 @@ class PyodbcConnector(Connector):
                 connection_string,
                 timeout=self.config.connect_timeout_seconds,
                 attrs_before=dict(attributes),
-                readonly=True,
+                readonly=self.readonly,
+                autocommit=not self.readonly,
             )
         except Exception as exc:  # pyodbc.Error and anything the driver raises
             # The message is the driver's, and the string it was built from

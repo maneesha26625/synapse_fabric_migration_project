@@ -71,10 +71,13 @@ describe("demo api", () => {
     for (const e of graph.edges) expect(wave.get(e.source)!).toBeGreaterThanOrEqual(wave.get(e.target)!);
   }, 20000);
 
-  it("simulates a run only once the Fabric target is connected", async () => {
+  it("simulates a run only once the Fabric target is connected, deferring what this session does not move", async () => {
     await discovered();
     const graph = await mockApi.getDependencies();
-    const items = graph.nodes.slice(0, 5).map((n) => ({ id: n.id, wave: n.wave }));
+    const movable = ["Notebook", "Table", "View", "Stored Procedure"];
+    const now = graph.nodes.filter((n) => movable.includes(n.type)).slice(0, 3);
+    const later = graph.nodes.filter((n) => n.type === "Pipeline").slice(0, 2);
+    const items = [...now, ...later].map((n) => ({ id: n.id, wave: n.wave }));
     await expect(mockApi.startExecution(items)).rejects.toMatchObject({ code: "target_not_connected" });
     await mockApi.authenticateFabric(FABRIC);
     await mockApi.testFabric(FABRIC);
@@ -83,7 +86,9 @@ describe("demo api", () => {
     await new Promise((r) => setTimeout(r, 3000));
     const done = await mockApi.getExecution();
     expect(done.state).toBe("completed");
-    expect(done.completed + done.failed).toBe(5);
+    expect(done.completed + done.failed).toBe(3);
+    expect(done.deferred).toBe(2);
+    expect(done.items.filter((i) => i.status === "DEFERRED").every((i) => i.type === "Pipeline" && !!i.error)).toBe(true);
   }, 20000);
 });
 

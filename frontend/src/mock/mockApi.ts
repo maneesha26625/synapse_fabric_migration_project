@@ -33,6 +33,8 @@ import { generateObjects } from "./mockData";
 import { mockComponents } from "./mockMapping";
 
 const STEP_MS = 700;
+/** What a migration run moves in this build; mirrors the backend's list. */
+const MIGRATABLE_TYPES = ["Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure", "Notebook"];
 const STEPS = [
   "Discovering SQL objects",
   "Discovering pipelines",
@@ -204,16 +206,22 @@ function completedObjects(): ObjectDetail[] {
 }
 
 function runNow(): ExecutionRun {
-  if (!execSim) return { runId: "", state: "idle", total: 0, completed: 0, inProgress: 0, failed: 0, pending: 0, items: [], logs: [] };
+  if (!execSim) return { runId: "", state: "idle", total: 0, completed: 0, inProgress: 0, failed: 0, pending: 0, skipped: 0, deferred: 0, items: [], logs: [] };
   const sim = execSim;
   const objects = new Map((s.objects ?? []).map((o) => [o.id, o]));
   const elapsed = sim.base + (sim.resumedAt === null ? 0 : Date.now() - sim.resumedAt);
   const PER = 350, DUR = 600;
   const started = Date.now() - elapsed;
   const logs: string[] = [];
-  const items: ExecItem[] = sim.items.map((pi, i) => {
+  let slot = 0;
+  const items: ExecItem[] = sim.items.map((pi) => {
     const o = objects.get(pi.id);
-    const begin = i * PER, end = begin + DUR;
+    // Like the real backend: only these types move in this session.
+    if (!MIGRATABLE_TYPES.includes(o?.type ?? "")) {
+      return { id: pi.id, name: o?.name ?? pi.id, type: o?.type ?? "", step: "Not migrated in this session", status: "DEFERRED", startedAt: null, completedAt: null, error: `${o?.type ?? "This type"} objects move in a later session (demo).` };
+    }
+    const begin = slot * PER, end = begin + DUR;
+    slot += 1;
     const failing = !sim.retried && hash(pi.id) % 11 === 0;
     const base: ExecItem = { id: pi.id, name: o?.name ?? pi.id, type: o?.type ?? "", step: "Waiting", status: "PENDING", startedAt: null, completedAt: null, error: null };
     if (elapsed < begin) return base;
@@ -230,11 +238,12 @@ function runNow(): ExecutionRun {
     return { ...base, step: "Validated", status: "COMPLETED", startedAt: at(begin), completedAt: at(end) };
   });
   const n = (st: ExecItem["status"]) => items.filter((i) => i.status === st).length;
-  const allDone = items.every((i) => i.status === "COMPLETED" || i.status === "FAILED");
+  const allDone = items.every((i) => i.status === "COMPLETED" || i.status === "FAILED" || i.status === "DEFERRED");
   return {
     runId: sim.runId,
     state: allDone ? "completed" : sim.resumedAt === null ? "paused" : "running",
     total: items.length, completed: n("COMPLETED"), inProgress: n("IN PROGRESS"), failed: n("FAILED"), pending: n("PENDING"),
+    skipped: n("SKIPPED"), deferred: n("DEFERRED"), workspace: fabric.workspaceName ?? null, warehouse: "demo_pool",
     items, logs,
   };
 }
@@ -258,6 +267,7 @@ export const mockApi: MigrationApi = {
           },
         ],
         discoveryScope: ["Tables", "Views", "Stored Procedures", "SQL Scripts", "Pipelines", "Datasets", "Linked Services", "Notebooks", "Spark Job Definitions"],
+        migratableTypes: [...MIGRATABLE_TYPES],
       },
     };
   },

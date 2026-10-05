@@ -54,7 +54,7 @@ export interface ConnectionState {
 
 export interface Health {
   status: "ok";
-  capabilities: { authMethods: AuthMethod[]; authMethodDetails?: AuthMethodDetail[]; discoveryScope: string[] };
+  capabilities: { authMethods: AuthMethod[]; authMethodDetails?: AuthMethodDetail[]; discoveryScope: string[]; migratableTypes?: string[] };
 }
 
 /** What the backend says about one sign-in method. */
@@ -340,6 +340,8 @@ export interface FabricTarget {
   workspaceName?: string | null;
   checks?: FabricCheck[];
   message?: string | null;
+  /** After a passed test: whether the workspace is on a Fabric capacity (migration needs one). */
+  capacityAssigned?: boolean | null;
 }
 
 // ---- plan, execution, validation ----------------------------------------------------
@@ -353,10 +355,15 @@ export interface ExecItem {
   name: string;
   type: string;
   step: string;
-  status: "PENDING" | "IN PROGRESS" | "COMPLETED" | "FAILED";
+  /** SKIPPED: already in Fabric, left unchanged. DEFERRED: not migrated in this session; error says why. */
+  status: "PENDING" | "IN PROGRESS" | "COMPLETED" | "FAILED" | "SKIPPED" | "DEFERRED";
   startedAt: string | null;
   completedAt: string | null;
   error: string | null;
+  /** What changed on the way (types mapped, settings dropped). */
+  notes?: string[];
+  /** Where it landed in Fabric. */
+  target?: string | null;
 }
 export interface ExecutionRun {
   runId: string;
@@ -366,6 +373,10 @@ export interface ExecutionRun {
   inProgress: number;
   failed: number;
   pending: number;
+  skipped: number;
+  deferred: number;
+  workspace?: string | null;
+  warehouse?: string | null;
   items: ExecItem[];
   logs: string[];
 }

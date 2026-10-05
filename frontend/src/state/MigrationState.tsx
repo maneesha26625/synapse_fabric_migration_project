@@ -43,7 +43,7 @@ function save(key: string, value: unknown) {
 
 const DEFAULT_PROJECT: Project = { id: "default", name: "Synapse to Fabric migration", createdAt: new Date(0).toISOString() };
 
-const EMPTY_RUN: ExecutionRun = { runId: "", state: "idle", total: 0, completed: 0, inProgress: 0, failed: 0, pending: 0, items: [], logs: [] };
+const EMPTY_RUN: ExecutionRun = { runId: "", state: "idle", total: 0, completed: 0, inProgress: 0, failed: 0, pending: 0, skipped: 0, deferred: 0, items: [], logs: [] };
 
 interface MigrationStateValue {
   projects: Project[];
@@ -246,7 +246,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   const runStatus = useMemo(() => new Map(execution.items.map((i) => [i.id, i.status])), [execution.items]);
   const planStatus = useCallback((id: string): PlanStatus => {
     const run = runStatus.get(id);
-    if (run === "COMPLETED") return "COMPLETED";
+    if (run === "COMPLETED" || run === "SKIPPED") return "COMPLETED"; // skipped = already in Fabric
     if (run === "FAILED") return "FAILED";
     if (run === "IN PROGRESS") return "IN PROGRESS";
     // Blocked: it needs something that is not in the plan, or that is planned later.

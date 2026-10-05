@@ -20,6 +20,9 @@ web framework would be the first. The surface is small and fixed.
     POST   /api/fabric/workspaces         refresh the workspace list
     POST   /api/fabric/test               verify the selected workspace
     DELETE /api/fabric/connection         forget the Fabric target
+    GET    /api/migration/run             the current migration run
+    POST   /api/migration/start           start a run from the migration plan
+    POST   /api/migration/control         pause | resume | retry
 
 Security posture, in order of importance:
 
@@ -46,6 +49,7 @@ from typing import Optional
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from discovery_agent.api.fabric import FabricError, FabricTarget
+from discovery_agent.api.migration import MigrationService
 from discovery_agent.api.service import ApiError, Session
 
 MAX_BODY_BYTES = 64 * 1024
@@ -53,8 +57,14 @@ _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 RESULTS_PREFIX = "/api/discovery/results/"
 
 
-def make_handler(session: Session, static_root: Optional[Path], fabric: Optional[FabricTarget] = None):
+def make_handler(
+    session: Session,
+    static_root: Optional[Path],
+    fabric: Optional[FabricTarget] = None,
+    migration: Optional[MigrationService] = None,
+):
     fabric = fabric or FabricTarget()
+    migration = migration or MigrationService(session, fabric)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "MigrationAcceleratorAPI"
@@ -126,6 +136,8 @@ def make_handler(session: Session, static_root: Optional[Path], fabric: Optional
                 self._dispatch(session.connection_state)
             elif path == "/api/fabric/connection":
                 self._dispatch(fabric.state)
+            elif path == "/api/migration/run":
+                self._dispatch(migration.state)
             elif path.startswith("/api/azure/"):
                 self._dispatch(lambda: session.azure_options(path[len("/api/azure/"):], query))
             elif path == "/api/dependencies":
@@ -152,6 +164,8 @@ def make_handler(session: Session, static_root: Optional[Path], fabric: Optional
                 "/api/fabric/authenticate": lambda: fabric.authenticate(self._json_body()),
                 "/api/fabric/workspaces": lambda: fabric.refresh_workspaces(self._json_body()),
                 "/api/fabric/test": lambda: fabric.test(self._json_body()),
+                "/api/migration/start": lambda: migration.start(self._json_body()),
+                "/api/migration/control": lambda: migration.control(self._json_body()),
                 "/api/discovery/start": session.start_discovery,
             }
             handler = routes.get(path)
