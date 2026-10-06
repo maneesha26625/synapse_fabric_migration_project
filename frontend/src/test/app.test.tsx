@@ -1,9 +1,10 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
+import { buildReport } from "../components/journey/report";
 import { mockApi, resetDemo } from "../mock/mockApi";
-import type { ConnectionConfig, FabricConfig, ResultsQuery } from "../types";
+import type { ConnectionConfig, ExecutionRun, FabricConfig, ResultsQuery } from "../types";
 
 const CONFIG: ConnectionConfig = {
   method: "azure_cli", tenantId: "", subscriptionId: "10eb96c3-ba3c-492e-b95b-e9f1d6d85d70",
@@ -14,12 +15,29 @@ const Q: ResultsQuery = {
   search: "", categories: [], types: [], statuses: [], fabricTargets: [], paths: [], workstreams: [], mappingStatuses: [],
   classifications: [], assessment: "", sort: "name", dir: "asc", page: 1, pageSize: 200,
 };
+const STEP_ORDER = ["discover", "assess", "waves", "plan", "migrate", "validate"];
+const JOURNEY = "ma.journey.mock.default";
+const PLAN = "ma.plan.mock.default";
+const stored = (key: string) => JSON.parse(localStorage.getItem(key) ?? "null");
 
-/** Connect and finish discovery in the demo layer, so a page can be rendered against results. */
+/** Connect and finish discovery in the demo layer, so a step can be rendered against results. */
 async function discovered() {
   await mockApi.testConnection(CONFIG);
   await mockApi.startDiscovery();
   await new Promise((r) => setTimeout(r, 3700));
+}
+
+/** Confirm every step before `step`, as if the operator had pressed Next on each. */
+function unlockTo(step: string) {
+  localStorage.setItem(JOURNEY, JSON.stringify(STEP_ORDER.slice(0, STEP_ORDER.indexOf(step))));
+}
+
+/** A small plan of real demo objects, as if built on the Plan step. Needs a finished discovery. */
+async function seedPlan(count = 3) {
+  const graph = await mockApi.getDependencies();
+  const items = graph.nodes.filter((n) => n.type === "Notebook").slice(0, count).map((n) => ({ id: n.id, wave: n.wave }));
+  localStorage.setItem(PLAN, JSON.stringify(items));
+  return items;
 }
 
 function go(path: string) {
@@ -27,13 +45,18 @@ function go(path: string) {
   return render(<App />);
 }
 
+const stepHeading = (name: string) => screen.findByRole("heading", { level: 2, name }, { timeout: 5000 });
+const stepBox = (n: number) => within(screen.getByRole("navigation", { name: "Migration steps" })).getByRole("button", { name: new RegExp(`^Step ${n}:`) });
+
 beforeEach(async () => {
   localStorage.clear();
   localStorage.setItem("ma.apiMode", "mock");
   window.history.pushState({}, "", "/");
+  resetDemo();
   await mockApi.disconnect();
   await mockApi.disconnectFabric();
 });
+afterEach(() => { vi.unstubAllGlobals(); });
 
 describe("ready demo", () => {
   it("starts connected and discovered, with a Fabric target on a capacity: no sign-in anywhere", async () => {
@@ -49,12 +72,15 @@ describe("ready demo", () => {
     expect((await mockApi.startExecution(items)).total).toBe(1);
   });
 
-  it("opens every page with content, not a request to connect", async () => {
+  it("opens the start page ready to go: route chosen, both sides connected, Start migration enabled", async () => {
     resetDemo();
-    go("/synapse");
-    expect(await screen.findByText("Demo data: no Azure needed")).toBeInTheDocument();
-    expect(await screen.findAllByText("DISCOVERY COMPLETE", {}, { timeout: 4000 })).not.toHaveLength(0);
-    expect(screen.queryByText("No Synapse workspace connected.")).not.toBeInTheDocument();
+    go("/");
+    expect(await screen.findByRole("heading", { level: 1, name: "Start a migration" })).toBeInTheDocument();
+    expect(screen.getByText("Demo data.")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: /Start migration/ })).toBeEnabled(), { timeout: 5000 });
+    expect(screen.getByRole("button", { name: "From · Source" })).toHaveTextContent("Azure Synapse Analytics");
+    expect(screen.getByRole("button", { name: "To · Destination" })).toHaveTextContent("Microsoft Fabric");
+    expect(document.title).toBe("Connections · Migration Accelerator");
   }, 15000);
 
   it("loads every table with that wave's pipeline and lists linked services until credentials are given", async () => {
@@ -66,7 +92,10 @@ describe("ready demo", () => {
       scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", dataRun: "run", collation: "match_synapse",
     });
     expect(run.items.filter((i) => i.type === "Table data")).toHaveLength(2);
-    expect(run.items.find((i) => i.type === "Linked Service")).toMatchObject({ status: "DEFERRED", step: "Needs credentials" });
+    const link = run.items.find((i) => i.type === "Linked Service")!;
+    expect(link).toMatchObject({ status: "DEFERRED", step: "Needs credentials" });
+    // The way forward names where credentials are entered: Plan, not the Connections page.
+    expect(link.notes?.join(" ")).toMatch(/in Plan, Stages & credentials/);
   });
 
   it("fails only a few objects on purpose, however large the plan, and Retry Failed clears them", async () => {
@@ -147,158 +176,396 @@ describe("demo api", () => {
     expect(done.deferred).toBe(later.length);
     expect(done.items.filter((i) => i.status === "DEFERRED").every((i) => i.type === "Integration Runtime" && !!i.error)).toBe(true);
   }, 20000);
+
+  it("resets a finished run and a finished discovery, and refuses while they are working", async () => {
+    resetDemo();
+    const graph = await mockApi.getDependencies();
+    await mockApi.startExecution(graph.nodes.map((n) => ({ id: n.id, wave: n.wave })));
+    await expect(mockApi.controlExecution("reset")).rejects.toMatchObject({ code: "run_in_progress" });
+    await mockApi.controlExecution("pause");
+    expect((await mockApi.controlExecution("reset")).state).toBe("idle");
+    expect((await mockApi.resetDiscovery()).state).toBe("idle");
+    await mockApi.startDiscovery();
+    await expect(mockApi.resetDiscovery()).rejects.toMatchObject({ code: "discovery_running" });
+  });
 });
 
-describe("routes", () => {
-  const routes: [string, string][] = [
-    ["/", "Projects"],
-    ["/synapse", "Synapse Source"],
-    ["/fabric", "Fabric Target"],
-    ["/discovery", "Discovery"],
-    ["/assessment", "Migration Assessment"],
-    ["/dependencies", "Dependencies & Migration Waves"],
-    ["/migrate", "Plan & Migrate"],
-    ["/validate", "Migration Validation"],
-  ];
-  it.each(routes)("renders %s with its empty state when nothing is connected", async (path, title) => {
-    go(path);
-    expect(await screen.findByRole("heading", { level: 1, name: title })).toBeInTheDocument();
-  });
-
-  it.each(["/plan", "/execute", "/execution"])("sends the old %s URL to Plan & Migrate", async (path) => {
-    go(path);
-    expect(await screen.findByRole("heading", { level: 1, name: "Plan & Migrate" })).toBeInTheDocument();
-  });
-
-  it("keeps the earlier URLs working", async () => {
-    go("/connections");
-    expect(await screen.findByRole("heading", { level: 1, name: "Synapse Source" })).toBeInTheDocument();
-  });
-
-  it("shows the sidebar sections and the workflow stepper", async () => {
+describe("start page", () => {
+  it("has no sidebar: a top bar with Connections, and Migration locked until a source connects", async () => {
     go("/");
-    const nav = await screen.findByRole("navigation", { name: "Primary" });
-    for (const label of ["Projects", "Synapse Source", "Fabric Target", "Discovery", "Assessment", "Dependencies & Waves", "Plan & Migrate", "Validation"]) {
-      expect(within(nav).getByRole("link", { name: label })).toBeInTheDocument();
-    }
-    expect(screen.getByRole("list", { name: "Migration workflow" })).toBeInTheDocument();
-  });
-});
-
-describe("synapse source", () => {
-  it("never offers Fabric in the source connection", async () => {
-    go("/synapse");
-    await screen.findByRole("heading", { level: 1, name: "Synapse Source" });
-    expect(screen.queryByLabelText(/fabric/i)).toBeNull();
+    expect(await screen.findByRole("heading", { level: 1, name: "Start a migration" })).toBeInTheDocument();
+    const nav = screen.getByRole("navigation", { name: "Primary" });
+    expect(within(nav).getByRole("link", { name: "Connections" })).toBeInTheDocument();
+    expect(within(nav).queryByRole("link", { name: "Migration" })).toBeNull();
+    expect(within(nav).getByText("Migration")).toHaveAttribute("aria-disabled", "true");
+    expect(screen.queryByRole("list", { name: "Migration workflow" })).toBeNull();
   });
 
-  it("offers Azure CLI and Interactive browser only, and swaps the form with the method", async () => {
+  it("chooses the route from two dropdowns where only Azure Synapse and Microsoft Fabric can be picked", async () => {
     const user = userEvent.setup();
-    go("/synapse");
-    await user.click((await screen.findAllByRole("button", { name: /Add Synapse Workspace/ }))[0]);
-    expect(await screen.findAllByRole("radio")).toHaveLength(2);
+    go("/");
+    await screen.findByRole("heading", { level: 1, name: "Start a migration" });
+    // Nothing to connect until the route is chosen.
+    expect(screen.getByText(/Choose a source and a destination above/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Start migration/ })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "From · Source" }));
+    let list = screen.getByRole("listbox", { name: "From · Source" });
+    const sources = within(list).getAllByRole("option");
+    expect(sources.length).toBeGreaterThan(4);
+    for (const o of sources) {
+      if (o.textContent?.includes("Azure Synapse Analytics")) expect(o).not.toHaveAttribute("aria-disabled");
+      else expect(o).toHaveAttribute("aria-disabled", "true");
+    }
+    // A platform that is coming soon cannot be chosen.
+    await user.click(within(list).getByRole("option", { name: /Snowflake/ }));
+    expect(screen.getByRole("listbox", { name: "From · Source" })).toBeInTheDocument();
+    await user.click(within(list).getByRole("option", { name: /Azure Synapse Analytics/ }));
+    expect(screen.queryByRole("listbox")).toBeNull();
+    expect(screen.getByRole("button", { name: "From · Source" })).toHaveTextContent("Azure Synapse Analytics");
+
+    await user.click(screen.getByRole("button", { name: "To · Destination" }));
+    list = screen.getByRole("listbox", { name: "To · Destination" });
+    for (const o of within(list).getAllByRole("option")) {
+      if (o.textContent?.includes("Microsoft Fabric")) expect(o).not.toHaveAttribute("aria-disabled");
+      else expect(o).toHaveAttribute("aria-disabled", "true");
+    }
+    await user.click(within(list).getByRole("option", { name: /Microsoft Fabric/ }));
+
+    // Both connection cards appear on the same page.
+    expect(screen.getByRole("region", { name: "Source connection: Azure Synapse Analytics" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Destination connection: Microsoft Fabric" })).toBeInTheDocument();
+    expect(stored("ma.route")).toEqual({ source: "synapse", destination: "fabric" });
+  });
+
+  it("lists every sign-in method, with ZIP and Git shown for later but not selectable", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem("ma.route", JSON.stringify({ source: "synapse", destination: "fabric" }));
+    go("/");
+    const source = await screen.findByRole("radiogroup", { name: "How to connect to Azure Synapse" });
+    expect(within(source).getAllByRole("radio")).toHaveLength(4);
+    for (const m of [/^Azure CLI/, /^Interactive browser/]) expect(within(source).getByRole("radio", { name: m })).not.toHaveAttribute("aria-disabled");
+    for (const m of [/Workspace export \(ZIP\)/, /Git repository/]) {
+      const tile = within(source).getByRole("radio", { name: m });
+      expect(tile).toHaveAttribute("aria-disabled", "true");
+      await user.click(tile);
+      expect(tile).toHaveAttribute("aria-checked", "false");
+    }
+    expect(within(source).getByRole("radio", { name: /^Azure CLI/ })).toHaveAttribute("aria-checked", "true");
     for (const gone of [/Service Principal/, /Managed Identity/]) expect(screen.queryByRole("radio", { name: gone })).toBeNull();
-    await user.click(screen.getByRole("radio", { name: /Interactive browser/ }));
-    // Only the two fields the sign-in needs: no optional extras, no secret.
-    expect(screen.getByLabelText("Tenant ID")).toBeInTheDocument();
-    expect(screen.getByLabelText("Subscription ID")).toBeInTheDocument();
-    expect(screen.queryByLabelText(/Client ID/)).toBeNull();
-    expect(screen.queryByLabelText(/secret/i)).toBeNull();
-    expect(screen.queryByText("(optional)")).toBeNull();
+
+    const target = await screen.findByRole("radiogroup", { name: "How to connect to Microsoft Fabric" });
+    expect(within(target).getAllByRole("radio")).toHaveLength(2);
+    await user.click(within(target).getByRole("radio", { name: /Fabric CLI/ }));
+    expect(screen.getByRole("button", { name: "Sign in with Fabric CLI" })).toBeInTheDocument();
+    // No secret is ever typed on this page.
+    expect(screen.queryByLabelText(/token|secret|password|Client ID/i)).toBeNull();
   });
 
   it("requires the tenant for the browser sign-in and says where the window opens", async () => {
     const user = userEvent.setup();
-    go("/synapse");
-    await user.click((await screen.findAllByRole("button", { name: /Add Synapse Workspace/ }))[0]);
-    await user.click(await screen.findByRole("radio", { name: /Interactive browser/ }));
-    await user.type(screen.getByLabelText("Subscription ID"), CONFIG.subscriptionId);
-    await user.click(screen.getByRole("button", { name: "Authenticate" }));
-    expect(await screen.findByText("Tenant ID is required.")).toBeInTheDocument();
-    await user.type(screen.getByLabelText("Tenant ID"), "8a24d8ed-7a4b-45b3-b56b-d781dd225aa1");
-    await user.click(screen.getByRole("button", { name: "Authenticate" }));
-    expect(await screen.findByText(/A sign-in window should open on this machine — complete it there. Waiting…/)).toBeInTheDocument();
-    await screen.findByLabelText("Resource group", {}, { timeout: 4000 });
+    localStorage.setItem("ma.route", JSON.stringify({ source: "synapse", destination: "fabric" }));
+    go("/");
+    const card = await screen.findByRole("region", { name: /^Source connection/ });
+    await user.click(await within(card).findByRole("radio", { name: /Interactive browser/ }));
+    await user.type(within(card).getByLabelText("Subscription ID"), CONFIG.subscriptionId);
+    await user.click(within(card).getByRole("button", { name: "Authenticate" }));
+    expect(await within(card).findByText("Tenant ID is required.")).toBeInTheDocument();
+    await user.type(within(card).getByLabelText("Tenant ID"), "8a24d8ed-7a4b-45b3-b56b-d781dd225aa1");
+    await user.click(within(card).getByRole("button", { name: "Authenticate" }));
+    expect(await within(card).findByText(/A sign-in window should open on the machine running the accelerator/)).toBeInTheDocument();
+    await within(card).findByLabelText("Resource group", {}, { timeout: 4000 });
   }, 15000);
 
-  it("keeps Discover Workspace disabled until the connection test passes", async () => {
+  it("keeps Start migration disabled until both sides are signed in, chosen and tested", async () => {
     const user = userEvent.setup();
-    go("/synapse");
-    await user.click((await screen.findAllByRole("button", { name: /Add Synapse Workspace/ }))[0]);
-    await user.click(screen.getByRole("radio", { name: /^Azure CLI/ })); // the form remembers the last method
-    expect(screen.getByRole("button", { name: "Test Connection" })).toBeDisabled();
-    await user.clear(screen.getByLabelText("Subscription ID"));
-    await user.type(screen.getByLabelText("Subscription ID"), CONFIG.subscriptionId);
-    await user.click(screen.getByRole("button", { name: "Sign in with Azure" }));
-    const group = await screen.findByLabelText("Resource group", {}, { timeout: 4000 });
+    localStorage.setItem("ma.route", JSON.stringify({ source: "synapse", destination: "fabric" }));
+    go("/");
+    const start = () => screen.getByRole("button", { name: /Start migration/ });
+    const source = await screen.findByRole("region", { name: /^Source connection/ });
+    expect(start()).toBeDisabled();
+
+    // Source: sign in, choose the workspace, test.
+    expect(await within(source).findByRole("button", { name: "Test connection" })).toBeDisabled();
+    await user.click(within(source).getByRole("radio", { name: /^Azure CLI/ })); // the form remembers the last method
+    await user.clear(within(source).getByLabelText("Subscription ID"));
+    await user.type(within(source).getByLabelText("Subscription ID"), CONFIG.subscriptionId);
+    await user.click(within(source).getByRole("button", { name: "Sign in with Azure" }));
+    const group = await within(source).findByLabelText("Resource group", {}, { timeout: 4000 });
     await waitFor(() => expect(within(group).getAllByRole("option").length).toBeGreaterThan(1));
     await user.selectOptions(group, "rg-demo-migration");
-    const ws = screen.getByLabelText("Synapse workspace");
+    const ws = within(source).getByLabelText("Synapse workspace");
     await waitFor(() => expect(within(ws).getAllByRole("option").length).toBeGreaterThan(1));
     await user.selectOptions(ws, "demo-synapse-ws");
-    await user.click(screen.getByRole("button", { name: "Test Connection" }));
-    // Re-query each time: the card re-renders as the connection state changes.
-    await waitFor(() => expect(screen.getByRole("button", { name: /Discover Workspace/ })).toBeEnabled(), { timeout: 8000 });
-  }, 25000);
-});
+    // The workspace has a single dedicated SQL pool: it is chosen without asking.
+    await waitFor(() => expect(within(source).getByLabelText(/Dedicated SQL pool/)).toHaveValue("TransportDW"));
+    await user.click(within(source).getByRole("button", { name: "Test connection" }));
+    await within(source).findByText("demo-synapse-ws", { selector: "strong" }, { timeout: 8000 });
+    expect(start()).toBeDisabled();
 
-describe("fabric target", () => {
-  it("is a separate page with exactly two methods", async () => {
-    const user = userEvent.setup();
-    go("/fabric");
-    await screen.findByRole("heading", { level: 1, name: "Fabric Target" });
-    for (const m of ["Azure CLI", "Fabric CLI"]) expect(screen.getByRole("radio", { name: new RegExp(m) })).toBeInTheDocument();
-    expect(screen.queryByRole("radio", { name: /Service Principal/ })).not.toBeInTheDocument();
-    await user.click(screen.getByRole("radio", { name: /Fabric CLI/ }));
-    expect(screen.getByRole("button", { name: "Login with Fabric CLI" })).toBeInTheDocument();
-    expect(screen.queryByLabelText(/token/i)).not.toBeInTheDocument();
-  });
+    // Destination: sign in, choose the workspace, test.
+    const target = screen.getByRole("region", { name: /^Destination connection/ });
+    await user.click(await within(target).findByRole("button", { name: "Sign in with Azure CLI" }));
+    const fabricWs = within(target).getByLabelText("Fabric workspace");
+    await waitFor(() => expect(fabricWs).toBeEnabled(), { timeout: 4000 });
+    await user.selectOptions(fabricWs, "Fabric_demo");
+    await user.click(within(target).getByRole("button", { name: "Test connection" }));
+    await within(target).findByText("Fabric_demo", { selector: "strong" }, { timeout: 4000 });
 
-  it("authenticates and tests in separate steps", async () => {
+    await waitFor(() => expect(start()).toBeEnabled());
+    await user.click(start());
+    expect(await stepHeading("Discover")).toBeInTheDocument();
+  }, 40000);
+
+  it("asks before disconnecting a source whose discovery would be lost", async () => {
+    resetDemo();
     const user = userEvent.setup();
-    go("/fabric");
-    await screen.findByRole("heading", { level: 1, name: "Fabric Target" });
-    expect(screen.getByRole("button", { name: "Test Connection" })).toBeDisabled();
-    await user.click(screen.getByRole("button", { name: "Login with Azure CLI" }));
-    await screen.findAllByText("AUTHENTICATED", {}, { timeout: 3000 });
-    await user.selectOptions(screen.getByLabelText("Fabric Workspace"), "Fabric_demo");
-    await user.click(screen.getByRole("button", { name: "Test Connection" }));
-    await screen.findAllByText("CONNECTED", {}, { timeout: 3000 });
-    expect(screen.getByText("Workspace accessible")).toBeInTheDocument();
+    go("/");
+    const source = await screen.findByRole("region", { name: /^Source connection/ });
+    await user.click(await within(source).findByRole("button", { name: "Disconnect" }, { timeout: 5000 }));
+    let dialog = screen.getByRole("dialog", { name: "Disconnect Azure Synapse?" });
+    expect(within(dialog).getByText(/discovered inventory \([\d,]+ objects\) is cleared/)).toBeInTheDocument();
+    expect(within(dialog).getByRole("button", { name: "Cancel" })).toHaveFocus();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect((await mockApi.getConnection()).status).toBe("connected");
+    await user.click(within(source).getByRole("button", { name: "Disconnect" }));
+    dialog = screen.getByRole("dialog", { name: "Disconnect Azure Synapse?" });
+    await user.click(within(dialog).getByRole("button", { name: "Disconnect" }));
+    await waitFor(async () => expect((await mockApi.getConnection()).status).not.toBe("connected"));
   }, 15000);
 });
 
-describe("validation page", () => {
-  it("compares both sides in demo mode, shows why each check landed where it did, and filters by status", async () => {
-    await discovered();
-    await mockApi.authenticateFabric(FABRIC);
-    await mockApi.testFabric(FABRIC);
-    const items = (await mockApi.getDependencies()).nodes.filter((n) => n.type === "Notebook").slice(0, 2).map((n) => ({ id: n.id, wave: n.wave }));
+describe("migration journey", () => {
+  it("asks to connect first when nothing is connected", async () => {
+    go("/migration");
+    expect(await screen.findByText("Connect both sides first")).toBeInTheDocument();
+  });
+
+  it("shows the six steps left to right, locks the ones after the open step, and Next unlocks the following one", async () => {
+    resetDemo();
+    const user = userEvent.setup();
+    go("/migration");
+    expect(await stepHeading("Discover")).toBeInTheDocument();
+    const nav = screen.getByRole("navigation", { name: "Migration steps" });
+    const boxes = within(nav).getAllByRole("button");
+    expect(boxes.map((b) => b.getAttribute("aria-label")?.match(/^Step \d: (\w+)/)?.[1])).toEqual(["Discover", "Assess", "Waves", "Plan", "Migrate", "Validate"]);
+    expect(boxes[0]).toHaveAttribute("aria-current", "step");
+    for (const b of boxes.slice(1)) expect(b).toBeDisabled();
+    expect(document.title).toBe("Discover · Migration · Migration Accelerator");
+
+    // Discovery is already done in the demo, so the step can be confirmed.
+    await user.click(await screen.findByRole("button", { name: "Looks good, continue to Assess" }, { timeout: 5000 }));
+    expect(await stepHeading("Assess")).toBeInTheDocument();
+    expect(stepBox(2)).toBeEnabled();
+    expect(stepBox(2)).toHaveAttribute("aria-current", "step");
+    expect(stepBox(3)).toBeDisabled();
+    expect(window.location.search).toBe("?step=assess");
+    expect(stored(JOURNEY)).toEqual(["discover"]);
+
+    // Back returns to a confirmed step, which then offers the way forward again.
+    await user.click(screen.getByRole("button", { name: "Discover" }));
+    expect(await stepHeading("Discover")).toBeInTheDocument();
+    expect(screen.getByText("Discover confirmed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Go to Assess" })).toBeInTheDocument();
+  }, 20000);
+
+  it("opens any unlocked step by clicking its box, and falls back to the open step for a locked one", async () => {
+    resetDemo();
+    unlockTo("waves");
+    const user = userEvent.setup();
+    go("/migration?step=validate");
+    // Validate is locked, so the open step (Waves) is shown instead.
+    expect(await stepHeading("Waves")).toBeInTheDocument();
+    await user.click(stepBox(1));
+    expect(await stepHeading("Discover")).toBeInTheDocument();
+    await user.click(stepBox(2));
+    expect(await stepHeading("Assess")).toBeInTheDocument();
+    expect(stepBox(4)).toBeDisabled();
+  }, 15000);
+
+  it("marks a confirmed step whose results are gone as Run again, and keeps the steps after it locked", async () => {
+    resetDemo();
+    await seedPlan();
+    unlockTo("validate"); // Migrate is confirmed, but there is no run (as after a reload of Demo data)
+    go("/migration");
+    expect(await stepHeading("Migrate")).toBeInTheDocument();
+    await waitFor(() => expect(stepBox(5)).toHaveAccessibleName(/Run again/));
+    expect(stepBox(6)).toBeDisabled();
+    expect(screen.getByText("Migrate needs to run again")).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Migration complete" })).toBeNull();
+    // The confirmation itself is kept: once the run exists again, the journey comes back.
+    expect(stored(JOURNEY)).toContain("migrate");
+  }, 15000);
+
+  it("asks before running discovery again when later steps are confirmed", async () => {
+    resetDemo();
+    unlockTo("waves");
+    const user = userEvent.setup();
+    go("/migration?step=discover");
+    await user.click(await screen.findByRole("button", { name: "Run again" }, { timeout: 5000 }));
+    const dialog = screen.getByRole("dialog", { name: "Run discovery again?" });
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(stored(JOURNEY)).toEqual(["discover", "assess"]);
+  }, 15000);
+
+  it.each([
+    ["/discovery", "Discover"],
+    ["/assessment", "Assess"],
+    ["/dependencies", "Waves"],
+    ["/execute", "Migrate"],
+  ])("sends the old %s URL to its step", async (path, title) => {
+    resetDemo();
+    await seedPlan();
+    unlockTo("validate");
+    go(path);
+    expect(await stepHeading(title)).toBeInTheDocument();
+  });
+
+  it.each(["/synapse", "/fabric", "/connections", "/nowhere/at/all"])("sends %s to the start page", async (path) => {
+    go(path);
+    expect(await screen.findByRole("heading", { level: 1, name: "Start a migration" })).toBeInTheDocument();
+  });
+});
+
+describe("resetting a step", () => {
+  it("asks first, then clears the step and the ones after it, and nothing before it", async () => {
+    resetDemo();
+    await seedPlan();
+    unlockTo("migrate"); // Discover to Plan confirmed
+    const user = userEvent.setup();
+    go("/migration?step=plan");
+    expect(await stepHeading("Plan")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reset step" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Reset step" }));
+    let dialog = screen.getByRole("dialog", { name: "Reset Plan?" });
+    expect(within(dialog).getByText(/The plan: 3 objects/)).toBeInTheDocument();
+    expect(within(dialog).getByText("Your confirmation of Plan.")).toBeInTheDocument();
+    // Focus starts on Cancel, so Enter never resets by accident; Cancel changes nothing.
+    expect(within(dialog).getByRole("button", { name: "Cancel" })).toHaveFocus();
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(stored(PLAN)).toHaveLength(3);
+
+    await user.click(screen.getByRole("button", { name: "Reset step" }));
+    dialog = screen.getByRole("dialog", { name: "Reset Plan?" });
+    await user.click(within(dialog).getByRole("button", { name: "Reset Plan" }));
+    expect(await screen.findByRole("button", { name: /^Add all .* objects/ }, { timeout: 5000 })).toBeInTheDocument();
+    expect(stored(PLAN)).toEqual([]);
+    expect(stored(JOURNEY)).toEqual(["discover", "assess", "waves"]);
+    expect(screen.getByText(/Plan was reset, with the steps after it/)).toBeInTheDocument();
+  }, 20000);
+
+  it("resets Discover to an empty workspace, ready to run again", async () => {
+    resetDemo();
+    unlockTo("assess");
+    const user = userEvent.setup();
+    go("/migration?step=discover");
+    expect(await stepHeading("Discover")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reset step" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Reset step" }));
+    const dialog = screen.getByRole("dialog", { name: "Reset Discover?" });
+    expect(within(dialog).getByText(/The discovered inventory: [\d,]+ objects/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Reset Discover" }));
+    expect(await screen.findByRole("button", { name: "Run discovery" }, { timeout: 5000 })).toBeEnabled();
+    expect((await mockApi.getDiscoveryStatus()).state).toBe("idle");
+    expect(stored(JOURNEY)).toEqual([]);
+  }, 20000);
+
+  it("resets Migrate by forgetting the run, so a fresh run can start", async () => {
+    resetDemo();
+    const items = await seedPlan(2);
     await mockApi.startExecution(items);
     await new Promise((r) => setTimeout(r, 2500));
+    unlockTo("validate");
     const user = userEvent.setup();
-    go("/validate");
-    await screen.findByRole("heading", { level: 1, name: "Migration Validation" });
-    expect(screen.queryByText(/not implemented in the backend/i)).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Run Validation" }));
-    await screen.findByRole("table", { name: "Validation results" }, { timeout: 5000 });
-    expect(screen.getByRole("columnheader", { name: "Details" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: /^Match/ }));
-    expect(screen.getAllByText(/MATCH/).length).toBeGreaterThan(0);
+    go("/migration?step=migrate");
+    expect(await stepHeading("Migrate")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Reset step" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Reset step" }));
+    const dialog = screen.getByRole("dialog", { name: "Reset Migrate?" });
+    expect(within(dialog).getByText(/The record of migration run #\d+/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/anything already created in Fabric/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Reset Migrate" }));
+    expect(await screen.findByText("Nothing is running.", {}, { timeout: 5000 })).toBeInTheDocument();
+    expect((await mockApi.getExecution()).state).toBe("idle");
+    expect(stored(JOURNEY)).toEqual(["discover", "assess", "waves", "plan"]);
   }, 20000);
 });
 
-describe("discovery page", () => {
-  it("shows the inventory with Fabric equivalents and opens an object", async () => {
+describe("assistant", () => {
+  it("opens from the + button (or Ctrl+I) as a panel on the right, marked as a preview, and closes with Escape", async () => {
+    const user = userEvent.setup();
+    go("/");
+    await user.click(await screen.findByRole("button", { name: "Open the migration assistant (Ctrl+I)" }));
+    const panel = screen.getByRole("complementary", { name: "Migration assistant" });
+    expect(within(panel).getByText("Preview")).toBeInTheDocument();
+    expect(within(panel).getByLabelText("Message the assistant")).toBeDisabled();
+    expect(within(panel).getByRole("button", { name: "Send" })).toBeDisabled();
+    // The launcher hides while the panel is open.
+    expect(screen.queryByRole("button", { name: "Open the migration assistant (Ctrl+I)" })).toBeNull();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("complementary", { name: "Migration assistant" })).toBeNull();
+    await user.keyboard("{Control>}i{/Control}");
+    expect(screen.getByRole("complementary", { name: "Migration assistant" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Close the assistant" }));
+    expect(screen.getByRole("button", { name: "Open the migration assistant (Ctrl+I)" })).toBeInTheDocument();
+  });
+});
+
+describe("projects and the frame", () => {
+  it("creates (with Enter), renames and deletes projects from the project menu", async () => {
+    const user = userEvent.setup();
+    go("/");
+    await user.click(await screen.findByRole("button", { name: /^Project: / }));
+    await user.click(screen.getByRole("menuitem", { name: "New project…" }));
+    // The name field has focus: typing goes straight into it, and Enter creates the project.
+    await user.keyboard("Wave 2 rollout{Enter}");
+    expect(await screen.findByRole("button", { name: "Project: Wave 2 rollout" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Project: Wave 2 rollout" }));
+    await user.click(screen.getByRole("menuitem", { name: "Rename this project…" }));
+    const field = screen.getByLabelText("Project name");
+    await user.clear(field);
+    await user.type(field, "Finance estate{Enter}");
+    expect(await screen.findByRole("button", { name: "Project: Finance estate" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Project: Finance estate" }));
+    await user.click(screen.getByRole("menuitem", { name: "Delete this project…" }));
+    await user.click(within(screen.getByRole("dialog", { name: /Delete/ })).getByRole("button", { name: "Delete project" }));
+    expect(await screen.findByRole("button", { name: "Project: Synapse to Fabric migration" })).toBeInTheDocument();
+    // The only project left cannot be deleted.
+    await user.click(screen.getByRole("button", { name: "Project: Synapse to Fabric migration" }));
+    expect(screen.getByRole("menuitem", { name: "Delete this project…" })).toBeDisabled();
+  }, 15000);
+
+  it("says plainly when the backend is not answering in Live mode, with a retry and a way to Demo data", async () => {
+    localStorage.setItem("ma.apiMode", "real");
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
+    const user = userEvent.setup();
+    go("/");
+    expect(await screen.findByText("The accelerator's backend is not answering.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Use Demo data" }));
+    await waitFor(() => expect(screen.queryByText("The accelerator's backend is not answering.")).toBeNull());
+    expect(screen.getByRole("button", { name: "Demo" })).toHaveAttribute("aria-pressed", "true");
+  }, 15000);
+});
+
+describe("discover step", () => {
+  it("summarises the discovery, then shows the inventory with Fabric equivalents and opens an object", async () => {
     await discovered();
     const user = userEvent.setup();
-    go("/discovery");
-    await screen.findByText("DEMO DATA", { selector: ".badge" });
+    go("/migration?step=discover");
+    expect(await stepHeading("Discover")).toBeInTheDocument();
+    const summary = await screen.findByLabelText("Discovery summary", {}, { timeout: 5000 });
+    for (const label of ["Objects", "Object types", "With a Fabric mapping", "Warnings"]) expect(within(summary).getByText(label)).toBeInTheDocument();
+    // The type tiles are buttons in a list, so screen readers announce both.
+    const types = screen.getByRole("list", { name: "Discovered object types" });
+    expect(within(types).getAllByRole("button").length).toBeGreaterThan(5);
+    await user.click(screen.getByRole("tab", { name: /^Inventory/ }));
     const table = await screen.findByRole("table", {}, { timeout: 5000 });
     for (const h of ["Fabric equivalent", "Migration classification", "Object name", "Synapse component"]) {
       expect(within(table).getByText(h)).toBeInTheDocument();
     }
-    expect(screen.getByRole("tab", { name: /Pipelines/ })).toBeInTheDocument();
     const rows = await within(table).findAllByRole("row", { name: /Open details/ }, { timeout: 8000 });
     await user.click(rows[0]);
     const dialog = await screen.findByRole("dialog", {}, { timeout: 5000 });
@@ -308,48 +575,60 @@ describe("discovery page", () => {
   }, 25000);
 });
 
-describe("assessment and plan", () => {
-  it("counts classifications from the discovery result and offers the component mapping", async () => {
+describe("assess step", () => {
+  it("counts how objects move, filters by a class, and offers the component mapping", async () => {
     await discovered();
+    unlockTo("assess");
     const user = userEvent.setup();
-    go("/assessment");
-    await screen.findByText("Preliminary classification from Discovery", {}, { timeout: 5000 });
-    expect(screen.getByText("Requires configuration")).toBeInTheDocument();
-    await user.click(screen.getByRole("tab", { name: "Component Mapping" }));
+    go("/migration?step=assess");
+    const strip = await screen.findByRole("list", { name: "How objects move" }, { timeout: 5000 });
+    for (const label of ["Direct", "Reconfigure", "Transform", "Manual", "Review"]) expect(within(strip).getByText(label)).toBeInTheDocument();
+    const manual = within(strip).getByRole("button", { name: /Manual/ });
+    await user.click(manual);
+    expect(manual).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("tab", { name: /^Objects/ })).toHaveAttribute("aria-selected", "true");
+    await user.click(screen.getByRole("tab", { name: "Component mapping" }));
     expect(await screen.findByText("Serverless SQL", {}, { timeout: 4000 })).toBeInTheDocument();
   }, 20000);
+});
 
-  it("builds a plan, then offers every stage with its strategy and says why the run cannot start yet", async () => {
+describe("plan step", () => {
+  it("builds a plan, scores it, configures every stage without running any, and will not move on while risks block it", async () => {
     await discovered();
+    unlockTo("plan");
     const user = userEvent.setup();
-    go("/migrate");
-    // Re-query: the card re-renders when the graph arrives, replacing the element.
-    await waitFor(() => expect(screen.getByRole("button", { name: /Add all objects/ })).toBeEnabled(), { timeout: 8000 });
-    await user.click(screen.getByRole("button", { name: /Add all objects/ }));
-    await screen.findByText("DETERMINISTIC");
-    expect(await screen.findByText("Readiness", {}, { timeout: 4000 })).toBeInTheDocument();
-    expect(screen.getByRole("heading", { name: /Risks \(/ })).toBeInTheDocument();
+    go("/migration?step=plan");
+    // Re-query: the panel re-renders when the graph arrives, replacing the element.
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Add all .* objects/ })).toBeEnabled(), { timeout: 8000 });
+    await user.click(screen.getByRole("button", { name: /^Add all .* objects/ }));
+    const summary = await screen.findByLabelText("Plan summary", {}, { timeout: 5000 });
+    expect(within(summary).getByText("Readiness")).toBeInTheDocument();
+    expect(await screen.findByRole("list", { name: "Migration risks" })).toBeInTheDocument();
+    // The Fabric target is not connected in this test, so the planner blocks and Next stays shut.
+    expect(screen.getByRole("button", { name: /Continue to Migrate/ })).toBeDisabled();
+
+    await user.click(screen.getByRole("tab", { name: "Strategy by type" }));
     expect(screen.getByRole("table", { name: "Migration strategy by object type" })).toBeInTheDocument();
-    // Every stage is offered, on by default, with its own run button.
+
+    await user.click(screen.getByRole("tab", { name: "Stages & credentials" }));
+    // Every stage is offered and on by default. Plan only configures: runs start in the Migrate step.
     for (const label of ["Warehouse & schema", "Table data", "Spark pool & environment", "Notebooks", "Connections", "Pipelines & datasets", "Spark job definitions", "SQL scripts", "Schedules", "External tables"]) {
       expect(await screen.findByRole("checkbox", { name: `Include ${label}` })).toBeChecked();
     }
-    expect(screen.getAllByRole("button", { name: /Run this stage/ })).toHaveLength(10);
-    // The Fabric target is not connected in this test, so the planner blocks and nothing can start.
-    expect(screen.getByRole("button", { name: /Start migration/ })).toBeDisabled();
-    expect(screen.getAllByRole("button", { name: /Run this stage/ }).every((b) => (b as HTMLButtonElement).disabled)).toBe(true);
-    expect(screen.getByText("Not ready to start")).toBeInTheDocument();
+    expect(screen.queryAllByRole("button", { name: /Run this stage/ })).toHaveLength(0);
     // The run strategy is a choice, and stop-on-failure is off by default.
     expect(screen.getByRole("radio", { name: /Automated objects only/ })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: /Stop at the end of a wave/ })).not.toBeChecked();
-  }, 25000);
+  }, 30000);
 
   it("switching a stage off marks its objects Not selected, and credentials never reach browser storage", async () => {
     await discovered();
+    unlockTo("plan");
     const user = userEvent.setup();
-    go("/migrate");
-    await waitFor(() => expect(screen.getByRole("button", { name: /Add all objects/ })).toBeEnabled(), { timeout: 8000 });
-    await user.click(screen.getByRole("button", { name: /Add all objects/ }));
+    go("/migration?step=plan");
+    await waitFor(() => expect(screen.getByRole("button", { name: /^Add all .* objects/ })).toBeEnabled(), { timeout: 8000 });
+    await user.click(screen.getByRole("button", { name: /^Add all .* objects/ }));
+    await user.click(await screen.findByRole("tab", { name: "Stages & credentials" }));
     const pipelines = await screen.findByRole("checkbox", { name: "Include Pipelines & datasets" });
     await user.click(pipelines);
     expect(pipelines).not.toBeChecked();
@@ -369,7 +648,87 @@ describe("assessment and plan", () => {
     const secret = (await screen.findAllByLabelText(/^Password for /))[0];
     expect(secret).toHaveAttribute("type", "password");
     await user.type(secret, "S3CRET-NEVER-STORED");
-    const stored = JSON.stringify({ ...localStorage }) + JSON.stringify({ ...sessionStorage });
-    expect(stored).not.toContain("S3CRET-NEVER-STORED");
+    const kept = JSON.stringify({ ...localStorage }) + JSON.stringify({ ...sessionStorage });
+    expect(kept).not.toContain("S3CRET-NEVER-STORED");
   }, 30000);
+
+  it("keeps a project's stage options after a reload, including every stage off", async () => {
+    resetDemo();
+    await seedPlan();
+    unlockTo("plan");
+    const user = userEvent.setup();
+    const openStages = async () => user.click(await screen.findByRole("tab", { name: "Stages & credentials" }, { timeout: 5000 }));
+    const first = go("/migration?step=plan");
+    await openStages();
+    await user.click(await screen.findByRole("checkbox", { name: "Include Pipelines & datasets" }));
+    first.unmount();
+
+    const second = go("/migration?step=plan");
+    await openStages();
+    expect(await screen.findByRole("checkbox", { name: "Include Pipelines & datasets" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Include Notebooks" })).toBeChecked();
+    await user.click(screen.getByRole("button", { name: "All off" }));
+    second.unmount();
+
+    go("/migration?step=plan");
+    await openStages();
+    expect(await screen.findByRole("checkbox", { name: "Include Notebooks" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Include Warehouse & schema" })).not.toBeChecked();
+  }, 25000);
+});
+
+describe("migrate step", () => {
+  it("offers to run every stage or a single one, here and not in Plan", async () => {
+    resetDemo();
+    await seedPlan();
+    unlockTo("migrate");
+    go("/migration?step=migrate");
+    await screen.findByRole("combobox", { name: "What to run" }, { timeout: 5000 });
+    // Re-query: the panel re-renders as the plan is scored.
+    await waitFor(() => {
+      const choice = screen.getByRole("combobox", { name: "What to run" });
+      expect(within(choice).getByRole("option", { name: /^Every stage that is on/ })).toBeInTheDocument();
+      expect(within(choice).getByRole("option", { name: "Only Notebooks" })).toBeInTheDocument();
+    });
+  }, 15000);
+});
+
+describe("validate step", () => {
+  it("compares both sides, filters by result, and Finish completes the migration with a report to download", async () => {
+    await discovered();
+    await mockApi.authenticateFabric(FABRIC);
+    await mockApi.testFabric(FABRIC);
+    const items = await seedPlan(2);
+    await mockApi.startExecution(items);
+    await new Promise((r) => setTimeout(r, 2500));
+    unlockTo("validate");
+    const user = userEvent.setup();
+    go("/migration?step=validate");
+    expect(await stepHeading("Validate")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Finish migration/ })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "Run validation" }));
+    const table = await screen.findByRole("table", { name: "Validation results" }, { timeout: 5000 });
+    expect(within(table).getByRole("columnheader", { name: "Details" })).toBeInTheDocument();
+    const match = screen.getByRole("button", { name: /^Match/ });
+    await user.click(match);
+    expect(match).toHaveAttribute("aria-pressed", "true");
+    expect(within(table).getAllByText(/MATCH/).length).toBeGreaterThan(0);
+    await user.click(screen.getByRole("button", { name: /Finish migration/ }));
+    expect(await screen.findByRole("heading", { name: "Migration complete" })).toBeInTheDocument();
+    expect(screen.getByLabelText("Migration result")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Download report (CSV)" })).toBeInTheDocument();
+  }, 25000);
+});
+
+describe("report", () => {
+  it("lists every object and check as CSV, quoting what needs it and never anything secret", () => {
+    const run: ExecutionRun = {
+      runId: "007", state: "completed", total: 1, completed: 1, inProgress: 0, failed: 0, pending: 0, skipped: 0, deferred: 0, logs: [],
+      items: [{ id: "a", name: 'dbo.Fact, "Sales"', type: "Table", wave: 2, step: "Table created", status: "COMPLETED", startedAt: null, completedAt: "2026-10-06T12:00:00Z", error: null, target: "WH / dbo.Fact" }],
+    };
+    const csv = buildReport({ run, validation: [{ category: "Tables", object: "dbo.Fact", source: "8 columns", target: "8 columns", status: "MATCH", detail: "Same columns and types." }], project: "Finance", source: "ws", target: "Fabric_demo" });
+    expect(csv).toContain('"Migration","dbo.Fact, ""Sales""","Table","2","COMPLETED","Table created","WH / dbo.Fact","","2026-10-06T12:00:00Z"');
+    expect(csv).toContain('"Validation","dbo.Fact","Tables","8 columns","8 columns","MATCH","Same columns and types."');
+    expect(csv.split("\r\n")[0]).toBe('"Migration report","Finance"');
+  });
 });

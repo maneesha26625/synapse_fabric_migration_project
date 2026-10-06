@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -32,6 +33,14 @@ import { useAppState } from "./AppState";
 export interface Project { id: string; name: string; createdAt: string }
 const PROJECTS_KEY = "ma.projects";
 const PLAN_KEY = "ma.plan";
+const OPTIONS_KEY = "ma.options";
+const JOURNEY_KEY = "ma.journey";
+/** Everything kept per project in this browser, by mode. Credentials are never among them. */
+const PROJECT_KEYS = [PLAN_KEY, OPTIONS_KEY, JOURNEY_KEY];
+
+/** The migration journey, in order. Each step unlocks once the one before it is confirmed. */
+export const STEP_KEYS = ["discover", "assess", "waves", "plan", "migrate", "validate"] as const;
+export type StepKey = (typeof STEP_KEYS)[number];
 
 function load<T>(key: string, fallback: T): T {
   try {
@@ -47,6 +56,8 @@ function save(key: string, value: unknown) {
 
 const DEFAULT_PROJECT: Project = { id: "default", name: "Synapse to Fabric migration", createdAt: new Date(0).toISOString() };
 
+const DEFAULT_OPTIONS: RunOptions = { scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", dataRun: "run", collation: "match_synapse" };
+
 const EMPTY_RUN: ExecutionRun = { runId: "", state: "idle", total: 0, completed: 0, inProgress: 0, failed: 0, pending: 0, skipped: 0, deferred: 0, items: [], logs: [] };
 
 interface MigrationStateValue {
@@ -54,6 +65,9 @@ interface MigrationStateValue {
   project: Project;
   addProject: (name: string) => void;
   selectProject: (id: string) => void;
+  renameProject: (id: string, name: string) => void;
+  /** Removes the project and what this browser keeps for it (plan, options, confirmations). Never the last one. */
+  deleteProject: (id: string) => void;
 
   /** The dependency graph and suggested waves, for the current discovery. */
   graph: DependencyGraph | null;
@@ -73,6 +87,8 @@ interface MigrationStateValue {
   planStatus: (id: string) => PlanStatus;
 
   fabric: FabricTarget;
+  /** False until the Fabric target's state has been read once. */
+  fabricReady: boolean;
   fabricBusy: "authenticate" | "test" | null;
   fabricError: string | null;
   authenticateFabric: (c: FabricConfig) => Promise<void>;
@@ -95,6 +111,8 @@ interface MigrationStateValue {
   clearCredentials: () => void;
 
   execution: ExecutionRun;
+  /** False until the run's state has been read once, so an empty run is never mistaken for a lost one. */
+  executionReady: boolean;
   executionError: string | null;
   /** Starts a run. `only` runs a single stage, leaving the others off for that run. */
   startExecution: (only?: string) => Promise<boolean>;
@@ -104,6 +122,20 @@ interface MigrationStateValue {
   validationError: string | null;
   validationBusy: boolean;
   runValidation: () => Promise<void>;
+
+  /** Steps the operator has reviewed and confirmed with Next, per project and data mode. */
+  confirmed: StepKey[];
+  confirmStep: (step: StepKey) => void;
+  /** Forget the confirmations from ``step`` onwards (a step was redone). Without a step: all of them. */
+  resetJourney: (from?: StepKey) => void;
+  /**
+   * Start ``step`` over: clear its results and those of every step after it,
+   * and their confirmations. The backend is asked first, so a refusal (something
+   * still running) changes nothing here. Throws the backend's message.
+   */
+  resetStep: (step: StepKey) => Promise<void>;
+  /** Changes on every reset, so a step's panel can start over from a clean state. */
+  resetNonce: number;
 }
 
 const Ctx = createContext<MigrationStateValue | null>(null);
@@ -117,7 +149,7 @@ export function useMigration(): MigrationStateValue {
 const messageOf = (e: unknown) => (e instanceof ApiRequestError || e instanceof Error ? e.message : "Something went wrong.");
 
 export function MigrationStateProvider({ children }: { children: ReactNode }) {
-  const { api, mode, discovery, isConnected } = useAppState();
+  const { api, mode, discovery, isConnected, connection, resetDiscovery, refreshDiscovery } = useAppState();
 
   // ---- projects
   const [projects, setProjects] = useState<Project[]>(() => load<Project[]>(PROJECTS_KEY, [DEFAULT_PROJECT]));
@@ -130,6 +162,19 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     setProjects((ps) => [...ps, created]);
     setProjectId(created.id);
   }, []);
+  const renameProject = useCallback((id: string, name: string) => {
+    if (!name.trim()) return;
+    setProjects((ps) => ps.map((p) => (p.id === id ? { ...p, name: name.trim() } : p)));
+  }, []);
+  const deleteProject = useCallback((id: string) => {
+    const rest = projects.filter((p) => p.id !== id);
+    if (!rest.length) return;
+    for (const m of ["real", "mock"]) for (const k of PROJECT_KEYS) {
+      try { localStorage.removeItem(`${k}.${m}.${id}`); } catch { /* storage unavailable */ }
+    }
+    setProjects(rest);
+    if (project.id === id) setProjectId(rest[0].id);
+  }, [projects, project.id]);
 
   // ---- graph (loaded once per completed discovery)
   const done = discovery.state === "completed" || discovery.state === "completed_with_warnings";
@@ -148,6 +193,16 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     ).finally(() => !cancelled && setGraphLoading(false));
     return () => { cancelled = true; };
   }, [api, done, discovery.finishedAt, graphEpoch]);
+
+  // ---- journey (which steps were confirmed), per mode and project like the plan
+  const journeyKey = `${JOURNEY_KEY}.${mode}.${project.id}`;
+  const [confirmed, setConfirmed] = useState<StepKey[]>(() => load<StepKey[]>(journeyKey, []));
+  useEffect(() => { setConfirmed(load<StepKey[]>(journeyKey, [])); }, [journeyKey]);
+  useEffect(() => save(journeyKey, confirmed), [journeyKey, confirmed]);
+  const confirmStep = useCallback((step: StepKey) => setConfirmed((c) => (c.includes(step) ? c : [...c, step])), []);
+  const resetJourney = useCallback((from?: StepKey) => {
+    setConfirmed((c) => (from ? c.filter((k) => STEP_KEYS.indexOf(k) < STEP_KEYS.indexOf(from)) : []));
+  }, []);
 
   // ---- plan (ids and waves only, per mode so demo ids never leak into live)
   const planKey = `${PLAN_KEY}.${mode}.${project.id}`;
@@ -185,11 +240,18 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
 
   // ---- fabric target
   const [fabric, setFabric] = useState<FabricTarget>({ status: "disconnected" });
+  const [fabricReady, setFabricReady] = useState(false);
   const [fabricBusy, setFabricBusy] = useState<"authenticate" | "test" | null>(null);
   const [fabricError, setFabricError] = useState<string | null>(null);
   useEffect(() => {
+    let live = true;
     setFabricError(null);
-    api.getFabricTarget().then(setFabric, () => setFabric({ status: "disconnected" }));
+    setFabricReady(false);
+    api.getFabricTarget().then(
+      (f) => { if (live) setFabric(f); },
+      () => { if (live) setFabric({ status: "disconnected" }); },
+    ).finally(() => { if (live) setFabricReady(true); });
+    return () => { live = false; };
   }, [api]);
   const fabricCall = useCallback(async (kind: "authenticate" | "test", call: () => Promise<FabricTarget>) => {
     setFabricBusy(kind);
@@ -223,7 +285,18 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   const [analysis, setAnalysis] = useState<PlanAnalysis | null>(null);
   const [analysisBusy, setAnalysisBusy] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
-  const [options, setOptionsState] = useState<RunOptions>({ scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", dataRun: "run", collation: "match_synapse" });
+  // Run options are kept per project like the plan, so a stage switched off stays off after a reload.
+  const optionsKey = `${OPTIONS_KEY}.${mode}.${project.id}`;
+  const stored = (key: string) => load<Partial<RunOptions>>(key, {});
+  const [options, setOptionsState] = useState<RunOptions>(() => ({ ...DEFAULT_OPTIONS, ...stored(optionsKey) }));
+  // Whether the stage list was ever chosen: an empty list then means "all off", not "not chosen yet".
+  const stagesChosen = useRef(Array.isArray(stored(optionsKey).stages));
+  useEffect(() => {
+    const kept = stored(optionsKey);
+    stagesChosen.current = Array.isArray(kept.stages);
+    setOptionsState({ ...DEFAULT_OPTIONS, ...kept });
+  }, [optionsKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => save(optionsKey, stagesChosen.current ? options : { ...options, stages: undefined }), [optionsKey, options]);
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [credentials, setCredentials] = useState<ConnectionCredentials>({});
   const setCredential = useCallback((name: string, patch: Record<string, string>) => setCredentials((c) => ({ ...c, [name]: { ...(c[name] ?? {}), ...patch } })), []);
@@ -231,15 +304,19 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   // The stage list comes from the backend, so the page can never offer one it cannot run.
   useEffect(() => {
     let live = true;
-    setCapabilities(null);
+    // Keep the stages on screen while they are read again: no flicker when discovery finishes.
     api.getCapabilities().then((c) => {
       if (!live) return;
       setCapabilities(c);
-      setOptionsState((o) => ({ ...o, stages: o.stages.length ? o.stages : c.stages.map((s) => s.key) }));
+      const known = new Set(c.stages.map((s) => s.key));
+      setOptionsState((o) => ({ ...o, stages: stagesChosen.current ? o.stages.filter((k) => known.has(k)) : c.stages.map((s) => s.key) }));
     }, () => { if (live) setCapabilities(null); });
     return () => { live = false; };
   }, [api, discovery.state]);
-  const setOptions = useCallback((patch: Partial<RunOptions>) => setOptionsState((o) => ({ ...o, ...patch })), []);
+  const setOptions = useCallback((patch: Partial<RunOptions>) => {
+    if (patch.stages) stagesChosen.current = true;
+    setOptionsState((o) => ({ ...o, ...patch }));
+  }, []);
   const analyze = useCallback(async (record = false) => {
     if (!plan.length) { setAnalysis(null); setAnalysisError(null); return; }
     setAnalysisBusy(true);
@@ -262,8 +339,20 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
 
   // ---- execution (polls only while running)
   const [execution, setExecution] = useState<ExecutionRun>(EMPTY_RUN);
+  const [executionReady, setExecutionReady] = useState(false);
   const [executionError, setExecutionError] = useState<string | null>(null);
-  useEffect(() => { api.getExecution().then(setExecution, () => setExecution(EMPTY_RUN)); }, [api]);
+  useEffect(() => {
+    let live = true;
+    setExecutionReady(false);
+    api.getExecution().then((r) => { if (live) setExecution(r); }, () => { if (live) setExecution(EMPTY_RUN); })
+      .finally(() => { if (live) setExecutionReady(true); });
+    return () => { live = false; };
+  }, [api]);
+  // Signing out, reconnecting or a new discovery can change what the backend holds: read the run again.
+  useEffect(() => {
+    if (!executionReady) return;
+    api.getExecution().then(setExecution, () => undefined);
+  }, [connection.status, discovery.state]); // eslint-disable-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (execution.state !== "running") return;
     const id = setInterval(() => { api.getExecution().then(setExecution, () => undefined); }, 900);
@@ -296,7 +385,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     setValidationBusy(true);
     setValidationError(null);
     try { setValidation(await api.runValidation([...plan].sort((a, b) => a.wave - b.wave))); } catch (e) { setValidationError(messageOf(e)); } finally { setValidationBusy(false); }
-  }, [api]);
+  }, [api, plan]);
 
   // ---- plan status
   const dependsOn = useMemo(() => {
@@ -318,14 +407,44 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     return isConnected && plan.length ? "READY" : "NOT STARTED";
   }, [runStatus, planWave, dependsOn, isConnected, plan.length]);
 
+  // ---- start a step over
+  const [resetNonce, setResetNonce] = useState(0);
+  const resetStep = useCallback(async (step: StepKey) => {
+    const from = STEP_KEYS.indexOf(step);
+    const covers = (k: StepKey) => from <= STEP_KEYS.indexOf(k);
+    // The backend first: if it refuses (a run or a discovery still working), nothing here changes.
+    if (covers("migrate") && execution.state !== "idle") {
+      try { setExecution(await api.controlExecution("reset")); } catch (e) { throw new Error(messageOf(e)); }
+    }
+    if (step === "discover" && discovery.state !== "idle") {
+      try { await resetDiscovery(); } catch (e) { throw new Error(messageOf(e)); }
+    }
+    if (step === "assess") await refreshDiscovery();
+    if (step === "waves") setGraphEpoch((n) => n + 1);
+    if (covers("plan")) {
+      setPlan([]);
+      stagesChosen.current = false;
+      setOptionsState({ ...DEFAULT_OPTIONS, stages: capabilities?.stages.map((s) => s.key) ?? [] });
+      setCredentials({});
+      setAnalysis(null);
+      setAnalysisError(null);
+    }
+    if (covers("migrate")) setExecutionError(null);
+    setValidation(null);
+    setValidationError(null);
+    resetJourney(step);
+    setResetNonce((n) => n + 1);
+  }, [api, execution.state, discovery.state, resetDiscovery, refreshDiscovery, capabilities, resetJourney]);
+
   const value: MigrationStateValue = {
-    projects, project, addProject, selectProject: setProjectId,
+    projects, project, addProject, selectProject: setProjectId, renameProject, deleteProject,
     graph, graphError, graphLoading, reloadGraph: () => setGraphEpoch((n) => n + 1),
     plan, addToPlan, addAllToPlan, removeFromPlan, setPlanWave, movePlanItem, clearPlan, inPlan, planStatus,
-    fabric, fabricBusy, fabricError, authenticateFabric, testFabric, disconnectFabric,
+    fabric, fabricReady, fabricBusy, fabricError, authenticateFabric, testFabric, disconnectFabric,
     analysis, analysisBusy, analysisError, analyze, options, setOptions, capabilities, credentials, setCredential, clearCredentials,
-    execution, executionError, startExecution, controlExecution,
+    execution, executionReady, executionError, startExecution, controlExecution,
     validation, validationError, validationBusy, runValidation,
+    confirmed, confirmStep, resetJourney, resetStep, resetNonce,
   };
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

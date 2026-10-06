@@ -150,7 +150,7 @@ def _connection(source: Source, names: Set[str]) -> List[Finding]:
         return [Finding(source.id, "CONNECTION_BY_HAND", MEDIUM, f"{source.name}: {plan.unsupported}")]
     if source.name not in names:
         return [Finding(source.id, "NEEDS_CREDENTIALS", MEDIUM,
-                        f"{source.name} needs credentials entered under Connections before Fabric can create it; until then it stays deferred, and pipelines that use it cannot be created.")]
+                        f"{source.name} needs credentials entered in Plan, Stages & credentials (the Connections stage) before Fabric can create it; until then it stays deferred, and pipelines that use it cannot be created.")]
     return []
 
 
@@ -180,7 +180,7 @@ def environment_checks(fabric_state: Dict[str, Any], sql_driver: str = "", sourc
         "label": "Fabric target connected",
         "status": "ok" if connected else "fail",
         "detail": f"Workspace {fabric_state.get('workspaceName')}" if connected
-        else "Connect the Fabric target and pass its connection test on the Fabric Target page.",
+        else "Connect the Fabric target and pass its connection test on the Connections page.",
     })
     if connected:
         assigned = fabric_state.get("capacityAssigned")

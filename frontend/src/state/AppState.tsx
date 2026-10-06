@@ -60,6 +60,10 @@ interface AppStateValue {
   startDiscovery: () => Promise<void>;
   /** Re-read the discovery status and drop cached pages, so the table reloads. */
   refreshDiscovery: () => Promise<void>;
+  /** Forget the discovery's results; the connection is kept. Throws when refused (discovery running). */
+  resetDiscovery: () => Promise<void>;
+  /** Load everything again from the backend, e.g. after it was started. */
+  reload: () => void;
   getResults: (query: ResultsQuery) => Promise<ResultsPage>;
   getObject: (id: string) => Promise<ObjectDetail>;
   /** Dropdown contents for the Azure source form. */
@@ -112,6 +116,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   // not hit the backend again.
   const cache = useRef(new Map<string, Promise<unknown>>());
   const [epoch, setEpoch] = useState(0);
+  const [loadEpoch, setLoadEpoch] = useState(0);
   const runToken = `${mode}|${discovery.startedAt ?? ""}|${discovery.finishedAt ?? ""}|${epoch}`;
   useEffect(() => {
     cache.current.clear();
@@ -142,7 +147,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [api]);
+  }, [api, loadEpoch]);
 
   // Poll only while a run is in flight.
   useEffect(() => {
@@ -217,6 +222,12 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     setEpoch((n) => n + 1);
   }, [api]);
 
+  const resetDiscovery = useCallback(async () => {
+    setDiscoveryStartError(null);
+    setDiscovery(await api.resetDiscovery());
+    setEpoch((n) => n + 1);
+  }, [api]);
+
   const memo = useCallback(<T,>(key: string, load: () => Promise<T>): Promise<T> => {
     const hit = cache.current.get(key) as Promise<T> | undefined;
     if (hit) return hit;
@@ -254,6 +265,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     discoveryStartError,
     startDiscovery,
     refreshDiscovery,
+    resetDiscovery,
+    reload: () => setLoadEpoch((n) => n + 1),
     getResults,
     getObject,
     azureLists: api,

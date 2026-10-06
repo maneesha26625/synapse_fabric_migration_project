@@ -308,7 +308,7 @@ class FabricTarget:
         try:
             data = _json_in(out)
         except ValueError:
-            return 401, {}, json.dumps({"errorCode": "FabricCliNotSignedIn", "message": "The Fabric CLI did not answer. Log in with the Fabric CLI again on the Fabric Target page."}).encode()
+            return 401, {}, json.dumps({"errorCode": "FabricCliNotSignedIn", "message": "The Fabric CLI did not answer. Sign in with the Fabric CLI again on the Connections page."}).encode()
         status = int(data.get("status_code") or (500 if code else 200))
         response_headers = {str(k).lower(): str(v) for k, v in (data.get("headers") or {}).items()}
         text = data.get("text")
@@ -332,7 +332,7 @@ class FabricTarget:
                     data = {}
                 token = data.get("accessToken")
                 if code != 0 or not token:
-                    raise FabricError(401, "token_unavailable", "Could not get a token from the Azure CLI. Log in again on the Fabric Target page.")
+                    raise FabricError(401, "token_unavailable", "Could not get a token from the Azure CLI. Sign in again on the Connections page.")
                 expires = data.get("expires_on")
                 cache["token"] = token
                 cache["until"] = (float(expires) - 300) if expires else time.time() + 1800

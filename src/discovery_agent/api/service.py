@@ -533,6 +533,16 @@ class Session:
         thread.start()
         return self.discovery_status()
 
+    def reset_discovery(self) -> dict:
+        """Forget the last discovery's results, so the next one starts from
+        nothing. The connection and its sign-in are kept."""
+        with self._lock:
+            if self._job.state == "running":
+                raise ApiError(409, "discovery_running", "Discovery is running; wait for it to finish.")
+            self._job = _Job()
+            self._detail_cache.clear()
+        return self.discovery_status()
+
     def _discover(self, conn: _Connection, job: _Job) -> None:
         try:
             config = DiscoveryConfig(source=Path("."), out=Path(DEFAULT_OUTPUT_DIR))

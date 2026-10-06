@@ -97,6 +97,32 @@ def test_results_before_discovery_are_refused_not_empty(server):
     assert body["error"]["code"] == "no_results"
 
 
+def test_resetting_discovery_returns_it_to_idle(server):
+    status, body = call(server, "DELETE", "/api/discovery")
+    assert status == 200
+    assert body["state"] == "idle" and body["summary"] is None
+
+
+def test_a_reset_forgets_the_results_but_not_the_connection():
+    session = Session()
+    job = session._job  # noqa: SLF001 - seeding state without a live workspace
+    job.state, job.items, job.finished_at = "completed", [{"id": "x"}], "2026-10-06T12:00:00+00:00"
+    session._connection = object()  # noqa: SLF001
+    assert session.reset_discovery()["state"] == "idle"
+    with pytest.raises(ApiError) as gone:
+        session.results({})
+    assert gone.value.code == "no_results"
+    assert session._connection is not None  # noqa: SLF001
+
+
+def test_a_running_discovery_cannot_be_reset():
+    session = Session()
+    session._job.state = "running"  # noqa: SLF001
+    with pytest.raises(ApiError) as busy:
+        session.reset_discovery()
+    assert busy.value.code == "discovery_running"
+
+
 SP = {**VALID, "method": "service_principal", "tenantId": "8a24d8ed-7a4b-45b3-b56b-d781dd225aa1", "clientId": "11111111-2222-3333-4444-555555555555"}
 
 

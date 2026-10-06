@@ -10,6 +10,7 @@ web framework would be the first. The surface is small and fixed.
     DELETE /api/connections               forget the connection
     POST   /api/discovery/start
     GET    /api/discovery/status
+    DELETE /api/discovery                 forget the last discovery's results
     GET    /api/discovery/results         paged, filtered, sorted
     GET    /api/discovery/results/{id}    one object, in full
     GET    /api/dependencies              dependency graph + suggested waves
@@ -25,7 +26,7 @@ web framework would be the first. The surface is small and fixed.
     POST   /api/migration/plan            planner: strategy, risks, effort, checks (read-only)
     POST   /api/migration/validate        compare Synapse with Fabric, object by object (read-only)
     POST   /api/migration/start           start a run from the migration plan
-    POST   /api/migration/control         pause | resume | retry
+    POST   /api/migration/control         pause | resume | retry | reset
 
 Security posture, in order of importance:
 
@@ -184,6 +185,8 @@ def make_handler(
         def do_DELETE(self) -> None:  # noqa: N802
             if urlsplit(self.path).path == "/api/connections":
                 self._dispatch(session.disconnect)
+            elif urlsplit(self.path).path == "/api/discovery":
+                self._dispatch(session.reset_discovery)
             elif urlsplit(self.path).path == "/api/fabric/connection":
                 self._dispatch(fabric.disconnect)
             else:

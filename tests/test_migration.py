@@ -615,6 +615,38 @@ def test_retry_runs_only_the_failed_objects_again():
     assert svc.state()["completed"] == 2
 
 
+def test_reset_forgets_a_finished_run_and_its_credentials():
+    svc = service(fake_job())
+    svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}], "options": {"stages": ["notebooks"]},
+               "credentials": {"LS_Sql": {"authType": "Basic", "username": "u", "password": "p"}}})
+    assert wait_until(lambda: svc.state()["state"] == "completed")
+    idle = svc.control({"action": "reset"})
+    assert idle["state"] == "idle" and idle["items"] == [] and svc.state()["state"] == "idle"
+    assert svc._credentials == {}  # noqa: SLF001
+    # Nothing to resume or retry afterwards, and a second reset is harmless.
+    with pytest.raises(ApiError) as gone:
+        svc.control({"action": "retry"})
+    assert gone.value.code == "no_run"
+    assert svc.control({"action": "reset"})["state"] == "idle"
+
+
+def test_a_working_run_cannot_be_reset():
+    gate = threading.Event()
+
+    class SlowRest(FakeRest):
+        def list(self, path):
+            gate.wait(5)
+            return super().list(path)
+
+    svc = service(fake_job(), rest=SlowRest())
+    svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}]})
+    with pytest.raises(ApiError) as busy:
+        svc.control({"action": "reset"})
+    assert busy.value.code == "run_in_progress"
+    gate.set()
+    assert wait_until(lambda: svc.state()["state"] == "completed")
+
+
 def test_only_one_run_at_a_time():
     gate = threading.Event()
 

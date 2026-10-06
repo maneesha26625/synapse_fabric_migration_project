@@ -48,7 +48,7 @@ class StageMixin:
         """A read-only session on the Synapse pool, through the discovery sign-in."""
         if self._source is None:
             if self._source_factory is None:
-                raise MigrationError("The Synapse source is not connected. Reconnect it on the Synapse Source page.")
+                raise MigrationError("The Synapse source is not connected. Reconnect it on the Connections page.")
             try:
                 self._source = self._source_factory()
             except Exception as exc:  # noqa: BLE001 - driver, token or network failure

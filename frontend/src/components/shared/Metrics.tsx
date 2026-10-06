@@ -69,3 +69,18 @@ export function StageTracker({ stages }: { stages: { label: string; state: Stage
     </ol>
   );
 }
+
+/** A row of headline numbers with dividers: the summary at the top of a step, before any detail. */
+export function StatStrip({ items, label }: { items: { label: string; value: ReactNode; hint?: string; tone?: "success" | "warning" | "error" | "accent" }[]; label: string }) {
+  return (
+    <dl className="stat-strip" aria-label={label}>
+      {items.map((s) => (
+        <div key={s.label} className={`stat${s.tone ? ` tone-${s.tone}` : ""}`} title={s.hint}>
+          <dt>{s.label}</dt>
+          <dd>{s.value}</dd>
+          {s.hint && <span className="stat-hint">{s.hint}</span>}
+        </div>
+      ))}
+    </dl>
+  );
+}

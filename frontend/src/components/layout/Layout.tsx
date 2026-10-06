@@ -1,132 +1,115 @@
-import {
-  ChevronsLeft,
-  ChevronsRight,
-  Cloud,
-  Database,
-  Download,
-  FolderKanban,
-  Network,
-  Rocket,
-  Plus,
-  Radar,
-  RefreshCw,
-  ScanSearch,
-  Server,
-  ShieldCheck,
-  Zap,
-  type LucideIcon,
-} from "lucide-react";
-import { useEffect, useState } from "react";
-import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
+import { Check, ChevronDown, Download, FolderOpen, FolderPlus, Pencil, PlugZap, RefreshCw, ServerCrash, Trash2, Workflow, Zap } from "lucide-react";
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { useAppState } from "../../state/AppState";
 import { useMigration } from "../../state/MigrationState";
-import { Button, Modal, StatusBadge, TextField } from "../shared/Shared";
+import { notify, TOAST_EVENT } from "../shared/notify";
+import { Button, ConfirmDialog, Modal, TextField } from "../shared/Shared";
+import { AssistantLauncher, AssistantPanel } from "./Assistant";
 
-/* ---- Sidebar ---------------------------------------------------------------- */
-
-interface NavEntry { to: string; label: string; icon: LucideIcon }
-const NAV: { section: string; items: NavEntry[] }[] = [
-  { section: "Overview", items: [{ to: "/", label: "Projects", icon: FolderKanban }] },
-  {
-    section: "Connect",
-    items: [
-      { to: "/synapse", label: "Synapse Source", icon: Database },
-      { to: "/fabric", label: "Fabric Target", icon: Cloud },
-    ],
-  },
-  {
-    section: "Analyze",
-    items: [
-      { to: "/discovery", label: "Discovery", icon: Radar },
-      { to: "/assessment", label: "Assessment", icon: ScanSearch },
-      { to: "/dependencies", label: "Dependencies & Waves", icon: Network },
-    ],
-  },
-  {
-    section: "Migrate",
-    items: [
-      { to: "/migrate", label: "Plan & Migrate", icon: Rocket },
-      { to: "/validate", label: "Validation", icon: ShieldCheck },
-    ],
-  },
-];
-
-function Sidebar({ collapsed, onToggle }: { collapsed: boolean; onToggle: () => void }) {
+/** A side's live state, in the bar: green when connected. */
+function Presence({ label, name, ok, busy }: { label: string; name: string | null | undefined; ok: boolean; busy?: boolean }) {
   return (
-    <nav className="sidebar" aria-label="Primary">
-      {NAV.map(({ section, items }) => (
-        <div key={section} className="nav-group">
-          <div className="nav-section">{section}</div>
-          {items.map(({ to, label, icon: Icon }) => (
-            <NavLink key={to} to={to} end={to === "/"} className={({ isActive }) => `nav-item${isActive ? " active" : ""}`} title={label}>
-              <span className="nav-ico"><Icon size={18} aria-hidden="true" /></span>
-              <span className="nav-label">{label}</span>
-            </NavLink>
-          ))}
-        </div>
-      ))}
-      <div className="spacer" />
-      <Button variant="ghost" size="small" onClick={onToggle} aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"} style={{ alignSelf: "flex-start" }}>
-        {collapsed ? <ChevronsRight size={18} /> : <ChevronsLeft size={18} />}
-      </Button>
-    </nav>
+    <NavLink to="/" className={`presence${ok ? " ok" : ""}${busy ? " busy" : ""}`} title={ok ? `${label}: ${name} (connected)` : `${label}: not connected`}>
+      <span className="presence-dot" aria-hidden="true" />
+      <span className="presence-label">{label}</span>
+      <span className="presence-name">{ok ? name : "Not connected"}</span>
+    </NavLink>
   );
 }
 
-/* ---- Workflow stepper ------------------------------------------------------------ */
-
-type StepState = "done" | "active" | "pending";
-
-/** Where the operator is in the migration workflow, and what is already done. */
-export function useWorkflow(): { to: string; label: string; state: StepState }[] {
-  const { pathname } = useLocation();
-  const { isConnected, discovery } = useAppState();
-  const { fabric, execution, validation, project } = useMigration();
-  const discovered = discovery.state === "completed" || discovery.state === "completed_with_warnings";
-  const steps: { to: string; label: string; done: boolean }[] = [
-    { to: "/", label: "Project", done: !!project },
-    { to: "/synapse", label: "Synapse Source", done: isConnected },
-    { to: "/discovery", label: "Discovery", done: discovered },
-    { to: "/assessment", label: "Assessment", done: false },
-    { to: "/dependencies", label: "Dependencies & Waves", done: false },
-    { to: "/fabric", label: "Fabric Target", done: fabric.status === "connected" },
-    { to: "/migrate", label: "Plan & Migrate", done: execution.state === "completed" },
-    { to: "/validate", label: "Validate", done: !!validation },
-  ];
-  return steps.map((s) => ({
-    to: s.to,
-    label: s.label,
-    state: (s.to === "/" ? pathname === "/" : pathname.startsWith(s.to)) ? "active" : s.done ? "done" : "pending",
-  }));
-}
-
-function Stepper() {
-  const steps = useWorkflow();
-  return (
-    <ol className="stepper" aria-label="Migration workflow">
-      {steps.map((s, i) => (
-        <li key={s.to} style={{ display: "contents" }}>
-          {i > 0 && <span className="step-sep" aria-hidden="true" />}
-          <Link to={s.to} className={`step ${s.state}`} aria-current={s.state === "active" ? "step" : undefined}>
-            <span className="step-n" aria-hidden="true">{s.state === "done" ? "✓" : i + 1}</span>
-            <span className="step-label">{s.label}</span>
-            <span className="sr-only">{s.state === "done" ? "completed" : s.state === "active" ? "current" : "not started"}</span>
-          </Link>
-        </li>
-      ))}
-    </ol>
-  );
-}
-
-/* ---- Header ------------------------------------------------------------------------ */
-
-function Header({ onToast }: { onToast: (message: string) => void }) {
-  const { api, mode, setMode, isConnected, connection, connectionBusy, discovery, refreshDiscovery, refreshHealth } = useAppState();
-  const { projects, project, selectProject, addProject, reloadGraph } = useMigration();
-  const [creating, setCreating] = useState(false);
+/**
+ * The project switcher: pick a project, or create, rename or delete one. A
+ * project names a migration and keeps its own plan, options and progress.
+ */
+function ProjectMenu() {
+  const { projects, project, selectProject, addProject, renameProject, deleteProject } = useMigration();
+  const [open, setOpen] = useState(false);
+  const [dialog, setDialog] = useState<"new" | "rename" | "delete" | null>(null);
   const [name, setName] = useState("");
+  const root = useRef<HTMLDivElement>(null);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const menu = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const away = (e: MouseEvent) => { if (root.current && !root.current.contains(e.target as Node)) setOpen(false); };
+    document.addEventListener("mousedown", away);
+    (menu.current?.querySelector<HTMLElement>("[aria-checked=true]") ?? menu.current?.querySelector<HTMLElement>("button"))?.focus();
+    return () => document.removeEventListener("mousedown", away);
+  }, [open]);
+
+  const items = () => [...(menu.current?.querySelectorAll<HTMLButtonElement>("[role^=menuitem]:not(:disabled)") ?? [])];
+  const onMenuKey = (e: KeyboardEvent) => {
+    const list = items();
+    const i = list.indexOf(document.activeElement as HTMLButtonElement);
+    if (e.key === "ArrowDown") { e.preventDefault(); list[(i + 1) % list.length]?.focus(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); list[(i - 1 + list.length) % list.length]?.focus(); }
+    else if (e.key === "Home") { e.preventDefault(); list[0]?.focus(); }
+    else if (e.key === "End") { e.preventDefault(); list[list.length - 1]?.focus(); }
+    else if (e.key === "Escape") { setOpen(false); trigger.current?.focus(); }
+    else if (e.key === "Tab") setOpen(false);
+  };
+  const show = (d: "new" | "rename" | "delete") => { setOpen(false); setName(d === "rename" ? project.name : ""); setDialog(d); };
+  const close = useCallback(() => setDialog(null), []);
+  const submit = () => {
+    const value = name.trim();
+    if (!value) return;
+    if (dialog === "new") { addProject(value); notify(`Project “${value}” created.`); }
+    else if (dialog === "rename") { renameProject(project.id, value); notify(`Project renamed to “${value}”.`); }
+    setDialog(null);
+  };
+
+  return (
+    <div className="project-menu" ref={root}>
+      <button ref={trigger} type="button" className="project-trigger" aria-haspopup="menu" aria-expanded={open}
+        aria-label={`Project: ${project.name}`} title={project.name} onClick={() => setOpen((o) => !o)}>
+        <FolderOpen size={15} aria-hidden="true" />
+        <span className="project-name">{project.name}</span>
+        <ChevronDown size={15} className="project-chevron" aria-hidden="true" />
+      </button>
+      {open && (
+        <div className="menu" role="menu" aria-label="Projects" ref={menu} onKeyDown={onMenuKey}>
+          <div className="menu-label" aria-hidden="true">Projects</div>
+          {projects.map((p) => (
+            <button key={p.id} type="button" role="menuitemradio" aria-checked={p.id === project.id} className="menu-item"
+              onClick={() => { selectProject(p.id); setOpen(false); trigger.current?.focus(); }}>
+              <span className="menu-check" aria-hidden="true">{p.id === project.id && <Check size={14} />}</span>
+              <span className="menu-text">{p.name}</span>
+            </button>
+          ))}
+          <div className="menu-sep" role="separator" />
+          <button type="button" role="menuitem" className="menu-item" onClick={() => show("new")}><FolderPlus size={14} aria-hidden="true" /><span className="menu-text">New project…</span></button>
+          <button type="button" role="menuitem" className="menu-item" onClick={() => show("rename")}><Pencil size={14} aria-hidden="true" /><span className="menu-text">Rename this project…</span></button>
+          <button type="button" role="menuitem" className="menu-item danger" disabled={projects.length < 2} title={projects.length < 2 ? "The only project cannot be deleted" : undefined}
+            onClick={() => show("delete")}><Trash2 size={14} aria-hidden="true" /><span className="menu-text">Delete this project…</span></button>
+        </div>
+      )}
+
+      {(dialog === "new" || dialog === "rename") && (
+        <Modal title={dialog === "new" ? "New project" : "Rename project"} onClose={close} onSubmit={submit}
+          footer={<><Button onClick={close}>Cancel</Button><Button type="submit" variant="primary" disabled={!name.trim()}>{dialog === "new" ? "Create" : "Rename"}</Button></>}>
+          <TextField label="Project name" value={name} onChange={(e) => setName(e.target.value)} maxLength={80} />
+          {dialog === "new" && <p className="faint">A project names a migration and keeps its own plan, options and progress in this browser. The backend holds one connection at a time.</p>}
+        </Modal>
+      )}
+      {dialog === "delete" && (
+        <ConfirmDialog title={`Delete “${project.name}”?`} confirmLabel="Delete project" onCancel={close}
+          onConfirm={() => { const gone = project.name; deleteProject(project.id); setDialog(null); notify(`Project “${gone}” deleted.`); }}>
+          <p>This removes the project from this browser: its plan, stage options and the steps you confirmed.</p>
+          <p className="muted">Nothing in Synapse or Fabric changes, and the connections stay as they are.</p>
+        </ConfirmDialog>
+      )}
+    </div>
+  );
+}
+
+function TopBar() {
+  const { api, mode, setMode, isConnected, connection, connectionBusy, discovery, refreshDiscovery, refreshHealth } = useAppState();
+  const { reloadGraph, fabric, fabricBusy } = useMigration();
   const [exporting, setExporting] = useState(false);
   const discovered = discovery.state === "completed" || discovery.state === "completed_with_warnings";
+  const canMigrate = isConnected || discovered;
 
   const exportMetadata = async () => {
     setExporting(true);
@@ -139,9 +122,9 @@ function Header({ onToast }: { onToast: (message: string) => void }) {
       a.download = `synapse-metadata-${data.workspace ?? "workspace"}.json`;
       a.click();
       URL.revokeObjectURL(url);
-      onToast(`Exported ${data.objects.length.toLocaleString()} objects.`);
+      notify(`Exported ${data.objects.length.toLocaleString()} objects.`);
     } catch (e) {
-      onToast(e instanceof Error ? e.message : "The export failed.");
+      notify(e instanceof Error ? e.message : "The export failed.");
     } finally {
       setExporting(false);
     }
@@ -150,73 +133,98 @@ function Header({ onToast }: { onToast: (message: string) => void }) {
   const refresh = async () => {
     await Promise.all([refreshHealth(), refreshDiscovery()]);
     reloadGraph();
+    notify("Status and results refreshed.");
   };
 
   return (
-    <header className="header">
+    <header className="topbar">
       <div className="brand">
-        <span className="brand-mark" aria-hidden="true"><Zap size={14} /></span>
+        <span className="brand-mark" aria-hidden="true"><Zap size={16} /></span>
         <span className="brand-name">Migration Accelerator</span>
-        <span className={`live-pill${mode === "mock" ? " demo" : ""}`}><Server size={13} aria-hidden="true" />{mode === "mock" ? "DEMO" : "LIVE"}</span>
-        <span className="brand-sub">Synapse → Fabric</span>
       </div>
-      {isConnected ? (
-        <StatusBadge tone="success">CONNECTED</StatusBadge>
-      ) : (
-        <StatusBadge tone={connectionBusy ? "info" : "neutral"} running={!!connectionBusy}>{connectionBusy ? "CONNECTING" : "DISCONNECTED"}</StatusBadge>
-      )}
-      <div className="spacer" />
-      <label className="sr-only" htmlFor="project-select">Project</label>
-      <select id="project-select" className="select project-select" value={project.id} onChange={(e) => selectProject(e.target.value)} title={isConnected ? `Connected to ${connection.workspace}` : "Project"}>
-        {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-      </select>
-      <Button onClick={() => void exportMetadata()} loading={exporting} disabled={!discovered} title={discovered ? "Download the discovered inventory as JSON" : "Run discovery first"}>
-        <Download size={14} aria-hidden="true" /><span className="hide-narrow">Export Metadata</span>
-      </Button>
-      <Button onClick={() => void refresh()} aria-label="Refresh" title="Refresh status and results"><RefreshCw size={14} aria-hidden="true" /><span className="hide-narrow">Refresh</span></Button>
-      <Button variant="primary" onClick={() => setCreating(true)}><Plus size={14} aria-hidden="true" /><span className="hide-narrow">New Project</span></Button>
+
+      <nav className="topnav" aria-label="Primary">
+        <NavLink to="/" end className={({ isActive }) => `topnav-item${isActive ? " active" : ""}`}><PlugZap size={15} aria-hidden="true" />Connections</NavLink>
+        {canMigrate ? (
+          <NavLink to="/migration" className={({ isActive }) => `topnav-item${isActive ? " active" : ""}`}><Workflow size={15} aria-hidden="true" />Migration</NavLink>
+        ) : (
+          <span className="topnav-item" aria-disabled="true" title="Connect the source first"><Workflow size={15} aria-hidden="true" />Migration</span>
+        )}
+      </nav>
+
+      <div className="presence-group" aria-label="Connections">
+        <Presence label="Source" name={connection.workspace} ok={isConnected} busy={!!connectionBusy} />
+        <Presence label="Destination" name={fabric.workspaceName} ok={fabric.status === "connected"} busy={!!fabricBusy || fabric.status === "signing_in"} />
+      </div>
+
+      <span className="spacer" />
+
+      <ProjectMenu />
+      <Button variant="ghost" icon onClick={() => void exportMetadata()} loading={exporting} disabled={!discovered} aria-label="Export metadata" title={discovered ? "Download the discovered inventory as JSON" : "Run discovery first"}><Download size={16} /></Button>
+      <Button variant="ghost" icon onClick={() => void refresh()} aria-label="Refresh" title="Refresh status and results"><RefreshCw size={16} /></Button>
       <div className="mode-switch" role="group" aria-label="Data source">
-        <button type="button" aria-pressed={mode === "real"} onClick={() => setMode("real")} title="Talk to the accelerator backend">Live API</button>
-        <button type="button" className="demo" aria-pressed={mode === "mock"} onClick={() => setMode("mock")} title="Use generated sample data — not a real workspace">Demo data</button>
+        <button type="button" aria-pressed={mode === "real"} onClick={() => setMode("real")} title="Use your real Azure through the accelerator's backend">Live</button>
+        <button type="button" className="demo" aria-pressed={mode === "mock"} onClick={() => setMode("mock")} title="Use generated sample data; nothing real is touched">Demo</button>
       </div>
-      {creating && (
-        <Modal
-          title="New project"
-          onClose={() => setCreating(false)}
-          footer={<><Button onClick={() => setCreating(false)}>Cancel</Button><Button variant="primary" disabled={!name.trim()} onClick={() => { addProject(name); setName(""); setCreating(false); }}>Create</Button></>}
-        >
-          <TextField label="Project name" value={name} onChange={(e) => setName(e.target.value)} maxLength={80} autoFocus />
-          <p className="faint">A project names this migration. The backend holds one connection at a time, so projects label work; they do not separate data.</p>
-        </Modal>
-      )}
     </header>
   );
 }
 
-/* ---- Shell -------------------------------------------------------------------------- */
+/** Live mode without a backend: say so once, plainly, with the two ways forward. */
+function BackendBar() {
+  const { mode, backendError, reload, setMode } = useAppState();
+  if (mode !== "real" || !backendError) return null;
+  return (
+    <div className="backend-bar" role="alert">
+      <ServerCrash size={17} aria-hidden="true" />
+      <span>
+        <strong>The accelerator's backend is not answering.</strong>{" "}
+        Start it with <code>python -m discovery_agent.api</code> (or <code>start-ui.ps1</code>), then retry. Demo data works without it.
+      </span>
+      <span className="spacer" />
+      <Button size="small" onClick={reload}>Retry</Button>
+      <Button size="small" variant="ghost" onClick={() => setMode("mock")}>Use Demo data</Button>
+    </div>
+  );
+}
 
 export function Layout() {
-  const [collapsed, setCollapsed] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [assistant, setAssistant] = useState(false);
   const { mode } = useAppState();
+  const { pathname } = useLocation();
+
+  useEffect(() => {
+    const show = (e: Event) => setToast((e as CustomEvent<string>).detail);
+    window.addEventListener(TOAST_EVENT, show);
+    return () => window.removeEventListener(TOAST_EVENT, show);
+  }, []);
   useEffect(() => {
     if (!toast) return;
     const id = setTimeout(() => setToast(null), 4500);
     return () => clearTimeout(id);
   }, [toast]);
+
+  // Ctrl+I (Cmd+I) opens and closes the assistant, like an editor's chat.
+  useEffect(() => {
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "i") { e.preventDefault(); setAssistant((a) => !a); }
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
+  useEffect(() => { window.scrollTo?.(0, 0); }, [pathname]);
+
   return (
-    <div className={`app${collapsed ? " collapsed" : ""}`}>
-      <Header onToast={setToast} />
-      <Sidebar collapsed={collapsed} onToggle={() => setCollapsed((c) => !c)} />
-      <main className="main" id="main">
-        {mode === "mock" && (
-          <div className="demo-bar" role="note" style={{ margin: "-28px -32px 16px" }}>
-            DEMO DATA — generated sample content, not a real Synapse workspace
-          </div>
-        )}
-        <Stepper />
-        <Outlet />
-      </main>
+    <div className={`shell${assistant ? " with-assistant" : ""}`}>
+      <TopBar />
+      {mode === "mock" && <div className="demo-bar" role="note">DEMO DATA · generated sample content, not a real Synapse workspace</div>}
+      <BackendBar />
+      <div className="shell-body">
+        <main className="main" id="main"><Outlet /></main>
+        {assistant && <AssistantPanel onClose={() => setAssistant(false)} />}
+      </div>
+      {!assistant && <AssistantLauncher onOpen={() => setAssistant(true)} />}
       {toast && <div className="toast" role="status">{toast}</div>}
     </div>
   );

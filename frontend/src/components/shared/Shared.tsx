@@ -17,11 +17,19 @@ import {
   type InputHTMLAttributes,
   type ReactNode,
 } from "react";
+import { createPortal } from "react-dom";
+
+/** The browser tab's title for a page, e.g. "Plan · Migration · Migration Accelerator". */
+export function useDocumentTitle(title: string) {
+  useEffect(() => {
+    document.title = title ? `${title} · Migration Accelerator` : "Migration Accelerator";
+  }, [title]);
+}
 
 /* ---- Button ---------------------------------------------------------------- */
 
 type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
-  variant?: "default" | "primary" | "ghost";
+  variant?: "default" | "primary" | "ghost" | "danger";
   size?: "small" | "medium";
   loading?: boolean;
   icon?: boolean;
@@ -217,15 +225,24 @@ export function SelectField({ label, value, onChange, options, placeholder, load
 
 /* ---- Modal & Drawer ---------------------------------------------------------------- */
 
+/**
+ * Focus, Escape and the Tab loop for a dialog. It runs once per opening: the
+ * latest ``onClose`` is read through a ref, so a parent that re-renders (a run
+ * polling every second) never pulls focus back to the dialog. Focus starts on
+ * an element marked ``data-autofocus``, else the first field, else the dialog.
+ */
 function useDialogBehaviour(onClose: () => void) {
   const ref = useRef<HTMLDivElement>(null);
+  const close = useRef(onClose);
+  close.current = onClose;
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null;
-    ref.current?.focus();
+    const start = ref.current?.querySelector<HTMLElement>("[data-autofocus], input:not([disabled]):not([type=hidden]), select:not([disabled]), textarea:not([disabled])");
+    (start ?? ref.current)?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") close.current();
       if (e.key === "Tab" && ref.current) {
-        const items = ref.current.querySelectorAll<HTMLElement>('a[href],button:not([disabled]),input,select,summary,[tabindex]:not([tabindex="-1"])');
+        const items = ref.current.querySelectorAll<HTMLElement>('a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),summary,[tabindex]:not([tabindex="-1"])');
         if (!items.length) return;
         const first = items[0], last = items[items.length - 1];
         if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
@@ -237,32 +254,75 @@ function useDialogBehaviour(onClose: () => void) {
       document.removeEventListener("keydown", onKey);
       previous?.focus?.();
     };
-  }, [onClose]);
+  }, []);
   return ref;
 }
 
-export function Modal({ title, onClose, children, footer }: { title: string; onClose: () => void; children: ReactNode; footer?: ReactNode }) {
+/** Dialogs render at the end of the page, so no container (a blurred bar, a scrolling panel) can clip or offset them. */
+function Layer({ children }: { children: ReactNode }) {
+  return typeof document === "undefined" ? <>{children}</> : createPortal(children, document.body);
+}
+
+export function Modal({ title, onClose, children, footer, onSubmit }: {
+  title: string;
+  onClose: () => void;
+  children: ReactNode;
+  footer?: ReactNode;
+  /** Makes the dialog a form: Enter in a field submits it. */
+  onSubmit?: () => void;
+}) {
   const ref = useDialogBehaviour(onClose);
   const titleId = useId();
-  return (
+  const body = (
     <>
+      <div className="stack">{children}</div>
+      {footer && <div className="row modal-footer">{footer}</div>}
+    </>
+  );
+  return (
+    <Layer>
       <div className="scrim modal-scrim" onClick={onClose} />
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby={titleId} ref={ref} tabIndex={-1}>
         <div className="row" style={{ marginBottom: 12 }}>
           <h2 id={titleId} style={{ flex: 1 }}>{title}</h2>
           <Button variant="ghost" size="small" icon onClick={onClose} aria-label="Close"><X size={16} /></Button>
         </div>
-        <div className="stack">{children}</div>
-        {footer && <div className="row" style={{ justifyContent: "flex-end", marginTop: 20 }}>{footer}</div>}
+        {onSubmit ? <form onSubmit={(e) => { e.preventDefault(); onSubmit(); }}>{body}</form> : body}
       </div>
-    </>
+    </Layer>
+  );
+}
+
+/**
+ * Asks before something that cannot be undone. Focus starts on Cancel, so
+ * Enter never confirms by accident; Escape cancels unless the action is under way.
+ */
+export function ConfirmDialog({ title, children, confirmLabel, danger = true, busy, error, onConfirm, onCancel }: {
+  title: string;
+  children: ReactNode;
+  confirmLabel: string;
+  danger?: boolean;
+  busy?: boolean;
+  error?: string | null;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const cancel = () => { if (!busy) onCancel(); };
+  return (
+    <Modal title={title} onClose={cancel} footer={<>
+      <Button onClick={cancel} disabled={busy} data-autofocus>Cancel</Button>
+      <Button variant={danger ? "danger" : "primary"} onClick={onConfirm} loading={busy}>{confirmLabel}</Button>
+    </>}>
+      {children}
+      {error && <Banner tone="error" title="That did not work">{error}</Banner>}
+    </Modal>
   );
 }
 
 export function Drawer({ label, onClose, header, children }: { label: string; onClose: () => void; header: ReactNode; children: ReactNode }) {
   const ref = useDialogBehaviour(onClose);
   return (
-    <>
+    <Layer>
       <div className="scrim" onClick={onClose} />
       <aside className="drawer" role="dialog" aria-modal="true" aria-label={label} ref={ref} tabIndex={-1}>
         <div className="drawer-head">
@@ -271,7 +331,7 @@ export function Drawer({ label, onClose, header, children }: { label: string; on
         </div>
         {children}
       </aside>
-    </>
+    </Layer>
   );
 }
 
@@ -311,3 +371,23 @@ export function JsonViewer({ value }: { value: unknown }) {
   return <pre className="json" tabIndex={0} aria-label="JSON">{parts}</pre>;
 }
 
+
+/* ---- Tabs ------------------------------------------------------------------------- */
+
+/** A step's sections. Only the selected one is rendered, so detail costs nothing until asked for. */
+export function Tabs<T extends string>({ label, tabs, value, onChange }: {
+  label: string;
+  tabs: { id: T; label: string; count?: number }[];
+  value: T;
+  onChange: (id: T) => void;
+}) {
+  return (
+    <div className="tabs panel-tabs" role="tablist" aria-label={label}>
+      {tabs.map((t) => (
+        <button key={t.id} type="button" role="tab" className="tab" aria-selected={value === t.id} onClick={() => onChange(t.id)}>
+          {t.label}{t.count !== undefined && <span className="tab-count">{t.count.toLocaleString()}</span>}
+        </button>
+      ))}
+    </div>
+  );
+}

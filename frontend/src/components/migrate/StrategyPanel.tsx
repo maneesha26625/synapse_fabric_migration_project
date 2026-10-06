@@ -1,7 +1,7 @@
 import { ArrowDown, ArrowUp, ListPlus, Route, Trash2 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { ClassificationBadge } from "../shared/Metrics";
-import { Button, Card, Collapsible, StatusBadge, type Tone } from "../shared/Shared";
+import { Button, Collapsible, StatusBadge, type Tone } from "../shared/Shared";
 import { useMigration } from "../../state/MigrationState";
 import type { Strategy } from "../../types";
 
@@ -14,8 +14,34 @@ const STRATEGY_TEXT: Record<Strategy, string> = {
   deselected: "Its migration stage is switched off for this run.",
 };
 
-/** Strategy by object type, how the run is carried out, and the plan itself. */
-export function StrategyPanel() {
+/** How each kind of object is migrated: one row per object type. */
+export function StrategyTable() {
+  const { analysis } = useMigration();
+  if (!analysis) return <p className="muted" style={{ margin: 0 }}>Build a plan to see the strategy for each object type.</p>;
+  return (
+    <div className="table-wrap">
+      <table className="data" style={{ minWidth: 860 }}>
+        <caption className="sr-only">Migration strategy by object type</caption>
+        <thead><tr>{["Object type", "Objects", "Strategy", "Fabric target", "Waves", "Effort"].map((h) => <th key={h} scope="col" className="static">{h}</th>)}</tr></thead>
+        <tbody>
+          {analysis.typeStrategies.map((t) => (
+            <tr key={t.type}>
+              <td className="name">{t.type}</td>
+              <td className="num">{t.count}</td>
+              <td title={STRATEGY_TEXT[t.strategy]}><StatusBadge tone={STRATEGY_TONE[t.strategy]}>{t.strategyLabel}</StatusBadge></td>
+              <td className="ws" title={t.target}>{t.target || "—"}</td>
+              <td>{t.firstWave === t.lastWave ? `Wave ${t.firstWave}` : `Waves ${t.firstWave}–${t.lastWave}`}</td>
+              <td className="num">{t.effortDays}d</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** The plan itself: add, remove, reorder and move objects between waves. */
+export function PlanEditor() {
   const { graph, plan, analysis, addAllToPlan, addToPlan, removeFromPlan, setPlanWave, movePlanItem, clearPlan } = useMigration();
   const [pick, setPick] = useState("");
   const [pickWave, setPickWave] = useState(0);
@@ -35,35 +61,7 @@ export function StrategyPanel() {
   };
 
   return (
-    <>
-      <Card eyebrow="Migration strategy" title="How each kind of object is migrated"
-        subtitle="Chosen from what this build can create and each object's classification, never guessed from a name.">
-        {!analysis ? (
-          <p className="muted" style={{ margin: 0 }}>Build a plan to see the strategy for each object type.</p>
-        ) : (
-          <div className="table-wrap">
-            <table className="data" style={{ minWidth: 860 }}>
-              <caption className="sr-only">Migration strategy by object type</caption>
-              <thead><tr>{["Object type", "Objects", "Strategy", "Fabric target", "Waves", "Effort"].map((h) => <th key={h} scope="col" className="static">{h}</th>)}</tr></thead>
-              <tbody>
-                {analysis.typeStrategies.map((t) => (
-                  <tr key={t.type}>
-                    <td className="name">{t.type}</td>
-                    <td className="num">{t.count}</td>
-                    <td title={STRATEGY_TEXT[t.strategy]}><StatusBadge tone={STRATEGY_TONE[t.strategy]}>{t.strategyLabel}</StatusBadge></td>
-                    <td className="ws" title={t.target}>{t.target || "—"}</td>
-                    <td>{t.firstWave === t.lastWave ? `Wave ${t.firstWave}` : `Waves ${t.firstWave}–${t.lastWave}`}</td>
-                    <td className="num">{t.effortDays}d</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </Card>
-
-      <Card eyebrow="Migration objects" title="The plan"
-        subtitle="Waves are suggested from the dependency graph. Add, remove, reorder or move objects; the planner re-scores as you edit.">
+    <div className="stack">
         <div className="toolbar">
           <Button onClick={addAllToPlan} disabled={!graph?.nodes.length}><ListPlus size={14} aria-hidden="true" />Add all objects (suggested waves)</Button>
           <input className="input" style={{ maxWidth: 260 }} list="plan-objects" placeholder="Add an object by name" aria-label="Object to add" value={pick} onChange={(e) => setPick(e.target.value)} />
@@ -122,7 +120,6 @@ export function StrategyPanel() {
             })}
           </div>
         )}
-      </Card>
-    </>
+    </div>
   );
 }

@@ -74,7 +74,7 @@ class FabricStageMixin:
         supplied = self._credentials.get(plan.name)
         if not supplied:
             return DEFERRED_STATUS, "Needs credentials", plan.name, [
-                f"Enter credentials for '{plan.name}' under Connections, then run this stage again. "
+                f"Enter credentials for '{plan.name}' in Plan, Stages & credentials (the Connections stage), then run the Connections stage again from Migrate. "
                 "Synapse does not give up the secret, so Fabric cannot be given it automatically."] + plan.notes
         try:
             body = fabric_connections.create_body(plan, supplied)

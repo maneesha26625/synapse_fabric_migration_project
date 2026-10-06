@@ -44,13 +44,24 @@ export function DependencyGraph({ nodes, edges, selectedId, onSelect }: Props) {
     return { placed, waves, width: waves.length * (NODE_W + COL_GAP), height: HEADER + tallest * (NODE_H + ROW_GAP) };
   }, [nodes]);
 
+  /** The whole graph, however small: the Fit button. */
   const fit = useCallback(() => {
     const el = box.current;
     if (!el || !width) return;
     const k = Math.min(1, (el.clientWidth - 32) / width, (el.clientHeight - 32) / Math.max(height, 1));
     setView({ x: 16, y: 16, k: Math.max(0.2, k) });
   }, [width, height]);
-  useEffect(() => { fit(); }, [fit, nodes.length]);
+  /**
+   * The first view: every wave side by side, from the top, at a size where the
+   * names can be read. A tall wave continues below; drag to see the rest.
+   */
+  const readable = useCallback(() => {
+    const el = box.current;
+    if (!el || !width) return;
+    const k = Math.min(1, (el.clientWidth - 32) / width);
+    setView({ x: 16, y: 16, k: Math.max(0.55, k) });
+  }, [width]);
+  useEffect(() => { readable(); }, [readable, nodes.length]);
 
   // Wheel zoom needs preventDefault, which React's passive onWheel cannot do.
   useEffect(() => {
@@ -86,10 +97,10 @@ export function DependencyGraph({ nodes, edges, selectedId, onSelect }: Props) {
     else void el.requestFullscreen?.();
   };
   useEffect(() => {
-    const onChange = () => { setFull(document.fullscreenElement === box.current); setTimeout(fit, 50); };
+    const onChange = () => { setFull(document.fullscreenElement === box.current); setTimeout(readable, 50); };
     document.addEventListener("fullscreenchange", onChange);
     return () => document.removeEventListener("fullscreenchange", onChange);
-  }, [fit]);
+  }, [readable]);
 
   const visibleEdges = edges.filter((e) => placed.has(e.source) && placed.has(e.target));
   const connected = new Set<string>();
@@ -118,11 +129,12 @@ export function DependencyGraph({ nodes, edges, selectedId, onSelect }: Props) {
       onClick={(e) => { if (!(e.target as Element).closest(".gn, .graph-controls")) onSelect(null); }}
     >
       <div className="graph-controls">
-        <Button size="small" icon aria-label="Zoom in" onClick={() => zoom(1.25)}><Plus size={15} /></Button>
-        <Button size="small" icon aria-label="Zoom out" onClick={() => zoom(0.8)}><Minus size={15} /></Button>
-        <Button size="small" icon aria-label="Fit to view" onClick={fit}><ScanSearch size={15} /></Button>
-        <Button size="small" icon aria-label={full ? "Exit full screen" : "Full screen"} onClick={toggleFull}>{full ? <Minimize2 size={14} /> : <Maximize2 size={14} />}</Button>
+        <Button size="small" icon aria-label="Zoom in" title="Zoom in" onClick={() => zoom(1.25)}><Plus size={15} /></Button>
+        <Button size="small" icon aria-label="Zoom out" title="Zoom out" onClick={() => zoom(0.8)}><Minus size={15} /></Button>
+        <Button size="small" icon aria-label="Fit to view" title="Show the whole graph" onClick={fit}><ScanSearch size={15} /></Button>
+        <Button size="small" icon aria-label={full ? "Exit full screen" : "Full screen"} title={full ? "Exit full screen" : "Full screen"} onClick={toggleFull}>{full ? <Minimize2 size={14} /> : <Maximize2 size={14} />}</Button>
       </div>
+      <span className="graph-hint" aria-hidden="true">Drag to move · scroll to zoom · click an object for its links</span>
       <svg width="100%" height="100%" role="img" aria-label="Dependency graph. Columns are migration waves; arrows point to what an object needs.">
         <defs>
           <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto-start-reverse">

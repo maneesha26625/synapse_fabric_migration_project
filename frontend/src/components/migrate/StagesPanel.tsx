@@ -1,6 +1,6 @@
-import { CheckCircle2, CircleAlert, KeyRound, Play } from "lucide-react";
+import { CircleAlert, KeyRound } from "lucide-react";
 import { useMemo } from "react";
-import { Banner, Button, Card, Collapsible, StatusBadge, type Tone } from "../shared/Shared";
+import { Button, Card, Collapsible, StatusBadge, type Tone } from "../shared/Shared";
 import { useMigration } from "../../state/MigrationState";
 import type { ExecItem, LinkedServiceInput, RunOptions, StageDef } from "../../types";
 
@@ -56,9 +56,12 @@ function CredentialForm({ service }: { service: LinkedServiceInput }) {
   );
 }
 
-/** Which stages run, how, and a button to run any one of them on its own. */
+/**
+ * Which stages run, and how. Configuration only: nothing is written from the
+ * Plan step. The Migrate step runs every stage that is on, or one on its own.
+ */
 export function StagesPanel() {
-  const { capabilities, options, setOptions, graph, plan, fabric, execution: run, startExecution, credentials, clearCredentials } = useMigration();
+  const { capabilities, options, setOptions, graph, plan, execution: run, credentials, clearCredentials } = useMigration();
 
   const nodes = useMemo(() => new Map((graph?.nodes ?? []).map((n) => [n.id, n])), [graph]);
   const typesInPlan = useMemo(() => {
@@ -72,16 +75,14 @@ export function StagesPanel() {
   const enabled = new Set(options.stages);
   const toggle = (key: string) => setOptions({ stages: enabled.has(key) ? options.stages.filter((k) => k !== key) : [...options.stages, key] });
   const countFor = (s: StageDef) => s.types.reduce((a, t) => a + (typesInPlan.get(t) ?? 0), 0);
-  const running = run.state === "running";
-  const connected = fabric.status === "connected";
   const entered = (name: string) => Object.keys(credentials[name] ?? {}).some((k) => k !== "authType" && (credentials[name][k] ?? "").length > 0);
-  /** The credentials a stage asks for: linked services under Connections, the Synapse pool under Table data. */
+  /** The credentials a stage asks for: linked services under the Connections stage, the Synapse pool under Table data. */
   const servicesFor = (key: string) => capabilities.linkedServices.filter((l) => (l.stage ?? "connections") === key);
   const optionValue = (key: string, fallback: string) => (options as unknown as Record<string, string>)[key] ?? fallback;
 
   return (
     <Card eyebrow="Migration stages" title="Choose what to migrate"
-      subtitle="Switch stages on or off, set each one's strategy, and run any stage on its own. Start migration runs every stage that is on, in dependency order."
+      subtitle="Switch stages on or off and choose how each one works. The Migrate step runs every stage that is on, in dependency order, or a single stage on its own."
       actions={<div className="row" style={{ gap: 6 }}>
         <Button size="small" variant="ghost" onClick={() => setOptions({ stages: stages.map((s) => s.key) })}>All on</Button>
         <Button size="small" variant="ghost" onClick={() => setOptions({ stages: [] })}>All off</Button>
@@ -96,7 +97,6 @@ export function StagesPanel() {
           const services = servicesFor(s.key);
           const usable = services.filter((l) => !l.unsupported);
           const enteredCount = usable.filter((l) => entered(l.name)).length;
-          const canRun = on && count > 0 && connected && !running;
           return (
             <section key={s.key} className={`stage-card${on ? "" : " off"}`} aria-label={s.label}>
               <header>
@@ -142,12 +142,6 @@ export function StagesPanel() {
                 </Collapsible>
               )}
 
-              <footer>
-                <Button size="small" onClick={() => void startExecution(s.key)} disabled={!canRun} title={!connected ? "Connect the Fabric target first" : !count ? "Nothing in the plan for this stage" : undefined}>
-                  <Play size={13} aria-hidden="true" />Run this stage
-                </Button>
-                {progress?.tone === "success" && <CheckCircle2 size={15} color="var(--success)" aria-label="done" />}
-              </footer>
             </section>
           );
         })}
@@ -169,7 +163,6 @@ export function StagesPanel() {
           <span><strong>Stop at the end of a wave that has failures</strong><span className="muted"> — so a failed table never lets the views that read it start. Off: every object is attempted and failures are reported.</span></span>
         </label>
       </div>
-      {!connected && <Banner tone="warning" title="Fabric target not connected">Connect it on the Fabric Target page to run any stage.</Banner>}
     </Card>
   );
 }

@@ -1,29 +1,21 @@
-import { AppWindow, CheckCircle2, CircleSlash, SquareTerminal, XCircle, type LucideIcon } from "lucide-react";
+import { AppWindow, CheckCircle2, CircleSlash, FileArchive, GitBranch, SquareTerminal, XCircle } from "lucide-react";
 import { Fragment, useEffect, useState, type ReactNode } from "react";
 import { useAppState } from "../../state/AppState";
 import type { AuthMethod, ConnectionConfig, ConnectionState } from "../../types";
-import { Banner, Button, Card, SelectField, StatusBadge, TextField } from "../shared/Shared";
+import { Banner, Button, SelectField, TextField, ConfirmDialog } from "../shared/Shared";
+import { MethodTiles, MiniSteps, type MethodOption } from "./MethodTiles";
 
-/* ---- Authentication selector ---------------------------------------------------- */
+/* ---- Methods ------------------------------------------------------------------------ */
 
-const METHODS: { id: AuthMethod; title: string; desc: string; icon: LucideIcon }[] = [
-  { id: "azure_cli", title: "Azure CLI", desc: "Authenticate using Azure CLI", icon: SquareTerminal },
-  { id: "interactive_browser", title: "Interactive browser", desc: "Sign in through a Microsoft window; your Azure CLI session is untouched", icon: AppWindow },
+type SourceMethod = AuthMethod | "zip" | "git";
+
+const METHODS: MethodOption<SourceMethod>[] = [
+  { id: "azure_cli", title: "Azure CLI", desc: "Sign in with your Azure account in a browser window", icon: SquareTerminal },
+  { id: "interactive_browser", title: "Interactive browser", desc: "A Microsoft sign-in for the tenant you name; your Azure CLI session is untouched", icon: AppWindow },
+  { id: "zip", title: "Workspace export (ZIP)", desc: "Upload an exported Synapse workspace", icon: FileArchive, soon: true },
+  { id: "git", title: "Git repository", desc: "Read the workspace from its Git repository", icon: GitBranch, soon: true },
 ];
-
-export function AuthenticationSelector({ value, onChange }: { value: AuthMethod; onChange: (m: AuthMethod) => void }) {
-  return (
-    <div className="auth-cards" role="radiogroup" aria-label="Authentication method">
-      {METHODS.map(({ id, title, desc, icon: Icon }) => (
-        <button key={id} type="button" role="radio" aria-checked={value === id} className="auth-card" onClick={() => onChange(id)}>
-          <span className="title"><Icon size={17} aria-hidden="true" />{title}</span>
-          <span className="desc">{desc}</span>
-          <span className="pick">{value === id ? "Selected" : "Select"}</span>
-        </button>
-      ))}
-    </div>
-  );
-}
+const METHOD_LABEL: Record<AuthMethod, string> = { azure_cli: "Azure CLI", interactive_browser: "Interactive browser" };
 
 /* ---- Form state ------------------------------------------------------------------ */
 
@@ -58,12 +50,8 @@ function validate(c: ConnectionConfig, action: "authenticate" | "test"): Errors 
   need("subscriptionId", "Subscription ID"); guid("subscriptionId", "Subscription ID");
   guid("tenantId", "Tenant ID");
   if (action === "authenticate") {
-    // Every method proves an identity first, from the subscription alone; the
-    // group, workspace and pool are chosen afterwards.
-    if (c.method === "interactive_browser") {
-      // The window must open against the operator's own tenant.
-      need("tenantId", "Tenant ID");
-    }
+    // The browser sign-in must open against the operator's own tenant.
+    if (c.method === "interactive_browser") need("tenantId", "Tenant ID");
   } else {
     need("resourceGroup", "Resource group");
     need("workspace", "Synapse workspace");
@@ -71,24 +59,20 @@ function validate(c: ConnectionConfig, action: "authenticate" | "test"): Errors 
   return e;
 }
 
-/* ---- Forms ------------------------------------------------------------------------ */
+/* ---- Scope: resource group -> workspace -> SQL pool -------------------------------- */
 
-interface FormProps {
+interface ScopeProps {
   config: ConnectionConfig;
   errors: Errors;
   set: (patch: Partial<ConnectionConfig>) => void;
-  /** Authenticated as this method, for the subscription shown. */
   signedIn: boolean;
-  authenticating: boolean;
 }
 
 /**
- * Resource group -> workspace (for that group) -> optional SQL pool (for that
- * workspace). Every dropdown is filled from the authenticated identity, so
- * nothing is typed that could be misspelt, and the lists only offer what that
- * identity can actually see.
+ * Every dropdown is filled from the signed-in identity, so nothing is typed
+ * that could be misspelt, and only what that identity can see is offered.
  */
-function ScopeSelectors({ config, errors, set, signedIn }: FormProps) {
+function ScopeSelectors({ config, errors, set, signedIn }: ScopeProps) {
   const { azureLists } = useAppState();
   const [groups, setGroups] = useState<string[]>([]);
   const [workspaces, setWorkspaces] = useState<string[]>([]);
@@ -103,149 +87,108 @@ function ScopeSelectors({ config, errors, set, signedIn }: FormProps) {
     finally { setLoading(null); }
   };
 
+  // A list with exactly one entry is chosen for the operator: nobody should have to
+  // open a dropdown to pick its only item, and the SQL pool is never skipped by accident.
   useEffect(() => {
     if (!signedIn) { setGroups([]); return; }
-    void load("groups", () => azureLists.listResourceGroups(), setGroups);
+    void load("groups", () => azureLists.listResourceGroups(), (v) => {
+      setGroups(v);
+      if (v.length === 1 && !config.resourceGroup) set({ resourceGroup: v[0], workspace: "", sqlPool: "" });
+    });
   }, [signedIn]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     setWorkspaces([]); setPools([]);
     if (!signedIn || !config.resourceGroup) return;
-    void load("workspaces", () => azureLists.listWorkspaces(config.resourceGroup), setWorkspaces);
+    void load("workspaces", () => azureLists.listWorkspaces(config.resourceGroup), (v) => {
+      setWorkspaces(v);
+      if (v.length === 1 && !config.workspace) set({ workspace: v[0], sqlPool: "" });
+    });
   }, [signedIn, config.resourceGroup]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     setPools([]);
     if (!signedIn || !config.resourceGroup || !config.workspace) return;
-    void load("pools", () => azureLists.listSqlPools(config.resourceGroup, config.workspace), setPools);
+    void load("pools", () => azureLists.listSqlPools(config.resourceGroup, config.workspace), (v) => {
+      setPools(v);
+      if (v.length === 1 && !config.sqlPool) set({ sqlPool: v[0] });
+    });
   }, [signedIn, config.resourceGroup, config.workspace]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!signedIn) return null;
   return (
     <>
-      <Banner tone="success">Authenticated. Now choose the resource group and workspace.</Banner>
       <div className="form-grid">
         <SelectField label="Resource group" value={config.resourceGroup} onChange={(v) => set({ resourceGroup: v, workspace: "", sqlPool: "" })} options={groups} loading={loading === "groups"} placeholder="Select a resource group" error={errors.resourceGroup} />
         <SelectField label="Synapse workspace" value={config.workspace} onChange={(v) => set({ workspace: v, sqlPool: "" })} options={workspaces} loading={loading === "workspaces"} disabled={!config.resourceGroup} placeholder={config.resourceGroup ? (workspaces.length ? "Select a workspace" : "No Synapse workspaces in this group") : "Select a resource group first"} error={errors.workspace} />
-        <SelectField label="Dedicated SQL pool" optional value={config.sqlPool} onChange={(v) => set({ sqlPool: v })} options={pools} loading={loading === "pools"} disabled={!config.workspace} placeholder={config.workspace ? "None (skip SQL tables, views, procedures)" : "Select a workspace first"} hint="Needed to discover tables, views and stored procedures." />
+        <SelectField label="Dedicated SQL pool" optional value={config.sqlPool} onChange={(v) => set({ sqlPool: v })} options={pools} loading={loading === "pools"} disabled={!config.workspace} placeholder={config.workspace ? "None (skip tables, views, procedures)" : "Select a workspace first"} hint="Needed for tables, views and stored procedures." />
       </div>
       {listError && <Banner tone="error" title="Could not load the list">{listError}</Banner>}
     </>
   );
 }
 
-function SubscriptionField({ config, set, errors }: FormProps) {
-  return (
-    <TextField label="Subscription ID" value={config.subscriptionId} onChange={(e) => set({ subscriptionId: e.target.value })} error={errors.subscriptionId} placeholder="00000000-0000-0000-0000-000000000000" />
-  );
-}
+/* ---- Connected summary ---------------------------------------------------------------- */
 
-function AzureCliForm(p: FormProps) {
-  return (
-    <div className="stack" style={{ gap: 16 }}>
-      <div className="form-grid">
-        <SubscriptionField {...p} />
-        <TextField label="Tenant ID" optional value={p.config.tenantId} onChange={(e) => p.set({ tenantId: e.target.value })} error={p.errors.tenantId} hint="Found automatically from the subscription. Enter it only if sign-in picks the wrong tenant." />
-      </div>
-      {p.authenticating && <Banner tone="info" title="Waiting for you to sign in">A sign-in window has opened in your browser. Complete it there; this page continues automatically.</Banner>}
-      <ScopeSelectors {...p} />
-    </div>
-  );
-}
-
-/** Shown while a browser sign-in is pending, so the operator is not left watching a spinner. */
-const WAITING_FOR_WINDOW = "A sign-in window should open on this machine — complete it there. Waiting…";
-
-function InteractiveBrowserForm(p: FormProps) {
-  const { health } = useAppState();
-  const note = health?.capabilities.authMethodDetails?.find((d) => d.id === "interactive_browser");
-  return (
-    <div className="stack" style={{ gap: 16 }}>
-      {note?.caveat && <p className="muted">{note.caveat}</p>}
-      <div className="form-grid">
-        <TextField label="Tenant ID" value={p.config.tenantId} onChange={(e) => p.set({ tenantId: e.target.value })} error={p.errors.tenantId} placeholder="00000000-0000-0000-0000-000000000000" hint="The tenant the sign-in window opens against." />
-        <SubscriptionField {...p} />
-      </div>
-      {p.authenticating && <Banner tone="info" title="Waiting for you to sign in">{WAITING_FOR_WINDOW}</Banner>}
-      <ScopeSelectors {...p} />
-    </div>
-  );
-}
-
-/* ---- Connection status --------------------------------------------------------------- */
-
-const METHOD_LABEL: Record<AuthMethod, string> = { azure_cli: "Azure CLI", interactive_browser: "Interactive browser" };
-
-export function ConnectionStatus({ connection, busy, onTest, onChange, onDisconnect }: { connection: ConnectionState; busy: boolean; onTest: () => void; onChange: () => void; onDisconnect: () => void }) {
-  const rows: [string, ReactNode][] = [
-    ["Source", connection.sourcePlatform ?? "Azure Synapse"],
-    ["Workspace", connection.workspace],
-    ["Resource group", connection.resourceGroup],
-    ["Subscription", connection.subscriptionName ? `${connection.subscriptionName} (${connection.subscriptionId})` : connection.subscriptionId],
-    ["Tenant", connection.tenantId || "—"],
-    ["Authentication", connection.method ? METHOD_LABEL[connection.method] : "—"],
-    ["Dedicated SQL pool", connection.sqlPool || "Not configured"],
-    ["Last tested", connection.testedAt ? new Date(connection.testedAt).toLocaleString() : "—"],
-  ];
-  return (
-    <Card eyebrow="Source connection" actions={<StatusBadge tone="success">Connected</StatusBadge>}>
-      <dl className="kv">
-        {rows.map(([k, v]) => (<Fragment key={k}><dt>{k}</dt><dd>{v}</dd></Fragment>))}
-      </dl>
-      <CheckList checks={connection.checks} />
-      <div className="row" style={{ marginTop: 16 }}>
-        <Button onClick={onTest} loading={busy}>Test Connection</Button>
-        <Button onClick={onChange}>Change Authentication</Button>
-        <Button variant="ghost" onClick={onDisconnect} disabled={busy}>Disconnect</Button>
-      </div>
-    </Card>
-  );
-}
-
-function CheckList({ checks }: { checks: ConnectionState["checks"] }) {
+export function CheckList({ checks, label = "Connection checks" }: { checks: { name: string; status: "ok" | "failed" | "skipped"; message?: string | null }[]; label?: string }) {
   if (!checks.length) return null;
   return (
-    <ul className="checks" style={{ listStyle: "none", padding: 0, margin: "16px 0 0" }} aria-label="Connection checks">
+    <ul className="checks" aria-label={label}>
       {checks.map((c) => (
         <li key={c.name} className={`check ${c.status}`}>
           {c.status === "ok" ? <CheckCircle2 size={15} aria-label="passed" /> : c.status === "failed" ? <XCircle size={15} aria-label="failed" /> : <CircleSlash size={15} aria-label="skipped" />}
-          <span><strong>{c.name}</strong> <span className="muted">— {c.message}</span></span>
+          <span><strong>{c.name}</strong>{c.message ? <span className="muted"> — {c.message}</span> : null}</span>
         </li>
       ))}
     </ul>
   );
 }
 
-/* ---- Composite ------------------------------------------------------------------------- */
+/** Checks folded into one line ("3 of 3 checks passed"), opened on demand. */
+export function CheckFold({ checks, label }: { checks: { name: string; status: "ok" | "failed" | "skipped"; message?: string | null }[]; label?: string }) {
+  if (!checks.length) return null;
+  const passed = checks.filter((c) => c.status === "ok").length;
+  const failed = checks.some((c) => c.status === "failed");
+  return (
+    <details className={`check-fold${failed ? " failed" : ""}`}>
+      <summary>{failed ? <XCircle size={15} aria-hidden="true" /> : <CheckCircle2 size={15} aria-hidden="true" />}{passed} of {checks.length} checks passed</summary>
+      <CheckList checks={checks} label={label} />
+    </details>
+  );
+}
 
-const HELP: Record<AuthMethod, string> = {
-  azure_cli: "Enter the subscription ID and sign in. A browser window opens asking you to authenticate with your Azure account.",
-  interactive_browser: "Enter the tenant and subscription IDs, then authenticate. A Microsoft sign-in window opens on the machine running the server; choose your account there.",
-};
+export function SummaryList({ rows }: { rows: [string, ReactNode][] }) {
+  return (
+    <dl className="kv compact">
+      {rows.map(([k, v]) => (<Fragment key={k}><dt>{k}</dt><dd>{v || "—"}</dd></Fragment>))}
+    </dl>
+  );
+}
 
-/**
- * ``hideStatus`` leaves the connected summary to the page, and ``forceForm``
- * shows the form even while connected (the page's "Add Synapse Workspace").
- */
-export function SourceConnection({ hideStatus = false, forceForm = false }: { hideStatus?: boolean; forceForm?: boolean } = {}) {
+/* ---- The source panel ---------------------------------------------------------------- */
+
+/** Connect Azure Synapse: choose how to sign in, sign in, choose the workspace, test. */
+export function SourceConnectionPanel() {
   const app = useAppState();
   const { connection, connectionBusy, connectionError, health, mode } = app;
   const [config, setConfig] = useState<ConnectionConfig>(() => ({ ...EMPTY, ...(remembered ?? {}) }));
   const [errors, setErrors] = useState<Errors>({});
   const [changing, setChanging] = useState(false);
+  const [confirmSignOut, setConfirmSignOut] = useState(false);
+  const discovered = app.discovery.state === "completed" || app.discovery.state === "completed_with_warnings";
+  const signOut = () => { setChanging(false); setConfirmSignOut(false); void app.disconnect(); };
 
   const connected = app.isConnected;
-  const showForm = !connected || changing || forceForm;
   const supported = mode === "mock" || !health || health.capabilities.authMethods.includes(config.method);
   const busy = connectionBusy !== null;
-  const azure = config.method === "azure_cli";
+  const browser = config.method === "interactive_browser";
 
   // The backend may have been restarted since this page loaded; ask again
   // whenever the method changes so a stale answer never blocks a working option.
   useEffect(() => { void app.refreshHealth(); }, [config.method]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Authenticated *as this method, for the subscription shown*: changing either
-  // invalidates the dropdowns until the operator authenticates again.
+  // Signed in *as this method, for the subscription shown*: changing either
+  // invalidates the dropdowns until the operator signs in again.
   const signedInHere =
     !!connection.signedIn &&
     connection.method === config.method &&
@@ -260,11 +203,12 @@ export function SourceConnection({ hideStatus = false, forceForm = false }: { hi
   // After a reload the backend may still hold a sign-in; pick it back up.
   useEffect(() => {
     if (connection.signedIn && connection.subscriptionId && !config.subscriptionId) {
-      set({ subscriptionId: connection.subscriptionId, method: connection.method ?? "azure_cli" });
+      set({ subscriptionId: connection.subscriptionId, method: connection.method ?? "azure_cli", tenantId: connection.tenantId ?? "" });
     }
   }, [connection.signedIn, connection.subscriptionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const selectMethod = (method: AuthMethod) => {
+  const selectMethod = (method: SourceMethod) => {
+    if (method === "zip" || method === "git") return;
     setErrors({});
     app.clearConnectionError();
     setConfig((c) => ({ ...c, method, resourceGroup: "", workspace: "", sqlPool: "" }));
@@ -279,59 +223,81 @@ export function SourceConnection({ hideStatus = false, forceForm = false }: { hi
     if (action === "test") setChanging(false);
   };
 
-  const retest = () => app.testConnection(configFromConnection(connection));
+  if (connected && !changing) {
+    return (
+      <div className="stack conn-body">
+        <SummaryList rows={[
+          ["Workspace", <strong key="w">{connection.workspace}</strong>],
+          ["Resource group", connection.resourceGroup],
+          ["Subscription", connection.subscriptionName ?? connection.subscriptionId],
+          ["Dedicated SQL pool", connection.sqlPool || "Not configured"],
+          ["Signed in with", connection.method ? METHOD_LABEL[connection.method] : "—"],
+          ["Last tested", connection.testedAt ? new Date(connection.testedAt).toLocaleString() : "—"],
+        ]} />
+        <CheckFold checks={connection.checks} label="Source connection checks" />
+        <div className="row conn-actions">
+          <Button size="small" onClick={() => void app.testConnection(configFromConnection(connection))} loading={connectionBusy === "test"}>Test again</Button>
+          <Button size="small" onClick={() => { setConfig(configFromConnection(connection)); setChanging(true); }}>Change</Button>
+          <Button size="small" variant="ghost" onClick={() => (discovered ? setConfirmSignOut(true) : signOut())} disabled={busy || app.discovery.state === "running"}
+            title={app.discovery.state === "running" ? "Discovery is running; wait for it to finish" : undefined}>Disconnect</Button>
+        </div>
+        {confirmSignOut && (
+          <ConfirmDialog title="Disconnect Azure Synapse?" confirmLabel="Disconnect" onConfirm={signOut} onCancel={() => setConfirmSignOut(false)}>
+            <p>The accelerator signs out of {connection.workspace}. Your Azure CLI session is untouched.</p>
+            <p>The discovered inventory ({(app.discovery.summary?.total ?? 0).toLocaleString()} objects) is cleared as well, so discovery runs again after you reconnect. Your plan, its options and the record of a migration run are kept.</p>
+          </ConfirmDialog>
+        )}
+      </div>
+    );
+  }
 
-  const formProps: FormProps = { config, errors, set, signedIn: signedInHere, authenticating: connectionBusy === "authenticate" };
-  const Form = azure ? AzureCliForm : InteractiveBrowserForm;
-
+  const stage = signedInHere ? (config.workspace ? 2 : 1) : 0;
   return (
-    <div className="stack" style={{ gap: 16 }}>
-      {connected && !hideStatus && (
-        <ConnectionStatus connection={connection} busy={connectionBusy === "test"} onTest={retest} onChange={() => setChanging(true)} onDisconnect={() => { setChanging(false); void app.disconnect(); }} />
+    <div className="stack conn-body">
+      <MethodTiles label="How to connect to Azure Synapse" options={METHODS} value={config.method} onChange={selectMethod} disabled={busy} />
+      <MiniSteps steps={["Sign in", "Choose workspace", "Test"]} current={stage} />
+
+      {!supported && (
+        <Banner tone="warning" title="Not available in this backend">The running backend does not support {METHOD_LABEL[config.method]}. Restart it from the latest code.</Banner>
       )}
-      {showForm && (
-        <Card
-          eyebrow="Source connection"
-          title="Azure Synapse"
-          subtitle="Connect the migration accelerator to the Azure Synapse source environment."
-          actions={<StatusBadge tone={connection.status === "connected" ? "success" : connection.checks.length ? "warning" : "neutral"}>{connection.status === "connected" ? "Connected" : connection.checks.length ? "Not verified" : "Not connected"}</StatusBadge>}
-        >
-          <div className="stack" style={{ gap: 20 }}>
-            <AuthenticationSelector value={config.method} onChange={selectMethod} />
 
-            <div>
-              <div className="eyebrow" style={{ marginBottom: 6 }}>Authentication method</div>
-              <strong>{METHOD_LABEL[config.method]}</strong>
-              <p className="muted" style={{ marginTop: 4 }}>{HELP[config.method]} After that, pick the resource group, workspace and SQL pool from lists. No access token is ever shown or stored in the browser.</p>
-            </div>
+      <div className="form-grid">
+        {browser ? (
+          <>
+            <TextField label="Tenant ID" value={config.tenantId} onChange={(e) => set({ tenantId: e.target.value })} error={errors.tenantId} placeholder="00000000-0000-0000-0000-000000000000" hint="The sign-in window opens against this tenant." />
+            <TextField label="Subscription ID" value={config.subscriptionId} onChange={(e) => set({ subscriptionId: e.target.value })} error={errors.subscriptionId} placeholder="00000000-0000-0000-0000-000000000000" />
+          </>
+        ) : (
+          <>
+            <TextField label="Subscription ID" value={config.subscriptionId} onChange={(e) => set({ subscriptionId: e.target.value })} error={errors.subscriptionId} placeholder="00000000-0000-0000-0000-000000000000" />
+            <TextField label="Tenant ID" optional value={config.tenantId} onChange={(e) => set({ tenantId: e.target.value })} error={errors.tenantId} hint="Found from the subscription; enter it only if sign-in picks the wrong tenant." />
+          </>
+        )}
+      </div>
 
-            {!supported && (
-              <Banner tone="warning" title="Not available in this backend">
-                The running backend does not support {METHOD_LABEL[config.method]}. Restart it from the latest code.
-              </Banner>
-            )}
-
-            <Form {...formProps} />
-
-            {connectionError && (
-              <Banner tone="error" title={connectionError.title} actions={<><Button size="small" onClick={() => void submit(signedInHere ? "test" : "authenticate")} disabled={busy}>Retry</Button><Button size="small" onClick={app.clearConnectionError}>Dismiss</Button></>}>
-                {connectionError.hint && <div>{connectionError.hint}</div>}
-                <div className="faint" style={{ marginTop: 4 }}>{connectionError.message}</div>
-              </Banner>
-            )}
-
-            {!connectionError && connection.checks.length > 0 && !connected && <CheckList checks={connection.checks} />}
-
-            <div className="row">
-              <Button onClick={() => void submit("authenticate")} loading={connectionBusy === "authenticate"} disabled={busy || !supported}>
-                {azure ? (signedInHere ? "Sign in again" : "Sign in with Azure") : signedInHere ? "Authenticate again" : "Authenticate"}
-              </Button>
-              <Button variant="primary" onClick={() => void submit("test")} loading={connectionBusy === "test"} disabled={busy || !supported || !(signedInHere && config.workspace)}>Test Connection</Button>
-              {changing && <Button variant="ghost" onClick={() => setChanging(false)}>Cancel</Button>}
-            </div>
-          </div>
-        </Card>
+      {connectionBusy === "authenticate" && (
+        <Banner tone="info" title="Waiting for you to sign in">
+          {browser ? "A sign-in window should open on the machine running the accelerator. Complete it there; this page continues on its own." : "A sign-in window has opened in your browser. Complete it there; this page continues on its own."}
+        </Banner>
       )}
+
+      <ScopeSelectors config={config} errors={errors} set={set} signedIn={signedInHere} />
+
+      {connectionError && (
+        <Banner tone="error" title={connectionError.title} actions={<><Button size="small" onClick={() => void submit(signedInHere ? "test" : "authenticate")} disabled={busy}>Retry</Button><Button size="small" onClick={app.clearConnectionError}>Dismiss</Button></>}>
+          {connectionError.hint && <div>{connectionError.hint}</div>}
+          <div className="faint" style={{ marginTop: 4 }}>{connectionError.message}</div>
+        </Banner>
+      )}
+      {!connectionError && connection.checks.length > 0 && !connected && <CheckList checks={connection.checks} label="Source connection checks" />}
+
+      <div className="row conn-actions">
+        <Button variant={signedInHere ? "default" : "primary"} onClick={() => void submit("authenticate")} loading={connectionBusy === "authenticate"} disabled={busy || !supported}>
+          {signedInHere ? "Sign in again" : browser ? "Authenticate" : "Sign in with Azure"}
+        </Button>
+        <Button variant={signedInHere ? "primary" : "default"} onClick={() => void submit("test")} loading={connectionBusy === "test"} disabled={busy || !supported || !(signedInHere && config.workspace)}>Test connection</Button>
+        {changing && <Button variant="ghost" onClick={() => setChanging(false)}>Cancel</Button>}
+      </div>
     </div>
   );
 }

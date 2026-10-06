@@ -105,6 +105,7 @@ export const realApi: MigrationApi = {
   disconnect: () => request<ConnectionState>("/api/connections", { method: "DELETE" }),
   startDiscovery: () => request<DiscoveryStatus>("/api/discovery/start", { method: "POST" }),
   getDiscoveryStatus: () => request<DiscoveryStatus>("/api/discovery/status"),
+  resetDiscovery: () => request<DiscoveryStatus>("/api/discovery", { method: "DELETE" }),
   getResults: (q) => request<ResultsPage>(`/api/discovery/results?${toQueryString(q)}`),
   getObject: (id) =>
     request<ObjectDetail>(`/api/discovery/results/${encodeURIComponent(id)}`),

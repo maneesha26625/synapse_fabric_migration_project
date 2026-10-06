@@ -480,6 +480,8 @@ export interface ValidationRow {
 }
 
 /** The single seam between the UI and whatever supplies data. */
+export type RunControl = "pause" | "resume" | "retry" | "reset";
+
 export interface MigrationApi {
   readonly mode: ApiMode;
   health(): Promise<Health>;
@@ -489,6 +491,8 @@ export interface MigrationApi {
   disconnect(): Promise<ConnectionState>;
   startDiscovery(): Promise<DiscoveryStatus>;
   getDiscoveryStatus(): Promise<DiscoveryStatus>;
+  /** Forget the last discovery's results (the connection is kept). Refused while discovery runs. */
+  resetDiscovery(): Promise<DiscoveryStatus>;
   getResults(query: ResultsQuery): Promise<ResultsPage>;
   getObject(id: string): Promise<ObjectDetail>;
   /** Dropdown contents. Each needs a completed sign-in. */
@@ -498,8 +502,7 @@ export interface MigrationApi {
   getDependencies(): Promise<DependencyGraph>;
   getComponents(): Promise<ComponentRow[]>;
   exportMetadata(): Promise<MetadataExport>;
-  // The calls below have no backend yet. The real client rejects them with a
-  // "not_implemented" error; only the demo client simulates them.
+  // The Fabric target, the planner, the run and validation.
   getFabricTarget(): Promise<FabricTarget>;
   authenticateFabric(config: FabricConfig): Promise<FabricTarget>;
   testFabric(config: FabricConfig): Promise<FabricTarget>;
@@ -508,7 +511,8 @@ export interface MigrationApi {
   analyzePlan(items: PlanItem[], record?: boolean, options?: RunOptions, credentials?: ConnectionCredentials): Promise<PlanAnalysis>;
   startExecution(items: PlanItem[], options?: RunOptions, credentials?: ConnectionCredentials): Promise<ExecutionRun>;
   getExecution(): Promise<ExecutionRun>;
-  controlExecution(action: "pause" | "resume" | "retry"): Promise<ExecutionRun>;
+  /** `reset` forgets the run's record so the next run starts fresh; refused while the run is working. */
+  controlExecution(action: RunControl): Promise<ExecutionRun>;
   /** Compares Synapse with Fabric. With no items, every discovered object is checked. */
   runValidation(items?: PlanItem[]): Promise<ValidationRow[]>;
 }

@@ -1,8 +1,8 @@
-"""The migration run behind the Execute page.
+"""The migration run behind the Migrate step.
 
     GET  /api/migration/run        the current run (or an idle one)
     POST /api/migration/start      {items: [{id, wave}]} -> starts a run
-    POST /api/migration/control    {action: pause | resume | retry}
+    POST /api/migration/control    {action: pause | resume | retry | reset}
 
 A run needs a finished discovery (the Session) and a connected Fabric target
 (FabricTarget), signed in with either the Azure CLI or the Fabric CLI, whose
@@ -394,6 +394,8 @@ class MigrationService:
 
     def control(self, body: dict) -> dict:
         action = str(body.get("action") or "")
+        if action == "reset":
+            return self.reset()
         with self._lock:
             run = self._run
             if run is None:
@@ -423,8 +425,22 @@ class MigrationService:
                 run.log("RETRY", "run", f"retrying {len(failed)} failed objects")
                 self._spawn(run)
             else:
-                raise ApiError(400, "invalid_action", "Choose pause, resume or retry.")
+                raise ApiError(400, "invalid_action", "Choose pause, resume, retry or reset.")
             return run.to_dict()
+
+    def reset(self) -> dict:
+        """Forget the run's record, and the credentials it was given, so the next
+        run starts fresh. Objects already created in Fabric stay there: a new
+        run skips what exists, it never deletes or overwrites."""
+        with self._lock:
+            if self._busy():
+                raise ApiError(409, "run_in_progress",
+                               "The run is still working. Pause it, wait for the current object to finish, then reset.")
+            if self._run is not None:
+                self._run.pause.set()  # a forgotten run can never be resumed
+            self._run = None
+            self._credentials = {}
+        return dict(IDLE)
 
     # -- internals ---------------------------------------------------------
 

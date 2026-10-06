@@ -31,6 +31,7 @@ import {
   type PlanRisk,
   type PlannerRun,
   type RiskSeverity,
+  type RunControl,
   type RunOptions,
   type Strategy,
   type TypeStrategy,
@@ -306,7 +307,7 @@ function runNow(): ExecutionRun {
     }
     if (si.type === "Linked Service" && !sim.credentials.includes(si.name)) {
       return { ...base, step: "Needs credentials", status: "DEFERRED", target: si.name,
-        notes: [`Enter credentials for '${si.name}' under Connections, then run this stage again (demo).`] };
+        notes: [`Enter credentials for '${si.name}' in Plan, Stages & credentials (the Connections stage), then run the Connections stage again from Migrate (demo).`] };
     }
     const begin = slot * sim.per, end = begin + sim.dur;
     slot += 1;
@@ -497,7 +498,7 @@ export const mockApi: MigrationApi = {
 
   async disconnect() {
     await sleep(150);
-    execSim = null;
+    // Like the backend: signing out forgets the discovery, not the record of a run.
     s = fresh();
     return s.connection;
   },
@@ -514,6 +515,17 @@ export const mockApi: MigrationApi = {
   },
 
   async getDiscoveryStatus() {
+    return statusNow();
+  },
+
+  async resetDiscovery() {
+    await sleep(150);
+    if (statusNow().state === "running") throw new ApiRequestError("discovery_running", "Discovery is running; wait for it to finish.", 409);
+    s.startedAt = null;
+    s.startedIso = null;
+    s.objects = null;
+    s.summary = null;
+    s.error = null;
     return statusNow();
   },
 
@@ -712,7 +724,12 @@ export const mockApi: MigrationApi = {
     return runNow();
   },
 
-  async controlExecution(action: "pause" | "resume" | "retry") {
+  async controlExecution(action: RunControl) {
+    if (action === "reset") {
+      if (runNow().state === "running") throw new ApiRequestError("run_in_progress", "The run is still working. Pause it, then reset.", 409);
+      execSim = null;
+      return runNow();
+    }
     if (!execSim) throw new ApiRequestError("no_run", "There is no migration run.", 409);
     const now = Date.now();
     if (action === "pause" && execSim.resumedAt !== null) {
@@ -732,8 +749,9 @@ export const mockApi: MigrationApi = {
     await sleep(500);
     const run = runNow();
     const done = run.items.filter((i) => i.status === "COMPLETED");
-    if (!done.length) throw new ApiRequestError("nothing_to_validate", "Nothing has been migrated yet. Start a migration on Plan & Migrate first.", 409);
+    if (!done.length) throw new ApiRequestError("nothing_to_validate", "Nothing has been migrated yet. Run the migration in the Migrate step first.", 409);
     const rows: ValidationRow[] = [];
+    let short = 0; // deliberate row-count mismatches, at most three
     const category: Record<string, string> = {
       "Dedicated SQL Pool": "Warehouse", Schema: "Schema", Table: "Tables", View: "Views", "Stored Procedure": "Stored Procedures",
       "Spark Pool": "Spark", Notebook: "Notebooks", "Linked Service": "Connections", Pipeline: "Pipelines", Dataset: "Pipelines",
@@ -743,18 +761,18 @@ export const mockApi: MigrationApi = {
       const h = hash(i.id);
       if (i.type === "Table data") {
         const n = 1000 + (h % 900000);
-        const bad = h % 13 === 0;
+        const bad = h % 13 === 0 && short++ < 3;
         rows.push({ category: "Data Count", object: i.name.replace(/ \(data\)$/, ""), source: `${n.toLocaleString()} rows`, target: `${(bad ? n - 12 : n).toLocaleString()} rows`, status: bad ? "MISMATCH" : "MATCH",
           detail: bad ? "12 rows fewer in the Warehouse (demo): check the pipeline run, then reload the table." : "Same row count on both sides." });
       } else if (i.type === "Table") {
-        const changed = h % 4 === 0;
+        const changed = h % 20 === 0;
         rows.push({ category: "Tables", object: i.name, source: "8 columns", target: "8 columns", status: changed ? "REVIEW" : "MATCH",
           detail: changed ? "A column type changed by design (datetime → datetime2(3), demo)." : "Same columns and types." });
       } else if (i.type === "Pipeline" || i.type === "Notebook") {
         const n = 2 + (h % 6);
         rows.push({ category: category[i.type], object: i.name, source: `${n} ${i.type === "Pipeline" ? "activities" : "cells"}`, target: `${n} ${i.type === "Pipeline" ? "activities" : "cells"}`, status: "MATCH", detail: "Present in Fabric with the same structure." });
       } else if (i.type === "View" || i.type === "Stored Procedure") {
-        const review = h % 5 === 0;
+        const review = h % 10 === 0;
         rows.push({ category: category[i.type], object: i.name, source: "definition", target: "definition", status: review ? "REVIEW" : "MATCH",
           detail: review ? "The definition was converted for Fabric (storage options removed); compare its results once." : "The definition text agrees." });
       } else if (category[i.type]) {

@@ -1,6 +1,283 @@
-# Discovery Agent
+# Synapse → Fabric Migration Accelerator
 
-Read-only discovery for an Azure Synapse estate. It enumerates the nine P0
+Moves an **Azure Synapse Analytics** workspace to **Microsoft Fabric**. It
+reads everything in the Synapse workspace, works out how each object maps to
+Fabric, orders the objects into dependency waves, builds and scores a
+migration plan, creates the objects in Fabric, and then compares the two sides
+object by object.
+
+The accelerator *migrates* objects rather than copying them: table structures,
+views, procedures, notebooks, pipelines, connections, Spark settings and
+schedules are rebuilt in their Fabric form, with Synapse-only syntax rewritten
+on the way. Table **data** is never copied through the accelerator. It is
+loaded by **Fabric data pipelines** that the accelerator creates, one per wave.
+
+It is a web application (React, `frontend/`) on a small local Python API
+(`src/discovery_agent/`). **Demo data** mode runs the whole application on
+generated sample data, with no Azure, Synapse or Fabric needed.
+
+**Contents:**
+[What it does](#what-it-does) ·
+[Principles](#principles) ·
+[Quick start](#quick-start) ·
+[Using the application](#using-the-application) ·
+[Architecture](#architecture) ·
+[Repository layout](#repository-layout) ·
+[API](#api) ·
+[What is automated, manual, or coming](#what-is-automated-manual-or-coming) ·
+[Discovery engine](#discovery-engine) ·
+[Connection architecture](#connection-architecture) ·
+[Migration](#migration) ·
+[Tests](#tests)
+
+## What it does
+
+A migration is six steps, done in order. Each step is reviewed and confirmed
+before the next one opens.
+
+| # | Step | What happens | Writes to |
+|---|---|---|---|
+| 1 | **Discover** | Reads every object in the Synapse workspace (SQL pools, tables, views, procedures, scripts, pipelines, datasets, linked services, triggers, notebooks, Spark pools, Spark jobs, libraries, integration runtimes, storage) and maps each one to its Fabric component. | Nothing |
+| 2 | **Assess** | Classifies every object by how it moves: **Direct** (a matching Fabric component exists), **Reconfigure** (same idea, configured differently), **Transform** (code or settings change), **Manual** (needs a person), **Review** (no reliable one-to-one mapping). Also shows the Synapse → Fabric component mapping. | Nothing |
+| 3 | **Waves** | Builds the dependency graph and groups objects into waves, so nothing is created before what it depends on. | Nothing |
+| 4 | **Plan** | Chooses what moves. A deterministic planner gives each object a strategy, lists risks by severity, estimates effort and scores readiness (0–100). Stages, their options and any credentials are set here. | Nothing |
+| 5 | **Migrate** | Pre-run checks, then the run, wave by wave: Warehouse and schemas, empty tables, views, procedures, data pipelines that load the rows, notebooks, connections, pipelines, Spark, jobs, scripts, schedules and shortcuts. Safe to re-run; Retry failed re-runs only the failures. | **Fabric only** |
+| 6 | **Validate** | Compares Synapse with Fabric, object by object: columns and types, row counts, definitions, notebook cells, pipeline activities. | Nothing |
+
+## Principles
+
+* **Synapse is never changed.** Every Azure call against the source is a GET,
+  and every SQL statement is one of a fixed set of named SELECT queries.
+* **Only the Migrate step writes, and only to Fabric.** An object that already
+  exists in Fabric is skipped, never overwritten.
+* **Structure is migrated; data moves through Fabric data pipelines.** Rows go
+  from the Synapse pool to the Fabric Warehouse inside Fabric, never through
+  the accelerator.
+* **No secrets are kept.** Sign-in is done by the Azure CLI, a Microsoft
+  sign-in window, or the Fabric CLI, on the machine running the API. There is
+  no password or token field for signing in. Credentials that Synapse will not
+  give up (for linked services and the data-load connection) are typed into the
+  Plan step, sent once, held in memory, and never stored, logged or returned.
+* **Deterministic.** The same workspace and the same plan give the same
+  result. Parsers and rules do the work; no language model is in the path.
+* **Honest about limits.** Anything that cannot be converted is reported, with
+  the reason, as a risk before the run and as *left for a person* after it.
+
+## Quick start
+
+**You need:** Python 3.10+, Node.js 18+, the Azure CLI (and optionally the
+Fabric CLI), ODBC Driver 18 for SQL Server, and a Fabric workspace on a Fabric
+or Trial capacity.
+
+```
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e ".[dev,live]"
+az login
+.\start-ui.ps1
+```
+
+`start-ui.ps1` starts the API on port 8001 and the UI dev server on port 5173,
+and opens the browser. To start them yourself:
+
+```
+python -m discovery_agent.api              # API on http://127.0.0.1:8001
+cd frontend && npm install && npm run dev  # UI on http://localhost:5173, proxies /api to :8001
+```
+
+Or as one process: `cd frontend && npm run build`, then
+`python -m discovery_agent.api` serves the built UI on port 8001.
+
+**No Azure?** Choose **Demo** in the top bar. A sample Synapse workspace
+(`demo-synapse-ws`, about 1,500 objects) and a sample Fabric workspace
+(`Fabric_demo`) are already connected, and every step works on simulated
+results. See [frontend/README.md](frontend/README.md).
+
+## Using the application
+
+The application has two pages and no sidebar: **Connections**, where a
+migration starts, and **Migration**, where it runs.
+
+### Connections: choose the route and connect
+
+1. **Choose the route.** Two dropdowns: *From* (source) and *To*
+   (destination). **Azure Synapse Analytics** and **Microsoft Fabric** can be
+   chosen today. Other platforms are listed, dimmed and marked *Coming soon*
+   so the roadmap is visible: Azure Data Factory, SQL Server, Azure
+   Databricks, Snowflake, Teradata, Oracle, Amazon Redshift and Google
+   BigQuery as sources; Azure Databricks, Snowflake, Azure SQL Database and
+   Google BigQuery as destinations.
+2. **Connect both sides.** Each side is a card that shows its status, and
+   connecting is three steps: sign in, choose the workspace, test.
+
+   | Side | Sign-in methods |
+   |---|---|
+   | Azure Synapse (source) | **Azure CLI**; **Interactive browser** (for a tenant your `az login` cannot reach; asks only for Tenant ID and Subscription ID); *Workspace export (ZIP)* and *Git repository*, shown as coming soon |
+   | Microsoft Fabric (destination) | **Azure CLI**; **Fabric CLI** |
+
+   After sign-in, Synapse asks for the resource group, workspace and
+   (optional) dedicated SQL pool; Fabric asks for the workspace. A list with a
+   single entry is chosen for you, so a workspace's only SQL pool is never
+   skipped by accident. Test runs real checks: ARM and data-plane access, the
+   SQL pool, and for Fabric the workspace and its **capacity**. While the page
+   first reads both sides it says *Checking…* rather than *Not connected*.
+   Disconnecting the source asks first when discovery results would be lost.
+3. **Start migration.** The button at the bottom is enabled once the route is
+   chosen and both sides are connected and tested, with a capacity on the
+   Fabric workspace. A checklist beside it says what is still missing. If the
+   migration is already under way, the button reads *Continue migration*.
+
+### Migration: the six steps
+
+The six steps sit side by side at the top, each a box with its key number
+(objects found, % direct, waves, readiness, objects migrated, matches) and its
+state: *To do*, *Running*, *Paused*, *Needs attention*, *Ready to confirm*,
+*Done*, *Run again* or *Locked*. Clicking a box opens that step's details
+below the flow, and the address and the browser tab follow the step you are
+on. Steps after the current one stay locked until it is confirmed.
+
+Each step's details start with a short summary row and put the detail in tabs,
+so the page stays readable:
+
+| Step | Summary | Tabs |
+|---|---|---|
+| Discover | Objects, object types, with a Fabric mapping, manual or review, warnings | Overview (a tile per object type; click one to filter), Inventory (searchable table; click a row for the object's details, Fabric target and steps) |
+| Assess | A tile and percentage per class, and a bar across all of them | By workstream, Objects, Component mapping |
+| Waves | Objects, dependencies, waves | Waves (one row per wave with its object types), Dependency graph |
+| Plan | Readiness, objects, automated, needs a person, effort, blocking | Readiness & risks, Objects in plan, Strategy by type, Stages & credentials (configuration only: nothing runs from Plan) |
+| Migrate | Pre-run checks, then the run: every stage that is on or a single stage, progress by wave, every object's result, pause, resume, Retry failed | — |
+| Validate | Checks, match, review, mismatch (each one filters) | One tab per category |
+
+The bar at the foot of every step says where it stands and how to move on:
+*Looks good, continue to …* once the step is finished, *Continue to … anyway*
+when it finished with something worth a look (warnings, failures, blocking
+risks), and a disabled button with the reason while it is not finished. Plan
+cannot be confirmed while a risk is blocking. Confirming the last step shows
+*Migration complete*: the final numbers, said plainly when objects failed or
+checks did not match, and **Download report (CSV)** with every object's result
+and every validation check.
+
+**Starting a step over.** Every step has **Reset step** in its header. It
+clears that step and every step after it (the discovered inventory, the plan
+with its options and typed credentials, the record of the run, the validation
+results, and their confirmations), then lets you do them again from the
+start. A dialog lists exactly what will be cleared first, and says what is not
+touched: the connections, everything in Synapse, and anything already created
+in Fabric (a new run skips what exists; nothing is deleted). Reset is refused,
+with the reason, while discovery, a run or a validation is working. Running
+discovery again from Discover asks first when later steps are confirmed.
+
+**Results that disappear.** Confirmations are kept per project in the
+browser, but the discovery and the run live in the backend's memory and the
+validation results in the page's. When a confirmed step's results are gone
+(the source was signed out, the server restarted, or Demo data was reloaded),
+its box says *Run again* (*Rebuild* for an empty plan), the steps after it wait,
+and *Migration complete* is hidden until it has been redone; the later steps
+then come back by themselves.
+
+### Migration assistant (preview)
+
+The round **+** button at the bottom right (or **Ctrl+I**) opens the
+assistant, docked on the right like an editor's chat. It will help resolve
+migration errors without leaving the screen: explain why an object failed from
+its error and definition, suggest a fix (for example T-SQL a Fabric Warehouse
+accepts) for you to review, and apply it and retry just that object. This
+release shows the panel, the context it will use (step, source, target,
+failed objects) and suggested questions; the conversation itself is not built
+yet, and nothing typed there is sent anywhere.
+
+The layout works from wide screens down to phones: on a phone the top bar
+takes two rows, the step strip swipes sideways with the selected step kept in
+view, and the action bars sit at the end of the page.
+
+### Top bar
+
+Connections and Migration (Migration opens once a source is connected), a
+status chip for each side, the **project menu** (switch projects, or create,
+rename and delete one; each project keeps its own plan, stage options and
+progress in this browser), **Export** (the discovered inventory as JSON),
+**Refresh**, and the **Live / Demo** switch. In Live mode, if the backend does
+not answer, a bar under the top bar says so, with **Retry** and **Use Demo
+data**.
+
+## Architecture
+
+```
+ Browser: React UI (frontend/)
+    │  /api/*   (proxied by Vite in development; same origin when the API serves the build)
+    ▼
+ Local API: python -m discovery_agent.api (port 8001)
+    ├─ connections/          Azure sign-in and every source connection: Azure, Synapse, SQL, Git
+    ├─ discovery, extractors/, records, sql/, synapse/   read the source into Unified Discovery Records
+    ├─ mapping/              Synapse → Fabric mapping, classification, dependency waves
+    ├─ api/fabric.py         Fabric sign-in through the Azure CLI or the Fabric CLI
+    └─ migration/            planner, stages, T-SQL rules, Fabric REST, data pipelines, validation
+             │
+             ▼
+ Microsoft Fabric: REST API, Warehouse SQL endpoint, data pipelines
+```
+
+The UI talks to one interface, `MigrationApi` (`frontend/src/types.ts`). In
+Live mode that is `realApi.ts` and the local API; in Demo mode it is
+`mockApi.ts`, which simulates the same responses in the browser.
+
+## Repository layout
+
+| Path | What is there |
+|---|---|
+| `frontend/` | The web application. `src/pages/` (Setup = Connections, Workspace = Migration), `src/components/` (`setup/`, `connections/`, `journey/` with one panel per step, `discovery/`, `migrate/`, `layout/` with the top bar and assistant, `shared/`), `src/state/`, `src/services/realApi.ts`, `src/mock/`. See [frontend/README.md](frontend/README.md). |
+| `src/discovery_agent/connections/` | Authentication and every external connection. The only place that signs in. |
+| `src/discovery_agent/discovery.py`, `records.py`, `extractors/`, `sql/`, `synapse/`, `acquisition/`, `artifacts/` | The discovery engine: what the workspace, the SQL pool and the Git repository say, merged into one record per object. |
+| `src/discovery_agent/mapping/` | `synapse_fabric_mapping.py` (Fabric target, classification and workstream for each object type and pipeline activity) and `waves.py` (dependency waves). |
+| `src/discovery_agent/migration/` | The planner, the ten stages, the T-SQL rules, Fabric REST calls, data pipelines and validation. See [Migration](#migration). |
+| `src/discovery_agent/api/` | The local HTTP API: `service.py` (connections, discovery, results), `fabric.py` (Fabric sign-in), `migration.py` (plan, run, validate), `mapping.py`, `server.py`. |
+| `tests/` | The backend test suite; runs offline. |
+| `docs/` | [discovery.md](docs/discovery.md), [p0_source_strategy.md](docs/p0_source_strategy.md), [unified_discovery_record.md](docs/unified_discovery_record.md), and the *Synapse to Fabric Transformation Guide* (Word): what changes between Synapse and Fabric, what is automated and what needs a person. |
+| `input/` | Where Git repositories are cloned for discovery (gitignored). |
+| `start-ui.ps1` | Starts the API and the UI together on Windows. |
+
+## API
+
+All under `/api`, JSON in and out. Nothing returns a token or a secret.
+
+| Area | Endpoints |
+|---|---|
+| Health | `GET /health`: the sign-in methods this backend supports, what discovery reads, and the types a run migrates |
+| Synapse connection | `GET /connections` · `POST /connections/authenticate` · `POST /connections/test` · `DELETE /connections` · `GET /azure/<subscriptions, resource groups, workspaces, pools>` for the dropdowns |
+| Discovery | `POST /discovery/start` · `GET /discovery/status` · `GET /discovery/results` (filter, sort, page) · `GET /discovery/results/<id>` · `GET /discovery/export` · `DELETE /discovery` (forget the results; refused while discovery runs) |
+| Mapping and waves | `GET /mapping/components` · `GET /dependencies` |
+| Fabric connection | `GET /fabric/connection` · `POST /fabric/authenticate` · `POST /fabric/workspaces` · `POST /fabric/test` · `DELETE /fabric/connection` |
+| Migration | `GET /migration/capabilities` · `POST /migration/plan` · `POST /migration/start` · `GET /migration/run` · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: forget the run's record, refused while it is working) · `POST /migration/validate` |
+
+## What is automated, manual, or coming
+
+**Automated by a migration run:** Warehouse (one per SQL pool) and schemas;
+tables as empty structures with types mapped and keys recreated `NOT
+ENFORCED`; views and stored procedures after the T-SQL rules; table data
+through per-wave Fabric data pipelines with row counts compared; custom Spark
+pools and Environments; notebooks with `mssparkutils` and Synapse connector
+calls rewritten; linked services as Fabric connections (SQL, ADLS Gen2, Blob)
+from the credentials you enter; pipelines with datasets embedded and
+references re-pointed; Spark job definitions; SQL scripts as Warehouse
+notebooks; schedule triggers (created switched off); external tables as
+OneLake shortcuts.
+
+**Left for a person, and reported as such:** integration runtimes; linked
+services of other types; event and tumbling-window triggers and unusual
+recurrences; pipelines containing an activity with no Fabric equivalent (for
+example mapping data flows); .NET notebooks; Spark libraries; materialized
+views, `sys.pdw_*` system views and `COPY INTO` with Synapse's managed
+identity; security, networking and workload management.
+
+**Shown in the UI, not built yet:** sources and destinations other than
+Synapse and Fabric; connecting from a workspace ZIP export or a Git repository
+in the UI (the discovery engine can already read a repository from the command
+line); the migration assistant's conversation.
+
+## Discovery engine
+
+The engine under the Discover step, also usable on its own from the command
+line (`python -m discovery_agent`). Read-only discovery for an Azure Synapse estate. It enumerates the nine P0
 artifacts from whichever sources are reachable — the Git-integrated
 repository, the live workspace, and the dedicated SQL pool — and reports what
 each source said, together with what could not be established.
@@ -17,10 +294,10 @@ each source said, together with what could not be established.
 * No LLM. Structural facts are extracted by parsers, not by a model.
 * No secrets. Not redacted — structurally unable to be carried.
 
-Assessment (complexity scoring, effort, migration planning) and migration
-itself are separate components and deliberately not part of this agent.
+Assessment, planning and migration are separate packages (`mapping/`,
+`migration/`) that build on its records; the engine itself never writes.
 
-## Pipeline
+### Pipeline
 
 ```
                     ┌─ Git acquisition ──→ walk ──→ detect ──┐
@@ -38,30 +315,7 @@ summarised, not persisted. See **[docs/discovery.md](docs/discovery.md)** for
 the source-of-truth strategy, degradation behaviour, provenance and the full
 list of limitations.
 
-## Setup
-
-```
-python -m venv .venv
-.venv\Scripts\activate
-pip install -e ".[dev]"
-```
-
-For the live connection chain (Azure, Synapse, dedicated SQL pool) add the
-`live` extra, and sign in with the Azure CLI:
-
-```
-pip install -e ".[dev,live]"
-az login
-```
-
-## Web UI
-
-`frontend/` holds the Connections and Discovery UI, and `python -m
-discovery_agent.api` is the small local API it talks to. The API adds no
-authentication path and no discovery logic: it calls `ConnectionManager` and
-`discovery.run`. See **[frontend/README.md](frontend/README.md)**.
-
-## Repository acquisition
+### Repository acquisition
 
 Clones the source repository into `input/repository/<repository-name>/` and
 returns the snapshot's identity, including the exact checked-out commit SHA:
@@ -405,7 +659,7 @@ follow this rule themselves: both are consumers of the connection layer, not
 second connection paths. They are the worked examples to copy.
 
 
-## Discovery
+## Discovery from the command line
 
 You say *where* to look. The tool works out *what is there* — there is no flag
 with which to name a pipeline, a notebook or a table, because enumerating them
@@ -468,16 +722,17 @@ the data plane.
 
 ## Migration
 
-The **Plan & Migrate** page scores the plan, lets you choose which **stages**
-run and how, checks the target, then runs the migration wave by wave. It is the
-one part of the application that writes, and it writes only to Fabric: nothing
-in Synapse is changed.
+The **Plan** step scores the plan and is where you choose which **stages** run
+and how (*Stages & credentials*). The **Migrate** step checks the target, then
+runs the migration wave by wave. Migrate is the one part of the application
+that writes, and it writes only to Fabric: nothing in Synapse is changed.
 
 ### Stages
 
-Each stage is a capability you switch on or off, tune, and run on its own
-("Run this stage") or together ("Start migration", in dependency order). The
-list lives in one place, `migration/capabilities.py`, and the UI reads it from
+Each stage is a capability you switch on or off and tune in Plan, under
+*Stages & credentials*. The Migrate step runs every stage that is on, in
+dependency order, or a single stage on its own (*What to run*). The list lives
+in one place, `migration/capabilities.py`, and the UI reads it from
 `GET /api/migration/capabilities`.
 
 | Stage | Synapse object | Becomes in Fabric | Strategy / notes |
@@ -525,7 +780,7 @@ with Synapse's managed identity).
   jobs, pipelines, shortcuts, schedules. *Stop at the end of a wave with
   failures* is an option, and Pause stops after the current object.
 * **One Warehouse per SQL pool,** named after the pool.
-* **A Fabric capacity is required.** Test Connection on the Fabric Target page
+* **A Fabric capacity is required.** Test connection on the Connections page
   reports it, and a run is refused up front without one.
 * **Sign-in: either CLI.** With **Azure CLI** the run gets tokens from `az` for
   the Fabric API and the Warehouse SQL endpoint. With **Fabric CLI**, Fabric
@@ -542,7 +797,7 @@ with Synapse's managed identity).
 
 ### Validation
 
-The **Validation** page (`POST /api/migration/validate`) compares the discovered
+The **Validate** step (`POST /api/migration/validate`) compares the discovered
 Synapse objects with what is now in Fabric, object by object, and reads both
 sides without writing to either. Each row says what it saw on each side:
 
@@ -572,7 +827,8 @@ dataRun, collation, stopOnFailure}, credentials}`), `GET /api/migration/run` and
 ## Tests
 
 ```
-pytest
+pytest                                  # backend: 1,304 tests
+cd frontend && npm run typecheck && npm test   # UI: type check and 43 tests
 ```
 
 Tests run fully offline — no network access, no Azure subscription, no ODBC
@@ -589,3 +845,12 @@ SYNAPSE_SQL_INTEGRATION=1 SYNAPSE_SQL_SERVER=... SYNAPSE_SQL_DATABASE=... pytest
 # the whole connection chain, against a real subscription
 CONNECTIONS_INTEGRATION=1 AZURE_SUBSCRIPTION_ID=... SYNAPSE_RESOURCE_GROUP=...   SYNAPSE_WORKSPACE_NAME=... SYNAPSE_SQL_POOL=... pytest
 ```
+
+The UI tests run against Demo data in a simulated browser: choosing the
+route (only Synapse and Fabric selectable), the sign-in methods (ZIP and Git
+shown but not selectable), Start migration staying disabled until both sides
+are connected and tested, the step lock and Next, resetting a step, results
+that disappear (*Run again*), stage options kept per project, the project menu,
+the backend-unavailable bar, the dialogs that ask first, every step's panel, the
+assistant, the old page addresses, and that a typed credential never reaches
+browser storage.

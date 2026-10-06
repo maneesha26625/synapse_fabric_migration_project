@@ -2,7 +2,7 @@
 
 Discovery never writes; this is the one place that does, and it writes only to
 ``api.fabric.microsoft.com``. The token comes from a provider callable (the
-Fabric Target page's Azure CLI sign-in) and is put into a header at the call,
+Connections page's Azure CLI sign-in) and is put into a header at the call,
 never kept on this object.
 
 Fabric answers a create in one of two ways: ``201`` with the item, or ``202``
