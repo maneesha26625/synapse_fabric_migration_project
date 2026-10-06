@@ -22,7 +22,7 @@ from discovery_agent.api.migration import (
     MigrationService, apply_stages, data_sources, parse_credentials, parse_options, pipeline_bundle, sources_for,
 )
 from discovery_agent.api.service import ApiError
-from discovery_agent.migration import capabilities, datacopy, fabric_connections, jobs, pipelines, warehouse_ddl
+from discovery_agent.migration import capabilities, datacopy, datapipeline, fabric_connections, jobs, pipelines, warehouse_ddl
 from discovery_agent.migration.common import (
     COMPLETED, CONNECTION, DATA, DATASET, DEFERRED, DEFERRED_STATUS, FAILED, PIPELINE, SCHEDULE, SCRIPT, SHORTCUT,
     SKIPPED, SPARKJOB, TABLE, MigrationError, Source,
@@ -33,7 +33,7 @@ from discovery_agent.migration.runner import MigrationRun, Migrator
 from discovery_agent.source_strategy import P0Artifact
 from discovery_agent.sql.models import DistributionPolicy, SqlColumn, SqlObjectKey, SqlTable
 
-from test_migration import FakeDb, FakeSession, WS, table  # noqa: E402 - shared fixtures
+from test_migration import FakeDb, FakeSender, FakeSession, WS, client, table  # noqa: E402 - shared fixtures
 
 # --- fakes ------------------------------------------------------------------------
 
@@ -193,70 +193,207 @@ def data_source(tbl=None):
 ORDERS = "[sales].[Orders]"
 
 # =============================================================================
-# table data
+# table data: one Fabric data pipeline per wave
 # =============================================================================
 
-
-def test_rows_are_copied_in_safe_batches_with_typed_parameters_and_counts_verified():
-    run, _, db = migrate([data_source()], db=DataDb({ORDERS: []}), source=SourceDb(rows(2500)))
-    item = one(run)
-    assert item.status == COMPLETED and "2,500 rows" in item.step and "counts match" in item.step
-    assert len(db.tables[ORDERS]) == 2500
-    # 4 columns -> 500 rows per INSERT (2000 parameters), so five statements
-    assert [n for n, _, _ in db.inserts] == [500] * 5
-    assert all(params <= 2000 for _, params, _ in db.inserts)
-    assert "CAST(? AS int)" in db.inserts[0][2] and "CAST(? AS decimal(19,4))" in db.inserts[0][2]
+POOL_CONN = "synapse-ws-pool01"
+POOL_CREDS = {POOL_CONN: {"authType": "basic", "username": "loader", "password": "TOPSECRET"}}
+LINES = "[sales].[Lines]"
 
 
-def test_a_table_that_already_has_rows_is_left_alone_unless_replace_is_chosen():
-    existing = {ORDERS: [[1, "x", Decimal("1"), datetime(2026, 1, 1)]]}
-    run, _, db = migrate([data_source()], db=DataDb(existing), source=SourceDb(rows(3)))
-    assert one(run).status == SKIPPED and len(db.tables[ORDERS]) == 1
-    run, _, db = migrate([data_source()], db=DataDb(existing), source=SourceDb(rows(3)), settings={"dataMode": "replace"})
-    assert one(run).status == COMPLETED and len(db.tables[ORDERS]) == 3
-    assert any("Replaced 1 row" in n for n in one(run).notes)
+class PipelineRest(StageRest):
+    """A fake workspace that also runs data pipelines: a run loads each listed table from ``source_rows``."""
+
+    def __init__(self, db, source_rows=None, outcome="Completed", **seed):
+        super().__init__(**seed)
+        self.db, self.source_rows, self.outcome, self.runs = db, dict(source_rows or {}), outcome, []
+
+    def run_job(self, path, body):
+        self.runs.append((path, body))
+        if self.outcome == "Completed":
+            for e in body["executionData"]["parameters"]["tables"]:
+                key = f"[{e['schema']}].[{e['table']}]"
+                if e["preCopyScript"]:
+                    self.db.tables[key] = []
+                self.db.tables[key].extend(self.source_rows.get(key, []))
+        return f"/workspaces/{WS}/items/{path.split('/')[4]}/jobs/instances/job-{len(self.runs)}"
+
+    def get(self, path):
+        if "/jobs/instances/" in path:
+            return {"status": self.outcome, "failureReason": {"message": "Login failed for user 'loader'."} if self.outcome == "Failed" else None}
+        return super().get(path)
 
 
-def test_a_table_over_the_row_limit_is_deferred_to_a_pipeline_copy():
-    run, _, db = migrate([data_source()], db=DataDb({ORDERS: []}), source=SourceDb(rows(50)), settings={"maxRows": 10})
-    item = one(run)
-    assert item.status == DEFERRED_STATUS and "Copy activity" in item.notes[0] and db.tables[ORDERS] == []
+class SourceCounts:
+    """A fake Synapse pool that only answers row counts, per table."""
+
+    def __init__(self, counts):
+        self.counts = dict(counts)
+
+    def cursor(self):
+        db = self
+
+        class Cursor:
+            _row = None
+
+            def execute(self, sql, *params):
+                self._row = (db.counts.get(sql.split("FROM ")[1], 0),)
+
+            def fetchone(self):
+                return self._row
+
+        return Cursor()
+
+    def close(self):
+        pass
 
 
-def test_a_row_count_mismatch_clears_the_partial_rows_and_fails():
-    run, _, db = migrate([data_source()], db=DataDb({ORDERS: []}, drop_last=True), source=SourceDb(rows(10)))
-    item = one(run)
-    assert item.status == FAILED and "do not match" in item.error and db.tables[ORDERS] == []
+def data_item(name="Orders", wave=2):
+    tbl = table(name=name)
+    return Source(f"{name}#data", f"sales.{name} (data)", "Table data", wave, DATA, payload=tbl, schema="sales", object_name=name)
 
 
-def test_a_failure_part_way_clears_what_was_loaded_so_a_rerun_is_not_fooled():
-    run, _, db = migrate([data_source()], db=DataDb({ORDERS: []}, fail_after=500), source=SourceDb(rows(2000)))
-    assert one(run).status == FAILED and "partial rows were cleared" in one(run).error and db.tables[ORDERS] == []
+def load(sources, db, rest, source=None, credentials=POOL_CREDS, settings=None):
+    run = MigrationRun("001", sources, WS, "Sales WS", "pool01")
+    run.pool_name, run.source_server, run.source_database, run.source_connection_name = "pool01", "ws.sql.azuresynapse.net", "pool01", POOL_CONN
+    if settings:
+        run.settings.update(settings)
+    Migrator(run, lambda: rest, lambda host, database: db, source_factory=(lambda: source) if source is not None else None,
+             credentials=credentials).execute()
+    return run
 
 
-def test_data_needs_the_table_to_exist_and_the_source_to_be_connected():
-    run, _, _ = migrate([data_source()], db=DataDb({}), source=SourceDb(rows(1)))
-    assert "Warehouse stage first" in one(run).error
-    run, _, _ = migrate([data_source()], db=DataDb({ORDERS: []}))
-    assert "not connected" in one(run).error
+def pipeline_content(rest, name):
+    body = next(b for p, b in rest.created if p.endswith("/dataPipelines") and b["displayName"] == name)
+    return json.loads(base64.b64decode(body["definition"]["parts"][0]["payload"]))
 
 
-def test_an_empty_source_table_is_a_completed_no_op_and_an_external_table_is_skipped():
-    run, _, _ = migrate([data_source()], db=DataDb({ORDERS: []}), source=SourceDb([]))
-    assert one(run).status == COMPLETED and "empty" in one(run).step
+def test_each_wave_gets_one_pipeline_that_loads_its_tables_and_row_counts_are_compared():
+    db = DataDb({ORDERS: [], LINES: [], "[sales].[Late]": []})
+    rest = PipelineRest(db, {ORDERS: rows(3), LINES: rows(5), "[sales].[Late]": rows(1)})
+    source = SourceCounts({ORDERS: 3, LINES: 5, "[sales].[Late]": 1})
+    run = load([data_item("Orders"), data_item("Lines"), data_item("Late", wave=3)], db, rest, source)
+    assert [i.status for i in run.items] == [COMPLETED] * 3
+    assert all("counts match" in i.step for i in run.items)
+    assert by_target(run)["pool01.sales.Lines"].step == "Loaded 5 rows by pipeline; counts match"
+    # one connection to the pool, created from the credentials entered; the secret never reaches the log
+    conns = [b for p, b in rest.created if p == "/connections"]
+    assert len(conns) == 1 and conns[0]["displayName"] == POOL_CONN
+    params = {p["name"]: p["value"] for p in conns[0]["connectionDetails"]["parameters"]}
+    assert params == {"server": "ws.sql.azuresynapse.net", "database": "pool01"}
+    assert "TOPSECRET" not in "\n".join(run.logs)
+    # one pipeline per wave, run once each, with that wave's tables only
+    names = [b["displayName"] for p, b in rest.created if p.endswith("/dataPipelines")]
+    assert names == ["load_pool01_wave_2", "load_pool01_wave_3"]
+    assert [len(b["executionData"]["parameters"]["tables"]) for _, b in rest.runs] == [2, 1]
+    assert all("jobType=Pipeline" in p for p, _ in rest.runs)
+    content = pipeline_content(rest, "load_pool01_wave_2")
+    loop = content["properties"]["activities"][0]
+    copy = loop["typeProperties"]["activities"][0]
+    assert loop["type"] == "ForEach" and loop["typeProperties"]["items"]["value"] == "@pipeline().parameters.tables"
+    assert copy["typeProperties"]["source"]["type"] == "SqlDWSource"
+    assert copy["typeProperties"]["source"]["datasetSettings"]["externalReferences"]["connection"] == "connections-1"
+    assert copy["typeProperties"]["sink"]["type"] == "DataWarehouseSink"
+    assert copy["typeProperties"]["sink"]["datasetSettings"]["linkedService"]["properties"]["typeProperties"]["artifactId"] == "wh-1"
+    entry = content["properties"]["parameters"]["tables"]["defaultValue"][0]
+    assert entry["query"].startswith("SELECT [OrderId], [Customer], [Amount], [OrderedAt] FROM [sales].[Orders]")
+
+
+def by_target(run):
+    return {i.target: i for i in run.items}
+
+
+def test_tables_with_rows_are_skipped_unless_replace_which_truncates_inside_the_pipeline():
+    db = DataDb({ORDERS: [[1, "x", Decimal("1"), datetime(2026, 1, 1)]]})
+    rest = PipelineRest(db, {ORDERS: rows(4)})
+    run = load([data_item()], db, rest, SourceCounts({ORDERS: 4}))
+    assert one(run).status == SKIPPED and "Already has 1 row" in one(run).step and not rest.runs
+    run = load([data_item()], db, rest, SourceCounts({ORDERS: 4}), settings={"dataMode": "replace"})
+    assert one(run).status == COMPLETED and len(db.tables[ORDERS]) == 4
+    assert rest.runs[-1][1]["executionData"]["parameters"]["tables"][0]["preCopyScript"] == "TRUNCATE TABLE [sales].[Orders]"
+
+
+def test_without_credentials_or_an_existing_connection_the_tables_wait_for_one():
+    db = DataDb({ORDERS: []})
+    rest = PipelineRest(db)
+    run = load([data_item()], db, rest, credentials={})
+    assert one(run).status == DEFERRED_STATUS and "Synapse pool connection" in one(run).step
+    assert POOL_CONN in one(run).notes[0] and not rest.created
+
+
+def test_an_existing_connection_to_the_pool_is_reused():
+    db = DataDb({ORDERS: []})
+    existing = {"id": "c-9", "displayName": "my synapse", "connectionDetails": {"type": "SQL", "path": "ws.sql.azuresynapse.net;pool01"}}
+    rest = PipelineRest(db, {ORDERS: rows(2)}, connections=[existing])
+    run = load([data_item()], db, rest, SourceCounts({ORDERS: 2}), credentials={})
+    assert one(run).status == COMPLETED and not [p for p, _ in rest.created if p == "/connections"]
+    copy = pipeline_content(rest, "load_pool01_wave_2")["properties"]["activities"][0]["typeProperties"]["activities"][0]
+    assert copy["typeProperties"]["source"]["datasetSettings"]["externalReferences"]["connection"] == "c-9"
+
+
+def test_a_failed_pipeline_run_fails_every_table_with_fabrics_reason():
+    db = DataDb({ORDERS: [], LINES: []})
+    run = load([data_item("Orders"), data_item("Lines")], db, PipelineRest(db, outcome="Failed"), SourceCounts({}))
+    assert [i.status for i in run.items] == [FAILED, FAILED]
+    assert all("Login failed" in i.error for i in run.items)
+
+
+def test_a_count_mismatch_fails_only_that_table():
+    db = DataDb({ORDERS: [], LINES: []})
+    rest = PipelineRest(db, {ORDERS: rows(3), LINES: rows(2)})
+    run = load([data_item("Orders"), data_item("Lines")], db, rest, SourceCounts({ORDERS: 3, LINES: 9}))
+    got = by_target(run)
+    assert got["pool01.sales.Orders"].status == COMPLETED
+    assert got["pool01.sales.Lines"].status == FAILED and "9 rows in Synapse, 2 rows in the Warehouse" in got["pool01.sales.Lines"].error
+
+
+def test_create_only_makes_the_pipeline_and_leaves_running_it_to_the_operator():
+    db = DataDb({ORDERS: []})
+    rest = PipelineRest(db)
+    run = load([data_item()], db, rest, settings={"dataRun": "create"})
+    assert one(run).status == COMPLETED and "run it in Fabric" in one(run).step and not rest.runs
+
+
+def test_an_existing_pipeline_is_reused_and_given_this_runs_table_list():
+    db = DataDb({ORDERS: []})
+    rest = PipelineRest(db, {ORDERS: rows(1)}, dataPipelines=[{"id": "pl-7", "displayName": "load_pool01_wave_2"}])
+    run = load([data_item()], db, rest, SourceCounts({ORDERS: 1}))
+    assert one(run).status == COMPLETED and not [p for p, _ in rest.created if p.endswith("/dataPipelines")]
+    assert "/items/pl-7/jobs/instances" in rest.runs[0][0]
+
+
+def test_a_table_missing_from_the_warehouse_fails_alone_and_external_tables_are_skipped():
+    db = DataDb({ORDERS: []})
+    rest = PipelineRest(db, {ORDERS: rows(1)})
     external = SqlTable(key=SqlObjectKey("pool", "sales", "Ext"), is_external=True, columns=table().columns)
-    run, _, _ = migrate([data_source(external)], db=DataDb({"[sales].[Orders]": []}), source=SourceDb([]))
-    assert one(run).status == SKIPPED
+    ext = Source("Ext#data", "sales.Ext (data)", "Table data", 2, DATA, payload=external, schema="sales", object_name="Ext")
+    run = load([data_item("Orders"), data_item("Gone"), ext], db, rest, SourceCounts({ORDERS: 1}))
+    got = {i.source.name: i for i in run.items}
+    assert got["sales.Orders (data)"].status == COMPLETED
+    assert got["sales.Gone (data)"].status == FAILED and "Warehouse & schema stage first" in got["sales.Gone (data)"].error
+    assert got["sales.Ext (data)"].status == SKIPPED
+    assert [len(b["executionData"]["parameters"]["tables"]) for _, b in rest.runs] == [1]
 
 
-def test_values_are_prepared_for_the_driver_and_wide_tables_are_batched_by_parameter_count():
-    assert datacopy.to_parameter(bytearray(b"ab")) == b"ab" and datacopy.to_parameter(float("nan")) is None
-    assert datacopy.to_parameter(Decimal("NaN")) is None and datacopy.to_parameter(5) == 5
-    assert datacopy.batch_rows(1) == 1000 and datacopy.batch_rows(4) == 500 and datacopy.batch_rows(1500) == 1
+def test_without_the_synapse_source_the_load_still_runs_but_counts_are_not_compared():
+    db = DataDb({ORDERS: []})
+    run = load([data_item()], db, PipelineRest(db, {ORDERS: rows(2)}), source=None)
+    assert one(run).status == COMPLETED and any("not compared" in n for n in one(run).notes)
+
+
+def test_the_run_is_followed_on_the_fabric_host_even_when_fabric_answers_with_a_regional_link():
+    sender = FakeSender([(202, {"location": "https://wabi-west.analysis.windows.net/v1/workspaces/w/items/p/jobs/instances/j-1"}, {})])
+    path = client(sender).run_job("/workspaces/w/items/p/jobs/instances?jobType=Pipeline", {"executionData": {}})
+    assert path == "/workspaces/w/items/p/jobs/instances/j-1"
+    assert sender.requests[0][1] == "https://api.fabric.microsoft.com/v1/workspaces/w/items/p/jobs/instances?jobType=Pipeline"
+
+
+def test_read_helpers_carry_awkward_types_and_refuse_tables_fabric_cannot_hold():
     wide = SqlTable(key=SqlObjectKey("pool", "s", "W"), columns=tuple(SqlColumn(i, f"c{i}", "int", 4, 10, 0, True, False) for i in range(1, 1100)))
     assert datacopy.preflight(wide)[0] == "TOO_WIDE"
     geo = SqlColumn(1, "g", "geography", -1, 0, 0, True, False)
     assert datacopy.source_expression(geo) == "[g].STAsBinary() AS [g]"
+    assert datapipeline.pipeline_name("pool-01 x", 3) == "load_pool_01_x_wave_3"
 
 
 # =============================================================================
@@ -539,8 +676,10 @@ def test_objects_run_in_the_order_they_depend_on_each_other():
 
 
 def test_run_options_are_validated_and_credentials_are_checked_for_shape_only():
-    assert parse_options({})["stages"] == list(capabilities.STAGE_KEYS) and parse_options({})["dataMode"] == "if_empty"
-    for bad in ({"stages": ["nope"]}, {"stages": "data"}, {"dataMode": "wipe"}, {"maxRows": 0}, {"maxRows": "many"}, {"maxRows": 10**9}, {"scope": "x"}):
+    defaults = parse_options({})
+    assert defaults["stages"] == list(capabilities.STAGE_KEYS) and defaults["dataMode"] == "if_empty"
+    assert defaults["dataRun"] == "run" and defaults["collation"] == "match_synapse"
+    for bad in ({"stages": ["nope"]}, {"stages": "data"}, {"dataMode": "wipe"}, {"dataRun": "later"}, {"collation": "binary"}, {"scope": "x"}):
         with pytest.raises(ApiError) as exc:
             parse_options({"options": bad})
         assert exc.value.code == "invalid_options"
@@ -598,10 +737,12 @@ def test_planning_flags_what_would_fail_before_anything_runs():
     assert "NEEDS_CREDENTIALS" in codes
     assert "NEEDS_CREDENTIALS" not in {f.code for f in content_findings(sources, {"ls_sql"})}
     flow = Source("p", "df", "Pipeline", 4, PIPELINE, payload={"resource": {"properties": {"activities": [{"name": "DF", "type": "ExecuteDataFlow"}]}}, "datasets": {}, "linkedServices": {}})
-    bad_script = Source("q", "q", "SQL Script", 3, SCRIPT, payload={"properties": {"content": {"query": "CREATE TABLE x WITH (DISTRIBUTION = ROUND_ROBIN) AS SELECT 1", "metadata": {"language": "sql"}}}})
+    fixable = Source("q", "q", "SQL Script", 3, SCRIPT, payload={"properties": {"content": {"query": "CREATE TABLE x WITH (DISTRIBUTION = ROUND_ROBIN) AS SELECT 1", "metadata": {"language": "sql"}}}})
+    bad_script = Source("r", "r", "SQL Script", 3, SCRIPT, payload={"properties": {"content": {"query": "SELECT * FROM sys.dm_pdw_exec_requests", "metadata": {"language": "sql"}}}})
     bad_trigger = Source("t", "t", "Trigger", 7, SCHEDULE, payload=trigger("Month"))
-    codes = {f.code for f in content_findings([flow, bad_script, bad_trigger], set())}
-    assert {"NEEDS_REWRITE", "SYNAPSE_TSQL", "RECREATE_BY_HAND"} <= codes
+    found = content_findings([flow, fixable, bad_script, bad_trigger], set())
+    assert {"NEEDS_REWRITE", "SYNAPSE_TSQL", "RECREATE_BY_HAND", "TSQL_CONVERTED"} <= {f.code for f in found}
+    assert {f.code for f in found if f.object_id == "q"} == {"TSQL_CONVERTED"}  # the rules fix it; nothing left to review
 
 
 def test_the_source_check_appears_only_when_a_stage_needs_the_pool():
@@ -616,7 +757,20 @@ def test_the_service_exposes_the_stages_and_the_linked_services_that_need_creden
     caps = svc.capabilities()
     assert [s["key"] for s in caps["stages"]] == list(capabilities.STAGE_KEYS)
     data = next(s for s in caps["stages"] if s["key"] == "data")
-    assert data["options"][0]["key"] == "dataMode" and {c["value"] for c in data["options"][0]["choices"]} == {"if_empty", "replace"}
+    assert [o["key"] for o in data["options"]] == ["dataRun", "dataMode"] and data["needsInput"] == "credentials"
+    assert {c["value"] for c in data["options"][1]["choices"]} == {"if_empty", "replace"} and all(c["label"] for c in data["options"][1]["choices"])
+    warehouse = next(s for s in caps["stages"] if s["key"] == "warehouse")
+    assert {c["value"] for c in warehouse["options"][0]["choices"]} == {"match_synapse", "case_insensitive", "case_sensitive"}
     assert {l["name"] for l in caps["linkedServices"]} == {"ls_sql", "ls_adls"}
+    assert {l["stage"] for l in caps["linkedServices"]} == {"connections"}
     assert next(l for l in caps["linkedServices"] if l["name"] == "ls_adls")["needsPath"] is True
     assert "TOPSECRET" not in json.dumps(caps)
+
+
+def test_the_data_stage_asks_for_a_credential_for_the_synapse_pool_connection():
+    session = FakeSession(fake_job2())
+    session.source_endpoint = lambda: ("ws", "ws.sql.azuresynapse.net", "pool01")
+    svc = MigrationService(session, SimpleNamespace(state=lambda: {}, migration_target=lambda: (WS, "W", "azure_cli")), rest_factory=lambda: StageRest())
+    pool = next(l for l in svc.capabilities()["linkedServices"] if l["stage"] == "data")
+    assert pool["name"] == "synapse-ws-pool01" and pool["fabricType"] == "SQL"
+    assert {a["value"] for a in pool["authTypes"]} == {"basic", "servicePrincipal"}

@@ -10,21 +10,38 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from discovery_agent.migration import datacopy, environments, fabric_connections, jobs, notebooks, pipelines, warehouse_ddl
+from discovery_agent.migration import datacopy, environments, fabric_connections, jobs, notebooks, pipelines, tsql_rules, warehouse_ddl
 from discovery_agent.migration.common import (
     CONNECTION, DATA, ENVIRONMENT, NOTEBOOK, PIPELINE, PROCEDURE, SCHEDULE, SCRIPT, SPARKJOB, TABLE, VIEW, Source,
 )
 from discovery_agent.migration.planner import BLOCKING, HIGH, LOW, MEDIUM, Finding
 
-#: Dedicated-pool-only T-SQL that a Fabric Warehouse rejects or ignores.
+#: Dedicated-pool-only T-SQL that a Fabric Warehouse rejects, checked *after* the T-SQL rules
+#: (``tsql_rules``) have converted what they can. CTAS, OPTION (LABEL) and UPDATE STATISTICS
+#: are not listed: a Warehouse supports them.
 SYNAPSE_ONLY = (
     (re.compile(r"\bDISTRIBUTION\s*=", re.I), "a DISTRIBUTION option"),
     (re.compile(r"\bCLUSTERED\s+COLUMNSTORE\b", re.I), "CLUSTERED COLUMNSTORE INDEX"),
-    (re.compile(r"\bOPTION\s*\(\s*LABEL\b", re.I), "an OPTION (LABEL) query hint"),
-    (re.compile(r"\bCREATE\s+TABLE\b[^;]*?\bAS\s+SELECT\b", re.I | re.S), "CREATE TABLE AS SELECT (CTAS)"),
     (re.compile(r"\bRENAME\s+OBJECT\b", re.I), "RENAME OBJECT"),
-    (re.compile(r"\bUPDATE\s+STATISTICS\b", re.I), "UPDATE STATISTICS"),
+    (re.compile(r"\bsys\.(?:dm_)?pdw_", re.I), "Synapse system views (sys.pdw_*)"),
+    (re.compile(r"\bCREATE\s+(?:MATERIALIZED\s+VIEW|EXTERNAL\s+TABLE)\b", re.I), "a materialized view or external table"),
+    (re.compile(r"IDENTITY\s*=\s*'Managed Identity'", re.I), "COPY INTO with Synapse's managed identity"),
 )
+
+
+def _sql_findings(source: Source, text: str, after_rules: bool = True) -> List[Finding]:
+    """What the T-SQL rules will fix (LOW) and what is left for a person (MEDIUM)."""
+    converted = tsql_rules.rewrite(text)
+    # The rules leave what they removed as a comment; check only live code for leftovers.
+    live = re.sub(r"/\*.*?\*/|--[^\n]*", " ", converted.text, flags=re.S)
+    hits = [label for pattern, label in SYNAPSE_ONLY if pattern.search(live)]
+    found: List[Finding] = []
+    if converted.changed:
+        found.append(Finding(source.id, "TSQL_CONVERTED", LOW, f"{source.name}: converted automatically: " + " ".join(converted.notes)))
+    if hits:
+        found.append(Finding(source.id, "SYNAPSE_TSQL", MEDIUM,
+                             f"{source.name} uses {', '.join(hits)}, which a Fabric Warehouse rejects. Review it after the run."))
+    return found
 
 
 def _table(source: Source) -> List[Finding]:
@@ -47,11 +64,7 @@ def _module(source: Source) -> List[Finding]:
     if not text or not getattr(definition, "is_readable", False):
         return [Finding(source.id, "DEFINITION_UNREADABLE", BLOCKING,
                         f"{source.name}: the definition is encrypted or VIEW DEFINITION is not granted, so it cannot be recreated.")]
-    hits = [label for pattern, label in SYNAPSE_ONLY if pattern.search(text)]
-    if hits:
-        return [Finding(source.id, "SYNAPSE_TSQL", MEDIUM,
-                        f"{source.name} uses {', '.join(hits)}, which a Fabric Warehouse may reject. Review it after the run.")]
-    return []
+    return _sql_findings(source, text)
 
 
 def _notebook(source: Source) -> List[Finding]:
@@ -120,10 +133,7 @@ def _script(source: Source) -> List[Finding]:
     except jobs.NotConvertible as exc:
         return [Finding(source.id, "NEEDS_REWRITE", HIGH, f"{source.name}: {exc}")]
     query = str(((source.payload or {}).get("properties") or {}).get("content", {}).get("query") or "")
-    hits = [label for pattern, label in SYNAPSE_ONLY if pattern.search(query)]
-    if hits:
-        return [Finding(source.id, "SYNAPSE_TSQL", MEDIUM, f"{source.name} uses {', '.join(hits)}, which a Fabric Warehouse may reject.")]
-    return []
+    return _sql_findings(source, query)
 
 
 def _schedule(source: Source) -> List[Finding]:
@@ -187,9 +197,9 @@ def environment_checks(fabric_state: Dict[str, Any], sql_driver: str = "", sourc
     })
     if source_connected is not None:
         checks.append({
-            "label": "Synapse source connected (for table data and shortcuts)",
+            "label": "Synapse source connected (row counts and shortcuts)",
             "status": "ok" if source_connected else "fail",
-            "detail": "Rows are read through the discovery sign-in." if source_connected
-            else "Connect the Synapse source again: the data load reads the rows from it.",
+            "detail": "Row counts are compared and external-table locations read through the discovery sign-in." if source_connected
+            else "Connect the Synapse source again: data pipelines still run, but row counts cannot be compared and shortcuts cannot be made.",
         })
     return checks

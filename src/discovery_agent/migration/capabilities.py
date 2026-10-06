@@ -23,7 +23,7 @@ class Option:
 
     key: str
     label: str
-    choices: Tuple[Tuple[str, str], ...]  # (value, description)
+    choices: Tuple[Tuple[str, str, str], ...]  # (value, short label, description)
     default: str
 
 
@@ -46,14 +46,27 @@ class Stage:
 
 
 STAGES: Tuple[Stage, ...] = (
-    Stage("warehouse", "Warehouse & schema", "The SQL pool becomes a Fabric Warehouse; its schemas, tables (empty), views and stored procedures are created in it.",
-          ("Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure"), (POOL, SCHEMA, TABLE, VIEW, PROCEDURE), creates="Warehouse, schemas, tables, views, procedures"),
-    Stage("data", "Table data", "Copies the rows of each migrated table from the Synapse pool into the Warehouse, then checks the row counts match.",
-          ("Table",), (DATA,), needs=("warehouse",), creates="Rows in the Warehouse tables",
+    Stage("warehouse", "Warehouse & schema", "The SQL pool becomes a Fabric Warehouse; its schemas, tables (empty, with their keys), views and stored procedures are created in it. "
+          "Synapse-only T-SQL in views and procedures is converted first.",
+          ("Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure"), (POOL, SCHEMA, TABLE, VIEW, PROCEDURE), creates="Warehouse, schemas, tables, views, procedures",
           options=(
+              Option("collation", "Warehouse collation (set once, when it is created)", (
+                  ("match_synapse", "Same as Synapse", "Case-sensitive only if the Synapse pool was; Synapse's default is case-insensitive."),
+                  ("case_insensitive", "Case-insensitive", "'ABC' equals 'abc' in comparisons and object names, as in most Synapse pools."),
+                  ("case_sensitive", "Case-sensitive", "Fabric's own default: 'ABC' and 'abc' are different."),
+              ), "match_synapse"),
+          )),
+    Stage("data", "Table data", "Loads the rows of each migrated table with Fabric data pipelines: one pipeline per wave, reading the Synapse pool "
+          "through a Fabric connection and writing the Warehouse. The run then compares row counts.",
+          ("Table",), (DATA,), needs=("warehouse",), needs_input="credentials", creates="Data pipelines; rows in the Warehouse tables",
+          options=(
+              Option("dataRun", "What the stage does", (
+                  ("run", "Create and run", "Creates each wave's pipeline, runs it, waits for it, and compares row counts."),
+                  ("create", "Create only", "Creates the pipelines; you run them from Fabric (or a schedule) when you choose."),
+              ), "run"),
               Option("dataMode", "If a table already has rows", (
-                  ("if_empty", "Skip it. Never touches data that is already there (safe re-runs)."),
-                  ("replace", "Replace it. Clears the table, then loads it again."),
+                  ("if_empty", "Skip it (safe)", "Never touches data that is already there, so re-runs are safe."),
+                  ("replace", "Replace it", "The pipeline empties the table (TRUNCATE) before loading it again."),
               ), "if_empty"),
           )),
     Stage("spark", "Spark pool & environment", "A Spark pool becomes a custom Fabric Spark pool plus a published Environment.",
@@ -102,7 +115,7 @@ def describe() -> List[dict]:
             "needsInput": s.needs_input, "creates": s.creates,
             "options": [
                 {"key": o.key, "label": o.label, "default": o.default,
-                 "choices": [{"value": v, "description": d} for v, d in o.choices]}
+                 "choices": [{"value": v, "label": label, "description": d} for v, label, d in o.choices]}
                 for o in s.options
             ],
         }

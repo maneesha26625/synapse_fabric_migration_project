@@ -50,13 +50,14 @@ class ConnectionPlan:
     def auth_types(self) -> List[str]:
         return list(AUTH_FIELDS.get(self.fabric_type or "", {}))
 
-    def describe(self) -> dict:
-        """What the UI needs to ask for. No credential, only the shape of one."""
+    def describe(self, stage: str = "connections") -> dict:
+        """What the UI needs to ask for, and which stage asks. No credential, only the shape of one."""
         return {
             "name": self.name, "type": self.ls_type, "fabricType": self.fabric_type,
             "authTypes": [{"value": a, "label": AUTH_LABELS[a], "fields": list(AUTH_FIELDS[self.fabric_type][a])} for a in self.auth_types],
             "needsPath": self.fabric_type == "AzureDataLakeStorage",
             "unsupported": self.unsupported,
+            "stage": stage,
         }
 
 
@@ -79,6 +80,50 @@ def _plain(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
 
 
+_LS_PARAMETER = re.compile(r"@\{?\s*linkedService\(\)\.([A-Za-z_][A-Za-z0-9_]*)\s*\}?")
+
+
+def _defaults(props: Mapping[str, Any]) -> Dict[str, str]:
+    """A parameterised linked service's parameter defaults, as text."""
+    out: Dict[str, str] = {}
+    for key, spec in (props.get("parameters") or {}).items():
+        value = spec.get("defaultValue") if isinstance(spec, Mapping) else None
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            out[str(key)] = str(value)
+    return out
+
+
+def _resolve(node: Any, values: Mapping[str, str], unresolved: List[str]) -> Any:
+    """Replace ``@{linkedService().name}`` with the parameter's default; list any without one."""
+    if isinstance(node, Mapping) and set(node) == {"value", "type"} and node.get("type") == "Expression":
+        node = node.get("value")
+    if isinstance(node, str):
+        if "linkedService()" not in node:
+            return node
+        def repl(m: "re.Match[str]") -> str:
+            if m.group(1) in values:
+                return values[m.group(1)]
+            unresolved.append(m.group(1))
+            return m.group(0)
+        text = _LS_PARAMETER.sub(repl, node)
+        if "linkedService()" in text and not unresolved:
+            unresolved.append("an expression built from parameters")
+        return text
+    if isinstance(node, Mapping):
+        return {k: _resolve(v, values, unresolved) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_resolve(v, values, unresolved) for v in node]
+    return node
+
+
+def pool_plan(name: str, server: str, database: str) -> ConnectionPlan:
+    """The Fabric SQL connection the data pipelines read a Synapse dedicated pool through."""
+    plan = ConnectionPlan(name=name, ls_type="Synapse dedicated SQL pool", fabric_type="SQL", creation_method="SQL")
+    plan.parameters = [{"dataType": "Text", "name": "server", "value": server},
+                       {"dataType": "Text", "name": "database", "value": database}]
+    return plan
+
+
 def parse(payload: Mapping[str, Any]) -> ConnectionPlan:
     """The Fabric connection a linked service maps to, or why it has none."""
     props = payload.get("properties") or {}
@@ -87,10 +132,21 @@ def parse(payload: Mapping[str, Any]) -> ConnectionPlan:
     plan = ConnectionPlan(name=name, ls_type=ls_type)
     mapped = SUPPORTED.get(ls_type)
     if mapped is None:
-        plan.unsupported = f"A {ls_type or 'this kind of'} linked service has no Fabric connection type this tool can create. Create the connection in Fabric by hand."
+        plan.unsupported = (f"A {ls_type or 'this kind of'} linked service has no Fabric connection type this tool can create. "
+                            f"Create the connection in Fabric by hand and name it '{name}': pipelines that use it find it by that name.")
         return plan
     plan.fabric_type, plan.creation_method = mapped
-    tp = props.get("typeProperties") or {}
+    unresolved: List[str] = []
+    defaults = _defaults(props)
+    tp = _resolve(props.get("typeProperties") or {}, defaults, unresolved)
+    if unresolved:
+        plan.unsupported = (f"The linked service takes parameters with no default value ({', '.join(sorted(set(unresolved)))}), "
+                            "so there is no single address to connect to. Create one Fabric connection per value by hand.")
+        return plan
+    if defaults and props.get("parameters"):
+        plan.notes.append("Parameterised linked service: the connection uses the parameters' default values ("
+                          + ", ".join(f"{k}={v}" for k, v in sorted(defaults.items()))
+                          + "). If pipelines pass other values, create a connection for each of them.")
     cs = _pairs(_plain(tp.get("connectionString")))
 
     def param(key: str, value: str) -> None:

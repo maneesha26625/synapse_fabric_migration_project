@@ -6,7 +6,10 @@ What this build migrates:
 * **The dedicated SQL pool** -> a Fabric Warehouse of the same name (created
   if missing, reused if it exists).
 * **Schemas, tables, views, stored procedures** -> that Warehouse, as schema
-  only: tables are created empty, views and procedures from their own text.
+  only: tables are created empty (with their keys, NOT ENFORCED), views and
+  procedures from their own text after the T-SQL rules (``tsql_rules``) have
+  removed what a Warehouse rejects.
+* **Table data** -> Fabric data pipelines, one per wave (``stages``).
 
 Everything else in the plan is marked DEFERRED with the reason, so a run never
 pretends to have moved what it cannot move yet. An object that already exists
@@ -24,13 +27,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from discovery_agent.migration import environments, notebooks, warehouse_ddl
+from discovery_agent.migration import environments, notebooks, tsql_rules, warehouse_ddl
 from discovery_agent.migration.common import (  # noqa: F401 - re-exported: tests and the API import these from here
     COMPLETED, CONNECTION, DATA, DATASET, DEFERRED, DEFERRED_STATUS, ENVIRONMENT, FAILED, IN_PROGRESS, MISSING,
     NOTEBOOK, PENDING, PIPELINE, POOL, PROCEDURE, SCHEDULE, SCHEMA, SCRIPT, SHORTCUT, SKIPPED, SPARKJOB, TABLE,
     VIEW, WORKSPACE_ERRORS, MigrationError, Source,
 )
-from discovery_agent.migration.datacopy import DEFAULT_MAX_ROWS
 from discovery_agent.migration.stages import StageMixin
 from discovery_agent.migration.stages_fabric import FabricStageMixin
 from discovery_agent.migration.fabric_rest import FabricApiError, FabricRestClient
@@ -63,6 +65,22 @@ _DEFERRED_REASONS = {
 }
 
 SCHEMA_EXISTS_QUERY = "SELECT SCHEMA_ID(?)"
+
+#: Warehouse collations: Fabric's default is case-sensitive; Synapse's default is case-insensitive.
+CASE_SENSITIVE = "Latin1_General_100_BIN2_UTF8"
+CASE_INSENSITIVE = "Latin1_General_100_CI_AS_KS_WS_SC_UTF8"
+COLLATIONS = ("match_synapse", "case_insensitive", "case_sensitive")
+
+
+def warehouse_collation(choice: str, synapse_collation: Optional[str]) -> str:
+    """The collation to create the Warehouse with, from the run option and the pool's own collation."""
+    if choice == "case_sensitive":
+        return CASE_SENSITIVE
+    if choice == "case_insensitive":
+        return CASE_INSENSITIVE
+    source = (synapse_collation or "").upper()
+    sensitive = "_CS" in source or "_BIN" in source
+    return CASE_SENSITIVE if sensitive else CASE_INSENSITIVE  # an unknown pool collation is Synapse's default, case-insensitive
 
 
 def deferred_reason(object_type: str) -> str:
@@ -117,10 +135,15 @@ class MigrationRun:
         self.scope = "all"
         self.stop_on_failure = False
         self.halt_waived = False  # set when the operator resumes past a halt
-        #: Strategy settings for the stages (data mode, row ceiling, ...). Never credentials.
-        self.settings: Dict[str, Any] = {"dataMode": "if_empty", "maxRows": DEFAULT_MAX_ROWS}
+        #: Strategy settings for the stages (data mode, data run, collation). Never credentials.
+        self.settings: Dict[str, Any] = {"dataMode": "if_empty", "dataRun": "run", "collation": "match_synapse"}
         self.stages: List[str] = []
         self.pool_name: str = ""  # the Synapse pool being migrated, for retargeting pipelines
+        #: The pool's SQL endpoint and the Fabric connection the data pipelines read it through.
+        self.source_server: str = ""
+        self.source_database: str = ""
+        self.source_connection_name: str = ""
+        self.source_collation: Optional[str] = None
         self.halted_reason: Optional[str] = None
         for item in self.items:
             if item.source.kind == DEFERRED:
@@ -172,6 +195,7 @@ class Migrator(StageMixin, FabricStageMixin):
         self._sql: Any = None
         self._sql_error: Optional[str] = None
         self._warehouse_created = False
+        self._collation: Optional[str] = None
         #: A workspace-level failure; every later Fabric object fails with it at once.
         self._fatal: Optional[str] = None
 
@@ -263,7 +287,7 @@ class Migrator(StageMixin, FabricStageMixin):
         if not isinstance(source.payload, dict) or not source.payload:
             raise MigrationError("The notebook's definition was not kept by discovery. Run discovery again.")
         try:
-            document, notes = notebooks.to_fabric_ipynb(source.payload)
+            document, notes = notebooks.to_fabric_ipynb(source.payload, pool_name=self.run.pool_name, warehouse=self.run.warehouse)
         except notebooks.NotebookNotMigratable as exc:
             return DEFERRED_STATUS, "Not migrated: needs a rewrite", None, [str(exc)]
         client = self._client()
@@ -360,11 +384,14 @@ class Migrator(StageMixin, FabricStageMixin):
         run, client = self.run, self._client()
         warehouse = self._find_warehouse()
         if warehouse is None:
-            run.log("CREATE", run.warehouse, "creating the Fabric Warehouse")
+            collation = warehouse_collation(str(run.settings.get("collation") or "match_synapse"), run.source_collation)
+            run.log("CREATE", run.warehouse, f"creating the Fabric Warehouse with collation {collation}")
             client.create(f"/workspaces/{run.workspace_id}/warehouses", {
                 "displayName": run.warehouse, "description": "Migrated from an Azure Synapse dedicated SQL pool",
+                "creationPayload": {"defaultCollation": collation},
             })
             self._warehouse_created = True
+            self._collation = collation
         host = ""
         for _ in range(20):  # a new warehouse takes a moment to publish its SQL endpoint
             warehouse = warehouse or self._find_warehouse()
@@ -394,8 +421,16 @@ class Migrator(StageMixin, FabricStageMixin):
 
     def _pool(self, source: Source):
         self._warehouse()
-        step = "Fabric Warehouse created" if self._warehouse_created else "Fabric Warehouse already existed; reused"
-        return COMPLETED, step, f"{self.run.workspace_name} / {self.run.warehouse}", []
+        notes: List[str] = []
+        if self._warehouse_created:
+            step = "Fabric Warehouse created"
+            sensitive = self._collation == CASE_SENSITIVE
+            notes.append(f"Collation {self._collation} ({'case-sensitive' if sensitive else 'case-insensitive'}"
+                         f"{', like the Synapse pool' if self.run.settings.get('collation', 'match_synapse') == 'match_synapse' else ''}).")
+        else:
+            step = "Fabric Warehouse already existed; reused"
+            notes.append("An existing Warehouse keeps the collation it was created with; it cannot be changed afterwards.")
+        return COMPLETED, step, f"{self.run.workspace_name} / {self.run.warehouse}", notes
 
     def _schema(self, source: Source):
         schema = source.schema or source.name
@@ -415,7 +450,13 @@ class Migrator(StageMixin, FabricStageMixin):
         sql, notes = self._ddl(source)
         self._run_sql(cursor, warehouse_ddl.ensure_schema(schema), "create schema " + schema)
         self._run_sql(cursor, sql, "create table")
-        return COMPLETED, "Table created (empty: data moves in a later session)", target, notes
+        for statement in warehouse_ddl.key_constraints(source.payload):
+            try:
+                cursor.execute(statement)
+                notes.append("Key kept as NOT ENFORCED: " + statement.split(" ADD CONSTRAINT ", 1)[1].rstrip(";"))
+            except Exception as exc:  # noqa: BLE001 - a key is a hint; the table stands without it
+                notes.append(f"Key not recreated ({str(exc)[:160]}): {statement}")
+        return COMPLETED, "Table created (empty: the Table data stage loads it with a pipeline)", target, notes
 
     @staticmethod
     def _ddl(source: Source):
@@ -432,10 +473,11 @@ class Migrator(StageMixin, FabricStageMixin):
         cursor, schema, name, target = self._prepare(source)
         if self._exists(cursor, schema, name):
             return SKIPPED, "Already in the warehouse; left unchanged", target, []
+        converted = tsql_rules.rewrite(text.strip())
         self._run_sql(cursor, warehouse_ddl.ensure_schema(schema), "create schema " + schema)
-        self._run_sql(cursor, text.strip(), "create " + source.type.lower())
+        self._run_sql(cursor, converted.text, "create " + source.type.lower())
         what = "View" if source.kind == VIEW else "Stored procedure"
-        return COMPLETED, f"{what} created", target, []
+        return COMPLETED, f"{what} created" + (" (converted for Fabric)" if converted.changed else ""), target, converted.notes
 
     @staticmethod
     def _run_sql(cursor: Any, statement: Optional[str], what: str) -> None:

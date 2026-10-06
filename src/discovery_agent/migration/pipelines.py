@@ -25,7 +25,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 #: Control-flow and pass-through activities that need no conversion beyond their children.
-_PASS_THROUGH = {"Wait", "SetVariable", "AppendVariable", "Fail", "WebActivity", "Filter", "Validation", "Script", "Delete", "GetMetadata", "Lookup"}
+_PASS_THROUGH = {"Wait", "SetVariable", "AppendVariable", "Fail", "WebActivity", "WebHook", "Filter", "Validation", "Script", "Delete", "GetMetadata", "Lookup"}
+#: Activities that call another service through one linked service. Fabric has the same activities;
+#: each points at a Fabric connection, found by the linked service's name.
+_EXTERNAL_SERVICE = {"AzureFunctionActivity", "DatabricksNotebook", "DatabricksSparkJar", "DatabricksSparkPython", "Custom",
+                     "HDInsightHive", "HDInsightPig", "HDInsightMapReduce", "HDInsightSpark", "HDInsightStreaming",
+                     "AzureMLExecutePipeline"}
 _CONTAINERS = {"ForEach": ("activities",), "Until": ("activities",), "IfCondition": ("ifTrueActivities", "ifFalseActivities")}
 _DATASET_HOLDERS = {"Lookup", "GetMetadata", "Delete", "Validation"}
 _SQL_LS = {"AzureSqlDW", "AzureSynapseAnalytics"}
@@ -130,6 +135,10 @@ def dataset_settings(ref: Mapping[str, Any], ctx: Context, out: Converted) -> Tu
     params = {k: v for k, v in (ref.get("parameters") or {}).items()}
     ls_name = str((props.get("linkedServiceName") or {}).get("referenceName") or "")
     ls = ctx.linked_services.get(ls_name)
+    ls_values = (props.get("linkedServiceName") or {}).get("parameters") or {}
+    if ls_values:
+        out.notes.append(f"Dataset {name} passes {', '.join(sorted(ls_values))} to linked service {ls_name}; Fabric connections take no "
+                         f"parameters, so it uses the single connection '{ls_name}'. Check it points at the right place.")
     typeprops = _substitute(copy.deepcopy(props.get("typeProperties") or {}), params)
     schema = props.get("schema") or []
     if ls is not None and ctx.warehouse is not None and _is_pool_service(ls, ctx):
@@ -263,6 +272,25 @@ def _script(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, A
     return result
 
 
+def _external(act: Mapping[str, Any], ctx: Context, out: Converted) -> Optional[Dict[str, Any]]:
+    """Azure Function, Databricks, Batch, HDInsight and Machine Learning activities: same type, connection by name."""
+    kind, name = str(act.get("type")), str(act.get("name") or act.get("type"))
+    tp = act.get("typeProperties") or {}
+    extra = sorted(k for k, v in tp.items() if isinstance(v, Mapping) and v.get("type") == "LinkedServiceReference")
+    if extra:
+        out.unsupported.append(f"{name} ({kind}, which also uses {', '.join(extra)})")
+        return None
+    result = copy.deepcopy(dict(act))
+    ls_name = str((result.pop("linkedServiceName", None) or {}).get("referenceName") or "")
+    connection = ctx.connections.get(ls_name)
+    if not connection:
+        out.missing.append(f"connection {ls_name or '(none)'}")
+    else:
+        result["externalReferences"] = {"connection": connection}
+    out.notes.append(f"{kind} '{name}' runs through the Fabric connection '{ls_name}'; check its settings in Fabric before the first run.")
+    return result
+
+
 def convert_activity(act: Mapping[str, Any], ctx: Context, out: Converted) -> Optional[Dict[str, Any]]:
     kind = str(act.get("type") or "")
     name = str(act.get("name") or kind)
@@ -296,6 +324,8 @@ def convert_activity(act: Mapping[str, Any], ctx: Context, out: Converted) -> Op
             tp[key] = _convert_list(tp.get(key) or [], ctx, out)
         result["typeProperties"] = tp
         return result
+    if kind in _EXTERNAL_SERVICE:
+        return _external(act, ctx, out)
     if kind in _PASS_THROUGH:
         result = copy.deepcopy(dict(act))
         for noisy in ("linkedServiceName",):

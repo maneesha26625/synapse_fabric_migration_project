@@ -842,6 +842,14 @@ class Session:
             return None
         return lambda: conn.manager.sql().connect()
 
+    def source_endpoint(self) -> Optional[Tuple[str, str, str]]:
+        """(workspace, SQL endpoint host, pool) of the connected Synapse source, for the data pipelines' connection. None if unknown."""
+        with self._lock:
+            conn = self._connection
+        if conn is None or not conn.sql_pool:
+            return None
+        return conn.workspace, conn.manager.settings.synapse.resolved_sql_endpoint, conn.sql_pool
+
     def migration_snapshot(self) -> Tuple["_Job", Optional[str]]:
         """The finished discovery and the SQL pool it read, for a migration run.
 

@@ -1,6 +1,7 @@
 import { CheckCircle2, Cloud, SquareTerminal, TerminalSquare, XCircle, type LucideIcon } from "lucide-react";
 import { Fragment, useState } from "react";
 import { Banner, Button, Card, PageHead, SelectField, StatusBadge } from "../components/shared/Shared";
+import { useAppState } from "../state/AppState";
 import { useMigration } from "../state/MigrationState";
 import type { FabricAuthMethod } from "../types";
 
@@ -12,6 +13,7 @@ const METHODS: { id: FabricAuthMethod; title: string; desc: string; icon: Lucide
 /** The Fabric target. Separate from the Synapse source. The backend holds the session; no token ever reaches this page. */
 export function FabricTarget() {
   const { fabric, fabricBusy, fabricError, authenticateFabric, testFabric, disconnectFabric } = useMigration();
+  const { mode } = useAppState();
   const [method, setMethod] = useState<FabricAuthMethod>("azure_cli");
   const [workspaceId, setWorkspaceId] = useState("");
 
@@ -42,6 +44,13 @@ export function FabricTarget() {
       <PageHead icon={Cloud} title="Fabric Target">
         Connect the Microsoft Fabric environment that will receive the migrated Synapse workloads.
       </PageHead>
+      {mode === "mock" && (
+        <Banner tone="info" title="Demo data: no Fabric needed">
+          The demo Fabric workspace <strong>Fabric_demo</strong> is connected and on a capacity, so Plan &amp; Migrate can run straight away.
+          To try the sign-in steps, press Disconnect and sign in again with either CLI (no window opens in Demo data); a workspace named denied
+          fails its test. Reload the page to restore the ready demo.
+        </Banner>
+      )}
 
       <Card eyebrow="Target: Microsoft Fabric" title="Authentication Method" actions={badge}>
         <div className="stack" style={{ gap: 20 }}>

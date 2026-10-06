@@ -21,6 +21,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 _OPERATION_ID = re.compile(r"/operations/([0-9a-fA-F-]{36})")
+_JOB_INSTANCE = re.compile(r"/v1(/workspaces/[^/]+/items/[^/]+/jobs/instances/[0-9A-Za-z-]+)", re.IGNORECASE)
 FABRIC_HOST = "https://api.fabric.microsoft.com"
 FABRIC_API = FABRIC_HOST + "/v1"
 CALL_TIMEOUT_SECONDS = 60
@@ -178,6 +179,17 @@ class FabricRestClient:
                 return {}
             location = f"{FABRIC_API}/operations/{operation}"
         return self._wait(location, self._retry_after(headers, default=2.0))
+
+    def run_job(self, path: str, body: Optional[dict] = None) -> str:
+        """Start an on-demand job (``POST .../jobs/instances?jobType=...``) and return the path to follow it.
+
+        Fabric answers 202 with a Location naming the job instance, sometimes on a
+        regional host: only its path is kept, so the token stays on api.fabric.microsoft.com."""
+        status, headers, _ = self.request("POST", path, body if body is not None else {})
+        match = _JOB_INSTANCE.search(urllib.parse.urlsplit(headers.get("location") or "").path)
+        if not match:
+            raise FabricApiError(status, "job_not_started", "Fabric accepted the run but did not say where to follow it. Check the item's run history in Fabric.")
+        return match.group(1)
 
     def _wait(self, location: str, delay: float) -> dict:
         deadline = self._clock() + OPERATION_TIMEOUT_SECONDS

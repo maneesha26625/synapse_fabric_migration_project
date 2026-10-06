@@ -7,7 +7,7 @@ import { Banner, Button, Card, EmptyState, PageHead, StatusBadge } from "../comp
 import { useAppState } from "../state/AppState";
 
 export function SynapseSource() {
-  const { isConnected, connection, connectionBusy, connectionError, backendError, discovery, startDiscovery, testConnection, disconnect } = useAppState();
+  const { isConnected, connection, connectionBusy, connectionError, backendError, discovery, startDiscovery, testConnection, disconnect, mode } = useAppState();
   const navigate = useNavigate();
   const [adding, setAdding] = useState(false);
 
@@ -39,6 +39,13 @@ export function SynapseSource() {
       </PageHead>
 
       {backendError && <Banner tone="error" title="Backend unavailable">{backendError}</Banner>}
+      {mode === "mock" && (
+        <Banner tone="info" title="Demo data: no Azure needed">
+          The demo workspace <strong>demo-synapse-ws</strong> (pool TransportDW) is connected and already discovered, so every page works straight away.
+          To try the connection steps, press Disconnect and then Add Synapse Workspace: any subscription ID works, and workspaces named
+          denied, notfound, empty, partial or fail show those outcomes. Reload the page to restore the ready demo.
+        </Banner>
+      )}
 
       <div className="row">
         <h2>Registered Synapse Workspaces ({isConnected ? 1 : 0})</h2>

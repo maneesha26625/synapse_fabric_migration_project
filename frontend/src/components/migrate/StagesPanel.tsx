@@ -2,7 +2,7 @@ import { CheckCircle2, CircleAlert, KeyRound, Play } from "lucide-react";
 import { useMemo } from "react";
 import { Banner, Button, Card, Collapsible, StatusBadge, type Tone } from "../shared/Shared";
 import { useMigration } from "../../state/MigrationState";
-import type { ExecItem, LinkedServiceInput, StageDef } from "../../types";
+import type { ExecItem, LinkedServiceInput, RunOptions, StageDef } from "../../types";
 
 const SECRET_FIELDS = new Set(["password", "clientSecret", "key", "token"]);
 const FIELD_LABEL: Record<string, string> = { username: "Username", password: "Password", tenantId: "Tenant ID", clientId: "Client ID", clientSecret: "Client secret", key: "Account key", token: "SAS token" };
@@ -75,7 +75,9 @@ export function StagesPanel() {
   const running = run.state === "running";
   const connected = fabric.status === "connected";
   const entered = (name: string) => Object.keys(credentials[name] ?? {}).some((k) => k !== "authType" && (credentials[name][k] ?? "").length > 0);
-  const usable = capabilities.linkedServices.filter((l) => !l.unsupported);
+  /** The credentials a stage asks for: linked services under Connections, the Synapse pool under Table data. */
+  const servicesFor = (key: string) => capabilities.linkedServices.filter((l) => (l.stage ?? "connections") === key);
+  const optionValue = (key: string, fallback: string) => (options as unknown as Record<string, string>)[key] ?? fallback;
 
   return (
     <Card eyebrow="Migration stages" title="Choose what to migrate"
@@ -91,6 +93,8 @@ export function StagesPanel() {
           const progress = stageProgress(s, run.items);
           const missing = s.needs.filter((k) => !enabled.has(k) && stages.find((x) => x.key === k) && countFor(stages.find((x) => x.key === k)!) > 0);
           const credsNeeded = s.needsInput === "credentials";
+          const services = servicesFor(s.key);
+          const usable = services.filter((l) => !l.unsupported);
           const enteredCount = usable.filter((l) => entered(l.name)).length;
           const canRun = on && count > 0 && connected && !running;
           return (
@@ -107,22 +111,19 @@ export function StagesPanel() {
               <p className="muted">{s.summary}</p>
               <p className="faint" style={{ margin: 0 }}>Creates: {s.creates}</p>
 
-              {s.options.map((o) => (
-                <div key={o.key} className="stage-option">
-                  <label htmlFor={`opt-${o.key}`}>{o.label}</label>
-                  <select id={`opt-${o.key}`} className="select" disabled={!on} value={options.dataMode} onChange={(e) => setOptions({ dataMode: e.target.value as "if_empty" | "replace" })}>
-                    {o.choices.map((c) => <option key={c.value} value={c.value}>{c.value === "if_empty" ? "Skip it (safe)" : "Replace it"}</option>)}
-                  </select>
-                  <span className="faint">{o.choices.find((c) => c.value === options.dataMode)?.description}</span>
-                  {s.key === "data" && (
-                    <label className="stage-rows">Row limit per table
-                      <input className="input" type="number" min={1} max={capabilities.maxRowsCeiling} disabled={!on} value={options.maxRows}
-                        onChange={(e) => setOptions({ maxRows: Math.max(1, Math.min(capabilities.maxRowsCeiling, Number(e.target.value) || 1)) })} />
-                      <span className="faint">Larger tables are left for a pipeline Copy activity.</span>
-                    </label>
-                  )}
-                </div>
-              ))}
+              {s.options.map((o) => {
+                const value = optionValue(o.key, o.default);
+                return (
+                  <div key={o.key} className="stage-option">
+                    <label htmlFor={`opt-${s.key}-${o.key}`}>{o.label}</label>
+                    <select id={`opt-${s.key}-${o.key}`} className="select" disabled={!on} value={value}
+                      onChange={(e) => setOptions({ [o.key]: e.target.value } as Partial<RunOptions>)}>
+                      {o.choices.map((c) => <option key={c.value} value={c.value}>{c.label ?? c.value}</option>)}
+                    </select>
+                    <span className="faint">{o.choices.find((c) => c.value === value)?.description}</span>
+                  </div>
+                );
+              })}
 
               {missing.length > 0 && on && (
                 <p className="stage-warn"><CircleAlert size={14} aria-hidden="true" /> Needs {missing.map((k) => stages.find((x) => x.key === k)?.label).join(", ")}, which {missing.length === 1 ? "is" : "are"} off. Those must already exist in Fabric.</p>
@@ -130,9 +131,13 @@ export function StagesPanel() {
 
               {credsNeeded && on && (
                 <Collapsible summary={<span><KeyRound size={14} aria-hidden="true" /> Credentials <span className="muted">· {enteredCount} of {usable.length} entered</span></span>}>
-                  <p className="muted" style={{ marginTop: 0 }}>Synapse does not give up the secret behind a linked service, so Fabric needs it from you. It is sent once to the backend, kept in memory for this run, and never saved in the browser.</p>
-                  {capabilities.linkedServices.length === 0 && <p className="muted">No linked services were discovered.</p>}
-                  {capabilities.linkedServices.map((l) => <CredentialForm key={l.name} service={l} />)}
+                  <p className="muted" style={{ marginTop: 0 }}>
+                    {s.key === "data"
+                      ? "The data pipelines read the Synapse pool through a Fabric connection, which needs a SQL login or a service principal that can read the pool. If Fabric already has a connection to this pool, it is reused and this can stay empty."
+                      : "Synapse does not give up the secret behind a linked service, so Fabric needs it from you."}
+                    {" "}It is sent once to the backend, kept in memory for this run, and never saved in the browser.</p>
+                  {services.length === 0 && <p className="muted">{s.key === "data" ? "Connect the Synapse source with its dedicated SQL pool to set up the pool connection." : "No linked services were discovered."}</p>}
+                  {services.map((l) => <CredentialForm key={l.name} service={l} />)}
                   {Object.keys(credentials).length > 0 && <Button size="small" variant="ghost" onClick={clearCredentials}>Clear all credentials</Button>}
                 </Collapsible>
               )}

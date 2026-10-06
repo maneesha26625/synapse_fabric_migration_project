@@ -12,6 +12,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
+from discovery_agent.migration import tsql_rules
 from discovery_agent.migration.notebooks import create_body as notebook_create_body
 
 # ---- Spark job definitions ---------------------------------------------------------
@@ -77,7 +78,10 @@ def sql_script_notebook(payload: Mapping[str, Any], warehouse_id: Optional[str],
     language = str((content.get("metadata") or {}).get("language") or "sql").lower()
     if language != "sql":
         raise NotConvertible(f"The script is {language}, not SQL.")
+    converted = tsql_rules.rewrite(query)
+    query = converted.text
     notes = ["Review before running: the script ran on the Synapse pool and may use T-SQL a Fabric Warehouse does not support."]
+    notes.extend(converted.notes)
     pool = (content.get("currentConnection") or {}).get("poolName") or (content.get("currentConnection") or {}).get("databaseName")
     if pool:
         notes.append(f"It was written against '{pool}'; it is bound to the Warehouse '{warehouse_name}'.")

@@ -1,15 +1,15 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
-import { mockApi } from "../mock/mockApi";
+import { mockApi, resetDemo } from "../mock/mockApi";
 import type { ConnectionConfig, FabricConfig, ResultsQuery } from "../types";
 
 const CONFIG: ConnectionConfig = {
   method: "azure_cli", tenantId: "", subscriptionId: "10eb96c3-ba3c-492e-b95b-e9f1d6d85d70",
   resourceGroup: "rg-demo-migration", workspace: "demo-synapse-ws", workspaceUrl: "", sqlPool: "", resource: "",
 };
-const FABRIC: FabricConfig = { method: "azure_cli", workspaceId: "", workspaceName: "Fabric_practice" };
+const FABRIC: FabricConfig = { method: "azure_cli", workspaceId: "", workspaceName: "Fabric_demo" };
 const Q: ResultsQuery = {
   search: "", categories: [], types: [], statuses: [], fabricTargets: [], paths: [], workstreams: [], mappingStatuses: [],
   classifications: [], assessment: "", sort: "name", dir: "asc", page: 1, pageSize: 200,
@@ -33,6 +33,62 @@ beforeEach(async () => {
   window.history.pushState({}, "", "/");
   await mockApi.disconnect();
   await mockApi.disconnectFabric();
+});
+
+describe("ready demo", () => {
+  it("starts connected and discovered, with a Fabric target on a capacity: no sign-in anywhere", async () => {
+    resetDemo();
+    expect((await mockApi.getConnection()).status).toBe("connected");
+    expect((await mockApi.getDiscoveryStatus()).state).toBe("completed");
+    const target = await mockApi.getFabricTarget();
+    expect(target.status).toBe("connected");
+    expect(target.capacityAssigned).toBe(true);
+    // A run starts straight away.
+    const graph = await mockApi.getDependencies();
+    const items = graph.nodes.filter((n) => n.type === "Notebook").slice(0, 1).map((n) => ({ id: n.id, wave: n.wave }));
+    expect((await mockApi.startExecution(items)).total).toBe(1);
+  });
+
+  it("opens every page with content, not a request to connect", async () => {
+    resetDemo();
+    go("/synapse");
+    expect(await screen.findByText("Demo data: no Azure needed")).toBeInTheDocument();
+    expect(await screen.findAllByText("DISCOVERY COMPLETE", {}, { timeout: 4000 })).not.toHaveLength(0);
+    expect(screen.queryByText("No Synapse workspace connected.")).not.toBeInTheDocument();
+  }, 15000);
+
+  it("loads every table with that wave's pipeline and lists linked services until credentials are given", async () => {
+    resetDemo();
+    const graph = await mockApi.getDependencies();
+    const tables = graph.nodes.filter((n) => n.type === "Table").slice(0, 2);
+    const links = graph.nodes.filter((n) => n.type === "Linked Service").slice(0, 1);
+    const run = await mockApi.startExecution([...tables, ...links].map((n) => ({ id: n.id, wave: n.wave })), {
+      scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", dataRun: "run", collation: "match_synapse",
+    });
+    expect(run.items.filter((i) => i.type === "Table data")).toHaveLength(2);
+    expect(run.items.find((i) => i.type === "Linked Service")).toMatchObject({ status: "DEFERRED", step: "Needs credentials" });
+  });
+
+  it("fails only a few objects on purpose, however large the plan, and Retry Failed clears them", async () => {
+    resetDemo();
+    const graph = await mockApi.getDependencies();
+    await mockApi.startExecution(graph.nodes.map((n) => ({ id: n.id, wave: n.wave })));
+    // Jump the clock past the end of the run instead of waiting for it.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 10 * 60_000);
+      const run = await mockApi.getExecution();
+      expect(run.total).toBeGreaterThan(1000);
+      expect(run.state).toBe("completed");
+      expect(run.failed).toBeGreaterThan(0);
+      expect(run.failed).toBeLessThanOrEqual(3);
+      await mockApi.controlExecution("retry");
+      vi.setSystemTime(Date.now() + 10 * 60_000);
+      expect((await mockApi.getExecution()).failed).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("demo api", () => {
@@ -74,7 +130,7 @@ describe("demo api", () => {
   it("simulates a run only once the Fabric target is connected, deferring what this session does not move", async () => {
     await discovered();
     const graph = await mockApi.getDependencies();
-    const movable = ["Notebook", "Table", "View", "Stored Procedure"];
+    const movable = ["Notebook", "View", "Stored Procedure"];
     const now = graph.nodes.filter((n) => movable.includes(n.type)).slice(0, 3);
     // An integration runtime is always set up by hand, so it is the one thing a run never creates.
     const later = graph.nodes.filter((n) => n.type === "Integration Runtime").slice(0, 2);
@@ -205,7 +261,7 @@ describe("fabric target", () => {
     expect(screen.getByRole("button", { name: "Test Connection" })).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "Login with Azure CLI" }));
     await screen.findAllByText("AUTHENTICATED", {}, { timeout: 3000 });
-    await user.selectOptions(screen.getByLabelText("Fabric Workspace"), "Fabric_practice");
+    await user.selectOptions(screen.getByLabelText("Fabric Workspace"), "Fabric_demo");
     await user.click(screen.getByRole("button", { name: "Test Connection" }));
     await screen.findAllByText("CONNECTED", {}, { timeout: 3000 });
     expect(screen.getByText("Workspace accessible")).toBeInTheDocument();
@@ -297,12 +353,19 @@ describe("assessment and plan", () => {
     const pipelines = await screen.findByRole("checkbox", { name: "Include Pipelines & datasets" });
     await user.click(pipelines);
     expect(pipelines).not.toBeChecked();
-    // Data load options are a strategy the user can change.
+    // Data load options are a strategy the user can change: pipelines created and run, or created only.
     const mode = screen.getByLabelText("If a table already has rows");
     await user.selectOptions(mode, "replace");
     expect(mode).toHaveValue("replace");
+    const runMode = screen.getByLabelText("What the stage does");
+    await user.selectOptions(runMode, "create");
+    expect(runMode).toHaveValue("create");
+    // Two stages ask for credentials: Table data (the Synapse pool connection) and Connections (linked services).
+    const sections = screen.getAllByText(/Credentials/, { selector: "summary span" });
+    expect(sections).toHaveLength(2);
+    for (const section of sections) await user.click(section);
+    expect(await screen.findByLabelText("Password for synapse-demo-synapse-ws-TransportDW")).toHaveAttribute("type", "password");
     // Credentials: typed into a password field, kept out of localStorage and sessionStorage.
-    await user.click(screen.getByText(/Credentials/, { selector: "summary span" }));
     const secret = (await screen.findAllByLabelText(/^Password for /))[0];
     expect(secret).toHaveAttribute("type", "password");
     await user.type(secret, "S3CRET-NEVER-STORED");

@@ -482,18 +482,35 @@ list lives in one place, `migration/capabilities.py`, and the UI reads it from
 
 | Stage | Synapse object | Becomes in Fabric | Strategy / notes |
 |---|---|---|---|
-| Warehouse & schema | Dedicated SQL pool, schema, table, view, stored procedure | A Warehouse of the same name, its schemas, **empty** tables, views and procedures | Tables are rebuilt from discovered columns; storage clauses are dropped and unsupported types mapped, each change noted. Views and procedures are created from their own text. |
-| Table data | The rows of each migrated table | Rows in the Warehouse table | Read in chunks, written as multi-row `INSERT`s with typed parameters, **counts verified**; a failed load is cleared so a re-run is not fooled. Choose *skip* (default) or *replace* for a table that already has rows. Tables over the row limit (default 1,000,000) are left for a pipeline Copy activity. |
+| Warehouse & schema | Dedicated SQL pool, schema, table, view, stored procedure | A Warehouse of the same name, its schemas, **empty** tables, views and procedures | Structure only. Tables are rebuilt from discovered columns; storage clauses are dropped and unsupported types mapped, each change noted; primary keys and unique constraints are recreated `NOT ENFORCED`. Views and procedures are created from their own text after the T-SQL rules (below). The Warehouse **collation** is chosen once, at creation: *same as Synapse* (default), case-insensitive or case-sensitive. |
+| Table data | The rows of each migrated table | **Fabric data pipelines**, one per wave, and the rows they load | Data never passes through the accelerator. Each wave gets a metadata-driven pipeline (`load_<warehouse>_wave_<n>`): a ForEach over a `tables` parameter whose Copy activity reads the pool with a typed SELECT through a Fabric SQL connection and writes the Warehouse with the COPY command. *Create and run* (default) runs it, waits, and compares row counts table by table; *create only* leaves running it to you. *Skip* (default) leaves tables that already have rows; *replace* truncates them inside the pipeline first. The connection to the pool is reused if one exists, or created from the SQL login / service principal you enter on this stage. |
 | Spark pool & environment | Spark pool | A custom Spark pool and a published Environment | Node size, autoscale, runtime mapped; libraries are not copied. |
-| Notebooks | Notebook | Fabric Notebook | Cells kept; Spark pool binding and outputs dropped; Synapse-only calls flagged. .NET notebooks are deferred. |
-| Connections | Linked service | Fabric connection | Synapse does not give up the secret, so you enter credentials (sent once, held in memory, never stored or returned). SQL, ADLS Gen2 and Blob are converted; others are created by hand. |
-| Pipelines & datasets | Pipeline, dataset | Fabric data pipeline | Datasets are embedded in each activity; notebook, pipeline and Spark-job references become Fabric ids; anything that read the Synapse pool is pointed at the migrated Warehouse. A pipeline with an activity that has no Fabric equivalent is **not created**, with the activity names. |
+| Notebooks | Notebook | Fabric Notebook | Cells kept; Spark pool binding and outputs dropped. Python cells: `mssparkutils` becomes `notebookutils`, and the Synapse SQL connector import and reads of the migrated pool are pointed at Fabric's connector and the Warehouse. Other Synapse-only calls (linked-service credentials, `mssparkutils.env`, connector writes, ADLS paths) are flagged. .NET notebooks are deferred. |
+| Connections | Linked service | Fabric connection | Synapse does not give up the secret, so you enter credentials (sent once, held in memory, never stored or returned). SQL, ADLS Gen2 and Blob are converted; a parameterised linked service uses its parameters' default values. Others are created by hand, with the linked service's name so pipelines find them. |
+| Pipelines & datasets | Pipeline, dataset | Fabric data pipeline | Datasets are embedded in each activity; notebook, pipeline and Spark-job references become Fabric ids; anything that read the Synapse pool is pointed at the migrated Warehouse. Azure Function, Databricks, Batch (Custom), HDInsight, Machine Learning and Webhook activities keep their type and point at the connection of the same name. A pipeline with an activity that has no Fabric equivalent (for example a mapping data flow) is **not created**, with the activity names. |
 | Spark job definitions | Spark job definition | Fabric Spark job definition | Main file, class, arguments and libraries kept; attached to the Environment of the same name. |
-| SQL scripts | SQL script | A notebook with a T-SQL cell bound to the Warehouse | Flagged for review: Synapse-only T-SQL may be rejected. |
+| SQL scripts | SQL script | A notebook with a T-SQL cell bound to the Warehouse | The T-SQL rules are applied; what they cannot convert is flagged for review. |
 | Schedules | Schedule trigger | Pipeline schedule, **created switched off** | Minute, hour, daily and weekly recurrences. Event and tumbling-window triggers, and every-N-days or monthly, are recreated by hand. |
 | External tables | External table | A OneLake shortcut in a Lakehouse | The storage location is read from the pool's external data source; needs a Fabric connection to that storage. |
 
 Integration runtimes are always set up by hand.
+
+**T-SQL rules** (`migration/tsql_rules.py`), applied to views, procedures and SQL
+scripts before Fabric sees them, each change noted on the object:
+
+* storage options on `CREATE TABLE` / CTAS (`WITH (DISTRIBUTION = ...,
+  CLUSTERED COLUMNSTORE INDEX | HEAP | CLUSTERED INDEX (...), PARTITION (...))`)
+  are removed;
+* `RENAME OBJECT [schema.]a TO b` becomes `EXEC sp_rename`;
+* `SET TRANSACTION ISOLATION LEVEL` (other than SNAPSHOT) is removed;
+* workload management (`CREATE / ALTER / DROP WORKLOAD GROUP | CLASSIFIER`,
+  resource-class `sp_addrolemember`) is removed.
+
+Removed statements stay in the text as a comment. Strings, comments and
+quoted identifiers are never touched, and running the rules twice changes
+nothing more. The planner reports what the rules will fix (LOW) and what is
+left for a person (MEDIUM: `sys.pdw_*` views, materialized views, `COPY INTO`
+with Synapse's managed identity).
 
 * **Planner.** `POST /api/migration/plan` is read-only and deterministic: a
   strategy per object (Automated, Manual, Assess first, Later, Not selected),
@@ -514,12 +531,14 @@ Integration runtimes are always set up by hand.
   the Fabric API and the Warehouse SQL endpoint. With **Fabric CLI**, Fabric
   calls go through `fab api`; the first SQL object opens one Microsoft sign-in
   window (the Fabric CLI cannot issue a SQL token).
-* **Needs** ODBC Driver 18 on the machine running the server. Table data and
-  shortcuts also read from the connected Synapse pool, so keep that connection.
-* **What is verified.** The data load has been run against a real Warehouse.
-  The other stages are tested offline against Synapse's documented formats and
-  Fabric's documented request bodies; Fabric validates each create, and its own
-  error message is shown if it disagrees.
+* **Needs** ODBC Driver 18 on the machine running the server. Row counts after
+  a data pipeline run, and shortcuts, read from the connected Synapse pool, so
+  keep that connection.
+* **What is verified.** Every stage is tested offline against Synapse's
+  documented formats and Fabric's documented request bodies; Fabric validates
+  each create and each pipeline run, and its own error message is shown if it
+  disagrees. The data pipelines' Copy settings (Synapse source, Warehouse sink
+  with staging) should be confirmed on a first real run.
 
 ### Validation
 
@@ -543,10 +562,10 @@ counts need the Synapse connection; without it they are reported as unread.
 
 API: `GET /api/migration/capabilities`, `POST /api/migration/plan`,
 `POST /api/migration/validate`, `POST /api/migration/start` (`{items, options: {scope, stages, dataMode,
-maxRows, stopOnFailure}, credentials}`), `GET /api/migration/run` and
+dataRun, collation, stopOnFailure}, credentials}`), `GET /api/migration/run` and
 `POST /api/migration/control` (`pause|resume|retry`). Code:
 `src/discovery_agent/migration/` (`runner.py`, `stages.py`, `stages_fabric.py`,
-`capabilities.py`, `planner.py`, `preflight.py`, `datacopy.py`,
+`capabilities.py`, `planner.py`, `preflight.py`, `datacopy.py`, `datapipeline.py`, `tsql_rules.py`,
 `fabric_connections.py`, `pipelines.py`, `jobs.py`, `notebooks.py`,
 `environments.py`, `warehouse_ddl.py`, `fabric_rest.py`) and `api/migration.py`.
 

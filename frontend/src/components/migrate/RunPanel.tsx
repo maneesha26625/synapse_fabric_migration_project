@@ -73,6 +73,7 @@ export function RunPanel() {
       <Card eyebrow="Run the migration" title={started ? `Migration Run #${run.runId}` : "Migration run"}
         subtitle={started && (run.workspace || run.warehouse) ? `Fabric workspace ${run.workspace ?? "—"} · Warehouse ${run.warehouse ?? "—"}` : "Each wave is a step; each step's objects are created in dependency order."}
         actions={started ? <StatusBadge tone={run.state === "completed" ? (run.failed ? "warning" : "success") : run.state === "paused" ? "warning" : "info"} running={running}>{run.state.toUpperCase()}</StatusBadge> : undefined}>
+        {mode === "mock" && <Banner tone="info" title="Demo run">Nothing is created anywhere: each object's result is simulated, the way the real run reports it, including the data pipelines and objects that need credentials. A run takes about a minute; a few objects fail on purpose so you can try Retry Failed.</Banner>}
         {mode === "real" && <Banner tone="info" title="What a run does">Each stage you switched on is carried out in dependency order: Warehouse and schema, table data, Spark, notebooks, connections, pipelines, jobs, scripts, schedules and shortcuts. Nothing already in Fabric is overwritten, so a run can be repeated safely.{fabric.method === "fabric_cli" && " With the Fabric CLI the first SQL object opens one Microsoft sign-in window on the machine running the server."}</Banner>}
         {executionError && <Banner tone="error" title="Execution">{executionError}</Banner>}
         {run.haltedReason && run.state === "paused" && <Banner tone="warning" title="Run stopped at a wave boundary">{run.haltedReason}</Banner>}
@@ -113,11 +114,11 @@ export function RunPanel() {
             <MetricCard label="Pending" value={run.pending + run.inProgress} />
           </div>
 
-          <div className="steps">
+          <div className="waves">
             {steps.map((s, i) => (
-              <section key={s.wave} className={`step step-${s.state}`} aria-label={`Wave ${s.wave}`}>
+              <section key={s.wave} className={`wave-card wave-${s.state}`} aria-label={`Wave ${s.wave}`}>
                 <header>
-                  <span className="step-num">{i + 1}</span>
+                  <span className="wave-num">{i + 1}</span>
                   <div>
                     <h3>Wave {s.wave}</h3>
                     <p className="muted">{s.types.join(" · ")}</p>
@@ -130,7 +131,7 @@ export function RunPanel() {
                 <div className="bar" role="progressbar" aria-valuenow={Math.round((s.done / s.items.length) * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={`Wave ${s.wave} progress`}>
                   <span className={`fill ${s.state === "failed" ? "error" : s.state === "done" ? "success" : "info"}`} style={{ width: `${(s.done / s.items.length) * 100}%` }} />
                 </div>
-                <p className="faint" style={{ margin: "6px 0 0" }}>{s.done} of {s.items.length} finished</p>
+                <p className="faint">{s.done} of {s.items.length} finished{s.items.some((x) => x.status === "FAILED") ? ` · ${s.items.filter((x) => x.status === "FAILED").length} failed` : ""}</p>
               </section>
             ))}
           </div>

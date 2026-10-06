@@ -21,7 +21,7 @@ from discovery_agent.api.service import ApiError, Session
 from discovery_agent.migration import planner as planning
 from discovery_agent.migration.fabric_rest import NO_CAPACITY, FabricApiError, FabricRestClient
 from discovery_agent.migration.preflight import content_findings, environment_checks
-from discovery_agent.migration import capabilities, fabric_connections, pipelines
+from discovery_agent.migration import capabilities, datapipeline, fabric_connections, pipelines
 from discovery_agent.migration.validation import Validator, summarize
 from discovery_agent.migration.runner import (
     CONNECTION,
@@ -39,6 +39,7 @@ from discovery_agent.migration.runner import (
     SCRIPT,
     SPARKJOB,
     TABLE,
+    COLLATIONS,
     MigrationRun,
     Migrator,
     Source,
@@ -54,7 +55,7 @@ MAX_ITEMS = 10000
 #: Runner kinds that this build creates in Fabric (everything else is deferred).
 _AUTOMATED_KINDS = frozenset(MIGRATABLE.values()) | {DATA}
 DATA_MODES = ("if_empty", "replace")
-MAX_ROWS_CEILING = 10_000_000
+DATA_RUNS = ("run", "create")
 MAX_CREDENTIALS = 100
 MAX_CREDENTIAL_FIELD = 2048
 MAX_HISTORY = 20
@@ -88,15 +89,14 @@ def parse_options(body: dict) -> dict:
     mode = str(options.get("dataMode") or "if_empty")
     if mode not in DATA_MODES:
         raise ApiError(400, "invalid_options", "Choose to skip or replace tables that already have rows.")
-    try:
-        raw_rows = options.get("maxRows")
-        max_rows = int(raw_rows if raw_rows is not None else 1_000_000)
-    except (TypeError, ValueError):
-        raise ApiError(400, "invalid_options", "The row limit must be a number.") from None
-    if not 1 <= max_rows <= MAX_ROWS_CEILING:
-        raise ApiError(400, "invalid_options", f"The row limit must be between 1 and {MAX_ROWS_CEILING:,}.")
+    data_run = str(options.get("dataRun") or "run")
+    if data_run not in DATA_RUNS:
+        raise ApiError(400, "invalid_options", "Choose to create and run the data pipelines, or only create them.")
+    collation = str(options.get("collation") or "match_synapse")
+    if collation not in COLLATIONS:
+        raise ApiError(400, "invalid_options", "Choose a Warehouse collation: same as Synapse, case-insensitive or case-sensitive.")
     return {"scope": scope, "stopOnFailure": bool(options.get("stopOnFailure")), "stages": list(dict.fromkeys(stages)),
-            "dataMode": mode, "maxRows": max_rows}
+            "dataMode": mode, "dataRun": data_run, "collation": collation}
 
 
 def parse_credentials(raw: Any) -> Dict[str, Dict[str, str]]:
@@ -236,7 +236,7 @@ def sources_for(plan: List[dict], job: Any, pool: Optional[str]) -> List[Source]
                 sources.append(Source(oid, name, object_type, wave, DEFERRED,
                                       reason=f"Only the SQL pool you connected ({pool}) is migrated in this run."))
             else:
-                sources.append(Source(oid, name, object_type, wave, POOL))
+                sources.append(Source(oid, name, object_type, wave, POOL, payload=dict(extra.metadata or {}) if extra is not None else {}))
             continue
         if kind == SCHEMA:
             schema = str((extra.metadata or {}).get("schemaName") if extra is not None else "") or name.split(".")[-1]
@@ -383,7 +383,8 @@ class MigrationService:
             via = "Azure CLI" if method == "azure_cli" else "Fabric CLI"
             run.scope, run.stop_on_failure = scope, stop_on_failure
             run.stages, run.pool_name = list(options["stages"]), pool or ""
-            run.settings = {"dataMode": options["dataMode"], "maxRows": options["maxRows"]}
+            run.settings = {"dataMode": options["dataMode"], "dataRun": options["dataRun"], "collation": options["collation"]}
+            self._describe_source(run, job, pool)
             if credentials:
                 self._credentials = credentials
             run.log("RUN", "run", f"{len(sources)} objects, workspace {workspace_name}, warehouse {run.warehouse}, signed in with {via}")
@@ -449,20 +450,40 @@ class MigrationService:
         rows.sort(key=lambda r: (order.get(r["category"], len(order)), r["object"].lower()))
         return {"rows": rows, "summary": summarize(rows), "workspace": workspace_name, "warehouse": warehouse}
 
+    def _source_endpoint(self) -> Optional[tuple]:
+        getter = getattr(self._session, "source_endpoint", None)
+        return getter() if callable(getter) else None
+
+    def _describe_source(self, run: MigrationRun, job: Any, pool: Optional[str]) -> None:
+        """The Synapse pool the data pipelines read: its endpoint, its collation, and the connection's name."""
+        endpoint = self._source_endpoint()
+        if endpoint:
+            workspace, server, database = endpoint
+            run.source_server, run.source_database = server, database
+            run.source_connection_name = datapipeline.source_connection_name(workspace, database)
+        for extra in (getattr(job, "extras_by_id", {}) or {}).values():
+            if getattr(extra, "source_type", "") == "Dedicated SQL Pool" and pool and str(extra.name).lower() == pool.lower():
+                run.source_collation = (extra.metadata or {}).get("collation")
+
     def _source_available(self) -> bool:
         return self._source_factory is not None or getattr(self._session, "source_sql_factory", lambda: None)() is not None
 
     def capabilities(self) -> dict:
         """The stages, their options, and the linked services that need credentials. Reads only."""
         linked: List[dict] = []
+        endpoint = self._source_endpoint()
+        if endpoint:
+            # The data pipelines read the pool through a Fabric connection, which needs a credential.
+            workspace, server, database = endpoint
+            plan = fabric_connections.pool_plan(datapipeline.source_connection_name(workspace, database), server, database)
+            linked.append(plan.describe(stage="data"))
         try:
             job, _ = self._session.migration_snapshot()
             for name, payload in sorted(_artifacts(job).get(P0Artifact.LINKED_SERVICE, {}).items()):
                 linked.append(fabric_connections.parse(payload).describe())
         except ApiError:
             pass
-        return {"stages": capabilities.describe(), "defaults": capabilities.default_settings(), "linkedServices": linked,
-                "maxRowsDefault": 1_000_000, "maxRowsCeiling": MAX_ROWS_CEILING}
+        return {"stages": capabilities.describe(), "defaults": capabilities.default_settings(), "linkedServices": linked}
 
     def _spawn(self, run: MigrationRun) -> None:
         factory = self._source_factory or getattr(self._session, "source_sql_factory", lambda: None)()

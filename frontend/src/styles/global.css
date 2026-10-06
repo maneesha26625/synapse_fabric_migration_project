@@ -483,14 +483,18 @@ span.cls { display: inline-block; padding: 2px 10px; border-radius: 999px; font-
 .risk.sev-low { border-left-color: var(--border-strong, var(--border)); } .risk.sev-low .sev { color: var(--text-faint); }
 .check-row { display: flex; gap: 10px; align-items: flex-start; margin-top: 16px; cursor: pointer; }
 .check-row input { margin-top: 4px; }
-.steps { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
-.step { border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; background: var(--surface-2); }
-.step header { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
-.step h3 { margin: 0; font-size: 16px; } .step p { margin: 0; font-size: 13px; }
-.step-num { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 13px; background: var(--surface); border: 1px solid var(--border); }
-.step-done { border-color: color-mix(in srgb, var(--success) 45%, transparent); } .step-done .step-num { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success); }
-.step-failed { border-color: color-mix(in srgb, var(--error) 55%, transparent); } .step-failed .step-num { color: var(--error); }
-.step-active { border-color: color-mix(in srgb, var(--accent) 55%, transparent); } .step-active .step-num { color: var(--accent); }
+/* Wave cards on Plan & Migrate. Named wave-*, not step-*: .step is the workflow stepper's pill link. */
+.waves { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.wave-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; background: var(--surface-2); display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.wave-card header { display: flex; gap: 10px; align-items: flex-start; }
+.wave-card header > div { min-width: 0; flex: 1; }
+.wave-card h3 { margin: 0; font-size: 16px; }
+.wave-card p { margin: 0; font-size: 13px; overflow-wrap: anywhere; }
+.wave-card .badge { flex-shrink: 0; }
+.wave-num { width: 26px; height: 26px; flex-shrink: 0; border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 13px; background: var(--surface); border: 1px solid var(--border); }
+.wave-done { border-color: color-mix(in srgb, var(--success) 45%, transparent); } .wave-done .wave-num { background: color-mix(in srgb, var(--success) 18%, transparent); color: var(--success); }
+.wave-failed { border-color: color-mix(in srgb, var(--error) 55%, transparent); } .wave-failed .wave-num { color: var(--error); }
+.wave-active { border-color: color-mix(in srgb, var(--accent) 55%, transparent); } .wave-active .wave-num { color: var(--accent); }
 .stage-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 12px; }
 .stage-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; background: var(--surface-2); display: flex; flex-direction: column; gap: 8px; min-width: 0; }
 .stage-card.off { opacity: .6; }

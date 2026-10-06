@@ -223,7 +223,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   const [analysis, setAnalysis] = useState<PlanAnalysis | null>(null);
   const [analysisBusy, setAnalysisBusy] = useState(false);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
-  const [options, setOptionsState] = useState<RunOptions>({ scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", maxRows: 1_000_000 });
+  const [options, setOptionsState] = useState<RunOptions>({ scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", dataRun: "run", collation: "match_synapse" });
   const [capabilities, setCapabilities] = useState<Capabilities | null>(null);
   const [credentials, setCredentials] = useState<ConnectionCredentials>({});
   const setCredential = useCallback((name: string, patch: Record<string, string>) => setCredentials((c) => ({ ...c, [name]: { ...(c[name] ?? {}), ...patch } })), []);
@@ -235,7 +235,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     api.getCapabilities().then((c) => {
       if (!live) return;
       setCapabilities(c);
-      setOptionsState((o) => ({ ...o, stages: o.stages.length ? o.stages : c.stages.map((s) => s.key), maxRows: c.maxRowsDefault }));
+      setOptionsState((o) => ({ ...o, stages: o.stages.length ? o.stages : c.stages.map((s) => s.key) }));
     }, () => { if (live) setCapabilities(null); });
     return () => { live = false; };
   }, [api, discovery.state]);

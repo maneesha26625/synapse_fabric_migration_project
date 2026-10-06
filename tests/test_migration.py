@@ -864,12 +864,14 @@ def test_preflight_reads_the_content_the_run_will_translate():
         src("sales.vOk", VIEW, payload=view()),
         src("sales.vOpaque", VIEW, payload=view(name="vOpaque", text="")),
         src("sales.vCtas", VIEW, payload=view(name="vCtas", text="CREATE TABLE x WITH (DISTRIBUTION = ROUND_ROBIN) AS SELECT 1")),
+        src("sales.vPdw", VIEW, payload=view(name="vPdw", text="CREATE VIEW sales.vPdw AS SELECT * FROM sys.dm_pdw_nodes")),
     ])
     by = {(f.object_id, f.code): f.severity for f in findings}
     assert by[("sales.Orders", "TYPE_CONVERSION")] in ("LOW", "MEDIUM")
     assert by[("sales.Odd", "UNSUPPORTED_TYPE")] == "BLOCKING"
     assert by[("sales.vOpaque", "DEFINITION_UNREADABLE")] == "BLOCKING"
-    assert by[("sales.vCtas", "SYNAPSE_TSQL")] == "MEDIUM"
+    assert by[("sales.vCtas", "TSQL_CONVERTED")] == "LOW" and ("sales.vCtas", "SYNAPSE_TSQL") not in by  # the rules fix it
+    assert by[("sales.vPdw", "SYNAPSE_TSQL")] == "MEDIUM"  # no rule can: a person rewrites it
     assert not [f for f in findings if f.object_id == "sales.vOk"]
 
 

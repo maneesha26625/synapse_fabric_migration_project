@@ -5,7 +5,7 @@ Fabric, discover, assess, plan and run the migration. In Live mode the Plan &
 Migrate page scores the plan and runs the stages you switch on (warehouse and
 schema, table data, Spark, notebooks, connections, pipelines, jobs, scripts,
 schedules, shortcuts); see "Migration" in
-the root README. Validation works in Demo data only.
+the root README. Demo data runs the whole application without Azure or Fabric.
 
 Stack: React 18 + TypeScript + Vite, `react-router-dom`, `lucide-react`. Plain
 CSS with design tokens (`src/styles/global.css`). No state library and no UI kit.
@@ -44,11 +44,23 @@ The header switch chooses the implementation of one interface, `MigrationApi`
 | Mode | Implementation | Notes |
 |---|---|---|
 | **Live API** | `services/realApi.ts` → `/api/*` | Real Synapse data. Default. |
-| **Demo data** | `mock/mockApi.ts` | Generated sample data, ~1,500 objects. A banner says so on every page. |
+| **Demo data** | `mock/mockApi.ts` | Generated sample data, ~1,500 objects. No backend, Azure or Fabric needed. A banner says so on every page. |
 
-Demo scenarios are chosen by workspace name: containing `denied`, `notfound`,
-`expired`, `offline` fails the connection test; `empty`, `partial`, `fail`,
-`timeout` change what discovery returns. Anything else succeeds.
+Demo data starts **ready**: the demo Synapse workspace `demo-synapse-ws` (pool
+`TransportDW`) is connected and already discovered, and the demo Fabric
+workspace `Fabric_demo` is connected and on a capacity. Every page has content
+straight away, and Plan & Migrate runs a simulated migration (about a minute)
+that reports objects the way the real run does: table data loaded by each
+wave's pipeline, linked services waiting for credentials, integration runtimes
+set up by hand, and a few failures on purpose so Retry Failed can be tried.
+Validation then compares the migrated objects.
+
+To walk through the connection screens, press Disconnect on Synapse Source or
+Fabric Target and connect again (no sign-in window opens). Scenarios are chosen
+by workspace name: containing `denied`, `notfound`, `expired`, `offline` fails
+the connection test; `empty`, `partial`, `fail`, `timeout` change what discovery
+returns. Anything else succeeds. Reloading the page restores the ready demo;
+the plan is kept per project.
 
 ## Environment
 

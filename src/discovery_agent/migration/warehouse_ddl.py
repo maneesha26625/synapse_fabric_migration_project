@@ -119,6 +119,27 @@ def create_table(table: SqlTable) -> Tuple[str, List[str]]:
     return sql, notes
 
 
+def key_constraints(table: SqlTable) -> List[str]:
+    """``ALTER TABLE ... ADD CONSTRAINT ... NOT ENFORCED`` for each primary key and unique constraint.
+
+    Synapse already holds these as NOT ENFORCED; a Warehouse accepts them in the
+    same form (NONCLUSTERED, NOT ENFORCED). They are not checked, but the query
+    optimiser and tools such as Power BI use them, so they are worth keeping."""
+    statements: List[str] = []
+    for index in table.indexes:
+        if not (index.is_primary_key or index.is_unique_constraint):
+            continue
+        columns = [c.name for c in index.key_columns if c.name]
+        if not columns:
+            continue
+        kind = "PRIMARY KEY" if index.is_primary_key else "UNIQUE"
+        name = index.name or f"{'PK' if index.is_primary_key else 'UQ'}_{table.key.name}_{index.index_id}"
+        statements.append(
+            f"ALTER TABLE {qualified(table.key.schema, table.key.name)} ADD CONSTRAINT {quote(name)} "
+            f"{kind} NONCLUSTERED ({', '.join(quote(c) for c in columns)}) NOT ENFORCED;")
+    return statements
+
+
 def ensure_schema(schema: str) -> Optional[str]:
     """A statement creating ``schema`` when it is missing, or None for dbo."""
     if schema.lower() == "dbo":

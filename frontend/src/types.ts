@@ -390,13 +390,15 @@ export interface RunOptions {
   stages: string[];
   /** Table data: what to do with a table that already has rows. */
   dataMode: "if_empty" | "replace";
-  /** Table data: the direct copy leaves tables over this many rows for a pipeline Copy activity. */
-  maxRows: number;
+  /** Table data: create each wave's data pipeline and run it, or only create it. */
+  dataRun: "run" | "create";
+  /** Warehouse: the collation it is created with (it cannot change afterwards). */
+  collation: "match_synapse" | "case_insensitive" | "case_sensitive";
 }
 
 // ---- migration stages ------------------------------------------------------------------
 
-export interface StageOption { key: string; label: string; default: string; choices: { value: string; description: string }[] }
+export interface StageOption { key: string; label: string; default: string; choices: { value: string; label?: string; description: string }[] }
 export interface StageDef {
   key: string;
   label: string;
@@ -418,13 +420,13 @@ export interface LinkedServiceInput {
   needsPath: boolean;
   /** Set when this linked service has no Fabric connection type this tool can create. */
   unsupported: string | null;
+  /** The stage that asks for this credential: "connections" for linked services, "data" for the Synapse pool connection. */
+  stage?: string;
 }
 export interface Capabilities {
   stages: StageDef[];
   defaults: Record<string, string>;
   linkedServices: LinkedServiceInput[];
-  maxRowsDefault: number;
-  maxRowsCeiling: number;
 }
 /** Credentials by linked-service name. Held in memory only: never stored in the browser, never shown again. */
 export type ConnectionCredentials = Record<string, Record<string, string>>;
