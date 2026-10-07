@@ -9,6 +9,7 @@ import { ObjectDetails } from "./ObjectDetails";
 import { ObjectStatusBadge } from "./ObjectStatusBadge";
 
 const PAGE_SIZES = [25, 50, 100];
+const NO_PATHS: string[] = [];
 
 interface Tab { id: string; label: string; categories?: string[]; types?: string[] }
 const TABS: Tab[] = [
@@ -51,6 +52,8 @@ interface Props {
   classification?: string;
   /** An object type chosen elsewhere on the page (for example a Discovery card). */
   type?: string;
+  /** Migration paths chosen elsewhere on the page (for example a Discovery summary card); [] means all. */
+  paths?: string[];
   showTabs?: boolean;
 }
 
@@ -60,7 +63,7 @@ const tabCount = (tab: Tab, s: DiscoverySummary) =>
   : s.total;
 
 /** The object inventory: tabs, filters, sortable columns, pagination. One page of rows is ever in the DOM. */
-export function Inventory({ summary, workstream = "", onWorkstream, classification = "", type = "", showTabs = true }: Props) {
+export function Inventory({ summary, workstream = "", onWorkstream, classification = "", type = "", paths = NO_PATHS, showTabs = true }: Props) {
   const { getResults } = useAppState();
   const [f, setF] = useState(INITIAL);
   const [searchText, setSearchText] = useState("");
@@ -77,6 +80,8 @@ export function Inventory({ summary, workstream = "", onWorkstream, classificati
   useEffect(() => { setF((s) => ({ ...s, page: 1 })); }, [workstream]);
   useEffect(() => { setF((s) => ({ ...s, classification, page: 1 })); }, [classification]);
   useEffect(() => { setF((s) => ({ ...s, type, tab: type ? "all" : s.tab, page: 1 })); }, [type]);
+  const pathGroup = paths.join(",");
+  useEffect(() => { setF((s) => ({ ...s, path: "", page: 1 })); }, [pathGroup]);
 
   useEffect(() => {
     const mine = ++ticket.current;
@@ -84,7 +89,7 @@ export function Inventory({ summary, workstream = "", onWorkstream, classificati
     const tab = TABS.find((t) => t.id === f.tab) ?? TABS[0];
     const query: ResultsQuery = {
       search: f.search, categories: tab.categories ?? [], types: f.type ? [f.type] : tab.types ?? [], statuses: one(f.status),
-      fabricTargets: one(f.target), paths: one(f.path), workstreams: one(workstream), mappingStatuses: [],
+      fabricTargets: one(f.target), paths: f.path ? [f.path] : paths, workstreams: one(workstream), mappingStatuses: [],
       classifications: one(f.classification), assessment: f.assessment, sort: f.sort, dir: f.dir, page: f.page, pageSize: f.pageSize,
     };
     setLoading(true);
@@ -102,7 +107,7 @@ export function Inventory({ summary, workstream = "", onWorkstream, classificati
         setLoading(false);
       },
     );
-  }, [f, workstream, getResults, attempt]);
+  }, [f, workstream, pathGroup, getResults, attempt]);
 
   const patch = (p: Partial<typeof INITIAL>) => setF((s) => ({ ...s, ...p, page: "page" in p ? p.page! : 1 }));
   const clear = () => { setSearchText(""); onWorkstream?.(""); setF({ ...INITIAL, classification, type, sort: f.sort, dir: f.dir, pageSize: f.pageSize }); };

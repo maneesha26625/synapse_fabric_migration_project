@@ -16,12 +16,23 @@ const PLURAL: Record<string, string> = {
   "Storage Reference": "Storage connections", "Spark Library": "Spark libraries", Function: "Functions",
 };
 
+// The migration paths behind the two summary counts, exactly as the API counts them.
+const NEEDS_DECISION = ["Requires Assessment", "Manual / Special Handling"];
+const MAPPED = ["Direct Target", "Target With Transformation", "Target With Refactoring", "Requires Reconfiguration"];
+type PathGroup = "" | "mapped" | "decision";
+const PATH_GROUPS: Record<Exclude<PathGroup, "">, { label: string; paths: string[] }> = {
+  mapped: { label: "With a Fabric mapping", paths: MAPPED },
+  decision: { label: "Manual or review", paths: NEEDS_DECISION },
+};
+
 export function DiscoverPanel() {
   const { isConnected, connection, discovery, startDiscovery, discoveryStartError, health } = useAppState();
   const { resetJourney, confirmed } = useMigration();
   const navigate = useNavigate();
   const [tab, setTab] = useState<"overview" | "inventory">("overview");
   const [type, setType] = useState("");
+  const [group, setGroup] = useState<PathGroup>("");
+  const [allWarnings, setAllWarnings] = useState(false);
   const [askRerun, setAskRerun] = useState(false);
   // Running again replaces what the confirmed steps were built on: ask before undoing them.
   const laterConfirmed = confirmed.some((k) => k !== "discover");
@@ -30,7 +41,9 @@ export function DiscoverPanel() {
   const summary = discovery.summary;
 
   // Discovering again replaces what every later step was built on, so their confirmations go too.
-  const run = async () => { resetJourney("discover"); setType(""); setTab("overview"); await startDiscovery(); };
+  const run = async () => { resetJourney("discover"); setType(""); setGroup(""); setAllWarnings(false); setTab("overview"); await startDiscovery(); };
+  // A summary card opens what it counts: the inventory narrowed to those objects, or the type overview.
+  const showInventory = (g: PathGroup) => { setType(""); setGroup(g); setTab("inventory"); };
 
   if (running) {
     return (
@@ -94,17 +107,26 @@ export function DiscoverPanel() {
       )}
 
       <StatStrip label="Discovery summary" items={[
-        { label: "Objects", value: summary.total.toLocaleString(), tone: "accent" },
-        { label: "Object types", value: types.length },
-        { label: "With a Fabric mapping", value: summary.withFabricMapping.toLocaleString(), hint: "A named Fabric component exists" },
-        { label: "Manual or review", value: summary.manualOrAssessment.toLocaleString(), hint: "Needs a decision before it moves" },
-        { label: "Warnings", value: summary.warningCount, tone: summary.warningCount ? "warning" : undefined },
+        { label: "Objects", value: summary.total.toLocaleString(), tone: "accent",
+          onClick: () => showInventory(""), active: tab === "inventory" && !group && !type },
+        { label: "Object types", value: types.length, onClick: () => setTab("overview"), active: tab === "overview" },
+        { label: "With a Fabric mapping", value: summary.withFabricMapping.toLocaleString(), hint: "A named Fabric component exists",
+          onClick: () => showInventory("mapped"), active: tab === "inventory" && group === "mapped" },
+        { label: "Manual or review", value: summary.manualOrAssessment.toLocaleString(), hint: "Needs a decision before it moves",
+          onClick: () => showInventory("decision"), active: tab === "inventory" && group === "decision" },
+        { label: "Warnings", value: summary.warningCount, tone: summary.warningCount ? "warning" : undefined,
+          ...(summary.warnings.length ? { onClick: () => setAllWarnings((v) => !v), active: allWarnings } : {}) },
       ]} />
 
       {discovery.state === "completed_with_warnings" && (
         <Banner tone="warning" title="Completed with warnings">
           {summary.failedCategories.length ? <>Not read: {summary.failedCategories.map((f) => f.name).join(", ")}. </> : null}
-          {summary.warnings.slice(0, 2).join(" ")}
+          {allWarnings ? (
+            <ul className="warning-list" aria-label="Discovery warnings">
+              {summary.warnings.map((w, i) => <li key={i}>{w}</li>)}
+              {summary.warningCount > summary.warnings.length && <li className="faint">And {summary.warningCount - summary.warnings.length} more in the export.</li>}
+            </ul>
+          ) : summary.warnings.slice(0, 2).join(" ")}
         </Banner>
       )}
 
@@ -118,7 +140,7 @@ export function DiscoverPanel() {
           <ul className="type-grid" aria-label="Discovered object types">
             {types.map(([t, count]) => (
               <li key={t}>
-                <button type="button" className="type-tile" onClick={() => { setType(t); setTab("inventory"); }} title={`Show the ${PLURAL[t] ?? t}`}>
+                <button type="button" className="type-tile" onClick={() => { setGroup(""); setType(t); setTab("inventory"); }} title={`Show the ${PLURAL[t] ?? t}`}>
                   <span className="type-count">{count.toLocaleString()}</span>
                   <span className="type-name">{PLURAL[t] ?? t}</span>
                 </button>
@@ -130,7 +152,8 @@ export function DiscoverPanel() {
       ) : (
         <>
           {type && <div className="row"><span className="chip" role="status">{PLURAL[type] ?? type}<button type="button" className="chip-x" aria-label="Show every type" onClick={() => setType("")}>×</button></span></div>}
-          <Inventory summary={summary} type={type} />
+          {group && <div className="row"><span className="chip" role="status">{PATH_GROUPS[group].label}<button type="button" className="chip-x" aria-label="Show every object" onClick={() => setGroup("")}>×</button></span></div>}
+          <Inventory summary={summary} type={type} paths={group ? PATH_GROUPS[group].paths : undefined} />
         </>
       )}
     </div>

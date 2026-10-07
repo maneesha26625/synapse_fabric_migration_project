@@ -2312,6 +2312,23 @@ def test_dynamic_sql_is_recorded_as_an_observation_and_never_evaluated():
     assert "not statically determinable" in message
 
 
+def test_dynamic_sql_whose_tables_are_written_out_is_read_without_a_warning():
+    body = (
+        "CREATE PROCEDURE dbo.pLoad @path varchar(200) AS\n"
+        "DECLARE @sql varchar(4000);\n"
+        "SET @sql = 'COPY INTO stage.Trips FROM ''' + @path + ''' WITH (FILE_TYPE = ''PARQUET'')';\n"
+        "EXEC (@sql);"
+    )
+    procedures, _ = procedure_source(
+        modules=[module_row(30, body)]
+    ).discover_procedures()
+
+    procedure = procedures[0]
+    assert not procedure.uses_dynamic_sql
+    assert "stage.Trips" in procedure.referenced_names
+    assert IssueCode.UNSUPPORTED_CONSTRUCT not in [i.code for i in procedure.issues]
+
+
 def test_unreadable_parameters_do_not_make_a_procedure_look_argumentless():
     procedures, issues = procedure_source(
         parameters=CatalogQueryError("SELECT permission denied on sys.parameters")

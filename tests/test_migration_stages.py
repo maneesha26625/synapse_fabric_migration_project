@@ -510,6 +510,43 @@ def test_a_pipeline_is_rebuilt_for_fabric_with_inline_datasets_ids_and_the_wareh
     assert any("Warehouse 'pool01'" in n for n in out.notes)
 
 
+DEFAULT_SQL_LS = {"name": "ws-WorkspaceDefaultSqlServer", "properties": {
+    "type": "AzureSqlDW", "parameters": {"DBName": {"type": "String"}},
+    "typeProperties": {"connectionString": "Data Source=tcp:ws.sql.azuresynapse.net,1433;Initial Catalog=@{linkedService().DBName}"}}}
+
+
+def _linked_proc(db: object) -> dict:
+    return {"properties": {"activities": [{
+        "name": "Log", "type": "SqlServerStoredProcedure", "dependsOn": [],
+        "typeProperties": {"storedProcedureName": "[operation].[usp_Log]", "storedProcedureParameters": {"Step": {"value": "start", "type": "String"}}},
+        "linkedServiceName": {"referenceName": "ws-WorkspaceDefaultSqlServer", "type": "LinkedServiceReference", "parameters": {"DBName": db}}}]}}
+
+
+def test_a_linked_stored_procedure_on_the_migrated_pool_runs_in_the_warehouse():
+    """The workspace default SQL server, given the pool as DBName, is the pool: the procedure moved to the Warehouse."""
+    ctx = context(linked_services={**BUNDLE["linkedServices"], "ws-WorkspaceDefaultSqlServer": DEFAULT_SQL_LS})
+    out = pipelines.convert(_linked_proc("pool01"), ctx)
+    assert not out.unsupported and not out.missing
+    act = out.definition["properties"]["activities"][0]
+    assert act["type"] == "SqlServerStoredProcedure" and "linkedServiceName" not in act
+    assert act["linkedService"]["properties"]["type"] == "DataWarehouse"
+    assert act["linkedService"]["properties"]["typeProperties"]["artifactId"] == "wh-1"
+    assert act["typeProperties"]["storedProcedureName"] == "[operation].[usp_Log]"
+    assert act["typeProperties"]["storedProcedureParameters"] == {"Step": {"value": "start", "type": "String"}}
+
+
+def test_a_linked_stored_procedure_elsewhere_needs_that_connection():
+    """Another database, or one decided at runtime, is not the pool: it goes through the linked service's connection."""
+    ctx = context(linked_services={**BUNDLE["linkedServices"], "ws-WorkspaceDefaultSqlServer": DEFAULT_SQL_LS})
+    for db in ("otherdb", {"value": "@pipeline().parameters.db", "type": "Expression"}):
+        out = pipelines.convert(_linked_proc(db), ctx)
+        assert not out.unsupported and out.missing == ["connection ws-WorkspaceDefaultSqlServer"]
+    linked = pipelines.convert(_linked_proc("otherdb"), context(
+        linked_services={"ws-WorkspaceDefaultSqlServer": DEFAULT_SQL_LS}, connections={"ws-WorkspaceDefaultSqlServer": "conn-sql"}))
+    act = linked.definition["properties"]["activities"][0]
+    assert not linked.missing and act["externalReferences"] == {"connection": "conn-sql"} and "linkedService" not in act
+
+
 def test_a_pipeline_reports_missing_dependencies_and_activities_it_cannot_convert():
     out = pipelines.convert(PIPELINE_RES, context(connections={}, notebooks={}, pipelines={}))
     assert {"connection ls_adls", "notebook LoadSales", "pipeline pl_child"} <= set(out.missing)

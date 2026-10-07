@@ -12,6 +12,7 @@ import pytest
 
 from discovery_agent.extractors.sql_models import SqlObjectKind, SqlOperation
 from discovery_agent.extractors.sql_scanning import (
+    resolve_dynamic_sql,
     scan_objects,
     split_qualified_name,
 )
@@ -134,3 +135,71 @@ def test_an_expression_alone_is_a_single_part():
 )
 def test_splitting_names_without_expressions_is_unchanged(raw, expected):
     assert split_qualified_name(raw) == expected
+
+
+# --- dynamic SQL whose structure is static -----------------------------------
+
+COPY_PROCEDURE = """CREATE PROC [operation].[usp_Load] @Account [varchar](100) AS
+BEGIN
+    DECLARE @root varchar(500) = 'https://' + @Account + '.dfs.core.windows.net/raw/';
+    DECLARE @sql varchar(4000);
+    SET @sql = 'COPY INTO stage.Green FROM ''' + @root + 'green/*.parquet'' WITH (FILE_TYPE = ''PARQUET'')';
+    EXEC (@sql);
+    SET @sql = 'COPY INTO stage.Yellow FROM ''' + @root + 'yellow/*.parquet'' WITH (FILE_TYPE = ''PARQUET'')';
+    EXEC (@sql);
+END;
+"""
+
+
+def test_dynamic_sql_with_only_runtime_values_resolves_to_its_tables():
+    references, unresolved = resolve_dynamic_sql(COPY_PROCEDURE, "p")
+
+    assert unresolved == ()
+    assert [(r.qualified_name, r.statement, r.kind) for r in references] == [
+        ("stage.Green", "COPY INTO", SqlObjectKind.TABLE),
+        ("stage.Yellow", "COPY INTO", SqlObjectKind.TABLE),
+    ]
+    assert [r.location for r in references] == ["p:L6", "p:L8"]
+
+
+@pytest.mark.parametrize(
+    "sql,name",
+    [
+        ("EXEC('DELETE FROM dbo.Old')", "dbo.Old"),
+        ("EXEC sp_executesql N'SELECT * FROM dbo.C WHERE id = @id', N'@id int', @id = 1", "dbo.C"),
+        ("SET @sql = 'DELETE FROM dbo.D WHERE d = ''' + CONVERT(varchar(10), @d, 120) + ''''; EXEC (@sql);", "dbo.D"),
+    ],
+)
+def test_literal_dynamic_sql_resolves(sql, name):
+    references, unresolved = resolve_dynamic_sql(sql, "x")
+
+    assert unresolved == ()
+    assert [r.qualified_name for r in references] == [name]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SET @sql = 'SELECT * FROM ' + @table; EXEC(@sql)",
+        "EXEC sp_executesql @statement",
+        "IF @a = 1 SET @sql = 'SELECT 1 FROM dbo.A' ELSE SET @sql = 'SELECT 1 FROM dbo.B'; EXEC(@sql)",
+        "SET @sql = 'SELECT 1 FROM dbo.A'; SET @sql += ' JOIN ' + @t; EXEC(@sql)",
+        "SET @sql = 'SELECT 1 FROM dbo.A'; SET @sql = @sql + ' JOIN ' + @t; EXEC(@sql)",
+        "SELECT @sql = 'SELECT 1 FROM dbo.A'; EXEC(@sql)",
+        "SET @sql = 'EXEC(''SELECT 1 FROM dbo.A'')'; EXEC(@sql)",
+        "EXEC @procedure",
+    ],
+)
+def test_dynamic_sql_that_could_name_anything_stays_unresolved(sql):
+    references, unresolved = resolve_dynamic_sql(sql, "x")
+
+    assert references == ()
+    assert len(unresolved) == 1
+
+
+def test_copy_into_options_are_not_an_object():
+    objects = scan_objects(
+        "COPY INTO dbo.T FROM 'https://a/b.parquet' WITH (FILE_TYPE = 'PARQUET')", "q"
+    )
+
+    assert [(o.qualified_name, o.statement) for o in objects] == [("dbo.T", "COPY INTO")]

@@ -1,5 +1,5 @@
 import { Check, CircleDot, Circle, XCircle, type LucideIcon } from "lucide-react";
-import type { ReactNode } from "react";
+import type { KeyboardEvent, ReactNode } from "react";
 import type { Classification } from "../../types";
 
 /** A summary number. The value is always supplied by the caller from real data. */
@@ -70,17 +70,35 @@ export function StageTracker({ stages }: { stages: { label: string; state: Stage
   );
 }
 
+export interface StatItem {
+  label: string;
+  value: ReactNode;
+  hint?: string;
+  tone?: "success" | "warning" | "error" | "accent";
+  /** Makes the number open what it counts. */
+  onClick?: () => void;
+  /** The view this number opens is the one showing. */
+  active?: boolean;
+}
+
 /** A row of headline numbers with dividers: the summary at the top of a step, before any detail. */
-export function StatStrip({ items, label }: { items: { label: string; value: ReactNode; hint?: string; tone?: "success" | "warning" | "error" | "accent" }[]; label: string }) {
+export function StatStrip({ items, label }: { items: StatItem[]; label: string }) {
   return (
     <dl className="stat-strip" aria-label={label}>
-      {items.map((s) => (
-        <div key={s.label} className={`stat${s.tone ? ` tone-${s.tone}` : ""}`} title={s.hint}>
-          <dt>{s.label}</dt>
-          <dd>{s.value}</dd>
-          {s.hint && <span className="stat-hint">{s.hint}</span>}
-        </div>
-      ))}
+      {items.map((s) => {
+        const cls = `stat${s.tone ? ` tone-${s.tone}` : ""}${s.onClick ? " stat-action" : ""}${s.active ? " active" : ""}`;
+        const action = s.onClick && {
+          role: "button", tabIndex: 0, "aria-pressed": !!s.active, onClick: s.onClick,
+          onKeyDown: (e: KeyboardEvent<HTMLDivElement>) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); s.onClick!(); } },
+        };
+        return (
+          <div key={s.label} className={cls} title={s.hint} {...action}>
+            <dt>{s.label}</dt>
+            <dd>{s.value}</dd>
+            {s.hint && <span className="stat-hint">{s.hint}</span>}
+          </div>
+        );
+      })}
     </dl>
   );
 }

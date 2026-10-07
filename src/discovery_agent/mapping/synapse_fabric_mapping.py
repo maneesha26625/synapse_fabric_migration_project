@@ -481,8 +481,8 @@ ACTIVITY_RULES: Dict[str, ActivityMapping] = {
     ),
     "SqlServerStoredProcedure": _a(
         "Stored procedure activity", True, True,
-        "Runs in the migrated Fabric Warehouse when it called the dedicated pool (the procedure is migrated "
-        "there); otherwise through the Fabric connection named after its linked service.",
+        "Runs in the migrated Fabric Warehouse when its linked service reached the dedicated pool (the "
+        "procedure is migrated there); otherwise through the Fabric connection made from that linked service.",
     ),
     "SynapseNotebook": _a(
         "Notebook activity", True, True,

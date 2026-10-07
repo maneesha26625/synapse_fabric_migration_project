@@ -721,6 +721,27 @@ describe("discover step", () => {
     expect(within(dialog).getByText(/Recommended migration steps/)).toBeInTheDocument();
     expect(within(dialog).getByRole("button", { name: /Add to Migration Plan/ })).toBeInTheDocument();
   }, 25000);
+
+  it("opens what each summary card counts: the inventory narrowed to its objects, or the types", async () => {
+    await discovered();
+    const user = userEvent.setup();
+    go("/migration?step=discover");
+    const summary = await screen.findByLabelText("Discovery summary", {}, { timeout: 5000 });
+    const card = (label: string) => within(summary).getByRole("button", { name: new RegExp(`^${label}`) });
+    const count = (label: string) => within(card(label)).getByRole("definition").textContent!;
+
+    for (const label of ["With a Fabric mapping", "Manual or review", "Objects"]) {
+      await user.click(card(label));
+      expect(card(label)).toHaveAttribute("aria-pressed", "true");
+      expect(screen.getByRole("tab", { name: /^Inventory/ })).toHaveAttribute("aria-selected", "true");
+      // The inventory shows exactly the objects the card counted.
+      expect(await screen.findByText(new RegExp(`of ${count(label)}$`), {}, { timeout: 8000 })).toBeInTheDocument();
+    }
+
+    await user.click(card("Object types"));
+    expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("list", { name: "Discovered object types" })).toBeInTheDocument();
+  }, 40000);
 });
 
 describe("assess step", () => {
@@ -892,6 +913,32 @@ describe("migrate step", () => {
       expect(within(choice).getByRole("option", { name: "Only Notebooks" })).toBeInTheDocument();
     });
   }, 15000);
+
+  it("narrows the object table to what each run card counts", async () => {
+    await discovered();
+    await mockApi.authenticateFabric(FABRIC);
+    await mockApi.testFabric(FABRIC);
+    const items = await seedPlan(4);
+    await mockApi.startExecution(items);
+    await new Promise((r) => setTimeout(r, 2500));
+    unlockTo("migrate");
+    const user = userEvent.setup();
+    go("/migration?step=migrate");
+    const card = (label: string) => screen.getByRole("button", { name: new RegExp(`^${label}`) });
+    await waitFor(() => expect(card("Migrated")).toBeInTheDocument(), { timeout: 5000 });
+    const table = screen.getByRole("table", { name: "Migration state by object" });
+    const shown = () => within(table).queryAllByRole("row").length - 1; // less the header row
+
+    await user.click(card("Migrated"));
+    expect(card("Migrated")).toHaveAttribute("aria-pressed", "true");
+    const migrated = Number(within(card("Migrated")).getByText(/^\d+$/).textContent);
+    expect(shown()).toBe(migrated || 1); // an empty view still has its "Nothing in this view" row
+    within(table).queryAllByRole("row").slice(1).forEach((r) => migrated && expect(r).toHaveTextContent("COMPLETED"));
+
+    await user.click(screen.getByRole("button", { name: "Show every object" }));
+    expect(card("Total")).toHaveAttribute("aria-pressed", "true");
+    expect(shown()).toBe(4);
+  }, 25000);
 });
 
 describe("validate step", () => {

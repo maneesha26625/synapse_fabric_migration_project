@@ -328,24 +328,27 @@ def _stored_procedure(act: Mapping[str, Any], ctx: Context, out: Converted) -> D
     return result
 
 
-def _sql_stored_procedure(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, Any]:
-    """A stored procedure called through a SQL linked service. When that service reached the
-    pool being migrated (often the workspace's default one, with the pool's name as DBName),
-    the procedure runs in the migrated Warehouse, where the procedure itself was migrated;
-    otherwise it runs through the Fabric connection of the linked service's name."""
-    result = _base(act)
-    result["type"] = "SqlServerStoredProcedure"
-    result["typeProperties"] = copy.deepcopy(act.get("typeProperties") or {})
+def _linked_stored_procedure(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, Any]:
+    """A stored procedure called through a SQL linked service rather than on a pool.
+
+    When that linked service reached the pool being migrated (often the workspace's
+    default one, with the pool's name as DBName), the procedure now lives in the
+    migrated Warehouse and runs there. Otherwise it runs through the Fabric
+    connection made from the linked service.
+    """
     ref = act.get("linkedServiceName") or {}
     ls_name = str(ref.get("referenceName") or "")
     ls = ctx.linked_services.get(ls_name)
-    if ls is not None and ctx.warehouse is not None and _is_pool_service(ls, ctx, ref.get("parameters") or {}):
-        result["linkedService"] = _warehouse_ref(ctx)
-        out.notes.append(f"Stored procedure '{act.get('name')}' runs in the migrated Warehouse '{ctx.warehouse.name}'.")
-    elif ctx.connections.get(ls_name):
-        result["externalReferences"] = {"connection": ctx.connections[ls_name]}
-    else:
+    if ls is not None and _is_pool_service(ls, ctx, ref.get("parameters")):
+        return _stored_procedure(act, ctx, out)
+    result = _base(act)
+    result["type"] = "SqlServerStoredProcedure"
+    result["typeProperties"] = copy.deepcopy(act.get("typeProperties") or {})
+    connection = ctx.connections.get(ls_name)
+    if not connection:
         out.missing.append(f"connection {ls_name or '(none)'}")
+    else:
+        result["externalReferences"] = {"connection": connection}
     return result
 
 
@@ -400,7 +403,7 @@ def convert_activity(act: Mapping[str, Any], ctx: Context, out: Converted) -> Op
     if kind == "SqlPoolStoredProcedure":
         return _stored_procedure(act, ctx, out)
     if kind == "SqlServerStoredProcedure":
-        return _sql_stored_procedure(act, ctx, out)
+        return _linked_stored_procedure(act, ctx, out)
     if kind == "Script":
         return _script(act, ctx, out)
     if kind == "Switch":

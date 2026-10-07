@@ -1,5 +1,5 @@
 import { CheckCircle2, CircleAlert, Pause, Play, RotateCcw, ScrollText, XCircle } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { MetricCard } from "../shared/Metrics";
 import { Banner, Button, Card, EmptyState, Modal, StatusBadge, type Tone } from "../shared/Shared";
@@ -12,6 +12,22 @@ const TONE: Record<ExecItem["status"], Tone> = { PENDING: "neutral", "IN PROGRES
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleTimeString() : "—");
 
 type WaveState = "done" | "active" | "failed" | "pending";
+
+// What the object table shows: one of its tabs, or the objects a summary card counts.
+type View = "attention" | "done" | "all" | "migrated" | "skipped" | "deferred" | "failed" | "pending";
+const VIEW_STATUSES: Record<View, ExecItem["status"][] | null> = {
+  all: null,
+  attention: ["FAILED", "DEFERRED"],
+  done: ["COMPLETED", "SKIPPED"],
+  migrated: ["COMPLETED"],
+  skipped: ["SKIPPED"],
+  deferred: ["DEFERRED"],
+  failed: ["FAILED"],
+  pending: ["PENDING", "IN PROGRESS"],
+};
+const CARD_LABEL: Partial<Record<View, string>> = {
+  migrated: "Migrated", skipped: "Skipped", deferred: "Left for a person", failed: "Failed", pending: "Pending",
+};
 const finished = (s: ExecItem["status"]) => s === "COMPLETED" || s === "SKIPPED" || s === "DEFERRED";
 
 /** Checks before anything is touched: the target, the capacity, the SQL driver. */
@@ -65,7 +81,11 @@ export function RunPanel() {
   const navigate = useNavigate();
   const { execution: run, executionError, startExecution, controlExecution, plan, fabric, analysis, analysisError, options, capabilities } = useMigration();
   const [logs, setLogs] = useState(false);
-  const [view, setView] = useState<"attention" | "done" | "all">("all");
+  const [view, setView] = useState<View>("all");
+  const table = useRef<HTMLDivElement>(null);
+  // A card shows the objects it counts, and brings the table into view.
+  const showCard = (v: View) => { setView(v); table.current?.scrollIntoView?.({ behavior: "smooth", block: "start" }); };
+  const card = (v: View) => ({ onClick: () => showCard(v), active: view === v });
   // Every stage that is on, or just one of them: a single stage can be run (or re-run) on its own.
   const [only, setOnly] = useState("");
   const stagesOn = (capabilities?.stages ?? []).filter((st) => options.stages.includes(st.key));
@@ -90,7 +110,8 @@ export function RunPanel() {
     });
   }, [run.items]);
 
-  const rows = run.items.filter((i) => view === "all" || (view === "attention" ? i.status === "FAILED" || i.status === "DEFERRED" : i.status === "COMPLETED" || i.status === "SKIPPED"));
+  const statuses = VIEW_STATUSES[view];
+  const rows = statuses ? run.items.filter((i) => statuses.includes(i.status)) : run.items;
   const attention = run.items.filter((i) => i.status === "FAILED").length;
 
   return (
@@ -143,13 +164,14 @@ export function RunPanel() {
         <>
           <RunProgress done={run.completed + (run.skipped ?? 0)} deferred={run.deferred ?? 0} failed={run.failed} total={run.total} />
           <div className="grid cols-6">
-            <MetricCard label="Total" value={run.total.toLocaleString()} />
-            <MetricCard label="Migrated" value={<span className="tone-success">{run.completed.toLocaleString()}</span>} />
-            <MetricCard label="Skipped" value={(run.skipped ?? 0).toLocaleString()} hint="Already in Fabric" />
-            <MetricCard label="Left for a person" value={<span className={run.deferred ? "tone-warning" : undefined}>{(run.deferred ?? 0).toLocaleString()}</span>} hint="Set up by hand, or needs input" />
-            <MetricCard label="Failed" value={<span className={run.failed ? "tone-error" : undefined}>{run.failed.toLocaleString()}</span>} />
-            <MetricCard label="Pending" value={(run.pending + run.inProgress).toLocaleString()} />
+            <MetricCard label="Total" value={run.total.toLocaleString()} {...card("all")} />
+            <MetricCard label="Migrated" value={<span className="tone-success">{run.completed.toLocaleString()}</span>} {...card("migrated")} />
+            <MetricCard label="Skipped" value={(run.skipped ?? 0).toLocaleString()} hint="Already in Fabric" {...card("skipped")} />
+            <MetricCard label="Left for a person" value={<span className={run.deferred ? "tone-warning" : undefined}>{(run.deferred ?? 0).toLocaleString()}</span>} hint="Set up by hand, or needs input" {...card("deferred")} />
+            <MetricCard label="Failed" value={<span className={run.failed ? "tone-error" : undefined}>{run.failed.toLocaleString()}</span>} {...card("failed")} />
+            <MetricCard label="Pending" value={(run.pending + run.inProgress).toLocaleString()} {...card("pending")} />
           </div>
+          <div ref={table} />
 
           <div className="waves">
             {steps.map((s, i) => (
@@ -179,6 +201,9 @@ export function RunPanel() {
                 ))}
               </div>
             }>
+            {!["all", "attention", "done"].includes(view) && (
+              <div className="row"><span className="chip" role="status">{CARD_LABEL[view]}: {rows.length.toLocaleString()}<button type="button" className="chip-x" aria-label="Show every object" onClick={() => setView("all")}>×</button></span></div>
+            )}
             <div className="table-wrap">
               <table className="data" style={{ minWidth: 1000 }}>
                 <caption className="sr-only">Migration state by object</caption>

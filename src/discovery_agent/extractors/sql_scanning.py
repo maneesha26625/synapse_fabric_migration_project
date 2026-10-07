@@ -8,8 +8,10 @@ cannot know:
   be a table, a view, or a synonym. Only a DDL keyword (``CREATE VIEW``,
   ``DROP TABLE``) settles it, so everything else is reported as UNKNOWN rather
   than guessed.
-* **Dynamic SQL is recorded, never resolved.** ``EXEC(@sql)`` has no static
-  answer; claiming one would be worse than admitting the gap.
+* **Dynamic SQL is recorded, never guessed.** ``EXEC(@sql)`` generally has no
+  static answer; claiming one would be worse than admitting the gap.
+  ``resolve_dynamic_sql`` reads only the provable case: SQL assembled from
+  literals whose runtime parts are values, never names.
 * **An interpolated name is reported, never completed.** A Synapse expression
   standing in for an identifier — ``TRUNCATE TABLE @{...}.TripsData`` — yields
   an INTERPOLATED reference carrying the name exactly as written. The
@@ -29,6 +31,7 @@ future SQL-source extractors will need exactly this.
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from discovery_agent.extractors.common_models import SecretKind, SecretReference
@@ -61,6 +64,9 @@ _NOT_OBJECTS = frozenset(
     {
         "openrowset", "openquery", "opendatasource", "openxml", "openjson",
         "string_split", "generate_series", "values", "select", "lateral",
+        # COPY INTO t FROM 'path' WITH (...): with the path blanked, the
+        # options clause is what follows FROM.
+        "with",
     }
 )
 
@@ -87,6 +93,7 @@ _OBJECT_PATTERNS: Tuple[Tuple[str, SqlOperation, SqlObjectKind, str], ...] = (
     (r"\bDROP\s+PROC(?:EDURE)?\s+(?:IF\s+EXISTS\s+)?({0})", SqlOperation.DROP, SqlObjectKind.PROCEDURE, "DROP PROCEDURE"),
     (r"\bDROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?({0})", SqlOperation.DROP, SqlObjectKind.TABLE, "DROP TABLE"),
     (r"\bTRUNCATE\s+TABLE\s+({0})", SqlOperation.TRUNCATE, SqlObjectKind.TABLE, "TRUNCATE TABLE"),
+    (r"\bCOPY\s+INTO\s+({0})", SqlOperation.WRITE, SqlObjectKind.TABLE, "COPY INTO"),
     (r"\bINSERT\s+INTO\s+({0})", SqlOperation.WRITE, SqlObjectKind.UNKNOWN, "INSERT INTO"),
     (r"\bDELETE\s+FROM\s+({0})", SqlOperation.WRITE, SqlObjectKind.UNKNOWN, "DELETE FROM"),
     (r"\bMERGE\s+(?:INTO\s+)?({0})", SqlOperation.MERGE, SqlObjectKind.UNKNOWN, "MERGE"),
@@ -365,21 +372,220 @@ def scan_dynamic_sql(sql: str, location: str) -> Tuple[DynamicSqlSite, ...]:
     inventing one would be worse than reporting the gap.
     """
     scrubbed = blank_comments_and_literals(sql)
-    sites: List[DynamicSqlSite] = []
+    sites = [
+        _site(sql, scrubbed, start, construct, location)
+        for start, construct in _dynamic_matches(scrubbed)
+    ]
+    return tuple(sorted(sites, key=lambda s: (s.location, s.construct)))
+
+
+def _dynamic_matches(scrubbed: str) -> List[Tuple[int, str]]:
+    """(offset, construct) for every dynamic SQL site, each claimed once."""
+    found: List[Tuple[int, str]] = []
     claimed: List[int] = []
     for pattern, construct in _COMPILED_DYNAMIC:
         for match in pattern.finditer(scrubbed):
             if match.start() in claimed:
                 continue
             claimed.append(match.start())
-            sites.append(
-                DynamicSqlSite(
-                    construct=construct,
-                    location=_at(location, _line_of(scrubbed, match.start())),
-                    evidence=_evidence(sql, match.start()),
-                )
-            )
-    return tuple(sorted(sites, key=lambda s: (s.location, s.construct)))
+            found.append((match.start(), construct))
+    return found
+
+
+def _site(sql: str, scrubbed: str, start: int, construct: str, location: str) -> DynamicSqlSite:
+    return DynamicSqlSite(
+        construct=construct,
+        location=_at(location, _line_of(scrubbed, start)),
+        evidence=_evidence(sql, start),
+    )
+
+
+# --- resolving dynamic SQL whose structure is static ------------------------
+#
+# ``SET @sql = 'COPY INTO stage.Trips FROM ''' + @root + 'trips/*.parquet'''``
+# followed by ``EXEC(@sql)`` builds its statement at runtime, but only a path
+# is decided then: the table it writes is written out in full. Such a site is
+# resolvable without guessing, under one strict condition: every runtime part
+# of the assembled text lands inside a string literal of the statement it
+# builds, so it can change a value and never the SQL's structure. Anything
+# else (a runtime table name, a variable assigned more than once or in a
+# form not read here, a nested EXEC) stays unresolved.
+
+_RUNTIME_VALUE = "__runtime_value__"
+_STRING_LITERAL_AT = re.compile(r"N?'((?:[^']|'')*)'", re.I)
+_VARIABLE_AT = re.compile(r"@\w+")
+_CALL_AT = re.compile(r"[A-Za-z_]\w*\s*\(")
+_EXEC_PAREN = re.compile(r"\bEXEC(?:UTE)?\s*\(", re.I)
+_SP_EXECUTESQL = re.compile(r"\bsp_executesql\s+", re.I)
+
+
+def _skip_space(text: str, index: int) -> int:
+    while index < len(text) and text[index].isspace():
+        index += 1
+    return index
+
+
+def _closing_paren(text: str, open_index: int) -> Optional[int]:
+    """Offset just after the parenthesis that closes ``text[open_index]``."""
+    depth = 0
+    index = open_index
+    while index < len(text):
+        literal = _STRING_LITERAL_AT.match(text, index)
+        if literal and text[index] in "Nn'":
+            index = literal.end()
+            continue
+        if text[index] == "(":
+            depth += 1
+        elif text[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+        index += 1
+    return None
+
+
+def _concatenation(text: str, index: int) -> Optional[Tuple[List[Optional[str]], int]]:
+    """Parse ``'literal' + @var + FUNC(...) + ...`` starting at ``index``.
+
+    Returns the pieces (a literal's text, ``"\\0@name"`` for a variable, None
+    for any other runtime value) and where the expression ended. None when the
+    text is not a plain concatenation.
+    """
+    pieces: List[Optional[str]] = []
+    while True:
+        index = _skip_space(text, index)
+        literal = _STRING_LITERAL_AT.match(text, index)
+        if literal:
+            pieces.append(literal.group(1).replace("''", "'"))
+            index = literal.end()
+        elif _VARIABLE_AT.match(text, index):
+            variable = _VARIABLE_AT.match(text, index)
+            pieces.append("\0" + variable.group(0).lower())
+            index = variable.end()
+        elif _CALL_AT.match(text, index):
+            call = _CALL_AT.match(text, index)
+            end = _closing_paren(text, call.end() - 1)
+            if end is None:
+                return None
+            pieces.append(None)
+            index = end
+        else:
+            return None
+        after = _skip_space(text, index)
+        if after < len(text) and text[after] == "+" and not text.startswith("+=", after):
+            index = after + 1
+            continue
+        return pieces, index
+
+
+def _assignments(scrubbed: str, variable: str, before: int) -> List["re.Match"]:
+    """Every statement before ``before`` that sets ``variable``, in any form."""
+    name = re.escape(variable)
+    pattern = re.compile(
+        r"\bSET\s+{0}\s*[-+*/%&|^]?=|\bSELECT\s+(?:[^;]*?,\s*)?{0}\s*[-+*/%&|^]?="
+        r"|\bDECLARE\s+{0}\s+\w+(?:\s*\([^)]*\))?\s*=|\b{0}\s+OUT(?:PUT)?\b".format(name),
+        re.I,
+    )
+    return [m for m in pattern.finditer(scrubbed, 0, before)]
+
+
+def _variable_text(sql: str, scrubbed: str, variable: str, site: int, floor: int) -> Optional[List[Optional[str]]]:
+    """The pieces of the one plain ``SET``/``DECLARE`` that last gave ``variable`` its value.
+
+    None unless exactly one assignment sits between ``floor`` (the previous
+    dynamic site) and ``site``, it is a plain ``=`` of a concatenation, and
+    nothing touches the variable between that assignment and the site.
+    """
+    found = [m for m in _assignments(scrubbed, variable, site) if m.start() >= floor]
+    if len(found) != 1:
+        return None
+    assignment = found[0]
+    written = assignment.group(0)
+    if not written.upper().startswith(("SET", "DECLARE")) or re.search(r"[-+*/%&|^]=$", written):
+        return None  # SELECT @v =, OUTPUT and += are not read here
+    parsed = _concatenation(sql, assignment.end())
+    if parsed is None:
+        return None
+    pieces, end = parsed
+    if re.search(r"(?<![\w@]){0}\b".format(re.escape(variable)), scrubbed[end:site], re.I):
+        return None
+    return pieces
+
+
+def _executed_pieces(sql: str, scrubbed: str, start: int, floor: int) -> Optional[List[Optional[str]]]:
+    """The pieces of the SQL text a site executes, or None when not readable."""
+    paren = _EXEC_PAREN.match(scrubbed, start)
+    if paren:
+        parsed = _concatenation(sql, paren.end())
+        if parsed is None or not sql[_skip_space(sql, parsed[1]):].startswith(")"):
+            return None
+        pieces = parsed[0]
+    else:
+        call = _SP_EXECUTESQL.match(scrubbed, start)
+        if not call:
+            return None  # EXEC @variable runs a procedure named at runtime
+        parsed = _concatenation(sql, call.end())
+        if parsed is None:
+            return None
+        pieces = parsed[0]
+
+    expanded: List[Optional[str]] = []
+    for piece in pieces:
+        if piece is not None and piece.startswith("\0"):
+            if len(pieces) == 1:
+                value = _variable_text(sql, scrubbed, piece[1:], start, floor)
+                if value is None:
+                    return None
+                expanded.extend(None if v is not None and v.startswith("\0") else v for v in value)
+            else:
+                expanded.append(None)
+        else:
+            expanded.append(piece)
+    return expanded
+
+
+def _resolve_site(pieces: List[Optional[str]], location: str) -> Optional[Tuple[SqlObjectReference, ...]]:
+    """The objects a statement names, when its runtime parts are only values."""
+    if not any(p for p in pieces if p is not None):
+        return None
+    text = "".join(_RUNTIME_VALUE if p is None else p for p in pieces)
+    literal_spans = [m.span() for m in _QUOTED_LITERAL.finditer(blank_comments(text))]
+    offset = text.find(_RUNTIME_VALUE)
+    while offset != -1:
+        if not any(start < offset and offset < end for start, end in literal_spans):
+            return None  # a runtime part shapes the SQL itself
+        offset = text.find(_RUNTIME_VALUE, offset + 1)
+    if _dynamic_matches(blank_comments_and_literals(text)):
+        return None  # it builds SQL of its own
+    return tuple(replace(r, location=location) for r in scan_objects(text, location))
+
+
+def resolve_dynamic_sql(
+    sql: str, location: str
+) -> Tuple[Tuple[SqlObjectReference, ...], Tuple[DynamicSqlSite, ...]]:
+    """The objects resolvable dynamic SQL names, and the sites that stay unresolved.
+
+    A site resolves only when the SQL it runs is assembled from literals, and
+    every runtime value lands inside a string literal of that SQL (a path, a
+    date), never where a name or keyword goes. See the note above.
+    """
+    scrubbed = blank_comments_and_literals(sql)
+    references: List[SqlObjectReference] = []
+    unresolved: List[DynamicSqlSite] = []
+    floor = 0
+    for start, construct in sorted(_dynamic_matches(scrubbed)):
+        site = _site(sql, scrubbed, start, construct, location)
+        pieces = _executed_pieces(sql, scrubbed, start, floor)
+        resolved = None if pieces is None else _resolve_site(pieces, site.location)
+        if resolved is None:
+            unresolved.append(site)
+        else:
+            references.extend(resolved)
+        floor = start + 1
+    return (
+        tuple(sorted(references, key=lambda o: (o.location, o.qualified_name))),
+        tuple(sorted(unresolved, key=lambda s: (s.location, s.construct))),
+    )
 
 
 def scan_sql_secrets(sql: str, location: str) -> Tuple[SecretReference, ...]:
