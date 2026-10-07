@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from discovery_agent.extractors.models import ExtractionIssue, IssueCode
 from discovery_agent.extractors.sql_models import DynamicSqlSite, SqlObjectReference
-from discovery_agent.extractors.sql_scanning import scan_dynamic_sql, scan_objects
+from discovery_agent.extractors.sql_scanning import resolve_dynamic_sql, scan_objects
 from discovery_agent.sql.models import (
     DISTRIBUTION_POLICY_CODES,
     INDEX_TYPE_CODES,
@@ -845,14 +845,20 @@ def observe_definition(
     FROM clause is an observation, and whether the object exists is the
     dependency stage's question.
 
+    Dynamic SQL whose structure is written out in literals, with only values
+    such as a storage path supplied at runtime, is read like any other
+    statement; only the sites that stay genuinely unknowable are returned.
+
     A body that was not readable yields nothing, rather than an empty tuple
     that would read as "this view references nothing".
     """
     if not definition.is_readable or definition.text is None:
         return (), ()
+    resolved, unresolved = resolve_dynamic_sql(definition.text, location)
+    references = scan_objects(definition.text, location) + resolved
     return (
-        scan_objects(definition.text, location),
-        scan_dynamic_sql(definition.text, location),
+        tuple(sorted(references, key=lambda o: (o.location, o.qualified_name))),
+        unresolved,
     )
 
 
