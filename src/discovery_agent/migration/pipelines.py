@@ -36,6 +36,7 @@ _DATASET_HOLDERS = {"Lookup", "GetMetadata", "Delete", "Validation"}
 _SQL_LS = {"AzureSqlDW", "AzureSynapseAnalytics"}
 _SOURCE_SINK_MAP = {"SqlDWSource": "DataWarehouseSource", "SqlDWSink": "DataWarehouseSink"}
 _DATASET_REF = re.compile(r"dataset\(\)\.([A-Za-z_][A-Za-z0-9_]*)")
+_LS_PARAM = re.compile(r"@\{?\s*linkedService\(\)\.([A-Za-z_][A-Za-z0-9_]*)\s*\}?")
 
 
 @dataclass
@@ -104,8 +105,34 @@ def _substitute(node: Any, params: Mapping[str, Any]) -> Any:
 # -- datasets ------------------------------------------------------------------------
 
 
-def _is_pool_service(ls: Mapping[str, Any], ctx: Context) -> bool:
-    """A linked service that points at the dedicated pool being migrated."""
+def _bind_ls_parameters(text: str, ls: Mapping[str, Any], passed: Optional[Mapping[str, Any]]) -> str:
+    """``@{linkedService().X}`` replaced by the literal value passed for X, or X's default.
+
+    Empty when any parameter has no literal value here (an expression decided at
+    runtime): which database that is cannot be known, so it must not match.
+    """
+    defaults = {k: (v or {}).get("defaultValue") for k, v in ((ls.get("properties") or {}).get("parameters") or {}).items()}
+    values = {**{k: v for k, v in defaults.items() if v is not None}, **dict(passed or {})}
+    unresolved = False
+
+    def repl(m: "re.Match[str]") -> str:
+        nonlocal unresolved
+        value = values.get(m.group(1))
+        if not isinstance(value, str) or value.startswith("@"):
+            unresolved = True
+            return ""
+        return value
+
+    bound = _LS_PARAM.sub(repl, text)
+    return "" if unresolved else bound
+
+
+def _is_pool_service(ls: Mapping[str, Any], ctx: Context, passed: Optional[Mapping[str, Any]] = None) -> bool:
+    """A linked service that points at the dedicated pool being migrated.
+
+    ``passed`` are the parameters the referring activity gives the linked service,
+    which settle a database written as ``@{linkedService().DBName}``.
+    """
     props = ls.get("properties") or {}
     if props.get("type") not in _SQL_LS | {"AzureSqlDatabase"} or not ctx.pool_name:
         return False
@@ -113,7 +140,7 @@ def _is_pool_service(ls: Mapping[str, Any], ctx: Context) -> bool:
     cs = str(tp.get("connectionString") or "") if isinstance(tp.get("connectionString"), str) else ""
     database = tp.get("database") if isinstance(tp.get("database"), str) else ""
     m = re.search(r"(?:initial catalog|database)\s*=\s*([^;]+)", cs, re.I)
-    database = database or (m.group(1).strip() if m else "")
+    database = _bind_ls_parameters(database or (m.group(1).strip() if m else ""), ls, passed)
     return database.lower() == ctx.pool_name.lower()
 
 
@@ -257,6 +284,30 @@ def _stored_procedure(act: Mapping[str, Any], ctx: Context, out: Converted) -> D
     return result
 
 
+def _linked_stored_procedure(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, Any]:
+    """A stored procedure called through a linked service rather than on a pool.
+
+    When that linked service is the dedicated pool being migrated (often the
+    workspace's default SQL server, given the pool name as ``DBName``), the
+    procedure now lives in the migrated Warehouse and runs there. Otherwise it
+    runs through the Fabric connection made from the linked service.
+    """
+    ref = act.get("linkedServiceName") or {}
+    ls_name = str(ref.get("referenceName") or "")
+    ls = ctx.linked_services.get(ls_name)
+    if ls is not None and _is_pool_service(ls, ctx, ref.get("parameters")):
+        return _stored_procedure(act, ctx, out)
+    result = _base(act)
+    result["type"] = "SqlServerStoredProcedure"
+    result["typeProperties"] = copy.deepcopy(act.get("typeProperties") or {})
+    connection = ctx.connections.get(ls_name)
+    if not connection:
+        out.missing.append(f"connection {ls_name or '(none)'}")
+    else:
+        result["externalReferences"] = {"connection": connection}
+    return result
+
+
 def _script(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, Any]:
     result = _base(act)
     result["type"] = "Script"
@@ -306,6 +357,8 @@ def convert_activity(act: Mapping[str, Any], ctx: Context, out: Converted) -> Op
         return _sparkjob(act, ctx, out)
     if kind == "SqlPoolStoredProcedure":
         return _stored_procedure(act, ctx, out)
+    if kind == "SqlServerStoredProcedure":
+        return _linked_stored_procedure(act, ctx, out)
     if kind == "Script":
         return _script(act, ctx, out)
     if kind == "Switch":

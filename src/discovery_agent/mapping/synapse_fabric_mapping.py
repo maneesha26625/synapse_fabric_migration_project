@@ -479,6 +479,11 @@ ACTIVITY_RULES: Dict[str, ActivityMapping] = {
         "Stored procedure activity", True, True,
         "The procedure must exist in the target Fabric Warehouse; the connection is re-pointed.",
     ),
+    "SqlServerStoredProcedure": _a(
+        "Stored procedure activity", True, True,
+        "Runs in the migrated Fabric Warehouse when its linked service is the dedicated pool; "
+        "otherwise through the Fabric connection made from that linked service.",
+    ),
     "SynapseNotebook": _a(
         "Notebook activity", True, True,
         "References a Fabric Notebook, which must exist as a migrated target.",
