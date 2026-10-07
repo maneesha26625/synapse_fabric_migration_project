@@ -629,6 +629,11 @@ html, body, #root { height: auto; min-height: 100%; }
 .stat.tone-success dd { color: var(--success); }
 .stat.tone-warning dd { color: var(--warning); }
 .stat.tone-error dd { color: var(--error); }
+.warning-list { margin: 4px 0 0; padding-left: 18px; display: grid; gap: 4px; max-height: 240px; overflow-y: auto; }
+.stat-action { cursor: pointer; transition: background .15s; }
+.stat-action:hover { background: rgba(255, 255, 255, 0.04); }
+.stat-action:focus-visible { outline-offset: -2px; }
+.stat-action.active { background: var(--accent-soft); box-shadow: 1px 0 0 var(--border), inset 0 -2px 0 var(--accent); }
 .type-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
 .type-tile { display: flex; flex-direction: column; gap: 2px; padding: 12px 14px; text-align: left; border-radius: 12px; border: 1px solid var(--border); background: var(--surface-2); cursor: pointer; }
 .type-tile:hover { border-color: var(--accent); background: var(--accent-soft); }
