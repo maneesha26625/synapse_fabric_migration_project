@@ -9,7 +9,9 @@ differences this module handles:
 * **Fabric items are referenced by id.** A notebook, Spark job or pipeline an
   activity runs is named by its Fabric id, so those must exist first.
 * **The SQL pool is gone.** Anything that read or wrote the Synapse pool is
-  pointed at the migrated Warehouse instead.
+  pointed at the migrated Warehouse instead: datasets, Script and Stored
+  procedure activities, including those that reach the pool through the
+  workspace's default SQL linked service with the database as a parameter.
 
 An activity this module does not know is never guessed at: the pipeline is
 reported as needing a rewrite, with the activity names, and not created.
@@ -21,7 +23,7 @@ import base64
 import copy
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 #: Control-flow and pass-through activities that need no conversion beyond their children.
@@ -58,6 +60,8 @@ class Context:
     workspace_id: str
     warehouse: Optional[Warehouse]
     pool_name: str = ""
+    #: The pipeline's own parameters and their default values, filled in by ``convert``.
+    pipeline_parameters: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -101,20 +105,86 @@ def _substitute(node: Any, params: Mapping[str, Any]) -> Any:
     return node
 
 
-# -- datasets ------------------------------------------------------------------------
+# -- the Synapse pool, wherever it is reached from ----------------------------------------
+
+_LS_PARAMETER = re.compile(r"@\{\s*linkedService\(\)\.([A-Za-z_]\w*)\s*\}|@linkedService\(\)\.([A-Za-z_]\w*)")
+_PIPELINE_PARAMETER = re.compile(r"@\{?\s*pipeline\(\)\.parameters\.([A-Za-z_]\w*)\s*\}?")
 
 
-def _is_pool_service(ls: Mapping[str, Any], ctx: Context) -> bool:
-    """A linked service that points at the dedicated pool being migrated."""
+def _literal(value: Any, pipeline_parameters: Mapping[str, Any]) -> Optional[str]:
+    """The text a value stands for, or None when only the running pipeline knows it.
+    ``@pipeline().parameters.x`` stands for that parameter's default value."""
+    if isinstance(value, Mapping):
+        value = value.get("value")
+    if not isinstance(value, str):
+        return None
+    m = _PIPELINE_PARAMETER.fullmatch(value.strip())
+    if m:
+        default = pipeline_parameters.get(m.group(1))
+        return default if isinstance(default, str) else None
+    return None if value.startswith("@") else value
+
+
+def _host(server: str) -> str:
+    """``tcp:name.sql.azuresynapse.net,1433`` -> ``name.sql.azuresynapse.net``."""
+    return re.sub(r"^tcp:", "", server.strip(), flags=re.I).split(",")[0].strip().lower()
+
+
+def sql_target(ls: Mapping[str, Any], values: Optional[Mapping[str, Any]] = None,
+               pipeline_parameters: Optional[Mapping[str, Any]] = None) -> Tuple[str, str]:
+    """(host, database) a SQL linked service reaches. Its ``linkedService()`` parameters are
+    filled in from ``values`` (what an activity or a dataset passes to it) or their defaults;
+    one that stays unknown keeps its ``@{linkedService().x}`` text."""
     props = ls.get("properties") or {}
-    if props.get("type") not in _SQL_LS | {"AzureSqlDatabase"} or not ctx.pool_name:
-        return False
     tp = props.get("typeProperties") or {}
-    cs = str(tp.get("connectionString") or "") if isinstance(tp.get("connectionString"), str) else ""
+    cs = tp.get("connectionString")
+    if isinstance(cs, Mapping):
+        cs = cs.get("value")
+    pairs = {k.strip().lower(): v.strip() for k, _, v in (part.partition("=") for part in (cs if isinstance(cs, str) else "").split(";")) if k.strip()}
+    server = tp.get("server") if isinstance(tp.get("server"), str) else ""
     database = tp.get("database") if isinstance(tp.get("database"), str) else ""
-    m = re.search(r"(?:initial catalog|database)\s*=\s*([^;]+)", cs, re.I)
-    database = database or (m.group(1).strip() if m else "")
-    return database.lower() == ctx.pool_name.lower()
+    server = server or pairs.get("server") or pairs.get("data source") or pairs.get("address") or ""
+    database = database or pairs.get("database") or pairs.get("initial catalog") or ""
+    defaults = {k: v.get("defaultValue") for k, v in (props.get("parameters") or {}).items() if isinstance(v, Mapping)}
+    given, known = values or {}, pipeline_parameters or {}
+
+    def fill(m: "re.Match[str]") -> str:
+        name = m.group(1) or m.group(2)
+        value = _literal(given[name], known) if name in given else None
+        if value is None and isinstance(defaults.get(name), str):
+            value = defaults[name]
+        return value if value is not None else m.group(0)
+
+    return _host(_LS_PARAMETER.sub(fill, server)), _LS_PARAMETER.sub(fill, database).strip()
+
+
+def is_pool_service(ls: Mapping[str, Any], pool_name: str, values: Optional[Mapping[str, Any]] = None, pool_server: str = "",
+                    pipeline_parameters: Optional[Mapping[str, Any]] = None, any_database: bool = False) -> bool:
+    """Whether a SQL linked service reaches the dedicated pool being migrated, whose part the
+    migrated Warehouse now plays. With ``any_database`` a database left to a parameter on the
+    pool's own server counts too: the workspace's default SQL linked service, whose only use in
+    a migrated pipeline is reaching this pool."""
+    props = ls.get("properties") or {}
+    if props.get("type") not in _SQL_LS | {"AzureSqlDatabase"} or not pool_name:
+        return False
+    host, database = sql_target(ls, values, pipeline_parameters)
+    if "-ondemand." in host:
+        return False  # the serverless endpoint holds other databases, never the dedicated pool
+    if pool_server and host and host != _host(pool_server):
+        return False
+    if database.lower() == pool_name.lower():
+        return True
+    if not any_database or not _LS_PARAMETER.fullmatch(database):
+        return False
+    return bool(pool_server) or host.endswith(".sql.azuresynapse.net")
+
+
+def _is_pool_service(ls: Mapping[str, Any], ctx: Context, values: Optional[Mapping[str, Any]] = None) -> bool:
+    """A linked service that, with the values this use passes it, points at the pool being migrated."""
+    return is_pool_service(ls, ctx.pool_name, values, "", ctx.pipeline_parameters)
+
+
+# -- datasets ------------------------------------------------------------------------
 
 
 def _warehouse_ref(ctx: Context) -> Dict[str, Any]:
@@ -135,19 +205,20 @@ def dataset_settings(ref: Mapping[str, Any], ctx: Context, out: Converted) -> Tu
     params = {k: v for k, v in (ref.get("parameters") or {}).items()}
     ls_name = str((props.get("linkedServiceName") or {}).get("referenceName") or "")
     ls = ctx.linked_services.get(ls_name)
-    ls_values = (props.get("linkedServiceName") or {}).get("parameters") or {}
-    if ls_values:
-        out.notes.append(f"Dataset {name} passes {', '.join(sorted(ls_values))} to linked service {ls_name}; Fabric connections take no "
-                         f"parameters, so it uses the single connection '{ls_name}'. Check it points at the right place.")
+    # What the dataset passes its linked service (say, DBName), with the activity's dataset parameters filled in.
+    ls_values = _substitute(copy.deepcopy((props.get("linkedServiceName") or {}).get("parameters") or {}), params)
     typeprops = _substitute(copy.deepcopy(props.get("typeProperties") or {}), params)
     schema = props.get("schema") or []
-    if ls is not None and ctx.warehouse is not None and _is_pool_service(ls, ctx):
+    if ls is not None and ctx.warehouse is not None and _is_pool_service(ls, ctx, ls_values):
         table = typeprops.get("table") or typeprops.get("tableName")
         settings = {"annotations": [], "type": "DataWarehouseTable", "schema": schema,
                     "typeProperties": {k: v for k, v in {"schema": typeprops.get("schema"), "table": table}.items() if v},
                     "linkedService": _warehouse_ref(ctx)}
         out.notes.append(f"Dataset {name} now reads and writes the migrated Warehouse '{ctx.warehouse.name}', not the Synapse pool.")
         return settings, True
+    if ls_values:
+        out.notes.append(f"Dataset {name} passes {', '.join(sorted(ls_values))} to linked service {ls_name}; Fabric connections take no "
+                         f"parameters, so it uses the single connection '{ls_name}'. Check it points at the right place.")
     connection = ctx.connections.get(ls_name)
     if not connection:
         out.missing.append(f"connection {ls_name or '(none)'}")
@@ -257,13 +328,35 @@ def _stored_procedure(act: Mapping[str, Any], ctx: Context, out: Converted) -> D
     return result
 
 
+def _sql_stored_procedure(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, Any]:
+    """A stored procedure called through a SQL linked service. When that service reached the
+    pool being migrated (often the workspace's default one, with the pool's name as DBName),
+    the procedure runs in the migrated Warehouse, where the procedure itself was migrated;
+    otherwise it runs through the Fabric connection of the linked service's name."""
+    result = _base(act)
+    result["type"] = "SqlServerStoredProcedure"
+    result["typeProperties"] = copy.deepcopy(act.get("typeProperties") or {})
+    ref = act.get("linkedServiceName") or {}
+    ls_name = str(ref.get("referenceName") or "")
+    ls = ctx.linked_services.get(ls_name)
+    if ls is not None and ctx.warehouse is not None and _is_pool_service(ls, ctx, ref.get("parameters") or {}):
+        result["linkedService"] = _warehouse_ref(ctx)
+        out.notes.append(f"Stored procedure '{act.get('name')}' runs in the migrated Warehouse '{ctx.warehouse.name}'.")
+    elif ctx.connections.get(ls_name):
+        result["externalReferences"] = {"connection": ctx.connections[ls_name]}
+    else:
+        out.missing.append(f"connection {ls_name or '(none)'}")
+    return result
+
+
 def _script(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, Any]:
     result = _base(act)
     result["type"] = "Script"
     result["typeProperties"] = copy.deepcopy(act.get("typeProperties") or {})
-    ls_name = str((act.get("linkedServiceName") or {}).get("referenceName") or "")
+    ref = act.get("linkedServiceName") or {}
+    ls_name = str(ref.get("referenceName") or "")
     ls = ctx.linked_services.get(ls_name)
-    if ls is not None and ctx.warehouse is not None and _is_pool_service(ls, ctx):
+    if ls is not None and ctx.warehouse is not None and _is_pool_service(ls, ctx, ref.get("parameters") or {}):
         result["linkedService"] = _warehouse_ref(ctx)
     elif ctx.connections.get(ls_name):
         result["externalReferences"] = {"connection": ctx.connections[ls_name]}
@@ -306,6 +399,8 @@ def convert_activity(act: Mapping[str, Any], ctx: Context, out: Converted) -> Op
         return _sparkjob(act, ctx, out)
     if kind == "SqlPoolStoredProcedure":
         return _stored_procedure(act, ctx, out)
+    if kind == "SqlServerStoredProcedure":
+        return _sql_stored_procedure(act, ctx, out)
     if kind == "Script":
         return _script(act, ctx, out)
     if kind == "Switch":
@@ -344,6 +439,8 @@ def convert(payload: Mapping[str, Any], ctx: Context) -> Converted:
     """The Fabric pipeline definition for one Synapse pipeline resource."""
     props = payload.get("properties") or {}
     out = Converted(definition={})
+    # A value passed as @pipeline().parameters.x is read as that parameter's default.
+    ctx = replace(ctx, pipeline_parameters={k: v.get("defaultValue") for k, v in (props.get("parameters") or {}).items() if isinstance(v, Mapping)})
     activities = _convert_list(props.get("activities") or [], ctx, out)
     content: Dict[str, Any] = {"properties": {"activities": activities}}
     for key in ("parameters", "variables", "concurrency", "annotations"):

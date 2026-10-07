@@ -1,6 +1,8 @@
 import { AppWindow, CheckCircle2, CircleSlash, FileArchive, GitBranch, SquareTerminal, XCircle } from "lucide-react";
+import { joinAnd } from "../shared/text";
 import { Fragment, useEffect, useState, type ReactNode } from "react";
 import { useAppState } from "../../state/AppState";
+import { useMigration } from "../../state/MigrationState";
 import type { AuthMethod, ConnectionConfig, ConnectionState } from "../../types";
 import { Banner, Button, SelectField, TextField, ConfirmDialog } from "../shared/Shared";
 import { MethodTiles, MiniSteps, type MethodOption } from "./MethodTiles";
@@ -165,6 +167,7 @@ export function SummaryList({ rows }: { rows: [string, ReactNode][] }) {
   );
 }
 
+
 /* ---- The source panel ---------------------------------------------------------------- */
 
 /** Connect Azure Synapse: choose how to sign in, sign in, choose the workspace, test. */
@@ -175,8 +178,18 @@ export function SourceConnectionPanel() {
   const [errors, setErrors] = useState<Errors>({});
   const [changing, setChanging] = useState(false);
   const [confirmSignOut, setConfirmSignOut] = useState(false);
+  const { plan, execution, validation, confirmed } = useMigration();
   const discovered = app.discovery.state === "completed" || app.discovery.state === "completed_with_warnings";
   const signOut = () => { setChanging(false); setConfirmSignOut(false); void app.disconnect(); };
+  // What a new source would clear: everything here was built on this one.
+  const loses = [
+    discovered ? `the discovered inventory (${(app.discovery.summary?.total ?? 0).toLocaleString()} objects)` : "",
+    plan.length ? `the plan (${plan.length.toLocaleString()} objects)` : "",
+    execution.state !== "idle" ? `the record of migration run #${execution.runId}` : "",
+    validation ? "the validation results" : "",
+  ].filter(Boolean);
+  const askFirst = loses.length > 0 || confirmed.length > 0;
+  const runWorking = execution.state === "running";
 
   const connected = app.isConnected;
   const supported = mode === "mock" || !health || health.capabilities.authMethods.includes(config.method);
@@ -238,13 +251,14 @@ export function SourceConnectionPanel() {
         <div className="row conn-actions">
           <Button size="small" onClick={() => void app.testConnection(configFromConnection(connection))} loading={connectionBusy === "test"}>Test again</Button>
           <Button size="small" onClick={() => { setConfig(configFromConnection(connection)); setChanging(true); }}>Change</Button>
-          <Button size="small" variant="ghost" onClick={() => (discovered ? setConfirmSignOut(true) : signOut())} disabled={busy || app.discovery.state === "running"}
-            title={app.discovery.state === "running" ? "Discovery is running; wait for it to finish" : undefined}>Disconnect</Button>
+          <Button size="small" variant="ghost" onClick={() => (askFirst ? setConfirmSignOut(true) : signOut())} disabled={busy || app.discovery.state === "running" || runWorking}
+            title={app.discovery.state === "running" ? "Discovery is running; wait for it to finish" : runWorking ? "A migration run is working: pause it first" : undefined}>Disconnect</Button>
         </div>
         {confirmSignOut && (
           <ConfirmDialog title="Disconnect Azure Synapse?" confirmLabel="Disconnect" onConfirm={signOut} onCancel={() => setConfirmSignOut(false)}>
             <p>The accelerator signs out of {connection.workspace}. Your Azure CLI session is untouched.</p>
-            <p>The discovered inventory ({(app.discovery.summary?.total ?? 0).toLocaleString()} objects) is cleared as well, so discovery runs again after you reconnect. Your plan, its options and the record of a migration run are kept.</p>
+            <p>This starts the migration over: {loses.length ? `${joinAnd(loses)} ${loses.length === 1 ? "is" : "are"} cleared, and ` : ""}every step is done again after you reconnect.</p>
+            <p className="muted">Nothing in Synapse changes, and anything already created in Fabric stays there.</p>
           </ConfirmDialog>
         )}
       </div>
@@ -254,6 +268,11 @@ export function SourceConnectionPanel() {
   const stage = signedInHere ? (config.workspace ? 2 : 1) : 0;
   return (
     <div className="stack conn-body">
+      {changing && askFirst && (
+        <Banner tone="info" title="A different workspace starts the migration over">
+          Testing another workspace or SQL pool clears what was built on this one ({joinAnd(loses.length ? loses : ["the confirmed steps"])}). Testing the same one again changes nothing.
+        </Banner>
+      )}
       <MethodTiles label="How to connect to Azure Synapse" options={METHODS} value={config.method} onChange={selectMethod} disabled={busy} />
       <MiniSteps steps={["Sign in", "Choose workspace", "Test"]} current={stage} />
 

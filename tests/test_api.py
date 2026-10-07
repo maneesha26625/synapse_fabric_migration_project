@@ -97,6 +97,33 @@ def test_results_before_discovery_are_refused_not_empty(server):
     assert body["error"]["code"] == "no_results"
 
 
+def test_health_says_which_api_version_this_backend_speaks(server):
+    from discovery_agent.api.service import API_VERSION
+    _, body = call(server, "GET", "/api/health")
+    assert body["apiVersion"] == API_VERSION >= 2
+
+
+def test_a_new_source_workspace_drops_the_last_discovery_and_the_same_one_keeps_it():
+    from discovery_agent.api.service import _Connection
+    session = Session()
+
+    def conn(workspace, pool="pool01"):
+        c = _Connection(method="azure_cli", manager=None, tenant_id="t", subscription_id="s", resource_group="rg",
+                        workspace=workspace, sql_pool=pool)
+        c.connected = True
+        return c
+
+    session._replace_connection(conn("ws"))  # noqa: SLF001
+    session._job.state = "completed"  # noqa: SLF001 - a finished discovery of ws
+    session._replace_connection(conn("WS"))  # noqa: SLF001 - tested again: the same workspace
+    assert session._job.state == "completed" and session.source_identity() == ("ws", "pool01")  # noqa: SLF001
+    session._replace_connection(conn("ws", "otherpool"))  # noqa: SLF001
+    assert session._job.state == "idle"  # noqa: SLF001
+    session._job.state = "completed"  # noqa: SLF001
+    session._replace_connection(conn("another-ws"))  # noqa: SLF001
+    assert session._job.state == "idle"  # noqa: SLF001
+
+
 def test_resetting_discovery_returns_it_to_idle(server):
     status, body = call(server, "DELETE", "/api/discovery")
     assert status == 200

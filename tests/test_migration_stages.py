@@ -437,10 +437,11 @@ def test_a_connection_body_carries_the_credential_only_in_credential_details():
 
 def test_the_connection_stage_defers_without_credentials_then_creates_and_never_logs_the_secret():
     source = Source("ls", "ls_sql", "Linked Service", 1, CONNECTION, payload=SQL_LS)
-    run, rest, _ = migrate([source])
+    # Migrating another pool, so this database is just another SQL server to connect to.
+    run, rest, _ = migrate([source], pool_name="otherpool")
     assert one(run).status == DEFERRED_STATUS and one(run).step == "Needs credentials" and not rest.created
     creds = {"ls_sql": {"authType": "basic", "username": "me", "password": "S3CRET-VALUE"}}
-    run, rest, _ = migrate([source], credentials=creds)
+    run, rest, _ = migrate([source], credentials=creds, pool_name="otherpool")
     assert one(run).status == COMPLETED and rest.created[0][0] == "/connections"
     assert rest.created[0][1]["credentialDetails"]["credentials"]["password"] == "S3CRET-VALUE"
     assert "S3CRET-VALUE" not in json.dumps(run.to_dict())
@@ -515,6 +516,96 @@ def test_a_pipeline_reports_missing_dependencies_and_activities_it_cannot_conver
     flow = {"properties": {"activities": [{"name": "DF", "type": "ExecuteDataFlow", "typeProperties": {}}, {"name": "W", "type": "Wait", "typeProperties": {"waitTimeInSeconds": 1}}]}}
     bad = pipelines.convert(flow, context())
     assert bad.unsupported == ["DF (ExecuteDataFlow)"] and [a["name"] for a in bad.definition["properties"]["activities"]] == ["W"]
+
+
+# The workspace's default SQL linked service: the dedicated endpoint, with the database as a parameter.
+DEFAULT_SQL_LS = {"name": "ws-WorkspaceDefaultSqlServer", "properties": {
+    "type": "AzureSqlDW", "parameters": {"DBName": {"type": "String"}},
+    "typeProperties": {"connectionString": "Data Source=tcp:ws.sql.azuresynapse.net,1433;Initial Catalog=@{linkedService().DBName}"},
+    "connectVia": {"referenceName": "AutoResolveIntegrationRuntime", "type": "IntegrationRuntimeReference"}}}
+SERVERLESS_LS = {"name": "LS_Serverless_SQL", "properties": {"type": "AzureSqlDW", "typeProperties": {
+    "connectionString": "Data Source=tcp:ws-ondemand.sql.azuresynapse.net,1433;Initial Catalog=pool01"}}}
+DEFAULT_REF = {"referenceName": "ws-WorkspaceDefaultSqlServer", "type": "LinkedServiceReference", "parameters": {"DBName": "pool01"}}
+DS_DEFAULT = {"name": "DS_SQL_DimCabType", "properties": {"type": "AzureSqlDWTable", "linkedServiceName": DEFAULT_REF,
+                                                          "typeProperties": {"schema": "dw", "table": "DimCabType"}, "schema": []}}
+INGEST = {"name": "PL_Cab_Data_Ingestion", "properties": {
+    "parameters": {"db": {"type": "String", "defaultValue": "pool01"}},
+    "activities": [
+        {"name": "Log_Start", "type": "SqlServerStoredProcedure", "linkedServiceName": DEFAULT_REF,
+         "typeProperties": {"storedProcedureName": "[operation].[usp_LogPipelineRun]",
+                            "storedProcedureParameters": {"Status": {"value": "Started", "type": "String"}}}},
+        {"name": "Count", "type": "Lookup", "dependsOn": [{"activity": "Log_Start", "dependencyConditions": ["Succeeded"]}],
+         "typeProperties": {"source": {"type": "SqlDWSource", "sqlReaderQuery": "SELECT COUNT(*) AS n FROM dw.DimCabType"},
+                            "dataset": {"referenceName": "DS_SQL_DimCabType", "type": "DatasetReference"}}},
+        {"name": "Via_Parameter", "type": "SqlServerStoredProcedure",
+         "linkedServiceName": {**DEFAULT_REF, "parameters": {"DBName": {"value": "@pipeline().parameters.db", "type": "Expression"}}},
+         "typeProperties": {"storedProcedureName": "[operation].[usp_ValidateFactLoad]"}},
+    ]}}
+DEFAULT_BUNDLE = {"resource": INGEST, "datasets": {"DS_SQL_DimCabType": DS_DEFAULT}, "linkedServices": {"ws-WorkspaceDefaultSqlServer": DEFAULT_SQL_LS}}
+
+
+def test_stored_procedures_and_lookups_through_the_default_sql_linked_service_run_in_the_warehouse():
+    out = pipelines.convert(INGEST, context(datasets=DEFAULT_BUNDLE["datasets"], linked_services=DEFAULT_BUNDLE["linkedServices"], connections={}))
+    assert not out.unsupported and not out.missing
+    acts = {a["name"]: a for a in out.definition["properties"]["activities"]}
+    for name in ("Log_Start", "Via_Parameter"):  # DBName given as text, and as a pipeline parameter whose default is the pool
+        assert acts[name]["type"] == "SqlServerStoredProcedure" and "linkedServiceName" not in acts[name]
+        assert acts[name]["linkedService"]["properties"]["type"] == "DataWarehouse"
+        assert acts[name]["linkedService"]["properties"]["typeProperties"]["artifactId"] == "wh-1"
+    assert acts["Log_Start"]["typeProperties"]["storedProcedureName"] == "[operation].[usp_LogPipelineRun]"
+    assert acts["Log_Start"]["typeProperties"]["storedProcedureParameters"] == {"Status": {"value": "Started", "type": "String"}}
+    lookup = acts["Count"]["typeProperties"]
+    assert lookup["datasetSettings"]["type"] == "DataWarehouseTable" and lookup["source"]["type"] == "DataWarehouseSource"
+    assert lookup["datasetSettings"]["typeProperties"] == {"schema": "dw", "table": "DimCabType"}
+
+
+def test_a_stored_procedure_on_another_sql_server_runs_through_its_fabric_connection():
+    ops = {"name": "LS_Ops", "properties": {"type": "AzureSqlDatabase", "typeProperties": {
+        "connectionString": "Data Source=ops.database.windows.net;Initial Catalog=opsdb"}}}
+    res = {"name": "p", "properties": {"activities": [{"name": "Audit", "type": "SqlServerStoredProcedure",
+                                                        "linkedServiceName": {"referenceName": "LS_Ops", "type": "LinkedServiceReference"},
+                                                        "typeProperties": {"storedProcedureName": "dbo.audit"}}]}}
+    out = pipelines.convert(res, context(datasets={}, linked_services={"LS_Ops": ops}, connections={"LS_Ops": "conn-ops"}))
+    act = out.definition["properties"]["activities"][0]
+    assert act["externalReferences"] == {"connection": "conn-ops"} and "linkedService" not in act
+    waiting = pipelines.convert(res, context(datasets={}, linked_services={"LS_Ops": ops}, connections={}))
+    assert waiting.missing == ["connection LS_Ops"] and not waiting.unsupported
+
+
+def test_only_the_dedicated_pool_itself_is_taken_for_the_pool():
+    assert pipelines.is_pool_service(DEFAULT_SQL_LS, "pool01", {"DBName": "pool01"})
+    assert not pipelines.is_pool_service(DEFAULT_SQL_LS, "pool01", {"DBName": "otherdb"})
+    assert not pipelines.is_pool_service(DEFAULT_SQL_LS, "pool01")  # this use does not say which database
+    assert not pipelines.is_pool_service(SERVERLESS_LS, "pool01")  # the serverless endpoint is never the pool
+    # The linked service as a whole: its only use in a migrated pipeline is reaching the pool.
+    assert pipelines.is_pool_service(DEFAULT_SQL_LS, "pool01", any_database=True)
+    assert pipelines.is_pool_service(DEFAULT_SQL_LS, "pool01", pool_server="tcp:ws.sql.azuresynapse.net,1433", any_database=True)
+    assert not pipelines.is_pool_service(DEFAULT_SQL_LS, "pool01", pool_server="other.sql.azuresynapse.net", any_database=True)
+    assert not pipelines.is_pool_service(DEFAULT_SQL_LS, "", any_database=True)
+
+
+def test_the_default_sql_linked_service_is_replaced_by_the_warehouse_not_left_for_a_person():
+    source = Source("ls", "ws-WorkspaceDefaultSqlServer", "Linked Service", 1, CONNECTION, payload=DEFAULT_SQL_LS)
+    run, rest, _ = migrate([source])
+    assert one(run).status == SKIPPED and one(run).step == "Replaced by the migrated Warehouse" and not rest.created
+    assert "no Fabric connection is needed" in one(run).notes[0]
+    # The planner neither asks for its credentials nor calls it work by hand.
+    assert content_findings([source], set(), ("pool01", "ws.sql.azuresynapse.net")) == []
+    assert content_findings([source], set())[0].code == "CONNECTION_BY_HAND"  # with no pool known, it stays a manual item
+    # The serverless linked service is a real connection to make.
+    serverless = Source("s", "LS_Serverless_SQL", "Linked Service", 1, CONNECTION, payload=SERVERLESS_LS)
+    run, _, _ = migrate([serverless])
+    assert one(run).status == DEFERRED_STATUS and one(run).step == "Needs credentials"
+
+
+def test_a_pipeline_waiting_for_its_child_pipelines_says_what_to_do_first():
+    master = {"name": "master", "properties": {"activities": [
+        {"name": "Run", "type": "ExecutePipeline", "typeProperties": {"pipeline": {"referenceName": "child", "type": "PipelineReference"}}}]}}
+    run, _, _ = migrate([Source("p", "master", "Pipeline", 5, PIPELINE, payload={"resource": master, "datasets": {}, "linkedServices": {}})])
+    error = one(run).error
+    assert one(run).status == FAILED and "pipeline child" in error
+    assert "get the pipelines it runs created first" in error and "Retry failed" in error
+    assert "Connections, Notebooks, Warehouse" not in error
 
 
 def test_pipeline_references_are_listed_for_planning():
@@ -761,7 +852,8 @@ def test_the_service_exposes_the_stages_and_the_linked_services_that_need_creden
     assert {c["value"] for c in data["options"][1]["choices"]} == {"if_empty", "replace"} and all(c["label"] for c in data["options"][1]["choices"])
     warehouse = next(s for s in caps["stages"] if s["key"] == "warehouse")
     assert {c["value"] for c in warehouse["options"][0]["choices"]} == {"match_synapse", "case_insensitive", "case_sensitive"}
-    assert {l["name"] for l in caps["linkedServices"]} == {"ls_sql", "ls_adls"}
+    # ls_sql reaches the pool being migrated: the Warehouse replaces it, so no credentials are asked for.
+    assert {l["name"] for l in caps["linkedServices"]} == {"ls_adls"}
     assert {l["stage"] for l in caps["linkedServices"]} == {"connections"}
     assert next(l for l in caps["linkedServices"] if l["name"] == "ls_adls")["needsPath"] is True
     assert "TOPSECRET" not in json.dumps(caps)

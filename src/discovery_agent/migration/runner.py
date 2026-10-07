@@ -23,9 +23,9 @@ from __future__ import annotations
 
 import re
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from discovery_agent.migration import environments, notebooks, tsql_rules, warehouse_ddl
 from discovery_agent.migration.common import (  # noqa: F401 - re-exported: tests and the API import these from here
@@ -141,6 +141,8 @@ class MigrationRun:
         self.pool_name: str = ""  # the Synapse pool being migrated, for retargeting pipelines
         #: The pool's SQL endpoint and the Fabric connection the data pipelines read it through.
         self.source_server: str = ""
+        #: (workspace, pool) of the Synapse source the run read, and the Fabric workspace is ``workspace_id``.
+        self.source_identity: Optional[Tuple[str, str]] = None
         self.source_database: str = ""
         self.source_connection_name: str = ""
         self.source_collation: Optional[str] = None
@@ -152,6 +154,27 @@ class MigrationRun:
     def log(self, level: str, name: str, message: str) -> None:
         with self.lock:
             self.logs.append(f"{_now()}  {level:<8}{name}: {message}")
+
+    def snapshot(self) -> Dict[str, Any]:
+        """The run's record, for a restart: everything but its lock and pause flag. A run holds no credential."""
+        with self.lock:
+            saved = {name: value for name, value in vars(self).items() if name not in ("lock", "pause")}
+            saved["items"] = [replace(item, notes=list(item.notes)) for item in self.items]
+            saved["logs"] = list(self.logs)
+            saved["stages"] = list(self.stages)
+            saved["settings"] = dict(self.settings)
+            return saved
+
+    @classmethod
+    def restore(cls, saved: Dict[str, Any]) -> "MigrationRun":
+        """A run from ``snapshot``. What this version no longer has is dropped; what it added keeps its default."""
+        run = cls(str(saved.get("run_id") or ""), [], str(saved.get("workspace_id") or ""),
+                  str(saved.get("workspace_name") or ""), str(saved.get("warehouse") or ""))
+        known = set(vars(run)) - {"lock", "pause"}
+        for name, value in saved.items():
+            if name in known:
+                setattr(run, name, value)
+        return run
 
     def to_dict(self) -> dict:
         with self.lock:

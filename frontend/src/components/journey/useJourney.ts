@@ -27,11 +27,15 @@ export interface StepStatus extends StepMeta {
    * It is the open step again, and the steps after it wait until it is redone.
    */
   stale: boolean;
-  /** Why a stale step's results went, for the Next bar. */
+  /** Why a stale step needs doing again, for the Next bar. */
   lostReason: string;
+  /** A stale step's badge ("Run again", "Rebuild", "Fix risks") and the Next bar's title. */
+  staleLabel: string;
+  staleTitle: string;
 }
 
-type Facts = Omit<StepStatus, keyof StepMeta | "index" | "confirmed" | "locked" | "stale" | "lostReason">;
+type Facts = Omit<StepStatus, keyof StepMeta | "index" | "confirmed" | "locked" | "stale" | "lostReason" | "staleLabel" | "staleTitle">;
+interface Lost { reason: string; label: string; title: string }
 
 const n = (v: number) => v.toLocaleString();
 const plural = (count: number, one: string, many = `${one}s`) => `${n(count)} ${count === 1 ? one : many}`;
@@ -105,17 +109,23 @@ export function useJourney(): { steps: StepStatus[]; current: StepKey; finished:
 
   // A confirmed step's results can disappear. Each check waits until its data
   // has been read once, so a page that is still loading never looks "lost".
-  const lost: Record<StepKey, string | null> = {
+  const lost: Record<StepKey, Lost | null> = {
     discover: ready && !discovered && discovery.state !== "running"
-      ? "The discovery result is no longer here: the source was signed out or reconnected, discovery was reset, or the server restarted."
+      ? { reason: "the discovery result is no longer here: the source was signed out or reconnected, discovery was reset, or the server restarted.", label: "Run again", title: "Discover needs to run again" }
       : null,
     assess: null,
     waves: null,
-    plan: plan.length === 0 ? "The plan is empty now." : null,
+    plan: plan.length === 0
+      ? { reason: "the plan is empty now.", label: "Rebuild", title: "The plan needs rebuilding" }
+      : analysis && analysis.blocking > 0
+        ? { reason: `the plan has changed and now has ${plural(analysis.blocking, "blocking risk")}.`, label: "Fix risks", title: "The plan has blocking risks" }
+        : null,
     migrate: executionReady && run.state === "idle"
-      ? mode === "mock" ? "Demo data starts afresh when the page reloads, so the run's record is gone." : "The run's record is gone: it was reset, or the server restarted."
+      ? { reason: mode === "mock" ? "Demo data starts afresh when the page reloads, so the run's record is gone." : "the run's record is gone: it was reset, or the server restarted.", label: "Run again", title: "Migrate needs to run again" }
       : null,
-    validate: validation === null && !validationBusy ? "Validation results are kept only while the page is open." : null,
+    validate: validation === null && !validationBusy
+      ? { reason: "validation results are kept only while the page is open.", label: "Run again", title: "Validate needs to run again" }
+      : null,
   };
 
   const isStale = (key: StepKey) => confirmed.includes(key) && !!lost[key];
@@ -128,7 +138,9 @@ export function useJourney(): { steps: StepStatus[]; current: StepKey; finished:
     confirmed: confirmed.includes(meta.key) && index <= open,
     locked: index > open,
     stale: index === open && isStale(meta.key),
-    lostReason: lost[meta.key] ?? "",
+    lostReason: lost[meta.key]?.reason ?? "",
+    staleLabel: lost[meta.key]?.label ?? "Run again",
+    staleTitle: lost[meta.key]?.title ?? `${meta.title} needs doing again`,
   }));
   return { steps, current: STEPS[open].key, finished: firstOpen === -1 };
 }

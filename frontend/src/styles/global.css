@@ -808,3 +808,34 @@ html, body, #root { height: auto; min-height: 100%; }
 /* the dependency graph */
 .graph-hint { position: absolute; left: 12px; bottom: 10px; z-index: 2; padding: 3px 8px; border-radius: 6px; font-size: 12px; color: var(--text-faint); background: rgba(10, 15, 29, .8); pointer-events: none; }
 
+
+/* =====================================================================================
+   Plan: risks with their objects, the plan tools, run options; the backend restart bar
+   ===================================================================================== */
+.risk-objects { margin-top: 8px; }
+.risk-objects > summary { cursor: pointer; width: fit-content; font-size: 13.5px; font-weight: 600; color: var(--accent); }
+.risk-objects ul { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 260px; overflow: auto; }
+.risk-objects li { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; font-size: 14px; }
+.risk-object-name { font-weight: 600; overflow-wrap: anywhere; }
+.risk-objects .link { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; }
+.risk-objects p { margin: 6px 0 0; }
+.plan-tools { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.plan-tools .select { width: auto; max-width: 300px; }
+.input-wrap.plan-find { flex: 1 1 320px; max-width: 460px; }
+.input-wrap.plan-find > svg { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); color: var(--text-faint); pointer-events: none; }
+.input-wrap.plan-find .input { width: 100%; padding-left: 34px; padding-right: 12px; }
+.stage-run-head { margin-bottom: 10px; }
+.stage-run-head p { margin: 2px 0 0; font-size: 14px; }
+table.data tfoot th, table.data tfoot td { padding: 10px 14px; border-top: 1px solid var(--border-strong); border-bottom: 0; font-weight: 700; text-align: left; white-space: nowrap; }
+table.data tfoot td.faint { font-weight: 400; }
+.backend-bar.outdated { background: var(--warning-soft); border-bottom-color: rgba(214, 162, 50, .45); }
+.backend-bar.outdated > svg { color: var(--warning); }
+.backend-bar.restarting { background: var(--info-soft); border-bottom-color: rgba(88, 166, 255, .35); }
+.backend-bar.restarting > svg { color: var(--info); }
+.backend-bar.restarting > .spinner { flex: none; }
+/* every collapsible shows that it opens: a chevron that turns when open */
+details.collapsible > summary::before { content: ""; flex: none; width: 7px; height: 7px; margin: 0 4px 0 2px; border-right: 2px solid var(--text-faint); border-bottom: 2px solid var(--text-faint); transform: rotate(-45deg); transition: transform .15s; }
+details.collapsible[open] > summary::before { transform: rotate(45deg); }
+details.collapsible > summary:hover { color: var(--text); }
+details.collapsible > summary:hover::before { border-color: var(--text-muted); }
+@media (prefers-reduced-motion: reduce) { details.collapsible > summary::before { transition: none; } }

@@ -49,7 +49,10 @@ python -m discovery_agent.api            # open http://127.0.0.1:8001
 ```
 
 On Windows, `..\start-ui.ps1` starts both. Checks: `npm run typecheck`,
-`npm test` (43 tests, on Demo data), and `pytest tests/test_api.py` for the API.
+`npm test` (50 tests, mostly on Demo data), and `pytest tests/test_api.py` for the API.
+
+The API restarts itself when its code changes and keeps its state, and Vite
+reloads the page's code: nothing is restarted by hand after an update.
 
 ## Data layer: Live vs Demo
 
@@ -72,9 +75,10 @@ failures on purpose so Retry failed can be tried. Validate then compares the
 migrated objects, with three deliberate row-count mismatches and a few items to
 review, so the filters have something to show.
 
-To walk through the connection steps, press **Disconnect** (it asks first,
-since the discovery is cleared too) or **Change** on a side's card on the
-Connections page and connect again; no sign-in window opens. Scenarios are chosen by workspace name: containing `denied`,
+To walk through the connection steps, press **Disconnect** or **Change** on a
+side's card on the Connections page and connect again; no sign-in window opens.
+As in Live mode, disconnecting (or connecting another workspace) starts over
+what was built on that side, and asks first. Scenarios are chosen by workspace name: containing `denied`,
 `notfound`, `expired` or `offline` fails the connection test; `empty`,
 `partial`, `fail` or `timeout` change what discovery returns. Anything else
 succeeds. Reloading the page restores the ready demo; steps you confirmed stay
@@ -104,14 +108,35 @@ failed and the filters have something to show.
   The dialog lists what goes (with the real numbers) and what stays; the backend
   is asked first, so a refusal (something still running) changes nothing.
 * **Ask before losing work.** Reset, running discovery again over confirmed
-  steps, disconnecting a discovered source and deleting a project all ask
-  first. Focus starts on Cancel, so Enter never confirms by accident.
+  steps, disconnecting either side, clearing the plan and deleting a project
+  all ask first and say exactly what goes. Focus starts on Cancel, so Enter
+  never confirms by accident.
+* **A new connection starts fresh.** Disconnecting the source, or connecting
+  another workspace, starts the whole migration over; doing so on the Fabric
+  side starts Migrate and Validate over. Old results never reappear under a new
+  connection. Testing the same workspace again, or a failed test, changes
+  nothing.
 * **Honest state.** A confirmed step whose results were lost (source signed
   out, server restarted, Demo data reloaded, validation results gone with the
   page) shows *Run again* with the reason, the steps after it wait, and the
-  completion card waits for it. A page that is still loading says so instead
-  of flashing "Not connected"; Live mode without a backend says that, with
-  Retry and Use Demo data.
+  completion card waits for it. A confirmed plan edited into a blocking risk
+  says *Fix risks* and holds Migrate. A page that is still loading says so
+  instead of flashing "Not connected".
+* **Rides through backend restarts.** In Live mode the page checks the backend
+  every few seconds. While it restarts after an update, a blue *Reconnecting*
+  bar shows and reads are retried; when it is back (a new `bootId`), the page
+  reads the connections, discovery, Fabric target and run again, and a note
+  says what the backend kept. A restart is never taken for a sign-out, so the
+  plan and confirmed steps stay. Resume and Retry send the run's credentials
+  again, since a restarted backend has none. A backend older than the page
+  (its `apiVersion`) that updates itself says it is updating; one that does
+  not is asked, once, to be replaced with `start-ui.ps1`; one that stays away
+  is *not answering*, with Retry and Use Demo data.
+* **A plan you can work with.** Risks open to show their objects, with *Find in
+  plan*; objects are added all at once, by type or by name, found by name or
+  type, moved between waves and taken out; large waves show 100 rows at a time;
+  objects no longer in the discovery are flagged; numbers read the same
+  everywhere (1,542; 98.4d).
 * **Plan configures, Migrate runs.** Stage switches, options and credentials
   live in Plan; every run, including a single stage on its own, starts from
   Migrate.

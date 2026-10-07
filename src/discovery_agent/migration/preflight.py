@@ -144,7 +144,9 @@ def _schedule(source: Source) -> List[Finding]:
     return []
 
 
-def _connection(source: Source, names: Set[str]) -> List[Finding]:
+def _connection(source: Source, names: Set[str], pool: Sequence[str] = ("", "")) -> List[Finding]:
+    if pipelines.is_pool_service(source.payload or {}, pool[0], pool_server=pool[1], any_database=True):
+        return []  # its part is played by the migrated Warehouse: nothing to create, nothing to enter
     plan = fabric_connections.parse(source.payload or {})
     if plan.unsupported:
         return [Finding(source.id, "CONNECTION_BY_HAND", MEDIUM, f"{source.name}: {plan.unsupported}")]
@@ -158,13 +160,14 @@ _CHECKS = {TABLE: _table, VIEW: _module, PROCEDURE: _module, NOTEBOOK: _notebook
            DATA: _data, PIPELINE: _pipeline, SPARKJOB: _sparkjob, SCRIPT: _script, SCHEDULE: _schedule}
 
 
-def content_findings(sources: Sequence[Source], credential_names: Optional[Set[str]] = None) -> List[Finding]:
-    """Findings for every object whose own content predicts trouble."""
+def content_findings(sources: Sequence[Source], credential_names: Optional[Set[str]] = None, pool: Sequence[str] = ("", "")) -> List[Finding]:
+    """Findings for every object whose own content predicts trouble. ``pool`` is the (name, server)
+    of the Synapse pool being migrated, whose linked services the Warehouse replaces."""
     names = credential_names or set()
     out: List[Finding] = []
     for source in sources:
         if source.kind == CONNECTION:
-            out.extend(_connection(source, names))
+            out.extend(_connection(source, names, pool))
             continue
         check = _CHECKS.get(source.kind)
         if check is not None:

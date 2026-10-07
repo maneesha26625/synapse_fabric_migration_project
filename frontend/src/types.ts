@@ -52,8 +52,34 @@ export interface ConnectionState {
   error?: ConnectionError;
 }
 
+/**
+ * The backend API version this page needs (``apiVersion`` in ``/api/health``). A backend
+ * started before an update reports a lower one, or none. One that restarts itself is
+ * updating and says when; an older one that does not is asked to be replaced, once.
+ */
+export const REQUIRED_API_VERSION = 3;
+
+/** What a restarted backend took back from before it stopped. */
+export interface RestoredState {
+  at: string;
+  /** "the Synapse sign-in", "the discovery (1,542 objects)", "migration run #003"... */
+  kept: string[];
+  /** Sentences: what did not come back, or what needs the operator. */
+  notes: string[];
+}
+
 export interface Health {
   status: "ok";
+  apiVersion?: number;
+  /** Changes every time the backend starts: a new one means it restarted. */
+  bootId?: string;
+  startedAt?: string;
+  /** It restarts by itself when its code changes, and keeps its state across restarts. */
+  supervised?: boolean;
+  /** What it is working on now; a restart waits for these. */
+  busy?: string[];
+  /** What it took back when it last started, or null. */
+  restored?: RestoredState | null;
   capabilities: { authMethods: AuthMethod[]; authMethodDetails?: AuthMethodDetail[]; discoveryScope: string[]; migratableTypes?: string[] };
 }
 
@@ -511,8 +537,9 @@ export interface MigrationApi {
   analyzePlan(items: PlanItem[], record?: boolean, options?: RunOptions, credentials?: ConnectionCredentials): Promise<PlanAnalysis>;
   startExecution(items: PlanItem[], options?: RunOptions, credentials?: ConnectionCredentials): Promise<ExecutionRun>;
   getExecution(): Promise<ExecutionRun>;
-  /** `reset` forgets the run's record so the next run starts fresh; refused while the run is working. */
-  controlExecution(action: RunControl): Promise<ExecutionRun>;
+  /** `reset` forgets the run's record so the next run starts fresh; refused while the run is working.
+   *  Resume and Retry carry the connection credentials again: a backend that restarted has none. */
+  controlExecution(action: RunControl, credentials?: ConnectionCredentials): Promise<ExecutionRun>;
   /** Compares Synapse with Fabric. With no items, every discovered object is checked. */
   runValidation(items?: PlanItem[]): Promise<ValidationRow[]>;
 }

@@ -4,6 +4,7 @@ import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { useAppState } from "../../state/AppState";
 import { useMigration } from "../../state/MigrationState";
 import { notify, TOAST_EVENT } from "../shared/notify";
+import { joinAnd } from "../shared/text";
 import { Button, ConfirmDialog, Modal, TextField } from "../shared/Shared";
 import { AssistantLauncher, AssistantPanel } from "./Assistant";
 
@@ -170,16 +171,58 @@ function TopBar() {
   );
 }
 
-/** Live mode without a backend: say so once, plainly, with the two ways forward. */
+/**
+ * The Live backend, when it needs a word: restarting (it updates itself and keeps its work),
+ * updating once its work finishes, an older one that does not update itself, or not answering.
+ */
 function BackendBar() {
-  const { mode, backendError, reload, setMode } = useAppState();
-  if (mode !== "real" || !backendError) return null;
+  const { mode, backendError, backendOutdated, backendRestarting, health, reload, setMode } = useAppState();
+  if (mode !== "real") return null;
+  if (backendRestarting) {
+    return (
+      <div className="backend-bar restarting" role="status">
+        <span className="spinner" aria-hidden="true" />
+        <span>
+          <strong>Reconnecting to the backend…</strong>{" "}
+          It restarts by itself after an update and keeps your work. This page carries on when it is back.
+        </span>
+      </div>
+    );
+  }
+  if (!backendError && backendOutdated) {
+    if (health?.supervised) {
+      const busy = health.busy ?? [];
+      return (
+        <div className="backend-bar restarting" role="status">
+          <RefreshCw size={17} aria-hidden="true" />
+          <span>
+            <strong>The backend is updating.</strong>{" "}
+            It restarts by itself on the latest code {busy.length ? `once ${joinAnd(busy)} finishes` : "in a moment"}, and keeps your work.
+          </span>
+        </div>
+      );
+    }
+    return (
+      <div className="backend-bar outdated" role="alert">
+        <RefreshCw size={17} aria-hidden="true" />
+        <span>
+          <strong>The accelerator's backend is an older version that does not update itself.</strong>{" "}
+          Run <code>start-ui.ps1</code> once more: it replaces the old backend with one that restarts by itself after every
+          update and keeps your sign-ins, discovery and run. This page reconnects by itself.
+        </span>
+        <span className="spacer" />
+        <Button size="small" onClick={reload}>Retry</Button>
+      </div>
+    );
+  }
+  if (!backendError) return null;
   return (
     <div className="backend-bar" role="alert">
       <ServerCrash size={17} aria-hidden="true" />
       <span>
         <strong>The accelerator's backend is not answering.</strong>{" "}
-        Start it with <code>python -m discovery_agent.api</code> (or <code>start-ui.ps1</code>), then retry. Demo data works without it.
+        Start it with <code>start-ui.ps1</code> (or <code>python -m discovery_agent.api</code>); this page reconnects by itself.
+        Demo data works without it.
       </span>
       <span className="spacer" />
       <Button size="small" onClick={reload}>Retry</Button>
@@ -201,7 +244,8 @@ export function Layout() {
   }, []);
   useEffect(() => {
     if (!toast) return;
-    const id = setTimeout(() => setToast(null), 4500);
+    // Long enough to read: a restart's message says what was kept, and what needs you.
+    const id = setTimeout(() => setToast(null), Math.min(15000, Math.max(4500, toast.length * 55)));
     return () => clearTimeout(id);
   }, [toast]);
 

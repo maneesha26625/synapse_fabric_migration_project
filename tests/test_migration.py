@@ -21,7 +21,7 @@ from discovery_agent.api.service import ApiError
 from discovery_agent.migration import notebooks, warehouse_ddl
 from discovery_agent.migration.fabric_rest import FabricApiError, FabricRestClient
 from discovery_agent.migration.runner import (
-    COMPLETED, DEFERRED, DEFERRED_STATUS, FAILED, MIGRATABLE_TYPES, NOTEBOOK, PENDING, POOL, PROCEDURE,
+    COMPLETED, DEFERRED, DEFERRED_STATUS, FAILED, IN_PROGRESS, MIGRATABLE_TYPES, NOTEBOOK, PENDING, POOL, PROCEDURE,
     SCHEMA, SCHEMA_EXISTS_QUERY, SKIPPED, TABLE, VIEW, MigrationRun, Migrator, Source, warehouse_name_for,
 )
 from discovery_agent.source_strategy import P0Artifact
@@ -520,6 +520,18 @@ def test_plan_entries_become_sources_with_their_definitions():
 class FakeSession:
     def __init__(self, job=None):
         self.job = job
+        self.identity = ("ws", "pool01")
+
+    def source_identity(self):
+        return self.identity
+
+    def test(self, body):
+        self.identity = (body["workspace"], body.get("sqlPool", "pool01"))
+        return {"status": "connected", "workspace": body["workspace"]}
+
+    def disconnect(self):
+        self.identity = None
+        return {"status": "disconnected"}
 
     def migration_snapshot(self):
         if self.job is None:
@@ -530,6 +542,15 @@ class FakeSession:
 class FakeFabric:
     def __init__(self, ready=True):
         self.ready = ready
+        self.workspace_id = WS
+
+    def test(self, body):
+        self.workspace_id = body["workspaceId"]
+        return {"status": "connected", "workspaceId": self.workspace_id}
+
+    def disconnect(self):
+        self.ready = False
+        return {"status": "disconnected"}
 
     def state(self):
         return {"status": "connected" if self.ready else "disconnected", "workspaceName": "Sales WS", "capacityAssigned": True}
@@ -643,6 +664,50 @@ def test_a_working_run_cannot_be_reset():
     with pytest.raises(ApiError) as busy:
         svc.control({"action": "reset"})
     assert busy.value.code == "run_in_progress"
+    gate.set()
+    assert wait_until(lambda: svc.state()["state"] == "completed")
+
+
+def finished_service():
+    svc = service(fake_job())
+    svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}], "options": {"stages": ["notebooks"]}})
+    assert wait_until(lambda: svc.state()["state"] == "completed")
+    return svc
+
+
+def test_disconnecting_either_side_forgets_the_run_so_the_next_connection_starts_clean():
+    svc = finished_service()
+    assert svc.sign_out_source()["status"] == "disconnected" and svc.state()["state"] == "idle"
+    svc = finished_service()
+    assert svc.sign_out_target()["status"] == "disconnected" and svc.state()["state"] == "idle"
+
+
+def test_the_run_is_kept_for_the_same_workspaces_and_forgotten_for_others():
+    svc = finished_service()
+    svc.test_source({"workspace": "ws", "sqlPool": "pool01"})  # tested again: the same source
+    svc.test_target({"workspaceId": WS})  # and the same Fabric workspace
+    assert svc.state()["state"] == "completed"
+    svc.test_source({"workspace": "other-ws"})
+    assert svc.state()["state"] == "idle"
+    svc = finished_service()
+    svc.test_target({"workspaceId": "99999999-8888-7777-6666-555555555555"})  # another Fabric workspace
+    assert svc.state()["state"] == "idle"
+
+
+def test_connections_cannot_change_under_a_working_run():
+    gate = threading.Event()
+
+    class SlowRest(FakeRest):
+        def list(self, path):
+            gate.wait(5)
+            return super().list(path)
+
+    svc = service(fake_job(), rest=SlowRest())
+    svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}]})
+    for change in (svc.sign_out_source, svc.sign_out_target, lambda: svc.test_target({"workspaceId": WS})):
+        with pytest.raises(ApiError) as busy:
+            change()
+        assert busy.value.code == "run_in_progress"
     gate.set()
     assert wait_until(lambda: svc.state()["state"] == "completed")
 
@@ -973,3 +1038,99 @@ def test_a_plan_with_nothing_automated_is_refused_and_bad_options_are_rejected()
     with pytest.raises(ApiError) as bad:
         svc.start({"items": ALL_THREE, "options": {"scope": "everything"}})
     assert bad.value.code == "invalid_options"
+
+
+# --- surviving a restart --------------------------------------------------------
+
+
+def stored_service(store, rest=None, db=None):
+    rest = rest or FakeRest(warehouses=[{"id": "wh-1", "displayName": "pool01"}])
+    db = db or FakeDb()
+    return MigrationService(FakeSession(fake_job()), FakeFabric(), rest_factory=lambda: rest,
+                            sql_factory=lambda h, d: db, store=store)
+
+
+def test_a_finished_run_and_the_planner_runs_come_back_after_a_restart_but_never_the_credentials(tmp_path):
+    from discovery_agent.api.state import StateStore
+
+    svc = stored_service(StateStore(tmp_path))
+    svc.analyze({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}], "record": True})
+    svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}], "options": {"stages": ["notebooks"]},
+               "credentials": {"LS_Sql": {"authType": "basic", "username": "u", "password": "s3cret-value"}}})
+    assert wait_until(lambda: svc.state()["state"] == "completed" and not svc.busy())
+
+    again = stored_service(StateStore(tmp_path))
+    kept, notes = again.restore()
+    assert kept == ["migration run #001", "1 planner run"]
+    assert again.state() == svc.state()
+    assert any("never saved" in note for note in notes)
+    assert b"s3cret-value" not in StateStore(tmp_path).path("migration").read_bytes()
+    # The count carries on: the next run is #002, not a second #001.
+    assert again.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}], "options": {"stages": ["notebooks"]}})["runId"] == "002"
+    assert wait_until(lambda: again.state()["state"] == "completed" and not again.busy())
+
+
+def test_a_run_the_server_stopped_mid_way_comes_back_paused_and_resumes_with_the_credentials_sent_again(tmp_path):
+    from discovery_agent.api.state import StateStore
+
+    svc = stored_service(StateStore(tmp_path))
+    run = MigrationRun("004", [src("LoadSales", NOTEBOOK, payload=notebook_payload()), src("sales.Orders", TABLE, payload=table()),
+                               src("sales.vOrders", VIEW, wave=2, payload=view())], WS, "Sales WS", "pool01")
+    items = by_name(run)
+    items["LoadSales"].status = COMPLETED
+    items["sales.Orders"].status, items["sales.Orders"].step = IN_PROGRESS, "Creating in Fabric"
+    run.log("START", "sales.Orders", "Table (table)")
+    svc._run, svc._counter = run, 4  # noqa: SLF001 - as the server held it when it stopped
+    svc.persist()
+
+    again = stored_service(StateStore(tmp_path))
+    kept, notes = again.restore()
+    assert kept == ["migration run #004"]
+    assert any("was working when the server stopped" in note and "Resume" in note for note in notes)
+    state = again.state()
+    rows = {i["name"]: i for i in state["items"]}
+    assert state["state"] == "paused" and again.busy() == []
+    assert rows["sales.Orders"]["status"] == FAILED and "server stopped" in rows["sales.Orders"]["error"]
+    assert (rows["LoadSales"]["status"], rows["sales.vOrders"]["status"]) == (COMPLETED, PENDING)
+    assert any("RESTART" in line for line in state["logs"])
+    assert StateStore(tmp_path).load("migration")["run"]["state"] == "paused"  # saved as it now is
+
+    credentials = {"LS_Sql": {"authType": "basic", "username": "u", "password": "p"}}
+    again.control({"action": "resume", "credentials": credentials})
+    assert again._credentials == credentials  # noqa: SLF001 - the page sends them again; the server had none
+    assert wait_until(lambda: again.state()["state"] == "completed" and not again.busy())
+    assert {i["name"]: i["status"] for i in again.state()["items"]}["sales.vOrders"] == COMPLETED
+    again.control({"action": "retry"})
+    assert wait_until(lambda: again.state()["failed"] == 0 and not again.busy())
+
+
+def test_a_working_run_is_saved_as_it_goes_and_reported_busy(tmp_path):
+    from discovery_agent.api.state import StateStore
+
+    gate = threading.Event()
+
+    class SlowRest(FakeRest):
+        def create(self, path, body):
+            gate.wait(5)
+            return super().create(path, body)
+
+    svc = stored_service(StateStore(tmp_path), rest=SlowRest())
+    svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}], "options": {"stages": ["notebooks"]}})
+    assert svc.busy() == ["the migration run"]
+    assert StateStore(tmp_path).load("migration")["run"]["state"] == "running"
+    gate.set()
+    assert wait_until(lambda: not svc.busy())
+    assert StateStore(tmp_path).load("migration")["run"]["state"] == "completed"
+
+
+def test_resetting_the_run_leaves_only_the_planner_runs_and_the_count(tmp_path):
+    from discovery_agent.api.state import StateStore
+
+    svc = stored_service(StateStore(tmp_path))
+    svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}], "options": {"stages": ["notebooks"]}})
+    assert wait_until(lambda: svc.state()["state"] == "completed" and not svc.busy())
+    svc.reset()
+    saved = StateStore(tmp_path).load("migration")
+    assert saved["run"] is None and saved["counter"] == 1
+    again = stored_service(StateStore(tmp_path))
+    assert again.restore() == ([], []) and again.state()["state"] == "idle"

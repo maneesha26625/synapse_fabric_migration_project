@@ -148,6 +148,10 @@ export function StagesPanel() {
       </div>
 
       <div className="stage-run-options">
+        <div className="stage-run-head">
+          <span className="eyebrow">Run options</span>
+          <p className="muted">What the run lists, and what it does when a wave has failures. They apply to every run started from Migrate.</p>
+        </div>
         <div className="auth-cards" style={{ gridTemplateColumns: "repeat(2, minmax(0, 1fr))" }} role="radiogroup" aria-label="Run scope">
           {([
             { id: "automated", title: "Automated objects only", desc: "Lists only what the selected stages create: the shortest, cleanest run." },

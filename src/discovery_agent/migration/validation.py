@@ -98,9 +98,12 @@ class Validator:
         sql_factory: Callable[[str, str], Any],
         source_factory: Optional[Callable[[], Any]] = None,
         artifacts: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        pool_name: str = "",
+        pool_server: str = "",
     ) -> None:
         self.rest, self.wid, self.workspace_name = rest, workspace_id, workspace_name
         self.warehouse_name = warehouse_name
+        self.pool_name, self.pool_server = pool_name, pool_server
         self._sql_factory, self._source_factory = sql_factory, source_factory
         self.artifacts = artifacts or {}
         self._ids: Dict[str, Dict[str, str]] = {}
@@ -321,6 +324,9 @@ class Validator:
         return [row(s, MATCH if same else REVIEW, src, got, "Pool and Environment exist with the same size." if same else "Exists with different settings.")]
 
     def _check_connection(self, s: Source) -> List[Dict[str, str]]:
+        if pipelines.is_pool_service(s.payload if isinstance(s.payload, dict) else {}, self.pool_name, pool_server=self.pool_server, any_database=True):
+            return [row(s, MATCH, "1 linked service", f"Warehouse {self.warehouse_name}",
+                        "Replaced by the migrated Warehouse: the pipelines that used it point at the Warehouse, so no connection is needed.")]
         try:
             names = {str(c.get("displayName", "")).lower() for c in self.rest.list("/connections")}
         except FabricApiError as exc:

@@ -271,6 +271,15 @@ def test_connections_jobs_scripts_schedules_and_shortcuts_are_found_or_missing()
     assert check([by_hand], rest=rest)[0]["status"] == v.REVIEW
 
 
+def test_the_default_sql_linked_service_counts_as_there_once_the_warehouse_replaces_it():
+    from test_migration_stages import DEFAULT_SQL_LS
+    src = Source("c", "ws-WorkspaceDefaultSqlServer", "Linked Service", 1, CONNECTION, payload=DEFAULT_SQL_LS)
+    replaced = v.Validator(ValRest(), WS, "Sales WS", "pool01", lambda host, name: CatalogDb(), None, None,
+                           pool_name="pool01", pool_server="ws.sql.azuresynapse.net").run([src])[0]
+    assert replaced["status"] == v.MATCH and replaced["target"] == "Warehouse pool01" and "Replaced" in replaced["detail"]
+    assert check([src], rest=ValRest())[0]["status"] == v.MISMATCH  # with no pool known it is just a missing connection
+
+
 def test_things_set_up_by_hand_are_listed_for_review_and_a_failing_check_does_not_stop_the_report():
     ir = Source("ir", "AutoResolve", "Integration Runtime", 1, DEFERRED, reason="Set it up by hand.")
     notebook_without_payload = Source("n", "Broken", "Notebook", 4, NOTEBOOK, payload=None)

@@ -10,8 +10,9 @@ operator already uses:
 * **Fabric CLI** -- ``fab auth logout`` then ``fab auth login`` (interactive browser); workspaces are
   read through ``fab api``. The CLI holds the token, not this process.
 
-No token is ever returned, logged or placed in an error message. Nothing is
-written to disk by this module.
+No token is ever returned, logged or placed in an error message. Given a
+``StateStore``, the connection's names and ids are saved as they change (never
+a token: the CLIs keep their own sign-in), so a restarted server keeps it.
 """
 
 from __future__ import annotations
@@ -29,7 +30,10 @@ from pathlib import Path
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from discovery_agent.api.state import StateStore
 
 FABRIC_RESOURCE = "https://api.fabric.microsoft.com"
 FABRIC_API = FABRIC_RESOURCE + "/v1"
@@ -40,6 +44,9 @@ METHODS = ("azure_cli", "fabric_cli")
 _GUID = re.compile(r"^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\\u001b\[[0-9;]*m")
 _JWT = re.compile(r"eyJ[A-Za-z0-9_\-\.]{10,}")
+#: What survives a restart: names, ids and the last checks. Never a token.
+_SAVED = ("status", "method", "account", "tenant", "workspaces", "workspace_id", "workspace_name", "checks", "message", "capacity_id")
+FABRIC_STATE = 1
 
 
 class FabricError(Exception):
@@ -113,10 +120,11 @@ def _clean_workspaces(items: List[dict]) -> List[dict]:
 class FabricTarget:
     """One Fabric target connection, in memory, guarded by a lock."""
 
-    def __init__(self) -> None:
+    def __init__(self, store: Optional["StateStore"] = None) -> None:
         self._lock = threading.RLock()
         self._gen = 0  # bumps on every authenticate/disconnect so a stale sign-in is ignored
         self._login_proc: Optional[subprocess.Popen] = None
+        self._store = store
         self._reset()
 
     def _reset(self) -> None:
@@ -149,7 +157,44 @@ class FabricTarget:
             if self._login_proc is not None and self._login_proc.poll() is None:
                 _kill_tree(self._login_proc)
             self._reset()
-            return self.state()
+            state = self.state()
+        self.persist()
+        return state
+
+    # -- surviving a restart -------------------------------------------
+
+    def busy(self) -> List[str]:
+        """What is working now. A supervised restart waits for it."""
+        with self._lock:
+            return ["a Fabric sign-in"] if self.status == "signing_in" else []
+
+    def persist(self) -> None:
+        """Save the connection for a restart. Never called with the lock held."""
+        if self._store is not None:
+            self._store.save("fabric", self._snapshot)
+
+    def _snapshot(self) -> Optional[dict]:
+        with self._lock:
+            if self.status in ("disconnected", "signing_in"):
+                return None  # nothing to keep, or a sign-in that a restart would cut off
+            saved = {name: getattr(self, name) for name in _SAVED}
+            saved["workspaces"] = [dict(w) for w in self.workspaces]
+            saved["checks"] = [dict(c) for c in self.checks]
+            return {"version": FABRIC_STATE, **saved}
+
+    def restore(self) -> Tuple[List[str], List[str]]:
+        """Take back the saved connection. The Azure CLI or Fabric CLI still holds its own
+        sign-in; if that has expired, the next call says so and asks to sign in again."""
+        saved = self._store.load("fabric") if self._store is not None else None
+        if not isinstance(saved, dict) or saved.get("version") != FABRIC_STATE or saved.get("method") not in METHODS:
+            return [], []
+        with self._lock:
+            for name in _SAVED:
+                if name in saved:
+                    setattr(self, name, saved[name])
+            if self.status == "connected":
+                return [f"the Fabric connection to {self.workspace_name or self.workspace_id}"], []
+            return (["the Fabric sign-in"] if self.status == "authenticated" else []), []
 
     def authenticate(self, body: dict) -> dict:
         """Start a browser sign-in and return at once; the UI polls ``state``."""
@@ -165,10 +210,17 @@ class FabricTarget:
             self.message = "Waiting for you to finish signing in in the browser window…"
             self._gen += 1
             gen = self._gen
+        self.persist()  # the last connection is gone
         threading.Thread(target=self._sign_in, args=(method, gen), daemon=True).start()
         return self.state()
 
     def _sign_in(self, method: str, gen: int) -> None:
+        try:
+            self._sign_in_now(method, gen)
+        finally:
+            self.persist()
+
+    def _sign_in_now(self, method: str, gen: int) -> None:
         try:
             self._browser_login(method, gen)
             with self._lock:
@@ -223,28 +275,33 @@ class FabricTarget:
             if self.method != method or self.status == "disconnected":
                 raise FabricError(409, "not_authenticated", "Log in first.")
             self.workspaces = self._list(method)
-            return self.state()
+            state = self.state()
+        self.persist()
+        return state
 
     def test(self, body: dict) -> dict:
         method = self._method(body)
         wid = str(body.get("workspaceId") or "").strip()
         if not _GUID.match(wid):
             raise FabricError(400, "invalid_configuration", "Select a Fabric workspace first.")
-        with self._lock:
-            if self.method != method or self.status == "disconnected":
-                raise FabricError(409, "not_authenticated", "Log in first.")
-            checks: List[dict] = []
-            self.checks = checks
-            try:
-                self._verify(method, wid, checks)
-            except FabricError as exc:
-                self.status = "failed"
-                self.message = exc.message
-                checks.append({"label": "Workspace accessible" if checks else "Authentication", "ok": False, "detail": exc.message})
-                raise FabricError(exc.status, exc.code, exc.message) from exc
-            self.status = "connected"
-            self.message = None
-            return self.state()
+        try:
+            with self._lock:
+                if self.method != method or self.status == "disconnected":
+                    raise FabricError(409, "not_authenticated", "Log in first.")
+                checks: List[dict] = []
+                self.checks = checks
+                try:
+                    self._verify(method, wid, checks)
+                except FabricError as exc:
+                    self.status = "failed"
+                    self.message = exc.message
+                    checks.append({"label": "Workspace accessible" if checks else "Authentication", "ok": False, "detail": exc.message})
+                    raise FabricError(exc.status, exc.code, exc.message) from exc
+                self.status = "connected"
+                self.message = None
+                return self.state()
+        finally:
+            self.persist()
 
     # -- for the migration run ----------------------------------------
 

@@ -1,8 +1,11 @@
 """The state behind the API: one connection, one discovery.
 
 A single-operator, single-process model on purpose. The migration accelerator
-is a local tool today; the connection lives in this process's memory and is
-gone when the process ends. Nothing here writes a credential anywhere.
+is a local tool today; the connection lives in this process's memory. Given a
+``StateStore``, the sign-in, the connection and the discovery are also saved as
+they change (names, ids and what discovery read; never a token or a secret),
+so a restarted server picks up where it left off. Nothing here writes a
+credential anywhere.
 
 Two ways to prove an identity, both built by the connection layer:
 
@@ -31,7 +34,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from discovery_agent import discovery
 from discovery_agent.api import mapping
@@ -75,6 +78,9 @@ from discovery_agent.mapping.synapse_fabric_mapping import (
     TRANSFORMATION,
 )
 from discovery_agent.extractors.models import SourceType
+
+if TYPE_CHECKING:
+    from discovery_agent.api.state import StateStore
 
 SOURCE_PLATFORM = "Azure Synapse"
 _GUID = re.compile(
@@ -214,6 +220,30 @@ class _Connection:
     tested_at: Optional[str] = None
 
 
+
+def _identity(conn: "_Connection") -> Tuple[str, str]:
+    return conn.workspace.lower(), (conn.sql_pool or "").lower()
+
+
+def _sign_in_for(method: str, subscription: str, tenant: Optional[str]) -> Tuple[AzureCredentialProvider, AzureConnection]:
+    """The identity for a sign-in, built without opening anything: a token is asked for on first use.
+
+    Both methods are a browser sign-in. "azure_cli" keeps nothing, as it always
+    has; "interactive_browser" uses the identity the connection layer holds,
+    whose authentication record lets a restarted server sign in silently."""
+    config = AzureConnectionConfig(
+        subscription_id=subscription,
+        tenant_id=tenant,
+        credential_method=CredentialMethod.INTERACTIVE_BROWSER,
+    )
+    provider = credential_provider(
+        method=CredentialMethod.INTERACTIVE_BROWSER,
+        tenant_id=tenant,
+        remember=method == "interactive_browser",
+    )
+    return provider, AzureConnection(config, credential=provider)
+
+
 @dataclass
 class _Job:
     state: str = "idle"  # idle | running | completed | completed_with_warnings | failed
@@ -224,6 +254,9 @@ class _Job:
     items: List[dict] = field(default_factory=list)
     records_by_id: Dict[str, Any] = field(default_factory=dict)
     extras_by_id: Dict[str, "mapping.Extra"] = field(default_factory=dict)
+    #: What discovery read beyond ``run``: with it, the rest is rebuilt after a restart.
+    extras: List["mapping.Extra"] = field(default_factory=list)
+    extra_failures: List[dict] = field(default_factory=list)
     known: Dict[str, str] = field(default_factory=dict)
     referenced_by: Dict[str, List[dict]] = field(default_factory=dict)
     graph: Optional[dict] = None
@@ -231,16 +264,27 @@ class _Job:
     workspace: Optional[str] = None
 
 
+#: Raised whenever the API changes in a way the page relies on. The page compares it
+#: with the version it needs and tells the operator to restart an older backend.
+API_VERSION = 3
+#: The layout of the saved discovery. Bumped when it changes, so an older file is not misread.
+DISCOVERY_STATE = 1
+_DONE = ("completed", "completed_with_warnings")
+
+
 class Session:
     """The connection and the last discovery, guarded by one lock."""
 
-    def __init__(self) -> None:
+    def __init__(self, store: Optional["StateStore"] = None) -> None:
         self._lock = threading.RLock()
         self._connection: Optional[_Connection] = None
         self._signin: Optional[_SignIn] = None
         self._signing_in = False
         self._job = _Job()
         self._detail_cache: Dict[str, dict] = {}
+        self._store = store
+        #: The discovery last written to the store, and its state then.
+        self._saved_discovery: Optional[Tuple[_Job, str]] = None
 
     # -- capabilities ------------------------------------------------------
 
@@ -249,6 +293,7 @@ class Session:
         """What this build can do, so the UI never offers what would fail."""
         return {
             "status": "ok",
+            "apiVersion": API_VERSION,
             "capabilities": {
                 # Only what ``credential_provider`` actually implements.
                 "authMethods": list(METHODS),
@@ -262,6 +307,153 @@ class Session:
                 "migratableTypes": list(MIGRATABLE_TYPES),
             },
         }
+
+    # -- surviving a restart -----------------------------------------------
+
+    def busy(self) -> List[str]:
+        """What is working now. A supervised restart waits for it."""
+        with self._lock:
+            working = ["discovery"] if self._job.state == "running" else []
+            if self._signing_in:
+                working.append("a Synapse sign-in")
+            return working
+
+    def persist(self) -> None:
+        """Save the sign-in, the connection and the discovery. Without a store, nothing."""
+        if self._store is None:
+            return
+        self._store.save("source", self._source_snapshot)
+        taken: Dict[str, Any] = {}
+
+        def discovery_snapshot() -> Any:
+            from discovery_agent.api.state import UNCHANGED  # noqa: PLC0415 - only with a store
+
+            with self._lock:
+                job, state = self._job, self._job.state
+            saved = self._saved_discovery
+            if saved is not None and saved[0] is job and saved[1] == state:
+                return UNCHANGED  # a discovery can be large: written once per change, not per request
+            taken["marker"] = (job, state)
+            return self._discovery_value(job, state)
+
+        if self._store.save("discovery", discovery_snapshot) and "marker" in taken:
+            self._saved_discovery = taken["marker"]
+
+    def _source_snapshot(self) -> Optional[dict]:
+        with self._lock:
+            signin, conn = self._signin, self._connection
+            if signin is None and conn is None:
+                return None
+            return {
+                "signIn": None if signin is None else {
+                    "method": signin.method, "subscriptionId": signin.subscription_id,
+                    "tenantId": signin.tenant_id, "subscriptionName": signin.subscription_name,
+                },
+                "connection": None if conn is None else {
+                    "method": conn.method, "tenantId": conn.tenant_id, "subscriptionId": conn.subscription_id,
+                    "resourceGroup": conn.resource_group, "workspace": conn.workspace, "sqlPool": conn.sql_pool,
+                    "subscriptionName": conn.subscription_name, "checks": [dict(c) for c in conn.checks],
+                    "connected": conn.connected, "testedAt": conn.tested_at,
+                },
+            }
+
+    @staticmethod
+    def _discovery_value(job: _Job, state: str) -> Optional[dict]:
+        """What discovery read, not the index built from it: the index is rebuilt on restore."""
+        if state == "idle":
+            return None
+        saved = {
+            "version": DISCOVERY_STATE, "state": state, "startedAt": job.started_at,
+            "finishedAt": job.finished_at, "error": job.error, "workspace": job.workspace,
+        }
+        if state in _DONE:
+            saved.update({"run": job.run, "extras": list(job.extras), "extraFailures": list(job.extra_failures)})
+        return saved
+
+    def restore(self) -> Tuple[List[str], List[str]]:
+        """Take back what was saved before the server last stopped.
+
+        Returns what came back, and notes on what did not or needs the operator.
+        Builds no connection: a token is asked for on first use, silently where
+        the sign-in method keeps one."""
+        kept: List[str] = []
+        notes: List[str] = []
+        if self._store is None:
+            return kept, notes
+        source = self._store.load("source")
+        source = source if isinstance(source, dict) else {}
+        saved_signin, saved_conn = source.get("signIn"), source.get("connection")
+        signin: Optional[_SignIn] = None
+        conn: Optional[_Connection] = None
+        if saved_signin:
+            try:
+                method = str(saved_signin.get("method") or "")
+                if method not in METHODS:
+                    raise ValueError(method)
+                provider, azure = _sign_in_for(method, saved_signin["subscriptionId"], saved_signin.get("tenantId"))
+                signin = _SignIn(method=method, provider=provider, azure=azure,
+                                 subscription_id=saved_signin["subscriptionId"], tenant_id=saved_signin.get("tenantId"),
+                                 subscription_name=saved_signin.get("subscriptionName"))
+                kept.append("the Synapse sign-in")
+                if method == "azure_cli":
+                    notes.append("Synapse asks you to sign in once more the next time it is read: "
+                                 "the Azure CLI method keeps no sign-in between restarts (Interactive browser does).")
+            except Exception:  # noqa: BLE001 - a sign-in that cannot be rebuilt is asked for again
+                notes.append("Sign in to Synapse again: the last sign-in could not be restored.")
+        if saved_conn and signin is not None:
+            try:
+                settings = ConnectionSettings(
+                    azure=signin.azure.config,
+                    synapse=SynapseConnectionConfig(resource_group=saved_conn["resourceGroup"],
+                                                    workspace_name=saved_conn["workspace"],
+                                                    sql_pool_name=saved_conn.get("sqlPool")),
+                )
+                conn = _Connection(
+                    method=signin.method, manager=ConnectionManager(settings, credential=signin.provider),
+                    tenant_id=saved_conn.get("tenantId"), subscription_id=saved_conn["subscriptionId"],
+                    resource_group=saved_conn["resourceGroup"], workspace=saved_conn["workspace"],
+                    sql_pool=saved_conn.get("sqlPool"), subscription_name=saved_conn.get("subscriptionName"),
+                    checks=[dict(c) for c in saved_conn.get("checks") or []],
+                    connected=bool(saved_conn.get("connected")), tested_at=saved_conn.get("testedAt"),
+                )
+                if conn.connected:
+                    kept.append(f"the connection to {conn.workspace}" + (f" / {conn.sql_pool}" if conn.sql_pool else ""))
+            except Exception:  # noqa: BLE001
+                notes.append("Test the Synapse connection again: it could not be restored.")
+        job: Optional[_Job] = None
+        saved_job = self._store.load("discovery")
+        saved_job = saved_job if isinstance(saved_job, dict) else None
+        if saved_job:
+            try:
+                job = self._job_from(saved_job)
+            except Exception:  # noqa: BLE001 - the new code cannot read what the old one found
+                self._store.clear("discovery")
+                notes.append("Run discovery again: the updated code could not rebuild the last one.")
+        with self._lock:
+            self._signin, self._connection = signin, conn
+            if job is not None:
+                self._job = job
+        if job is not None and job.state in _DONE:
+            kept.append(f"the discovery ({len(job.items):,} objects)")
+        if job is not None and saved_job is not None and job.state == saved_job.get("state"):
+            self._saved_discovery = (job, job.state)  # already on disk as it is
+        else:
+            self.persist()
+        return kept, notes
+
+    def _job_from(self, saved: dict) -> _Job:
+        if saved.get("version") != DISCOVERY_STATE:
+            raise ValueError("saved in another layout")
+        job = _Job(state=str(saved.get("state") or "idle"), started_at=saved.get("startedAt"),
+                   finished_at=saved.get("finishedAt"), error=saved.get("error"), workspace=saved.get("workspace"))
+        if job.state == "running":
+            job.state, job.finished_at = "failed", _now()
+            job.error = "The server restarted while discovery was running. Run it again."
+        elif job.state in _DONE:
+            index = self._indexed(job.workspace or "", saved["run"], list(saved.get("extras") or []),
+                                  list(saved.get("extraFailures") or []))
+            self._fill(job, index)
+        return job
 
     # -- connections -------------------------------------------------------
 
@@ -283,6 +475,7 @@ class Session:
             reset_credentials()
             forget_auth_record()
             payload = self._connection_payload(None)
+        self.persist()
         payload["note"] = "Signed out of this accelerator. Your Azure CLI session is untouched."
         return payload
 
@@ -314,22 +507,9 @@ class Session:
             # Sending the operator to the right tenant's sign-in page is what
             # lets a subscription id alone be enough.
             tenant = tenant or discover_tenant_id(subscription)
-            # Both are a browser sign-in. "azure_cli" keeps nothing, as it
-            # always has; "interactive_browser" uses the held identity.
-            credential_method = CredentialMethod.INTERACTIVE_BROWSER
             try:
-                config = AzureConnectionConfig(
-                    subscription_id=subscription,
-                    tenant_id=tenant,
-                    credential_method=credential_method,
-                )
-                provider = credential_provider(
-                    method=credential_method,
-                    tenant_id=tenant,
-                    remember=browser,
-                )
+                provider, azure = _sign_in_for(method, subscription, tenant)
                 provider.start_attempt()  # an explicit attempt retries a refused one
-                azure = AzureConnection(config, credential=provider)
             except (ConfigError, AzureAuthenticationError) as exc:
                 raise ApiError(400, "invalid_configuration", redact(str(exc))) from exc
             result = azure.validate()  # for azure_cli, this call opens the browser
@@ -353,6 +533,7 @@ class Session:
             else:
                 self._signin = None
             payload = self._connection_payload(None)
+        self.persist()
         payload["checks"] = [self._check(result)]
         return self._with_error(payload, [] if result.ok else [result], tenant_hint=not tenant)
 
@@ -435,11 +616,25 @@ class Session:
         conn.tested_at = _now()
         failures = [r for r in results if not r.ok and r.connection is not SourceType.SQL]
         with self._lock:
-            self._connection = conn
-            if not conn.connected:
-                self._job = _Job()
-                self._detail_cache.clear()
+            self._replace_connection(conn)
+        self.persist()
         return self._with_error(self._connection_payload(conn), failures)
+
+    def _replace_connection(self, conn: "_Connection") -> None:
+        """Hold a newly tested connection. The last discovery is dropped when the test failed,
+        or when it reached another workspace or pool: it describes a different source."""
+        previous = self._connection
+        changed = previous is not None and _identity(previous) != _identity(conn)
+        self._connection = conn
+        if not conn.connected or changed:
+            self._job = _Job()
+            self._detail_cache.clear()
+
+    def source_identity(self) -> Optional[Tuple[str, str]]:
+        """(workspace, pool) of the connected source, to tell one connection from another."""
+        with self._lock:
+            conn = self._connection
+            return _identity(conn) if conn is not None and conn.connected else None
 
     @staticmethod
     def _method(body: dict) -> str:
@@ -529,6 +724,7 @@ class Session:
             self._job = _Job(state="running", started_at=_now(), workspace=conn.workspace)
             self._detail_cache.clear()
             job = self._job
+        self.persist()
         thread = threading.Thread(target=self._discover, args=(conn, job), daemon=True)
         thread.start()
         return self.discovery_status()
@@ -541,68 +737,88 @@ class Session:
                 raise ApiError(409, "discovery_running", "Discovery is running; wait for it to finish.")
             self._job = _Job()
             self._detail_cache.clear()
+        self.persist()
         return self.discovery_status()
 
     def _discover(self, conn: _Connection, job: _Job) -> None:
         try:
             config = DiscoveryConfig(source=Path("."), out=Path(DEFAULT_OUTPUT_DIR))
             run = discovery.run(config, connections=conn.manager, scan_repository=False)
-            records = list(run.records.records)
-            extras, extra_failures = self._collect_extras(conn, records)
-
-            # Every id a dependency can join onto, in one place.
-            known: Dict[str, str] = {}
-            for r in records:
-                known[r.logical_id] = r.identity.scoped_id
-                known[r.identity.scoped_id] = r.identity.scoped_id
-            for e in extras:
-                known[e.id] = e.id
-                if e.source_type in ("Spark Pool", "Integration Runtime"):
-                    known[f"compute:{e.name}"] = e.id
-
-            items = [mapping.list_item(r, conn.workspace, known) for r in records]
-            items += [mapping.extra_item(e, conn.workspace, known) for e in extras]
-            items.sort(key=lambda i: (i["category"], i["type"], i["name"].lower()))
-
-            # "Referenced by": the reverse of every dependency that joined.
-            referenced_by: Dict[str, List[dict]] = {}
-
-            def add_reverse(source_id: str, source_name: str, source_type: str, deps: List[dict]) -> None:
-                for dep in deps:
-                    if dep["objectId"] and dep.get("location") != "contains":
-                        referenced_by.setdefault(dep["objectId"], []).append(
-                            {"name": source_name, "type": source_type, "objectId": source_id}
-                        )
-
-            for r in records:
-                add_reverse(r.identity.scoped_id, r.identity.qualified_name,
-                            mapping._record_source_type(r), mapping._dependencies(r, known))
-            for e in extras:
-                add_reverse(e.id, e.name, e.source_type, mapping._extra_dependencies(e, known))
-
-            graph = self._build_graph(items, records, extras, known)
-            wave_of = {n["id"]: n["wave"] for n in graph["nodes"]}
-            for item in items:
-                item["wave"] = wave_of.get(item["id"], 0)
-
-            summary = self._summarise(run, items, extra_failures)
+            extras, extra_failures = self._collect_extras(conn, list(run.records.records))
+            index = self._indexed(conn.workspace, run, extras, extra_failures)
             with self._lock:
-                job.graph = graph
-                job.run = run
-                job.items = items
-                job.records_by_id = {r.identity.scoped_id: r for r in records}
-                job.extras_by_id = {e.id: e for e in extras}
-                job.known = known
-                job.referenced_by = referenced_by
-                job.summary = summary
+                self._fill(job, index)
                 job.finished_at = _now()
-                job.state = (
-                    "completed_with_warnings" if summary["failedCategories"] or summary["warnings"] else "completed"
-                )
         except DiscoveryError as exc:
             self._fail(job, redact(str(exc)))
         except Exception as exc:  # noqa: BLE001 - never leak a traceback to the UI
             self._fail(job, f"Discovery stopped unexpectedly ({type(exc).__name__}).")
+        self.persist()
+
+    @classmethod
+    def _indexed(cls, workspace: str, run: discovery.DiscoveryRun, extras: list, extra_failures: List[dict]) -> dict:
+        """Everything the API serves about a discovery, built from what it read.
+
+        Uses no connection, so a restarted server rebuilds it from the saved
+        discovery with the code it runs now."""
+        records = list(run.records.records)
+        # Every id a dependency can join onto, in one place.
+        known: Dict[str, str] = {}
+        for r in records:
+            known[r.logical_id] = r.identity.scoped_id
+            known[r.identity.scoped_id] = r.identity.scoped_id
+        for e in extras:
+            known[e.id] = e.id
+            if e.source_type in ("Spark Pool", "Integration Runtime"):
+                known[f"compute:{e.name}"] = e.id
+
+        items = [mapping.list_item(r, workspace, known) for r in records]
+        items += [mapping.extra_item(e, workspace, known) for e in extras]
+        items.sort(key=lambda i: (i["category"], i["type"], i["name"].lower()))
+
+        # "Referenced by": the reverse of every dependency that joined.
+        referenced_by: Dict[str, List[dict]] = {}
+
+        def add_reverse(source_id: str, source_name: str, source_type: str, deps: List[dict]) -> None:
+            for dep in deps:
+                if dep["objectId"] and dep.get("location") != "contains":
+                    referenced_by.setdefault(dep["objectId"], []).append(
+                        {"name": source_name, "type": source_type, "objectId": source_id}
+                    )
+
+        for r in records:
+            add_reverse(r.identity.scoped_id, r.identity.qualified_name,
+                        mapping._record_source_type(r), mapping._dependencies(r, known))
+        for e in extras:
+            add_reverse(e.id, e.name, e.source_type, mapping._extra_dependencies(e, known))
+
+        graph = cls._build_graph(items, records, extras, known)
+        wave_of = {n["id"]: n["wave"] for n in graph["nodes"]}
+        for item in items:
+            item["wave"] = wave_of.get(item["id"], 0)
+
+        summary = cls._summarise(run, items, extra_failures)
+        return {
+            "graph": graph,
+            "run": run,
+            "items": items,
+            "records_by_id": {r.identity.scoped_id: r for r in records},
+            "extras_by_id": {e.id: e for e in extras},
+            "extras": list(extras),
+            "extra_failures": list(extra_failures),
+            "known": known,
+            "referenced_by": referenced_by,
+            "summary": summary,
+            "state": "completed_with_warnings" if summary["failedCategories"] or summary["warnings"] else "completed",
+        }
+
+    @staticmethod
+    def _fill(job: _Job, index: dict) -> None:
+        """Put an index on a job; its state goes last, so nothing reads it half-filled."""
+        for name, value in index.items():
+            if name != "state":
+                setattr(job, name, value)
+        job.state = index["state"]
 
     @staticmethod
     def _build_graph(items: List[dict], records: list, extras: list, known: Dict[str, str]) -> dict:

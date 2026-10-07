@@ -30,7 +30,7 @@ function stateOf(s: StepStatus): { cls: string; label: string } {
   if (s.locked) return { cls: "locked", label: "Locked" };
   if (s.running) return { cls: "running", label: "Running" };
   if (s.paused) return { cls: "current attention", label: "Paused" };
-  if (s.stale) return { cls: "current attention", label: s.key === "plan" ? "Rebuild" : "Run again" };
+  if (s.stale) return { cls: "current attention", label: s.staleLabel };
   if (s.confirmed) return { cls: s.attention ? "done attention" : "done", label: "Done" };
   if (s.complete) return { cls: s.attention ? "current attention" : "current", label: "Ready to confirm" };
   return { cls: s.attention ? "current attention" : "current", label: s.attention ? "Needs attention" : "To do" };
@@ -110,10 +110,10 @@ function NextBar({ step, steps, onGo }: { step: StepStatus; steps: StepStatus[];
       : <Circle size={18} className="faint" aria-hidden="true" />;
     title = step.running ? `${step.title} in progress`
       : step.paused ? `${step.title} is paused`
-      : step.stale ? (step.key === "plan" ? "The plan needs rebuilding" : `${step.title} needs to run again`)
+      : step.stale ? step.staleTitle
       : `${step.title} is not finished`;
     detail = step.stale
-      ? `Confirmed earlier, but ${step.lostReason.charAt(0).toLowerCase()}${step.lostReason.slice(1)} ${step.waiting}${next ? " The steps after it return once it is done again." : ""}`
+      ? `Confirmed earlier, but ${step.lostReason} ${step.waiting}${next ? " The steps after it return once it is done again." : ""}`
       : step.waiting;
     action = <Button variant="primary" disabled title={step.waiting}>{next ? `Continue to ${next.title}` : "Finish migration"}<ArrowRight size={15} aria-hidden="true" /></Button>;
   }

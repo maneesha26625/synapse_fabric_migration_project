@@ -10,7 +10,7 @@ const n = (v: number) => v.toLocaleString();
 
 /** What resetting ``step`` would clear, and why it cannot be done right now. */
 export function useResetPlan(step: StepKey) {
-  const { discovery, isConnected } = useAppState();
+  const { discovery, isConnected, backendOutdated } = useAppState();
   const { plan, credentials, execution: run, validation, validationBusy, confirmed, projects } = useMigration();
   const from = STEP_KEYS.indexOf(step);
   const covers = (k: StepKey) => from <= STEP_KEYS.indexOf(k);
@@ -30,7 +30,10 @@ export function useResetPlan(step: StepKey) {
   const unconfirm = STEP_KEYS.filter((k) => covers(k) && confirmed.includes(k));
   if (unconfirm.length) clears.push(`Your confirmation of ${unconfirm.map((k) => stepMeta(k).title).join(", ")}.`);
 
+  // Clearing a discovery or a run is the backend's job: an old backend does not know how yet.
+  const needsBackend = (step === "discover" && discovery.state !== "idle") || (covers("migrate") && run.state !== "idle");
   const blocked =
+    backendOutdated && needsBackend ? "Restart the backend first: it was started before the last update and cannot reset yet." :
     discovery.state === "running" ? "Discovery is running. Wait for it to finish." :
     covers("migrate") && run.state === "running" ? "The migration is running. Pause it first, then reset." :
     validationBusy ? "Validation is running. Wait for it to finish." :

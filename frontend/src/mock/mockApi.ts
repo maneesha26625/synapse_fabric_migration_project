@@ -16,6 +16,7 @@
 
 import {
   ApiRequestError,
+  REQUIRED_API_VERSION,
   type Capabilities,
   type ConnectionConfig,
   type ConnectionCredentials,
@@ -372,8 +373,21 @@ function demoAnalysis(items: PlanItem[], record: boolean, options?: RunOptions):
   }
   const risks: PlanRisk[] = [];
   if (fabric.status !== "connected") risks.push({ id: "", code: "TARGET_NOT_READY", severity: "BLOCKING", title: "Fabric target connected", message: "Connect the Fabric target and pass its connection test (in Demo data, reload the page to restore the demo target).", objects: [] });
+  // Like the backend planner: a dependency planned in a later wave blocks the run;
+  // one left out of the plan is a high risk for an object this run creates.
+  const planWave = new Map(rows.map(({ o, wave }) => [o.id, wave]));
+  const named = (ids: string[]) => `${ids.slice(0, 3).map((id) => byId.get(id)?.name ?? id).sort().join(", ")}${ids.length > 3 ? " and more" : ""}`;
+  for (const { o, wave } of rows) {
+    const needs = o.dependencies.filter((d) => d.objectId && byId.has(d.objectId) && d.location !== "contains").map((d) => d.objectId as string);
+    const laterDeps = needs.filter((d) => (planWave.get(d) ?? 0) > wave);
+    const missing = needs.filter((d) => !planWave.has(d));
+    if (laterDeps.length) risks.push({ id: "", code: "DEPENDENCY_LATER", severity: "BLOCKING", title: o.name, message: `${o.name} is in wave ${wave} but needs ${named(laterDeps)}, planned in a later wave. Move it later or its dependency earlier.`, objects: [o.id] });
+    if (missing.length && objectStrategies[o.id].strategy === "automated") risks.push({ id: "", code: "DEPENDENCY_NOT_PLANNED", severity: "HIGH", title: o.name, message: `${o.name} needs ${named(missing)}, which is not in the plan. Add it, or confirm it already exists in Fabric.`, objects: [o.id] });
+  }
   const later = rows.filter(({ o }) => !["automated", "deselected"].includes(objectStrategies[o.id].strategy));
   if (later.length) risks.push({ id: "", code: "NOT_AUTOMATED", severity: "LOW", title: "Not migrated by this build", message: `${later.length} object(s) are in the plan but not created by this run (demo).`, objects: later.map(({ o }) => o.id) });
+  const rank: Record<RiskSeverity, number> = { BLOCKING: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+  risks.sort((a, b) => rank[a.severity] - rank[b.severity]);
   risks.forEach((r, i) => { r.id = `R${String(i + 1).padStart(3, "0")}`; });
   const riskCounts = { BLOCKING: 0, HIGH: 0, MEDIUM: 0, LOW: 0 } as Record<RiskSeverity, number>;
   for (const r of risks) riskCounts[r.severity] += 1;
@@ -431,6 +445,11 @@ export const mockApi: MigrationApi = {
     await sleep(80);
     return {
       status: "ok",
+      apiVersion: REQUIRED_API_VERSION,
+      bootId: "demo",
+      supervised: true,
+      busy: [],
+      restored: null,
       capabilities: {
         authMethods: ["azure_cli", "interactive_browser"],
         authMethodDetails: [
@@ -459,6 +478,8 @@ export const mockApi: MigrationApi = {
     if (c.method === "interactive_browser" && !c.tenantId.trim()) throw new ApiRequestError("invalid_configuration", "Tenant ID is required.");
     s.signedIn = { subscriptionId: c.subscriptionId.trim(), tenantId: c.tenantId.trim() || DEMO_TENANT };
     s.connection = { status: "disconnected", ok: true, signedIn: true, method: c.method, subscriptionId: s.signedIn.subscriptionId, subscriptionName: "Demo subscription", tenantId: s.signedIn.tenantId, checks: [] };
+    // Like the backend: a new sign-in drops the last discovery (the run's record stays).
+    s.startedAt = null; s.startedIso = null; s.objects = null; s.summary = null; s.error = null;
     return s.connection;
   },
 
@@ -487,19 +508,26 @@ export const mockApi: MigrationApi = {
     await sleep(700);
     requireFields(c);
     const error = scenarioError(c.workspace);
+    const before = s.connection.workspace ? `${s.connection.workspace}|${s.connection.sqlPool ?? ""}`.toLowerCase() : null;
     s.connection = { ...connectionFor(c, !error, error ?? undefined), signedIn: !!s.signedIn };
     s.scenario = c.workspace;
-    if (error) {
+    const changed = before !== null && before !== `${s.connection.workspace}|${s.connection.sqlPool ?? ""}`.toLowerCase();
+    if (error || changed) {
+      // Like the backend: a failed test, or another workspace, drops the last discovery;
+      // another workspace also drops the run's record, which belongs to the old one.
       s.startedAt = null;
       s.objects = null;
+      if (changed && !error) execSim = null;
     }
     return s.connection;
   },
 
   async disconnect() {
     await sleep(150);
-    // Like the backend: signing out forgets the discovery, not the record of a run.
+    if (runNow().state === "running") throw new ApiRequestError("run_in_progress", "A migration run is working. Pause it before you disconnect the source.", 409);
+    // Like the backend: signing out forgets the discovery and the run's record.
     s = fresh();
+    execSim = null;
     return s.connection;
   },
 
@@ -650,6 +678,9 @@ export const mockApi: MigrationApi = {
       return fabric;
     }
     const picked = DEMO_FABRIC_WORKSPACES.find((w) => w.id === c.workspaceId.trim());
+    const nextId = c.workspaceId.trim() || DEMO_FABRIC_WORKSPACES[0].id;
+    // Like the backend: another Fabric workspace drops the run's record, which belongs to the old one.
+    if (fabric.workspaceId && fabric.workspaceId.toLowerCase() !== nextId.toLowerCase()) execSim = null;
     fabric = {
       ...fabric, status: "connected", method: c.method,
       workspaceName: c.workspaceName.trim() || picked?.name || DEMO_FABRIC_WORKSPACES[0].name,
@@ -660,7 +691,9 @@ export const mockApi: MigrationApi = {
   },
 
   async disconnectFabric() {
+    if (runNow().state === "running") throw new ApiRequestError("run_in_progress", "A migration run is working. Pause it before you disconnect Fabric.", 409);
     fabric = { status: "disconnected" };
+    execSim = null;
     return fabric;
   },
 

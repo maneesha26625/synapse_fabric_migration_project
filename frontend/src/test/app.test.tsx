@@ -4,7 +4,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { buildReport } from "../components/journey/report";
 import { mockApi, resetDemo } from "../mock/mockApi";
-import type { ConnectionConfig, ExecutionRun, FabricConfig, ResultsQuery } from "../types";
+import { RESTART_GRACE } from "../services/realApi";
+import { BACKEND_WATCH } from "../state/AppState";
+import { REQUIRED_API_VERSION } from "../types";
+import type { ConnectionConfig, ConnectionState, ExecutionRun, FabricConfig, FabricTarget, RestoredState, ResultsQuery } from "../types";
 
 const CONFIG: ConnectionConfig = {
   method: "azure_cli", tenantId: "", subscriptionId: "10eb96c3-ba3c-492e-b95b-e9f1d6d85d70",
@@ -333,6 +336,151 @@ describe("start page", () => {
     await user.click(within(dialog).getByRole("button", { name: "Disconnect" }));
     await waitFor(async () => expect((await mockApi.getConnection()).status).not.toBe("connected"));
   }, 15000);
+});
+
+describe("starting over", () => {
+  it("disconnecting Fabric starts Migrate and Validate over, and disconnecting the source starts everything over", async () => {
+    resetDemo();
+    const items = await seedPlan(2);
+    await mockApi.startExecution(items);
+    await new Promise((r) => setTimeout(r, 2500));
+    unlockTo("validate");
+    const user = userEvent.setup();
+    go("/");
+    // Fabric: the run's record and the later confirmations go; the discovery and the plan stay.
+    const target = await screen.findByRole("region", { name: /^Destination connection/ });
+    await user.click(await within(target).findByRole("button", { name: "Disconnect" }, { timeout: 5000 }));
+    let dialog = screen.getByRole("dialog", { name: "Disconnect Microsoft Fabric?" });
+    expect(within(dialog).getByText(/the record of migration run #\d+ is cleared/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Disconnect" }));
+    await waitFor(() => expect(stored(JOURNEY)).toEqual(["discover", "assess", "waves", "plan"]));
+    expect((await mockApi.getExecution()).state).toBe("idle");
+    expect(stored(PLAN)).toHaveLength(2);
+    // The source: everything that was built on it goes.
+    const source = screen.getByRole("region", { name: /^Source connection/ });
+    await user.click(within(source).getByRole("button", { name: "Disconnect" }));
+    dialog = screen.getByRole("dialog", { name: "Disconnect Azure Synapse?" });
+    expect(within(dialog).getByText(/This starts the migration over/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/the plan \(2 objects\)/)).toBeInTheDocument();
+    await user.click(within(dialog).getByRole("button", { name: "Disconnect" }));
+    await waitFor(() => expect(stored(JOURNEY)).toEqual([]));
+    expect(stored(PLAN)).toEqual([]);
+    expect((await mockApi.getDiscoveryStatus()).state).toBe("idle");
+  }, 25000);
+
+  it("asks once for an older Live backend that does not update itself to be replaced, instead of failing on calls it does not know", async () => {
+    localStorage.setItem("ma.apiMode", "real");
+    liveBackend({ up: true, boot: "", apiVersion: 0, supervised: false, connection: SIGNED_OUT, fabric: { status: "disconnected" } });
+    go("/");
+    expect(await screen.findByText("The accelerator's backend is an older version that does not update itself.")).toBeInTheDocument();
+    expect(screen.getByText(/replaces the old backend with one that restarts by itself/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+  }, 15000);
+});
+
+/* ---- a Live backend, played by the test ---------------------------------------------------- */
+
+interface LiveBackend {
+  up: boolean;
+  boot: string;
+  apiVersion?: number;
+  supervised?: boolean;
+  busy?: string[];
+  restored?: RestoredState | null;
+  connection: ConnectionState;
+  fabric: Partial<FabricTarget>;
+}
+
+const SIGNED_OUT: ConnectionState = { status: "disconnected", ok: true, signedIn: false, checks: [] };
+const CONNECTED: ConnectionState = {
+  status: "connected", ok: true, signedIn: true, method: "azure_cli", workspace: "ws-live", sqlPool: "pool01",
+  subscriptionId: CONFIG.subscriptionId, resourceGroup: "rg", checks: [],
+};
+const FABRIC_CONNECTED: Partial<FabricTarget> = {
+  status: "connected", method: "azure_cli", workspaceId: "11111111-2222-3333-4444-555555555555", workspaceName: "Fabric WS",
+  workspaces: [{ id: "11111111-2222-3333-4444-555555555555", name: "Fabric WS" }], capacityAssigned: true, checks: [],
+};
+
+/** Answers the page's calls from `state`, or not at all while `state.up` is false (a restart). */
+function liveBackend(state: LiveBackend): LiveBackend {
+  const idleRun = { runId: "", state: "idle", total: 0, completed: 0, inProgress: 0, failed: 0, pending: 0, skipped: 0, deferred: 0, items: [], logs: [] };
+  vi.stubGlobal("fetch", vi.fn(async (url: string) => {
+    if (!state.up) throw new TypeError("Failed to fetch");
+    const bodies: Record<string, unknown> = {
+      "/api/health": {
+        status: "ok", apiVersion: state.apiVersion ?? REQUIRED_API_VERSION, bootId: state.boot, supervised: state.supervised ?? true,
+        busy: state.busy ?? [], restored: state.restored ?? null,
+        capabilities: { authMethods: ["azure_cli", "interactive_browser"], discoveryScope: [] },
+      },
+      "/api/connections": state.connection,
+      "/api/discovery/status": { state: "idle", startedAt: null, finishedAt: null, error: null, workspace: null, progress: null, summary: null },
+      "/api/fabric/connection": state.fabric,
+      "/api/migration/run": idleRun,
+      "/api/migration/capabilities": { stages: [], defaults: {}, linkedServices: [] },
+    };
+    return { ok: true, status: 200, json: async () => bodies[url.split("?")[0]] ?? {} };
+  }));
+  return state;
+}
+
+describe("a backend that restarts itself", () => {
+  const watch = { ...BACKEND_WATCH };
+  const grace = { ...RESTART_GRACE };
+  const REAL_PLAN = "ma.plan.real.default";
+  const REAL_JOURNEY = "ma.journey.real.default";
+  beforeEach(() => {
+    Object.assign(BACKEND_WATCH, { everyMs: 60, awayEveryMs: 40, giveUpMs: 20000 });
+    Object.assign(RESTART_GRACE, { stepMs: 20 });
+    localStorage.setItem("ma.apiMode", "real");
+  });
+  afterEach(() => {
+    Object.assign(BACKEND_WATCH, watch);
+    Object.assign(RESTART_GRACE, grace);
+  });
+
+  it("waits quietly while it restarts, reads again what it kept, says so, and starts nothing over", async () => {
+    localStorage.setItem(REAL_PLAN, JSON.stringify([{ id: "sql://ws-live/pool01/dbo/Orders", wave: 1 }]));
+    localStorage.setItem(REAL_JOURNEY, JSON.stringify(["discover", "assess", "waves", "plan"]));
+    const backend = liveBackend({ up: true, boot: "A", connection: CONNECTED, fabric: FABRIC_CONNECTED });
+    go("/");
+    expect((await screen.findAllByText("ws-live", {}, { timeout: 5000 })).length).toBeGreaterThan(0);
+
+    backend.up = false; // the code changed: the backend restarts
+    expect(await screen.findByText("Reconnecting to the backend…")).toBeInTheDocument();
+    expect(screen.queryByText("The accelerator's backend is not answering.")).toBeNull();
+
+    // Back, as a new process. Say this one could not take the source connection back.
+    Object.assign(backend, {
+      up: true, boot: "B", connection: SIGNED_OUT,
+      restored: { at: "2026-10-07T10:00:00+00:00", kept: ["the discovery (12 objects)", "migration run #003"], notes: ["Sign in to Synapse again: the last sign-in could not be restored."] },
+    });
+    expect(await screen.findByText(/^The backend restarted and kept the discovery \(12 objects\) and migration run #003\. Sign in to Synapse again/, {}, { timeout: 5000 })).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByText("Reconnecting to the backend…")).toBeNull());
+    await waitFor(() => expect(screen.queryAllByText("ws-live")).toHaveLength(0)); // read again: signed out now
+    // A restart is not the operator signing out: the plan and the confirmed steps stay.
+    expect(stored(REAL_PLAN)).toEqual([{ id: "sql://ws-live/pool01/dbo/Orders", wave: 1 }]);
+    expect(stored(REAL_JOURNEY)).toEqual(["discover", "assess", "waves", "plan"]);
+  }, 20000);
+
+  it("says an outdated backend that updates itself is updating, and waits for the work it names", async () => {
+    liveBackend({ up: true, boot: "A", apiVersion: REQUIRED_API_VERSION - 1, supervised: true, busy: ["the migration run"], connection: SIGNED_OUT, fabric: { status: "disconnected" } });
+    go("/");
+    expect(await screen.findByText("The backend is updating.")).toBeInTheDocument();
+    expect(screen.getByText(/restarts by itself on the latest code once the migration run finishes, and keeps your work/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull(); // nothing to do
+  }, 15000);
+
+  it("reports a backend gone for good as not answering, and reconnects by itself when it is back", async () => {
+    Object.assign(BACKEND_WATCH, { giveUpMs: 300 });
+    const backend = liveBackend({ up: true, boot: "A", connection: CONNECTED, fabric: { status: "disconnected" } });
+    go("/");
+    expect((await screen.findAllByText("ws-live", {}, { timeout: 5000 })).length).toBeGreaterThan(0);
+    backend.up = false;
+    expect(await screen.findByText("The accelerator's backend is not answering.", {}, { timeout: 5000 })).toBeInTheDocument();
+    backend.up = true; // started again by hand, the same process kept nothing to say
+    await waitFor(() => expect(screen.queryByText("The accelerator's backend is not answering.")).toBeNull(), { timeout: 5000 });
+    expect(screen.queryByText(/The backend restarted/)).toBeNull(); // the same process: no restart to report
+  }, 20000);
 });
 
 describe("migration journey", () => {
@@ -674,6 +822,59 @@ describe("plan step", () => {
     await openStages();
     expect(await screen.findByRole("checkbox", { name: "Include Notebooks" })).not.toBeChecked();
     expect(screen.getByRole("checkbox", { name: "Include Warehouse & schema" })).not.toBeChecked();
+  }, 25000);
+});
+
+describe("plan tab", () => {
+  it("lists the objects behind a risk, finds one in the plan, and a confirmed plan that gains a blocking risk is not done", async () => {
+    resetDemo();
+    const graph = await mockApi.getDependencies();
+    const byId = new Map(graph.nodes.map((n) => [n.id, n]));
+    const edge = graph.edges.find((e) => byId.get(e.source)?.type === "View" && byId.get(e.target)?.type === "Table")!;
+    const view = byId.get(edge.source)!, table = byId.get(edge.target)!;
+    // The view runs in wave 1, before the table it reads (wave 2): a blocking risk.
+    localStorage.setItem(PLAN, JSON.stringify([{ id: view.id, wave: 1 }, { id: table.id, wave: 2 }]));
+    unlockTo("migrate"); // Plan was confirmed before the change
+    const user = userEvent.setup();
+    go("/migration?step=plan");
+    expect(await stepHeading("Plan")).toBeInTheDocument();
+    await waitFor(() => expect(stepBox(4)).toHaveAccessibleName(/Fix risks/), { timeout: 5000 });
+    expect(stepBox(5)).toBeDisabled();
+    expect(screen.getByText("1 blocking risk")).toBeInTheDocument();
+    await user.click(screen.getAllByText("Show the object")[0]);
+    await user.click(screen.getAllByRole("button", { name: /Find in plan/ })[0]);
+    expect(screen.getByRole("tab", { name: /^Objects in plan/ })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByLabelText("Find in the plan")).toHaveValue(view.name);
+    expect(await screen.findByText(view.name, { selector: "td" })).toBeInTheDocument();
+    // Moving the view after the table it reads resolves it, and the plan is done again.
+    await user.selectOptions(screen.getByLabelText(`Wave for ${view.name}`), "2");
+    await waitFor(() => expect(stepBox(4)).toHaveAccessibleName(/Done/), { timeout: 5000 });
+    expect(stepBox(5)).toBeEnabled();
+  }, 25000);
+
+  it("adds a whole type, says when everything is in, finds objects, and asks before clearing the plan", async () => {
+    resetDemo();
+    await seedPlan(2);
+    unlockTo("plan");
+    const user = userEvent.setup();
+    go("/migration?step=plan");
+    await user.click(await screen.findByRole("tab", { name: /^Objects in plan/ }, { timeout: 5000 }));
+    await user.selectOptions(screen.getByLabelText("Add every object of a type"), "Table");
+    await waitFor(() => expect(stored(PLAN).length).toBeGreaterThan(700));
+    expect(screen.getByText(/Table objects added to the plan/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^Add the .* not in the plan/ }));
+    expect(screen.getByRole("button", { name: "Every object is in the plan" })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: /Move .* up/ })).toBeNull(); // order inside a wave is by type, not by hand
+    await user.type(screen.getByLabelText("Find in the plan"), "FactSales");
+    expect(screen.getByText(/objects match/)).toBeInTheDocument();
+    // Clearing asks first, and Cancel keeps everything.
+    await user.click(screen.getByRole("button", { name: "Clear plan" }));
+    await user.click(within(screen.getByRole("dialog", { name: "Clear the plan?" })).getByRole("button", { name: "Cancel" }));
+    expect(stored(PLAN).length).toBeGreaterThan(1000);
+    await user.click(screen.getByRole("button", { name: "Clear plan" }));
+    await user.click(within(screen.getByRole("dialog", { name: "Clear the plan?" })).getByRole("button", { name: "Clear plan" }));
+    expect(stored(PLAN)).toEqual([]);
+    expect(await screen.findByRole("button", { name: /^Add all .* objects/ })).toBeInTheDocument();
   }, 25000);
 });
 

@@ -78,15 +78,58 @@ az login
 ```
 
 `start-ui.ps1` starts the API on port 8001 and the UI dev server on port 5173,
-and opens the browser. To start them yourself:
+and opens the browser. It is safe to run again at any time: an API that updates
+itself is reused, an older one that does not is stopped and replaced (once),
+and a UI dev server that is already running is reused. To start them yourself:
 
 ```
-python -m discovery_agent.api              # API on http://127.0.0.1:8001
+python -m discovery_agent.api              # API on http://127.0.0.1:8001, restarts itself on code changes
 cd frontend && npm install && npm run dev  # UI on http://localhost:5173, proxies /api to :8001
 ```
 
 Or as one process: `cd frontend && npm run build`, then
 `python -m discovery_agent.api` serves the built UI on port 8001.
+
+### Updates apply by themselves
+
+Nothing has to be restarted by hand after an update.
+
+* **The API restarts itself.** `python -m discovery_agent.api` runs the server
+  under a small supervisor that watches `src/discovery_agent/` and restarts the
+  server when a file changes, usually in under a second.
+* **It never cuts work off.** While discovery, a migration run, a validation or
+  a sign-in is working, the restart waits for it to finish, and the API's
+  window says what it is waiting for.
+* **It never swaps a working server for broken code.** The new code is compiled
+  and imported in a separate process first; if that fails, the server keeps
+  running the version before it, the error is shown in the API's window, and
+  the restart happens as soon as the code is fixed.
+* **It keeps its work.** The server saves, as they change, the Synapse sign-in
+  and connection (names and ids), what the last discovery read, the Fabric
+  connection, the migration run's record and the planner's runs, and takes
+  them back when it starts. The discovery is indexed again by the new code, so
+  a fix to classification or waves applies without discovering again. The
+  files are under `~/.synapse-discovery/api-state/<port>` (or
+  `$SYNAPSE_DISCOVERY_HOME`), readable by your user only; a part whose layout
+  the update changed starts fresh, with a note, and the others still come back.
+* **Never a secret.** No token, password or key is ever written. Sign-ins come
+  back through what already keeps them: the Interactive browser method's
+  authentication record and encrypted token cache (silent), and the Azure and
+  Fabric CLIs' own sessions. The **Azure CLI** source method keeps no sign-in
+  by design, so Synapse asks once more the next time it is read. Connection
+  credentials typed for a run stay in the page: it sends them again when you
+  Resume or Retry.
+* **The page carries on.** While the API restarts, a blue *Reconnecting to the
+  backend* bar shows; reads made meanwhile are retried. When it is back, the
+  page reads everything again and a note says what was kept. A restart is
+  never taken for a sign-out: the plan and the confirmed steps stay.
+* A discovery or run that a crash or a forced stop cut off comes back as
+  *failed* (discovery) or *paused*, with the object it was creating marked
+  failed (run): check it in Fabric, then Resume.
+
+`--no-reload` serves from one process with no restarts, and `--no-state` keeps
+nothing between runs of the server. On Windows the server binds its port
+exclusively, so an old API and a new one can never answer side by side.
 
 **No Azure?** Choose **Demo** in the top bar. A sample Synapse workspace
 (`demo-synapse-ws`, about 1,500 objects) and a sample Fabric workspace
@@ -121,7 +164,15 @@ migration starts, and **Migration**, where it runs.
    skipped by accident. Test runs real checks: ARM and data-plane access, the
    SQL pool, and for Fabric the workspace and its **capacity**. While the page
    first reads both sides it says *Checking…* rather than *Not connected*.
-   Disconnecting the source asks first when discovery results would be lost.
+
+   **A new connection starts fresh.** Disconnecting the source, or connecting
+   it to a different workspace or SQL pool, starts the migration over: the
+   discovered inventory, the plan, the record of the run, the validation
+   results and the confirmed steps are cleared. Disconnecting Fabric, or
+   switching its workspace, starts Migrate and Validate over. Both ask first and
+   list what goes; testing the same workspace again changes nothing. Neither
+   side can be disconnected while a run is working, and nothing in Synapse or
+   Fabric is ever deleted.
 3. **Start migration.** The button at the bottom is enabled once the route is
    chosen and both sides are connected and tested, with a capacity on the
    Fabric workspace. A checklist beside it says what is still missing. If the
@@ -164,16 +215,29 @@ results, and their confirmations), then lets you do them again from the
 start. A dialog lists exactly what will be cleared first, and says what is not
 touched: the connections, everything in Synapse, and anything already created
 in Fabric (a new run skips what exists; nothing is deleted). Reset is refused,
-with the reason, while discovery, a run or a validation is working. Running
-discovery again from Discover asks first when later steps are confirmed.
+with the reason, while discovery, a run or a validation is working, and when
+the backend was started before the last update (see below). Running discovery
+again from Discover asks first when later steps are confirmed.
 
 **Results that disappear.** Confirmations are kept per project in the
 browser, but the discovery and the run live in the backend's memory and the
 validation results in the page's. When a confirmed step's results are gone
-(the source was signed out, the server restarted, or Demo data was reloaded),
-its box says *Run again* (*Rebuild* for an empty plan), the steps after it wait,
-and *Migration complete* is hidden until it has been redone; the later steps
-then come back by themselves.
+(the server restarted, or Demo data was reloaded), its box says *Run again*,
+the steps after it wait, and *Migration complete* is hidden until it has been
+redone; the later steps then come back by themselves. A confirmed plan that is
+emptied says *Rebuild*, and one edited into a blocking risk says *Fix risks*
+and holds Migrate until the risk is resolved.
+
+**The Plan step.** *Readiness & risks* lists every risk worst first; each one
+opens to show its objects, with *Find in plan* to jump to one. *Objects in
+plan* adds objects (everything, a whole type, or one by name), finds them by
+name or type, moves them between waves and takes them out; *Clear plan* asks
+first, and objects that are no longer in the discovery are flagged with one
+click to remove them. Inside a wave, objects run by type (Warehouse and
+schemas, connections, tables, views and procedures, data, notebooks, jobs,
+pipelines, schedules), so the order there is explained rather than edited.
+*Strategy by type* totals the objects and effort, and *Score again* keeps each
+scoring under *Planner runs*.
 
 ### Migration assistant (preview)
 
@@ -196,9 +260,13 @@ Connections and Migration (Migration opens once a source is connected), a
 status chip for each side, the **project menu** (switch projects, or create,
 rename and delete one; each project keeps its own plan, stage options and
 progress in this browser), **Export** (the discovered inventory as JSON),
-**Refresh**, and the **Live / Demo** switch. In Live mode, if the backend does
-not answer, a bar under the top bar says so, with **Retry** and **Use Demo
-data**.
+**Refresh**, and the **Live / Demo** switch. In Live mode a bar under the top
+bar speaks up only when needed: *Reconnecting to the backend* while it restarts
+after an update; *The backend is updating* when it is on an older version and
+restarts once its work finishes; for an older backend that does not update
+itself (started before it could), one request to run `start-ui.ps1` once more;
+and, if the backend stays away, *not answering*, with **Retry** and **Use Demo
+data**. The page reconnects by itself in every case.
 
 ## Architecture
 
@@ -206,7 +274,8 @@ data**.
  Browser: React UI (frontend/)
     │  /api/*   (proxied by Vite in development; same origin when the API serves the build)
     ▼
- Local API: python -m discovery_agent.api (port 8001)
+ Local API: python -m discovery_agent.api (port 8001), under a supervisor that restarts it on code changes
+    ├─ api/state.py          what survives a restart: sign-ins, connections, discovery, the run's record
     ├─ connections/          Azure sign-in and every source connection: Azure, Synapse, SQL, Git
     ├─ discovery, extractors/, records, sql/, synapse/   read the source into Unified Discovery Records
     ├─ mapping/              Synapse → Fabric mapping, classification, dependency waves
@@ -230,11 +299,11 @@ Live mode that is `realApi.ts` and the local API; in Demo mode it is
 | `src/discovery_agent/discovery.py`, `records.py`, `extractors/`, `sql/`, `synapse/`, `acquisition/`, `artifacts/` | The discovery engine: what the workspace, the SQL pool and the Git repository say, merged into one record per object. |
 | `src/discovery_agent/mapping/` | `synapse_fabric_mapping.py` (Fabric target, classification and workstream for each object type and pipeline activity) and `waves.py` (dependency waves). |
 | `src/discovery_agent/migration/` | The planner, the ten stages, the T-SQL rules, Fabric REST calls, data pipelines and validation. See [Migration](#migration). |
-| `src/discovery_agent/api/` | The local HTTP API: `service.py` (connections, discovery, results), `fabric.py` (Fabric sign-in), `migration.py` (plan, run, validate), `mapping.py`, `server.py`. |
+| `src/discovery_agent/api/` | The local HTTP API: `service.py` (connections, discovery, results), `fabric.py` (Fabric sign-in), `migration.py` (plan, run, validate), `mapping.py`, `server.py`; `supervisor.py` (restarts the server on code changes, when idle) and `state.py` (what it keeps across restarts). |
 | `tests/` | The backend test suite; runs offline. |
 | `docs/` | [discovery.md](docs/discovery.md), [p0_source_strategy.md](docs/p0_source_strategy.md), [unified_discovery_record.md](docs/unified_discovery_record.md), and the *Synapse to Fabric Transformation Guide* (Word): what changes between Synapse and Fabric, what is automated and what needs a person. |
 | `input/` | Where Git repositories are cloned for discovery (gitignored). |
-| `start-ui.ps1` | Starts the API and the UI together on Windows. |
+| `start-ui.ps1` | Starts the API and the UI together on Windows. Safe to run again: it reuses what runs and replaces an API that does not update itself. |
 
 ## API
 
@@ -242,12 +311,12 @@ All under `/api`, JSON in and out. Nothing returns a token or a secret.
 
 | Area | Endpoints |
 |---|---|
-| Health | `GET /health`: the sign-in methods this backend supports, what discovery reads, and the types a run migrates |
-| Synapse connection | `GET /connections` · `POST /connections/authenticate` · `POST /connections/test` · `DELETE /connections` · `GET /azure/<subscriptions, resource groups, workspaces, pools>` for the dropdowns |
+| Health | `GET /health`: the API version (`apiVersion`), which process answers (`bootId`, new after every restart), whether it restarts itself (`supervised`), what it is working on (`busy`: a restart waits for it), what it took back when it started (`restored`: what was kept, and notes), the sign-in methods it supports, what discovery reads, and the types a run migrates |
+| Synapse connection | `GET /connections` · `POST /connections/authenticate` · `POST /connections/test` (another workspace or pool than the run read clears the discovery and the run's record) · `DELETE /connections` (also forgets the run's record) · `GET /azure/<subscriptions, resource groups, workspaces, pools>` for the dropdowns |
 | Discovery | `POST /discovery/start` · `GET /discovery/status` · `GET /discovery/results` (filter, sort, page) · `GET /discovery/results/<id>` · `GET /discovery/export` · `DELETE /discovery` (forget the results; refused while discovery runs) |
 | Mapping and waves | `GET /mapping/components` · `GET /dependencies` |
-| Fabric connection | `GET /fabric/connection` · `POST /fabric/authenticate` · `POST /fabric/workspaces` · `POST /fabric/test` · `DELETE /fabric/connection` |
-| Migration | `GET /migration/capabilities` · `POST /migration/plan` · `POST /migration/start` · `GET /migration/run` · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: forget the run's record, refused while it is working) · `POST /migration/validate` |
+| Fabric connection | `GET /fabric/connection` · `POST /fabric/authenticate` · `POST /fabric/workspaces` · `POST /fabric/test` (another workspace than the run wrote to forgets the run's record) · `DELETE /fabric/connection` (also forgets it). Sign-in, test and sign-out on either side are refused while a run is working. |
+| Migration | `GET /migration/capabilities` · `POST /migration/plan` · `POST /migration/start` · `GET /migration/run` · `POST /migration/control` (`pause`, `resume`, `retry` (both accept the connection `credentials` again), `reset`: forget the run's record, refused while it is working) · `POST /migration/validate` |
 
 ## What is automated, manual, or coming
 
@@ -257,8 +326,10 @@ ENFORCED`; views and stored procedures after the T-SQL rules; table data
 through per-wave Fabric data pipelines with row counts compared; custom Spark
 pools and Environments; notebooks with `mssparkutils` and Synapse connector
 calls rewritten; linked services as Fabric connections (SQL, ADLS Gen2, Blob)
-from the credentials you enter; pipelines with datasets embedded and
-references re-pointed; Spark job definitions; SQL scripts as Warehouse
+from the credentials you enter, except the workspace's default SQL linked
+service, which the Warehouse replaces; pipelines with datasets embedded,
+references re-pointed, and Stored procedure, Script and Lookup activities that
+called the pool running in the Warehouse; Spark job definitions; SQL scripts as Warehouse
 notebooks; schedule triggers (created switched off); external tables as
 OneLake shortcuts.
 
@@ -741,8 +812,8 @@ in one place, `migration/capabilities.py`, and the UI reads it from
 | Table data | The rows of each migrated table | **Fabric data pipelines**, one per wave, and the rows they load | Data never passes through the accelerator. Each wave gets a metadata-driven pipeline (`load_<warehouse>_wave_<n>`): a ForEach over a `tables` parameter whose Copy activity reads the pool with a typed SELECT through a Fabric SQL connection and writes the Warehouse with the COPY command. *Create and run* (default) runs it, waits, and compares row counts table by table; *create only* leaves running it to you. *Skip* (default) leaves tables that already have rows; *replace* truncates them inside the pipeline first. The connection to the pool is reused if one exists, or created from the SQL login / service principal you enter on this stage. |
 | Spark pool & environment | Spark pool | A custom Spark pool and a published Environment | Node size, autoscale, runtime mapped; libraries are not copied. |
 | Notebooks | Notebook | Fabric Notebook | Cells kept; Spark pool binding and outputs dropped. Python cells: `mssparkutils` becomes `notebookutils`, and the Synapse SQL connector import and reads of the migrated pool are pointed at Fabric's connector and the Warehouse. Other Synapse-only calls (linked-service credentials, `mssparkutils.env`, connector writes, ADLS paths) are flagged. .NET notebooks are deferred. |
-| Connections | Linked service | Fabric connection | Synapse does not give up the secret, so you enter credentials (sent once, held in memory, never stored or returned). SQL, ADLS Gen2 and Blob are converted; a parameterised linked service uses its parameters' default values. Others are created by hand, with the linked service's name so pipelines find them. |
-| Pipelines & datasets | Pipeline, dataset | Fabric data pipeline | Datasets are embedded in each activity; notebook, pipeline and Spark-job references become Fabric ids; anything that read the Synapse pool is pointed at the migrated Warehouse. Azure Function, Databricks, Batch (Custom), HDInsight, Machine Learning and Webhook activities keep their type and point at the connection of the same name. A pipeline with an activity that has no Fabric equivalent (for example a mapping data flow) is **not created**, with the activity names. |
+| Connections | Linked service | Fabric connection | Synapse does not give up the secret, so you enter credentials (sent once, held in memory, never stored or returned): a SQL login or service principal for SQL; an account key, SAS token or service principal for ADLS Gen2 and Blob. A parameterised linked service uses its parameters' default values. A linked service that reaches the pool being migrated (the workspace's default `<workspace>-WorkspaceDefaultSqlServer`, whose database is a `DBName` parameter, or one naming the pool) is **replaced by the Warehouse**: no connection, no credentials. Other types are created by hand, with the linked service's name so pipelines find them. |
+| Pipelines & datasets | Pipeline, dataset | Fabric data pipeline | Datasets are embedded in each activity; notebook, pipeline and Spark-job references become Fabric ids; anything that read or called the Synapse pool is pointed at the migrated Warehouse: Copy and Lookup datasets, Script activities, and Stored procedure activities (`SqlPoolStoredProcedure`, and `SqlServerStoredProcedure` through a linked service to the pool, the `DBName` it passes read as text or as a pipeline parameter's default). A stored procedure on another SQL server runs through the Fabric connection of its linked service's name. Azure Function, Databricks, Batch (Custom), HDInsight, Machine Learning and Webhook activities keep their type and point at the connection of the same name. A pipeline with an activity that has no Fabric equivalent (for example a mapping data flow) is **not created**, with the activity names. |
 | Spark job definitions | Spark job definition | Fabric Spark job definition | Main file, class, arguments and libraries kept; attached to the Environment of the same name. |
 | SQL scripts | SQL script | A notebook with a T-SQL cell bound to the Warehouse | The T-SQL rules are applied; what they cannot convert is flagged for review. |
 | Schedules | Schedule trigger | Pipeline schedule, **created switched off** | Minute, hour, daily and weekly recurrences. Event and tumbling-window triggers, and every-N-days or monthly, are recreated by hand. |
@@ -818,7 +889,7 @@ counts need the Synapse connection; without it they are reported as unread.
 API: `GET /api/migration/capabilities`, `POST /api/migration/plan`,
 `POST /api/migration/validate`, `POST /api/migration/start` (`{items, options: {scope, stages, dataMode,
 dataRun, collation, stopOnFailure}, credentials}`), `GET /api/migration/run` and
-`POST /api/migration/control` (`pause|resume|retry`). Code:
+`POST /api/migration/control` (`pause|resume|retry|reset`; resume and retry accept `credentials`). Code:
 `src/discovery_agent/migration/` (`runner.py`, `stages.py`, `stages_fabric.py`,
 `capabilities.py`, `planner.py`, `preflight.py`, `datacopy.py`, `datapipeline.py`, `tsql_rules.py`,
 `fabric_connections.py`, `pipelines.py`, `jobs.py`, `notebooks.py`,
@@ -827,13 +898,15 @@ dataRun, collation, stopOnFailure}, credentials}`), `GET /api/migration/run` and
 ## Tests
 
 ```
-pytest                                  # backend: 1,304 tests
-cd frontend && npm run typecheck && npm test   # UI: type check and 43 tests
+pytest                                  # backend: 1,345 tests
+cd frontend && npm run typecheck && npm test   # UI: type check and 50 tests
 ```
 
 Tests run fully offline — no network access, no Azure subscription, no ODBC
 driver and no dependency on any real repository. Every credential, ARM call,
-SQL session and git invocation in the unit suite is a fake.
+SQL session and git invocation in the unit suite is a fake. `tests/test_supervisor.py`
+also starts real local processes: a supervisor over a copy of the package,
+whose code it edits (and breaks, and fixes) while it watches the server restart.
 
 Two opt-in integration suites talk to real resources and are skipped unless
 their flag and configuration are both set:

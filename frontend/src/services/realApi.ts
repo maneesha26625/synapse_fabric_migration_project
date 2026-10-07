@@ -18,7 +18,30 @@ import {
   type ValidationRow,
 } from "../types";
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/**
+ * The backend restarts itself after an update and is back within seconds. A read that fails
+ * soon after the backend last answered is tried again for a little while, instead of failing
+ * the page; a write is never repeated. Exported for tests.
+ */
+export const RESTART_GRACE = { recentMs: 60_000, retryForMs: 15_000, stepMs: 500 };
+let lastAnswer = 0;
+
+async function request<T>(path: string, init?: RequestInit, retry = true): Promise<T> {
+  const read = !init?.method || init.method === "GET";
+  const began = Date.now();
+  for (;;) {
+    try {
+      return await once<T>(path, init);
+    } catch (e) {
+      const restarting = retry && read && e instanceof ApiRequestError && e.code === "backend_unavailable"
+        && began - lastAnswer < RESTART_GRACE.recentMs && Date.now() - began < RESTART_GRACE.retryForMs;
+      if (!restarting) throw e;
+      await new Promise((r) => setTimeout(r, RESTART_GRACE.stepMs));
+    }
+  }
+}
+
+async function once<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path, {
@@ -47,12 +70,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
         response.status,
       );
     }
+    lastAnswer = Date.now();
     throw new ApiRequestError(
       err?.code ?? "request_failed",
       err?.message ?? `The request failed (HTTP ${response.status}).`,
       response.status,
     );
   }
+  lastAnswer = Date.now();
   return body as T;
 }
 
@@ -90,7 +115,8 @@ function toQueryString(q: ResultsQuery): string {
 
 export const realApi: MigrationApi = {
   mode: "real",
-  health: () => request<Health>("/api/health"),
+  // Fails at once: the page's own watch decides when the backend is away.
+  health: () => request<Health>("/api/health", undefined, false),
   getConnection: () => request<ConnectionState>("/api/connections"),
   authenticate: (c) =>
     request<ConnectionState>("/api/connections/authenticate", {
@@ -137,8 +163,12 @@ export const realApi: MigrationApi = {
       body: JSON.stringify({ items, ...(options ? { options } : {}), ...(credentials ? { credentials } : {}) }),
     }),
   getExecution: () => request<ExecutionRun>("/api/migration/run"),
-  controlExecution: (action) =>
-    request<ExecutionRun>("/api/migration/control", { method: "POST", body: JSON.stringify({ action }) }),
+  controlExecution: (action, credentials) =>
+    request<ExecutionRun>("/api/migration/control", {
+      method: "POST",
+      // Resume and Retry send the credentials again (memory only): a backend that restarted has none.
+      body: JSON.stringify({ action, ...(credentials && Object.keys(credentials).length && (action === "resume" || action === "retry") ? { credentials } : {}) }),
+    }),
   runValidation: async (items) =>
     (await request<{ rows: ValidationRow[] }>("/api/migration/validate", { method: "POST", body: JSON.stringify(items?.length ? { items } : {}) })).rows,
   listSqlPools: async (rg, ws) =>

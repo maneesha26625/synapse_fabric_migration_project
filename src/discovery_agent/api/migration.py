@@ -8,13 +8,19 @@ A run needs a finished discovery (the Session) and a connected Fabric target
 (FabricTarget), signed in with either the Azure CLI or the Fabric CLI, whose
 workspace is on a Fabric capacity. It runs on one background thread; the page
 polls ``GET /api/migration/run``. Only one run at a time.
+
+Given a ``StateStore``, the run's record and the planner's runs are saved as
+they change -- every few seconds while a run works, and at every pause, end and
+reset -- so a restarted server still has them. The connection credentials a run
+is given are never saved: Resume and Retry accept them again.
 """
 
 from __future__ import annotations
 
 import threading
+import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from discovery_agent.api.fabric import FabricTarget
 from discovery_agent.api.service import ApiError, Session
@@ -29,6 +35,8 @@ from discovery_agent.migration.runner import (
     DATASET,
     DEFERRED,
     ENVIRONMENT,
+    FAILED,
+    IN_PROGRESS,
     MIGRATABLE,
     MISSING,
     NOTEBOOK,
@@ -51,6 +59,9 @@ from discovery_agent.sql.auth import AccessTokenAuthentication
 from discovery_agent.sql.config import SqlConnectionConfig
 from discovery_agent.sql.connection import PyodbcConnector
 
+if TYPE_CHECKING:
+    from discovery_agent.api.state import StateStore
+
 MAX_ITEMS = 10000
 #: Runner kinds that this build creates in Fabric (everything else is deferred).
 _AUTOMATED_KINDS = frozenset(MIGRATABLE.values()) | {DATA}
@@ -63,6 +74,14 @@ MAX_HISTORY = 20
 VALIDATION_ORDER = ("Warehouse", "Schema", "Tables", "Data Count", "Views", "Stored Procedures", "Spark", "Notebooks", "Connections",
                     "Pipelines", "Spark Jobs", "SQL Scripts", "Schedules", "Shortcuts", "Manual")
 SCOPES = ("automated", "all")
+#: How often a working run's record is saved, when it has moved on.
+AUTOSAVE_SECONDS = 3.0
+#: The layout of the saved run. Bumped when it changes, so an older file is not misread.
+MIGRATION_STATE = 1
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def sql_driver() -> str:
@@ -291,9 +310,12 @@ class MigrationService:
         rest_factory: Optional[Callable[[], FabricRestClient]] = None,
         sql_factory: Optional[Callable[[str, str], Any]] = None,
         source_factory: Optional[Callable[[], Any]] = None,
+        store: Optional["StateStore"] = None,
     ) -> None:
         self._session = session
         self._source_factory = source_factory
+        self._store = store
+        self._validating = 0
         #: Connection credentials for the run's life. Memory only: never logged, returned or written.
         self._credentials: Dict[str, Dict[str, str]] = {}
         self._fabric = fabric
@@ -304,6 +326,8 @@ class MigrationService:
         self._history: List[dict] = []
         self._rest_factory = rest_factory or fabric.rest_client
         self._sql_factory = sql_factory or self._open_sql
+        if store is not None:
+            threading.Thread(target=self._autosave, name="migration-autosave", daemon=True).start()
 
     def _open_sql(self, host: str, database: str) -> Any:
         """A writable session on a Fabric Warehouse, signed in for the Fabric Target's tenant."""
@@ -342,7 +366,8 @@ class MigrationService:
         checks = environment_checks(self._fabric.state(), sql_driver(),
                                     source_connected=self._source_available() if needs_source else None)
         names = set(credentials) | set(self._credentials)
-        result = planning.analyze(objects, content_findings(sources, names), checks)
+        endpoint = self._source_endpoint()
+        result = planning.analyze(objects, content_findings(sources, names, (pool or "", endpoint[1] if endpoint else "")), checks)
         result["options"] = options
         if body.get("record"):
             with self._lock:
@@ -351,9 +376,10 @@ class MigrationService:
                     "fingerprint": result["fingerprint"], "objects": result["objects"],
                     "effortDays": result["effortDays"], "waves": len(result["waves"]),
                     "readiness": result["readiness"], "blocking": result["blocking"],
-                    "createdAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "status": "COMPLETED",
+                    "createdAt": _now(), "status": "COMPLETED",
                 }
                 self._history = (self._history + [entry])[-MAX_HISTORY:]
+            self.persist()
         with self._lock:
             result["history"] = list(reversed(self._history))
         return result
@@ -385,21 +411,28 @@ class MigrationService:
             run.stages, run.pool_name = list(options["stages"]), pool or ""
             run.settings = {"dataMode": options["dataMode"], "dataRun": options["dataRun"], "collation": options["collation"]}
             self._describe_source(run, job, pool)
+            run.source_identity = getattr(self._session, "source_identity", lambda: None)()
             if credentials:
                 self._credentials = credentials
             run.log("RUN", "run", f"{len(sources)} objects, workspace {workspace_name}, warehouse {run.warehouse}, signed in with {via}")
             self._run = run
             self._spawn(run)
-            return run.to_dict()
+            started = run.to_dict()
+        self.persist()
+        return started
 
     def control(self, body: dict) -> dict:
         action = str(body.get("action") or "")
         if action == "reset":
             return self.reset()
+        # Resume and Retry may bring the connection credentials again: a restarted server has none.
+        credentials = parse_credentials(body.pop("credentials", None)) if action in ("resume", "retry") else {}
         with self._lock:
             run = self._run
             if run is None:
                 raise ApiError(409, "no_run", "There is no migration run.")
+            if credentials:
+                self._credentials = credentials
             if action == "pause":
                 if run.state == "running":
                     run.pause.set()
@@ -426,7 +459,9 @@ class MigrationService:
                 self._spawn(run)
             else:
                 raise ApiError(400, "invalid_action", "Choose pause, resume, retry or reset.")
-            return run.to_dict()
+            result = run.to_dict()
+        self.persist()
+        return result
 
     def reset(self) -> dict:
         """Forget the run's record, and the credentials it was given, so the next
@@ -440,7 +475,141 @@ class MigrationService:
                 self._run.pause.set()  # a forgotten run can never be resumed
             self._run = None
             self._credentials = {}
+        self.persist()
         return dict(IDLE)
+
+    # -- surviving a restart ---------------------------------------------------
+
+    def busy(self) -> List[str]:
+        """What is working now. A supervised restart waits for it."""
+        working = ["the migration run"] if self._busy() else []
+        if self._validating:
+            working.append("validation")
+        return working
+
+    def persist(self) -> None:
+        """Save the run's record and the planner's runs. Never called with the lock held."""
+        if self._store is not None:
+            self._store.save("migration", self._snapshot)
+
+    def _snapshot(self) -> Optional[dict]:
+        with self._lock:
+            run, counter, history, had = self._run, self._counter, list(self._history), bool(self._credentials)
+        if run is None and not history and not counter:
+            return None
+        return {
+            "version": MIGRATION_STATE, "counter": counter, "history": history,
+            "run": run.snapshot() if run is not None else None,
+            "hadCredentials": had,  # whether the run was given connection credentials; never what they were
+        }
+
+    def _autosave(self) -> None:
+        """While a run works, save its record every few seconds if it has moved on."""
+        last = None
+        while True:
+            time.sleep(AUTOSAVE_SECONDS)
+            run = self._run
+            if run is None or not self._busy():
+                continue
+            with run.lock:
+                marker = (run.run_id, run.state, len(run.logs))
+            if marker != last:
+                last = marker
+                self.persist()
+
+    def restore(self) -> Tuple[List[str], List[str]]:
+        """Take back the saved run and planner runs. A run the server stopped in the middle of
+        comes back paused, with the objects it was creating marked failed: check them, then Resume."""
+        saved = self._store.load("migration") if self._store is not None else None
+        if not isinstance(saved, dict) or saved.get("version") != MIGRATION_STATE:
+            return [], []
+        kept: List[str] = []
+        notes: List[str] = []
+        run: Optional[MigrationRun] = None
+        if saved.get("run"):
+            try:
+                run = MigrationRun.restore(saved["run"])
+            except Exception:  # noqa: BLE001 - a record the new code cannot read
+                notes.append("The last migration run's record could not be restored. What it created is still in Fabric; a new run skips it.")
+        interrupted = run is not None and run.state == "running"
+        if run is not None and interrupted:
+            stopped = [i for i in run.items if i.status == IN_PROGRESS]
+            for item in stopped:
+                item.status, item.step, item.completed_at = FAILED, "Failed", _now()
+                item.error = "The server stopped while this object was being created. Check it in Fabric, then Retry failed."
+            run.state = "paused"
+            run.log("RESTART", "run", "the server stopped while the run was working; the run is paused")
+            notes.append(f"Migration run #{run.run_id} was working when the server stopped. It is paused"
+                         + (", and the objects it was creating are marked failed" if stopped else "")
+                         + ": Resume it to carry on.")
+        with self._lock:
+            self._run = run
+            self._counter = int(saved.get("counter") or 0)
+            self._history = [dict(h) for h in saved.get("history") or []][-MAX_HISTORY:]
+            history = len(self._history)
+        if run is not None:
+            kept.append(f"migration run #{run.run_id}")
+            if saved.get("hadCredentials"):
+                notes.append("Connection credentials are never saved. The page sends them again when you Resume or "
+                             "Retry; if it was reloaded, enter them again under Plan, Stages & credentials.")
+        if history:
+            kept.append(f"{history} planner run{'' if history == 1 else 's'}")
+        if interrupted:
+            self.persist()
+        return kept, notes
+
+    # -- connections: a run belongs to the source and the target it ran between ---------
+
+    def _refuse_while_working(self, what: str) -> None:
+        if self._busy():
+            raise ApiError(409, "run_in_progress",
+                           f"A migration run is working. Pause it and wait for the current object to finish before you {what}.")
+
+    def sign_in_source(self, body: dict) -> dict:
+        self._refuse_while_working("sign in to the source again")
+        return self._session.authenticate(body)
+
+    def test_source(self, body: dict) -> dict:
+        """Test the source. Connected to another workspace or pool than the run read, the run's
+        record is forgotten: it belongs to the other source."""
+        self._refuse_while_working("test the source connection")
+        payload = self._session.test(body)
+        current = getattr(self._session, "source_identity", lambda: None)()
+        with self._lock:
+            run = self._run
+        if run is not None and current is not None and run.source_identity is not None and run.source_identity != current:
+            self.reset()
+        return payload
+
+    def sign_out_source(self) -> dict:
+        """Sign out of the source. The run's record goes too, so the next connection starts clean."""
+        self._refuse_while_working("disconnect the source")
+        payload = self._session.disconnect()
+        self.reset()
+        return payload
+
+    def sign_in_target(self, body: dict) -> dict:
+        self._refuse_while_working("sign in to Fabric again")
+        return self._fabric.authenticate(body)
+
+    def test_target(self, body: dict) -> dict:
+        """Test the Fabric target. Connected to another workspace than the run wrote to, the run's
+        record is forgotten."""
+        self._refuse_while_working("test the Fabric connection")
+        payload = self._fabric.test(body)
+        wid = str(payload.get("workspaceId") or "").lower()
+        with self._lock:
+            run = self._run
+        if run is not None and wid and run.workspace_id.lower() != wid:
+            self.reset()
+        return payload
+
+    def sign_out_target(self) -> dict:
+        """Sign out of Fabric. The run's record goes too: the next workspace starts clean."""
+        self._refuse_while_working("disconnect Fabric")
+        payload = self._fabric.disconnect()
+        self.reset()
+        return payload
 
     # -- internals ---------------------------------------------------------
 
@@ -449,6 +618,15 @@ class MigrationService:
 
     def validate(self, body: dict) -> dict:
         """Compare the discovered Synapse objects with what is now in Fabric. Reads both sides, writes neither."""
+        with self._lock:
+            self._validating += 1
+        try:
+            return self._validate(body)
+        finally:
+            with self._lock:
+                self._validating -= 1
+
+    def _validate(self, body: dict) -> dict:
         plan = body.get("items")
         if plan is not None and (not isinstance(plan, list) or not all(isinstance(p, dict) for p in plan) or len(plan) > MAX_ITEMS):
             raise ApiError(400, "invalid_plan", "The list of objects to validate is not in a valid format.")
@@ -458,9 +636,11 @@ class MigrationService:
         sources = apply_stages(sources_for(plan, job, pool), {"stages": list(capabilities.STAGE_KEYS), "scope": "all"})
         factory = self._source_factory or getattr(self._session, "source_sql_factory", lambda: None)()
         warehouse = warehouse_name_for(pool)
+        endpoint = self._source_endpoint()
         validator = Validator(
             self._rest_factory(), workspace_id, workspace_name, warehouse, self._sql_factory, factory,
-            artifacts={"pipelines": _artifacts(job).get(P0Artifact.PIPELINE, {})})
+            artifacts={"pipelines": _artifacts(job).get(P0Artifact.PIPELINE, {})},
+            pool_name=pool or "", pool_server=endpoint[1] if endpoint else "")
         rows = validator.run(sources)
         order = {c: n for n, c in enumerate(VALIDATION_ORDER)}
         rows.sort(key=lambda r: (order.get(r["category"], len(order)), r["object"].lower()))
@@ -494,8 +674,11 @@ class MigrationService:
             plan = fabric_connections.pool_plan(datapipeline.source_connection_name(workspace, database), server, database)
             linked.append(plan.describe(stage="data"))
         try:
-            job, _ = self._session.migration_snapshot()
+            job, pool = self._session.migration_snapshot()
+            server = endpoint[1] if endpoint else ""
             for name, payload in sorted(_artifacts(job).get(P0Artifact.LINKED_SERVICE, {}).items()):
+                if pipelines.is_pool_service(payload, pool or "", pool_server=server, any_database=True):
+                    continue  # replaced by the migrated Warehouse: no credentials to ask for
                 linked.append(fabric_connections.parse(payload).describe())
         except ApiError:
             pass
@@ -505,7 +688,14 @@ class MigrationService:
         factory = self._source_factory or getattr(self._session, "source_sql_factory", lambda: None)()
         migrator = Migrator(run, self._rest_factory, self._sql_factory, sleep=_sleep,
                             source_factory=factory, credentials=self._credentials)
-        self._thread = threading.Thread(target=migrator.execute, name=f"migration-{run.run_id}", daemon=True)
+
+        def work() -> None:
+            try:
+                migrator.execute()
+            finally:
+                self.persist()  # the end of a pass: completed, paused or halted
+
+        self._thread = threading.Thread(target=work, name=f"migration-{run.run_id}", daemon=True)
         self._thread.start()
 
 

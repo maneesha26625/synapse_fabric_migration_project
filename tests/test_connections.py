@@ -1636,9 +1636,11 @@ def test_only_the_sql_package_opens_an_odbc_connection():
     assert not offenders, f"these modules call the ODBC driver directly: {offenders}"
 
 
-# The Fabric target (api/fabric.py) drives the `az` and `fab` CLIs for sign-in and is
-# the one sanctioned non-git subprocess user. These guards are about git only.
+# The sanctioned non-git subprocess users: the Fabric target (api/fabric.py) drives the
+# `az` and `fab` CLIs for sign-in, and the API's supervisor (api/supervisor.py) runs the
+# API's own Python to check new code and to restart the server. These guards are about git only.
 _FABRIC_CLI_MODULE = "fabric.py"
+_NON_GIT_SUBPROCESS_MODULES = (_FABRIC_CLI_MODULE, "supervisor.py")
 
 
 def test_only_the_acquisition_package_runs_a_git_subprocess():
@@ -1647,7 +1649,7 @@ def test_only_the_acquisition_package_runs_a_git_subprocess():
         str(path)
         for path in repository_python_files()
         if "subprocess.run(" in path.read_text(encoding="utf-8")
-        and path.name not in ("git.py", _FABRIC_CLI_MODULE)
+        and path.name not in ("git.py", *_NON_GIT_SUBPROCESS_MODULES)
     ]
 
     assert not offenders, f"these modules shell out to git directly: {offenders}"
@@ -2269,7 +2271,7 @@ def test_git_has_exactly_one_execution_boundary():
         str(path)
         for path in repository_python_files()
         if "subprocess.run(" in path.read_text(encoding="utf-8")
-        and path.name != _FABRIC_CLI_MODULE
+        and path.name not in _NON_GIT_SUBPROCESS_MODULES
     ]
     assert subprocess_sites == [str(inspect_module.getfile(git_module))]
 

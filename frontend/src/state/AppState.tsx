@@ -8,9 +8,12 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { notify } from "../components/shared/notify";
+import { joinAnd } from "../components/shared/text";
 import { apiFor, initialMode, rememberMode } from "../services";
 import {
   ApiRequestError,
+  REQUIRED_API_VERSION,
   type ApiMode,
   type ConnectionConfig,
   type ConnectionError,
@@ -36,6 +39,19 @@ const IDLE: DiscoveryStatus = {
 
 type Busy = "authenticate" | "test" | "disconnect" | null;
 
+/**
+ * How the page watches a Live backend: a health check every few seconds, every second while
+ * it is away. Away for longer than ``giveUpMs``, it is reported as not answering. Exported for tests.
+ */
+export const BACKEND_WATCH = { everyMs: 4000, awayEveryMs: 1000, giveUpMs: 30000 };
+
+/** The toast after the backend restarted: what it kept, and what needs the operator. */
+export function restartMessage(h: Health): string {
+  const kept = h.restored?.kept ?? [];
+  const notes = h.restored?.notes ?? [];
+  return [`The backend restarted${kept.length ? ` and kept ${joinAnd(kept)}` : ""}.`, ...notes].join(" ");
+}
+
 interface AppStateValue {
   /** The active data layer (real or demo). Pages call it through hooks, never directly. */
   api: MigrationApi;
@@ -47,6 +63,12 @@ interface AppStateValue {
   refreshHealth: () => Promise<void>;
   /** Set when the real backend cannot be reached. */
   backendError: string | null;
+  /** The real backend answers, but was started before an update: it needs a restart. */
+  backendOutdated: boolean;
+  /** The Live backend stopped answering after it had: it restarts by itself after an update. */
+  backendRestarting: boolean;
+  /** Bumped when the page reads again a backend that restarted or came back: the migration store re-reads its part. */
+  backendEpoch: number;
   connection: ConnectionState;
   connectionBusy: Busy;
   connectionError: ConnectionError | null;
@@ -110,6 +132,11 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const [connectionError, setConnectionError] = useState<ConnectionError | null>(null);
   const [discovery, setDiscovery] = useState<DiscoveryStatus>(IDLE);
   const [discoveryStartError, setDiscoveryStartError] = useState<string | null>(null);
+  const [restarting, setRestarting] = useState(false);
+  const [backendEpoch, setBackendEpoch] = useState(0);
+  // The Live backend's process, and whether it has answered since the page (or the mode) started.
+  const boot = useRef<string | null>(null);
+  const answered = useRef(false);
 
   // Cache of results and object details for the current discovery run. A new
   // run (or a mode change) invalidates it; a repeated page or drawer open does
@@ -131,10 +158,15 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     setConnection(DISCONNECTED);
     setConnectionError(null);
     setDiscovery(IDLE);
+    setRestarting(false);
+    boot.current = null;
+    answered.current = false;
     (async () => {
       try {
         const [h, c, d] = await Promise.all([api.health(), api.getConnection(), api.getDiscoveryStatus()]);
         if (cancelled) return;
+        boot.current = h.bootId ?? null;
+        answered.current = true;
         setHealth(h);
         setConnection(c);
         setDiscovery(d);
@@ -161,6 +193,65 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     }, 1200);
     return () => clearInterval(id);
   }, [api, discovery.state]);
+
+  // Read again what a backend that restarted, or came back, holds now. One render takes the new
+  // connection with the new epoch, so the migration store can tell a restart from a sign-out.
+  const resync = useCallback(async () => {
+    try {
+      const [c, d] = await Promise.all([api.getConnection(), api.getDiscoveryStatus()]);
+      setConnection(c);
+      setDiscovery(d);
+      setBackendError(null);
+    } catch {
+      // The next check tries again.
+    }
+    setEpoch((n) => n + 1);
+    setBackendEpoch((n) => n + 1);
+  }, [api]);
+
+  // Watch a Live backend. It restarts by itself after an update (and keeps its work); the page
+  // waits for it quietly, then reads everything again and says what it kept.
+  useEffect(() => {
+    if (mode !== "real" || !ready) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let awaySince: number | null = null;
+    const tick = async () => {
+      let next = BACKEND_WATCH.everyMs;
+      try {
+        const h = await api.health();
+        if (stopped) return;
+        const restarted = !!boot.current && !!h.bootId && h.bootId !== boot.current;
+        const back = awaySince !== null || !answered.current;
+        boot.current = h.bootId ?? boot.current;
+        answered.current = true;
+        awaySince = null;
+        setHealth(h);
+        setRestarting(false);
+        setBackendError(null);
+        if (restarted || back) {
+          await resync();
+          if (restarted && !stopped) notify(restartMessage(h));
+        }
+      } catch (e) {
+        if (stopped) return;
+        awaySince ??= Date.now();
+        next = BACKEND_WATCH.awayEveryMs;
+        if (answered.current && Date.now() - awaySince < BACKEND_WATCH.giveUpMs) {
+          setRestarting(true);
+        } else {
+          setRestarting(false);
+          setBackendError(describe(e).message);
+        }
+      }
+      if (!stopped) timer = setTimeout(tick, next);
+    };
+    timer = setTimeout(tick, BACKEND_WATCH.everyMs);
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [api, mode, ready, resync]);
 
   const refreshHealth = useCallback(async () => {
     try {
@@ -253,6 +344,9 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     health,
     refreshHealth,
     backendError,
+    backendOutdated: mode === "real" && !!health && (health.apiVersion ?? 1) < REQUIRED_API_VERSION,
+    backendRestarting: mode === "real" && restarting,
+    backendEpoch,
     connection,
     connectionBusy,
     connectionError,

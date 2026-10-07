@@ -14,6 +14,7 @@ import {
   type ExecutionRun,
   type FabricConfig,
   type FabricTarget,
+  type MigrationApi,
   type Capabilities,
   type ConnectionCredentials,
   type PlanAnalysis,
@@ -79,6 +80,8 @@ interface MigrationStateValue {
   addToPlan: (ids: string[]) => void;
   addAllToPlan: () => void;
   removeFromPlan: (id: string) => void;
+  /** Take several objects out of the plan at once (say, those no longer in the discovery). */
+  removeManyFromPlan: (ids: string[]) => void;
   setPlanWave: (id: string, wave: number) => void;
   movePlanItem: (id: string, direction: -1 | 1) => void;
   clearPlan: () => void;
@@ -99,8 +102,8 @@ interface MigrationStateValue {
   analysis: PlanAnalysis | null;
   analysisBusy: boolean;
   analysisError: string | null;
-  /** `record` also adds the result to the planner-run history. */
-  analyze: (record?: boolean) => Promise<void>;
+  /** `record` also adds the result to the planner-run history. Resolves to the new analysis (null if it failed). */
+  analyze: (record?: boolean) => Promise<PlanAnalysis | null>;
   options: RunOptions;
   setOptions: (patch: Partial<RunOptions>) => void;
   /** The migration stages, their strategies and the linked services that need credentials. Null until loaded. */
@@ -149,7 +152,7 @@ export function useMigration(): MigrationStateValue {
 const messageOf = (e: unknown) => (e instanceof ApiRequestError || e instanceof Error ? e.message : "Something went wrong.");
 
 export function MigrationStateProvider({ children }: { children: ReactNode }) {
-  const { api, mode, discovery, isConnected, connection, resetDiscovery, refreshDiscovery } = useAppState();
+  const { api, mode, ready, discovery, isConnected, connection, resetDiscovery, refreshDiscovery, backendEpoch } = useAppState();
 
   // ---- projects
   const [projects, setProjects] = useState<Project[]>(() => load<Project[]>(PROJECTS_KEY, [DEFAULT_PROJECT]));
@@ -192,7 +195,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
       (e) => !cancelled && setGraphError(messageOf(e)),
     ).finally(() => !cancelled && setGraphLoading(false));
     return () => { cancelled = true; };
-  }, [api, done, discovery.finishedAt, graphEpoch]);
+  }, [api, done, discovery.finishedAt, graphEpoch, backendEpoch]);
 
   // ---- journey (which steps were confirmed), per mode and project like the plan
   const journeyKey = `${JOURNEY_KEY}.${mode}.${project.id}`;
@@ -220,6 +223,10 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   }, [waveOf]);
   const addAllToPlan = useCallback(() => addToPlan((graph?.nodes ?? []).map((n) => n.id)), [addToPlan, graph]);
   const removeFromPlan = useCallback((id: string) => setPlan((p) => p.filter((x) => x.id !== id)), []);
+  const removeManyFromPlan = useCallback((ids: string[]) => {
+    const gone = new Set(ids);
+    setPlan((p) => p.filter((x) => !gone.has(x.id)));
+  }, []);
   const setPlanWave = useCallback((id: string, wave: number) => setPlan((p) => p.map((x) => (x.id === id ? { ...x, wave } : x))), []);
   const movePlanItem = useCallback((id: string, direction: -1 | 1) => {
     setPlan((p) => {
@@ -243,6 +250,8 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   const [fabricReady, setFabricReady] = useState(false);
   const [fabricBusy, setFabricBusy] = useState<"authenticate" | "test" | null>(null);
   const [fabricError, setFabricError] = useState<string | null>(null);
+  // Which backend epoch the Fabric target was last read in: a restart is not a sign-out.
+  const [fabricEpoch, setFabricEpoch] = useState(0);
   useEffect(() => {
     let live = true;
     setFabricError(null);
@@ -312,19 +321,22 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
       setOptionsState((o) => ({ ...o, stages: stagesChosen.current ? o.stages.filter((k) => known.has(k)) : c.stages.map((s) => s.key) }));
     }, () => { if (live) setCapabilities(null); });
     return () => { live = false; };
-  }, [api, discovery.state]);
+  }, [api, discovery.state, backendEpoch]);
   const setOptions = useCallback((patch: Partial<RunOptions>) => {
     if (patch.stages) stagesChosen.current = true;
     setOptionsState((o) => ({ ...o, ...patch }));
   }, []);
-  const analyze = useCallback(async (record = false) => {
-    if (!plan.length) { setAnalysis(null); setAnalysisError(null); return; }
+  const analyze = useCallback(async (record = false): Promise<PlanAnalysis | null> => {
+    if (!plan.length) { setAnalysis(null); setAnalysisError(null); return null; }
     setAnalysisBusy(true);
     setAnalysisError(null);
     try {
-      setAnalysis(await api.analyzePlan([...plan].sort((a, b) => a.wave - b.wave), record, options, credentials));
+      const result = await api.analyzePlan([...plan].sort((a, b) => a.wave - b.wave), record, options, credentials);
+      setAnalysis(result);
+      return result;
     } catch (e) {
       setAnalysisError(messageOf(e));
+      return null;
     } finally {
       setAnalysisBusy(false);
     }
@@ -335,7 +347,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     if (!discovered || !plan.length) { setAnalysis(null); return; }
     const t = setTimeout(() => { void analyze(false); }, 350);
     return () => clearTimeout(t);
-  }, [discovered, plan, fabric.status, options.stages, analyze]);
+  }, [discovered, plan, fabric.status, options.stages, analyze, backendEpoch]);
 
   // ---- execution (polls only while running)
   const [execution, setExecution] = useState<ExecutionRun>(EMPTY_RUN);
@@ -358,6 +370,14 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     const id = setInterval(() => { api.getExecution().then(setExecution, () => undefined); }, 900);
     return () => clearInterval(id);
   }, [api, execution.state]);
+  // A backend that restarted (it updates itself) or came back: read again the Fabric target and the run it kept.
+  useEffect(() => {
+    if (!backendEpoch) return;
+    let live = true;
+    api.getFabricTarget().then((f) => { if (live) { setFabric(f); setFabricEpoch(backendEpoch); } }, () => undefined);
+    api.getExecution().then((r) => { if (live) setExecution(r); }, () => undefined);
+    return () => { live = false; };
+  }, [backendEpoch]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const startExecution = useCallback(async (only?: string) => {
     setExecutionError(null);
@@ -373,8 +393,10 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   }, [api, plan, options, credentials]);
   const controlExecution = useCallback(async (action: "pause" | "resume" | "retry") => {
     setExecutionError(null);
-    try { setExecution(await api.controlExecution(action)); } catch (e) { setExecutionError(messageOf(e)); }
-  }, [api]);
+    // Resume and Retry send the credentials again: a backend that restarted has none.
+    const resend = action !== "pause" && Object.keys(credentials).length ? credentials : undefined;
+    try { setExecution(await api.controlExecution(action, resend)); } catch (e) { setExecutionError(messageOf(e)); }
+  }, [api, credentials]);
 
   // ---- validation
   const [validation, setValidation] = useState<ValidationRow[] | null>(null);
@@ -436,10 +458,61 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     setResetNonce((n) => n + 1);
   }, [api, execution.state, discovery.state, resetDiscovery, refreshDiscovery, capabilities, resetJourney]);
 
+  // ---- a new connection starts over what was built on the old one
+  //
+  // Disconnecting the source, or connecting it to another workspace, starts the whole
+  // migration over: the backend has already dropped its discovery and the run's record,
+  // and the plan, validation and confirmations here belonged to that source too.
+  // Disconnecting Fabric, or switching its workspace, starts Migrate and Validate over.
+  // "Test again" on the same workspace, or a failed test, changes nothing.
+  const startOver = useCallback((side: "source" | "destination") => {
+    if (side === "source") {
+      setPlan([]);
+      stagesChosen.current = false;
+      setOptionsState({ ...DEFAULT_OPTIONS, stages: capabilities?.stages.map((s) => s.key) ?? [] });
+      setCredentials({});
+      setAnalysis(null);
+      setAnalysisError(null);
+    }
+    resetJourney(side === "source" ? undefined : "migrate");
+    setValidation(null);
+    setValidationError(null);
+    setExecutionError(null);
+    setResetNonce((n) => n + 1);
+    api.getExecution().then(setExecution, () => undefined);
+  }, [api, capabilities, resetJourney]);
+
+  // A backend that restarted is not the operator signing out: what it kept or lost is read
+  // again in a new epoch, and changes nothing here. The last side seen is kept, so connecting
+  // another workspace afterwards still starts over.
+  const lastSource = useRef<{ api: MigrationApi; id: string | null; epoch: number } | null>(null);
+  useEffect(() => {
+    if (!ready) return;
+    const id = connection.status === "connected" ? `${connection.workspace ?? ""}|${connection.sqlPool ?? ""}`.toLowerCase() : null;
+    const signedOut = connection.status === "disconnected" && !connection.signedIn;
+    const seen = lastSource.current;
+    if (!seen || seen.api !== api) { lastSource.current = { api, id, epoch: backendEpoch }; return; }
+    if (seen.epoch !== backendEpoch) { lastSource.current = { api, id: id ?? seen.id, epoch: backendEpoch }; return; }
+    if (seen.id && (signedOut || (id && id !== seen.id))) startOver("source");
+    if (id || signedOut) lastSource.current = { api, id, epoch: backendEpoch };
+  }, [api, ready, backendEpoch, connection.status, connection.workspace, connection.sqlPool, connection.signedIn]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const lastTarget = useRef<{ api: MigrationApi; id: string | null; epoch: number } | null>(null);
+  useEffect(() => {
+    if (!fabricReady) return;
+    const id = fabric.status === "connected" && fabric.workspaceId ? fabric.workspaceId.toLowerCase() : null;
+    const signedOut = fabric.status === "disconnected";
+    const seen = lastTarget.current;
+    if (!seen || seen.api !== api) { lastTarget.current = { api, id, epoch: fabricEpoch }; return; }
+    if (seen.epoch !== fabricEpoch) { lastTarget.current = { api, id: id ?? seen.id, epoch: fabricEpoch }; return; }
+    if (seen.id && (signedOut || (id && id !== seen.id))) startOver("destination");
+    if (id || signedOut) lastTarget.current = { api, id, epoch: fabricEpoch };
+  }, [api, fabricReady, fabricEpoch, fabric.status, fabric.workspaceId]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const value: MigrationStateValue = {
     projects, project, addProject, selectProject: setProjectId, renameProject, deleteProject,
     graph, graphError, graphLoading, reloadGraph: () => setGraphEpoch((n) => n + 1),
-    plan, addToPlan, addAllToPlan, removeFromPlan, setPlanWave, movePlanItem, clearPlan, inPlan, planStatus,
+    plan, addToPlan, addAllToPlan, removeFromPlan, removeManyFromPlan, setPlanWave, movePlanItem, clearPlan, inPlan, planStatus,
     fabric, fabricReady, fabricBusy, fabricError, authenticateFabric, testFabric, disconnectFabric,
     analysis, analysisBusy, analysisError, analyze, options, setOptions, capabilities, credentials, setCredential, clearCredentials,
     execution, executionReady, executionError, startExecution, controlExecution,

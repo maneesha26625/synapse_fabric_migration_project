@@ -16,6 +16,24 @@ from discovery_agent.migration.fabric_rest import FabricApiError
 Result = tuple  # (status, step, target, notes)
 
 
+
+def _first_steps(missing: List[str]) -> str:
+    """What to do first for each kind of missing piece, so a failed pipeline says how to get unstuck."""
+    steps = []
+    if any(m.startswith("connection ") for m in missing):
+        steps.append("enter the linked services' credentials in Plan (Stages & credentials) and run the Connections stage")
+    if "the migrated Warehouse" in missing:
+        steps.append("run the Warehouse & schema stage")
+    if any(m.startswith("notebook ") for m in missing):
+        steps.append("run the Notebooks stage")
+    if any(m.startswith("Spark job definition ") for m in missing):
+        steps.append("run the Spark job definitions stage")
+    if any(m.startswith("pipeline ") for m in missing):
+        steps.append("get the pipelines it runs created first: each has its own row in this run saying why it is not there yet")
+    if any(m.startswith("dataset ") for m in missing):
+        steps.append("run discovery again, since a dataset it uses was not captured")
+    return "First " + "; ".join(steps) + ". Then use Retry failed." if steps else "Create them, then use Retry failed."
+
 class FabricStageMixin:
     # Provided by Migrator ------------------------------------------------
     run: Any
@@ -66,6 +84,12 @@ class FabricStageMixin:
 
     def _connection(self, source: Source) -> Result:
         self._need_definition(source, "linked service")
+        pool = getattr(self.run, "pool_name", "") or ""
+        if pipelines.is_pool_service(source.payload or {}, pool, pool_server=getattr(self.run, "source_server", "") or "", any_database=True):
+            # The workspace's default SQL linked service (or one naming the pool): the Warehouse takes its place.
+            return SKIPPED, "Replaced by the migrated Warehouse", f"{self.run.workspace_name} / {self.run.warehouse}", [
+                f"It reached the Synapse pool '{pool}', which is now the Fabric Warehouse '{self.run.warehouse}'. The pipeline "
+                "activities that used it are pointed at the Warehouse, so no Fabric connection is needed."]
         plan = fabric_connections.parse(source.payload or {})
         if plan.unsupported:
             return DEFERRED_STATUS, "Create it in Fabric by hand", None, [plan.unsupported]
@@ -109,8 +133,7 @@ class FabricStageMixin:
             return DEFERRED_STATUS, "Needs a rewrite", None, [
                 "These activities have no Fabric equivalent, so the pipeline was not created: " + "; ".join(converted.unsupported) + "."]
         if converted.missing:
-            raise MigrationError("It needs these in Fabric first: " + ", ".join(converted.missing)
-                                 + ". Run the stages that create them (Connections, Notebooks, Warehouse) and retry.")
+            raise MigrationError("It needs these in Fabric first: " + ", ".join(converted.missing) + ". " + _first_steps(converted.missing))
         description = str((resource.get("properties") or {}).get("description") or "Migrated from Azure Synapse")
         client.create(f"/workspaces/{wid}/dataPipelines", pipelines.create_body(source.name, converted.definition, description))
         self._forget("dataPipelines")

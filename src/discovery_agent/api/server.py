@@ -3,11 +3,11 @@
 Standard library only: the project's core has no runtime dependencies and a
 web framework would be the first. The surface is small and fixed.
 
-    GET    /api/health
+    GET    /api/health                    capabilities, and this process: bootId, busy, restored
     GET    /api/connections               current connection state
     POST   /api/connections/authenticate  prove an Azure identity
     POST   /api/connections/test          prove workspace access; enables discovery
-    DELETE /api/connections               forget the connection
+    DELETE /api/connections               forget the connection (and the run's record)
     POST   /api/discovery/start
     GET    /api/discovery/status
     DELETE /api/discovery                 forget the last discovery's results
@@ -20,7 +20,7 @@ web framework would be the first. The surface is small and fixed.
     POST   /api/fabric/authenticate       Azure CLI / Fabric CLI login + workspace list
     POST   /api/fabric/workspaces         refresh the workspace list
     POST   /api/fabric/test               verify the selected workspace
-    DELETE /api/fabric/connection         forget the Fabric target
+    DELETE /api/fabric/connection         forget the Fabric target (and the run's record)
     GET    /api/migration/capabilities    the migration stages, their options and the linked services
     GET    /api/migration/run             the current migration run
     POST   /api/migration/plan            planner: strategy, risks, effort, checks (read-only)
@@ -39,26 +39,52 @@ Security posture, in order of importance:
   carry a stable code and a message written for a person -- no traceback.
 * No token, secret or authorization header is ever returned: the connection
   layer that holds them is not reachable from here.
+* Binds its port exclusively. On Windows the standard server would let a
+  second process bind a port that is still listening, so an old API and a new
+  one could answer side by side.
+
+Restarts. ``create_server`` with a ``StateStore`` takes back what the last
+process saved (``state``) before it serves, and ``/api/health`` says which
+process is answering (``bootId``), what is working now (``busy``: a supervised
+restart waits for it) and what came back from before (``restored``).
 """
 
 from __future__ import annotations
 
 import json
 import mimetypes
+import secrets
 import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional
+from typing import Any, List, Optional, Tuple
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from discovery_agent.api.fabric import FabricError, FabricTarget
 from discovery_agent.api.migration import MigrationService
 from discovery_agent.api.service import ApiError, Session
+from discovery_agent.api.state import StateStore
 
 MAX_BODY_BYTES = 64 * 1024
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 RESULTS_PREFIX = "/api/discovery/results/"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+@dataclass
+class Runtime:
+    """This server process: which one it is, whether a supervisor restarts it, and what it restored."""
+
+    supervised: bool = False
+    boot_id: str = field(default_factory=lambda: secrets.token_hex(8))
+    started_at: str = field(default_factory=_now)
+    restored: Optional[dict] = None
 
 
 def make_handler(
@@ -66,9 +92,22 @@ def make_handler(
     static_root: Optional[Path],
     fabric: Optional[FabricTarget] = None,
     migration: Optional[MigrationService] = None,
+    runtime: Optional[Runtime] = None,
 ):
     fabric = fabric or FabricTarget()
     migration = migration or MigrationService(session, fabric)
+    runtime = runtime or Runtime()
+
+    def health() -> dict:
+        payload = session.health()
+        payload.update({
+            "bootId": runtime.boot_id,
+            "startedAt": runtime.started_at,
+            "supervised": runtime.supervised,
+            "busy": session.busy() + fabric.busy() + migration.busy(),
+            "restored": runtime.restored,
+        })
+        return payload
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "MigrationAcceleratorAPI"
@@ -77,8 +116,12 @@ def make_handler(
         # -- plumbing ------------------------------------------------------
 
         def log_message(self, format: str, *args) -> None:  # noqa: A002
-            # Method, path and status only. Never a body, never a header.
-            sys.stderr.write(f"{self.command} {urlsplit(self.path).path} -> {args[1] if len(args) > 1 else ''}\n")
+            # Method, path and status only. Never a body, never a header. The page and the
+            # supervisor check health every few seconds: only a failed check is worth a line.
+            path, status = urlsplit(self.path).path, str(args[1]) if len(args) > 1 else ""
+            if path == "/api/health" and status == "200":
+                return
+            sys.stderr.write(f"{self.command} {path} -> {status}\n")
 
         def _send(self, status: int, payload: object) -> None:
             body = json.dumps(payload, default=str, separators=(",", ":")).encode("utf-8")
@@ -135,7 +178,7 @@ def make_handler(
                 return
             query = dict(parse_qsl(parts.query))
             if path == "/api/health":
-                self._dispatch(session.health)
+                self._dispatch(health)
             elif path == "/api/connections":
                 self._dispatch(session.connection_state)
             elif path == "/api/fabric/connection":
@@ -165,11 +208,13 @@ def make_handler(
         def do_POST(self) -> None:  # noqa: N802
             path = urlsplit(self.path).path
             routes = {
-                "/api/connections/authenticate": lambda: session.authenticate(self._json_body()),
-                "/api/connections/test": lambda: session.test(self._json_body()),
-                "/api/fabric/authenticate": lambda: fabric.authenticate(self._json_body()),
+                # Sign-in, test and sign-out go through the migration service: a run in progress
+                # is never cut off, and a run's record never outlives the connections it used.
+                "/api/connections/authenticate": lambda: migration.sign_in_source(self._json_body()),
+                "/api/connections/test": lambda: migration.test_source(self._json_body()),
+                "/api/fabric/authenticate": lambda: migration.sign_in_target(self._json_body()),
                 "/api/fabric/workspaces": lambda: fabric.refresh_workspaces(self._json_body()),
-                "/api/fabric/test": lambda: fabric.test(self._json_body()),
+                "/api/fabric/test": lambda: migration.test_target(self._json_body()),
                 "/api/migration/plan": lambda: migration.analyze(self._json_body()),
                 "/api/migration/validate": lambda: migration.validate(self._json_body()),
                 "/api/migration/start": lambda: migration.start(self._json_body()),
@@ -184,11 +229,11 @@ def make_handler(
 
         def do_DELETE(self) -> None:  # noqa: N802
             if urlsplit(self.path).path == "/api/connections":
-                self._dispatch(session.disconnect)
+                self._dispatch(migration.sign_out_source)
             elif urlsplit(self.path).path == "/api/discovery":
                 self._dispatch(session.reset_discovery)
             elif urlsplit(self.path).path == "/api/fabric/connection":
-                self._dispatch(fabric.disconnect)
+                self._dispatch(migration.sign_out_target)
             else:
                 self._error(404, "not_found", "No such endpoint.")
 
@@ -217,5 +262,62 @@ def make_handler(
     return Handler
 
 
-def create_server(host: str, port: int, static_root: Optional[Path] = None) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_handler(Session(), static_root))
+class AcceleratorServer(ThreadingHTTPServer):
+    """The API's HTTP server, with the parts whose state it saves."""
+
+    # SO_REUSEADDR on Windows lets a second socket bind a port that is still listening;
+    # elsewhere it only skips TIME_WAIT. So only elsewhere.
+    allow_reuse_address = sys.platform != "win32"
+    daemon_threads = True
+    parts: Tuple[Any, ...] = ()
+
+    def save_state(self) -> None:
+        """Save every part once more, as the server stops."""
+        for part in self.parts:
+            try:
+                part.persist()
+            except Exception:  # noqa: BLE001 - stopping goes on regardless
+                pass
+
+
+def restore_state(*parts: Any) -> Optional[dict]:
+    """Each part takes back what it saved; one that cannot never stops the others or the server."""
+    kept: List[str] = []
+    notes: List[str] = []
+    for part in parts:
+        try:
+            got, said = part.restore()
+        except Exception as exc:  # noqa: BLE001
+            got, said = [], [f"Part of the last session could not be restored ({type(exc).__name__}); it starts fresh."]
+        kept += got
+        notes += said
+    if not kept and not notes:
+        return None
+    if kept:
+        print("Restored " + ", ".join(kept) + ".", flush=True)
+    for note in notes:
+        print("  " + note, flush=True)
+    return {"at": _now(), "kept": kept, "notes": notes}
+
+
+def create_server(
+    host: str,
+    port: int,
+    static_root: Optional[Path] = None,
+    store: Optional[StateStore] = None,
+    supervised: bool = False,
+    boot_id: Optional[str] = None,
+) -> AcceleratorServer:
+    """Bind the port, then take back the saved state: a server that cannot bind (the port
+    is another one's) never touches that state."""
+    session = Session(store)
+    fabric = FabricTarget(store)
+    migration = MigrationService(session, fabric, store=store)
+    runtime = Runtime(supervised=supervised)
+    if boot_id:
+        runtime.boot_id = boot_id
+    server = AcceleratorServer((host, port), make_handler(session, static_root, fabric, migration, runtime))
+    server.parts = (session, fabric, migration)
+    if store is not None:
+        runtime.restored = restore_state(session, fabric, migration)
+    return server

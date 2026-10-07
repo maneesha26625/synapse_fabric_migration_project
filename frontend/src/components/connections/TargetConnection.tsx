@@ -2,8 +2,9 @@ import { SquareTerminal, TerminalSquare } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useMigration } from "../../state/MigrationState";
 import type { FabricAuthMethod } from "../../types";
-import { Banner, Button, SelectField } from "../shared/Shared";
+import { Banner, Button, ConfirmDialog, SelectField } from "../shared/Shared";
 import { MethodTiles, MiniSteps, type MethodOption } from "./MethodTiles";
+import { joinAnd } from "../shared/text";
 import { CheckFold, CheckList, SummaryList } from "./SourceConnection";
 
 const METHODS: MethodOption<FabricAuthMethod>[] = [
@@ -15,10 +16,20 @@ const LABEL: Record<FabricAuthMethod, string> = { azure_cli: "Azure CLI", fabric
 
 /** Connect Microsoft Fabric: sign in with a CLI, choose the workspace, test it (including its capacity). */
 export function TargetConnectionPanel() {
-  const { fabric, fabricBusy, fabricError, authenticateFabric, testFabric, disconnectFabric } = useMigration();
+  const { fabric, fabricBusy, fabricError, authenticateFabric, testFabric, disconnectFabric, execution, validation, confirmed } = useMigration();
   const [method, setMethod] = useState<FabricAuthMethod>(fabric.method ?? "azure_cli");
   const [workspaceId, setWorkspaceId] = useState("");
   const [changing, setChanging] = useState(false);
+  const [confirmSignOut, setConfirmSignOut] = useState(false);
+  // What a new Fabric workspace would clear: the run wrote to this one, and validation compared it.
+  const loses = [
+    execution.state !== "idle" ? `the record of migration run #${execution.runId}` : "",
+    validation ? "the validation results" : "",
+  ].filter(Boolean);
+  const askFirst = loses.length > 0 || confirmed.includes("migrate") || confirmed.includes("validate");
+  const runWorking = execution.state === "running";
+  const signOut = () => { setConfirmSignOut(false); setWorkspaceId(""); void disconnectFabric(); };
+  const stopChanging = () => { setChanging(false); if (fabric.method) setMethod(fabric.method); };
 
   // Follow the backend's method when it already holds a session (after a reload, or in Demo data).
   useEffect(() => { if (fabric.method) setMethod(fabric.method); }, [fabric.method]);
@@ -32,11 +43,11 @@ export function TargetConnectionPanel() {
   const busy = fabricBusy !== null || signingIn;
   const checks = (fabric.checks ?? []).map((c) => ({ name: c.label, status: c.ok ? "ok" as const : "failed" as const, message: c.ok ? null : c.detail ?? null }));
 
+  // Choosing the other sign-in method changes nothing yet: the session is replaced only when you sign in with it.
   const pick = (id: FabricAuthMethod) => {
     if (id === method) return;
     setMethod(id);
     setWorkspaceId("");
-    if (fabric.status !== "disconnected") void disconnectFabric();
   };
   const test = async () => {
     if (!selected) return;
@@ -61,8 +72,16 @@ export function TargetConnectionPanel() {
         <div className="row conn-actions">
           <Button size="small" onClick={() => void test()} loading={fabricBusy === "test"} disabled={!selected}>Test again</Button>
           <Button size="small" onClick={() => setChanging(true)}>Change workspace</Button>
-          <Button size="small" variant="ghost" onClick={() => { setWorkspaceId(""); void disconnectFabric(); }}>Disconnect</Button>
+          <Button size="small" variant="ghost" onClick={() => (askFirst ? setConfirmSignOut(true) : signOut())} disabled={runWorking}
+            title={runWorking ? "A migration run is working: pause it first" : undefined}>Disconnect</Button>
         </div>
+        {confirmSignOut && (
+          <ConfirmDialog title="Disconnect Microsoft Fabric?" confirmLabel="Disconnect" onConfirm={signOut} onCancel={() => setConfirmSignOut(false)}>
+            <p>The accelerator signs out of the Fabric workspace {fabric.workspaceName}.</p>
+            <p>Migrate and Validate start over: {loses.length ? `${joinAnd(loses)} ${loses.length === 1 ? "is" : "are"} cleared, and ` : ""}they are done again after you reconnect. Your discovery and plan are kept.</p>
+            <p className="muted">Nothing in Fabric is deleted.</p>
+          </ConfirmDialog>
+        )}
       </div>
     );
   }
@@ -70,6 +89,11 @@ export function TargetConnectionPanel() {
   const stage = authed ? (selected ? 2 : 1) : 0;
   return (
     <div className="stack conn-body">
+      {changing && askFirst && (
+        <Banner tone="info" title="A different workspace starts Migrate and Validate over">
+          Testing another Fabric workspace clears {joinAnd(loses.length ? loses : ["their confirmations"])}. Testing the same one again changes nothing.
+        </Banner>
+      )}
       <MethodTiles label="How to connect to Microsoft Fabric" options={METHODS} value={method} onChange={pick} disabled={busy} />
       <MiniSteps steps={["Sign in", "Choose workspace", "Test"]} current={stage} />
 
@@ -102,7 +126,7 @@ export function TargetConnectionPanel() {
 
       <div className="row conn-actions">
         <Button variant={authed ? "primary" : "default"} onClick={() => void test()} loading={fabricBusy === "test"} disabled={busy || !authed || !selected}>Test connection</Button>
-        {changing && <Button variant="ghost" onClick={() => setChanging(false)}>Cancel</Button>}
+        {changing && <Button variant="ghost" onClick={stopChanging}>Cancel</Button>}
       </div>
     </div>
   );
