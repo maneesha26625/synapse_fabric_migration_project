@@ -56,7 +56,7 @@ function save(key: string, value: unknown) {
 
 const DEFAULT_PROJECT: Project = { id: "default", name: "Synapse to Fabric migration", createdAt: new Date(0).toISOString() };
 
-const DEFAULT_OPTIONS: RunOptions = { scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", dataRun: "run", collation: "match_synapse" };
+const DEFAULT_OPTIONS: RunOptions = { scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", dataRun: "run", collation: "match_synapse", syncOverlap: "1h", dataFilters: {} };
 
 const EMPTY_RUN: ExecutionRun = { runId: "", state: "idle", total: 0, completed: 0, inProgress: 0, failed: 0, pending: 0, skipped: 0, deferred: 0, items: [], logs: [] };
 
@@ -384,8 +384,8 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   const runValidation = useCallback(async () => {
     setValidationBusy(true);
     setValidationError(null);
-    try { setValidation(await api.runValidation([...plan].sort((a, b) => a.wave - b.wave))); } catch (e) { setValidationError(messageOf(e)); } finally { setValidationBusy(false); }
-  }, [api, plan]);
+    try { setValidation(await api.runValidation([...plan].sort((a, b) => a.wave - b.wave), { dataFilters: options.dataFilters })); } catch (e) { setValidationError(messageOf(e)); } finally { setValidationBusy(false); }
+  }, [api, plan, options.dataFilters]);
 
   // ---- plan status
   const dependsOn = useMemo(() => {

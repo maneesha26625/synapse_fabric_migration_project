@@ -435,6 +435,73 @@ def test_a_connection_body_carries_the_credential_only_in_credential_details():
     assert {"dataType": "Text", "name": "path", "value": "raw"} in ok["connectionDetails"]["parameters"]
 
 
+KV_ID = "4399ab2c-7551-4c0e-8aa7-18fc2f217626"
+
+
+def test_options_that_pass_no_secret_come_first_and_say_what_must_be_set_up():
+    sql = fabric_connections.parse(SQL_LS).describe()["authTypes"]
+    assert [a["value"] for a in sql] == ["workspaceIdentity", "basicKeyVault", "servicePrincipalKeyVault", "basic", "servicePrincipal"]
+    assert sql[0]["fields"] == [] and "FROM EXTERNAL PROVIDER" in sql[0]["hint"]
+    assert "Key Vault reference" in sql[1]["hint"] and sql[3]["hint"] == ""
+    adls = fabric_connections.parse(ADLS_LS).describe()["authTypes"]
+    assert [a["value"] for a in adls][:4] == ["workspaceIdentity", "keyKeyVault", "sasKeyVault", "servicePrincipalKeyVault"]
+    assert "Storage Blob Data Reader" in adls[0]["hint"]
+
+
+def test_workspace_identity_sends_no_credential_and_skips_the_connection_test():
+    body = fabric_connections.create_body(fabric_connections.parse(SQL_LS), {"authType": "workspaceIdentity"})
+    assert body["credentialDetails"]["credentials"] == {"credentialType": "WorkspaceIdentity"}
+    assert body["credentialDetails"]["skipTestConnection"] is True
+    secret = fabric_connections.create_body(fabric_connections.parse(SQL_LS), {"authType": "basic", "username": "me", "password": "pw"})
+    assert secret["credentialDetails"]["skipTestConnection"] is False
+    blob = fabric_connections.create_body(fabric_connections.parse(BLOB_LS), {"authType": "workspaceIdentity"})
+    assert blob["credentialDetails"]["credentials"] == {"credentialType": "WorkspaceIdentity"}
+
+
+def test_workspace_identity_is_never_assumed_when_no_method_is_named():
+    plan = fabric_connections.parse(SQL_LS)
+    with pytest.raises(fabric_connections.CredentialError, match="Choose how to sign in"):
+        fabric_connections.create_body(plan, {})
+    # Fields that fill exactly one method still choose it, as before.
+    inferred = fabric_connections.create_body(plan, {"username": "me", "password": "pw"})
+    assert inferred["credentialDetails"]["credentials"]["credentialType"] == "Basic"
+
+
+def test_key_vault_options_send_a_reference_never_a_secret():
+    sql = fabric_connections.parse(SQL_LS)
+    basic = fabric_connections.create_body(sql, {"authType": "basicKeyVault", "username": "me", "keyVault": KV_ID, "secretName": "pool-pw"})
+    assert basic["credentialDetails"]["credentials"] == {
+        "credentialType": "Basic", "username": "me", "passwordReference": {"connectionId": KV_ID, "secretName": "pool-pw"}}
+    sp = fabric_connections.create_body(sql, {"authType": "servicePrincipalKeyVault", "tenantId": "t", "clientId": "c",
+                                              "keyVault": KV_ID, "secretName": "sp-secret"})
+    assert sp["credentialDetails"]["credentials"] == {
+        "credentialType": "ServicePrincipal", "tenantId": "t", "servicePrincipalClientId": "c",
+        "servicePrincipalSecretReference": {"connectionId": KV_ID, "secretName": "sp-secret"}}
+    adls = fabric_connections.parse(ADLS_LS)
+    key = fabric_connections.create_body(adls, {"authType": "keyKeyVault", "keyVault": KV_ID, "secretName": "acct-key", "path": "raw"})
+    assert key["credentialDetails"]["credentials"] == {"credentialType": "Key", "keyReference": {"connectionId": KV_ID, "secretName": "acct-key"}}
+    sas = fabric_connections.create_body(adls, {"authType": "sasKeyVault", "keyVault": KV_ID, "secretName": "sas", "path": "raw"})
+    assert sas["credentialDetails"]["credentials"]["tokenReference"] == {"connectionId": KV_ID, "secretName": "sas"}
+    assert sas["credentialDetails"]["skipTestConnection"] is False
+
+
+def test_a_key_vault_reference_is_found_by_its_alias_and_a_pasted_secret_is_refused():
+    sql = fabric_connections.parse(SQL_LS)
+    vaults = fabric_connections.key_vault_ids({"Contoso-KV": {"id": KV_ID}, "no-id": {}})
+    body = fabric_connections.create_body(sql, {"authType": "basicKeyVault", "username": "me", "keyVault": "contoso-kv", "secretName": "pw"}, vaults)
+    assert body["credentialDetails"]["credentials"]["passwordReference"]["connectionId"] == KV_ID
+    with pytest.raises(fabric_connections.CredentialError, match="No Azure Key Vault reference named 'other'"):
+        fabric_connections.create_body(sql, {"authType": "basicKeyVault", "username": "me", "keyVault": "other", "secretName": "pw"}, vaults)
+    with pytest.raises(fabric_connections.CredentialError, match="not its value"):
+        fabric_connections.create_body(sql, {"authType": "basicKeyVault", "username": "me", "keyVault": KV_ID, "secretName": "P@ss w0rd!"})
+
+
+def test_blank_credential_entries_count_as_nothing_entered():
+    from discovery_agent.api.migration import parse_credentials
+    assert parse_credentials({"ls_sql": {"authType": "", "password": ""}, "ls_adls": {"authType": "workspaceIdentity"}}) == {
+        "ls_adls": {"authType": "workspaceIdentity"}}
+
+
 def test_the_connection_stage_defers_without_credentials_then_creates_and_never_logs_the_secret():
     source = Source("ls", "ls_sql", "Linked Service", 1, CONNECTION, payload=SQL_LS)
     run, rest, _ = migrate([source])
@@ -843,7 +910,7 @@ def test_the_service_exposes_the_stages_and_the_linked_services_that_need_creden
     caps = svc.capabilities()
     assert [s["key"] for s in caps["stages"]] == list(capabilities.STAGE_KEYS)
     data = next(s for s in caps["stages"] if s["key"] == "data")
-    assert [o["key"] for o in data["options"]] == ["dataRun", "dataMode"] and data["needsInput"] == "credentials"
+    assert [o["key"] for o in data["options"]] == ["dataRun", "dataMode", "syncOverlap"] and data["needsInput"] == "credentials"
     assert {c["value"] for c in data["options"][1]["choices"]} == {"if_empty", "replace"} and all(c["label"] for c in data["options"][1]["choices"])
     warehouse = next(s for s in caps["stages"] if s["key"] == "warehouse")
     assert {c["value"] for c in warehouse["options"][0]["choices"]} == {"match_synapse", "case_insensitive", "case_sensitive"}
@@ -859,4 +926,4 @@ def test_the_data_stage_asks_for_a_credential_for_the_synapse_pool_connection():
     svc = MigrationService(session, SimpleNamespace(state=lambda: {}, migration_target=lambda: (WS, "W", "azure_cli")), rest_factory=lambda: StageRest())
     pool = next(l for l in svc.capabilities()["linkedServices"] if l["stage"] == "data")
     assert pool["name"] == "synapse-ws-pool01" and pool["fabricType"] == "SQL"
-    assert {a["value"] for a in pool["authTypes"]} == {"basic", "servicePrincipal"}
+    assert {a["value"] for a in pool["authTypes"]} == {"workspaceIdentity", "basicKeyVault", "servicePrincipalKeyVault", "basic", "servicePrincipal"}

@@ -20,6 +20,7 @@ import {
   type ConnectionConfig,
   type ConnectionCredentials,
   type ConnectionState,
+  type DataFilterInput,
   type DependencyGraph,
   type DiscoveryStatus,
   type ExecItem,
@@ -92,7 +93,7 @@ const readyFabric = (): FabricTarget => ({
 
 // Demo-only simulation state for the later phases.
 let fabric: FabricTarget = readyFabric();
-interface SimItem { id: string; name: string; type: string; wave: number; table?: string }
+interface SimItem { id: string; name: string; type: string; wave: number; table?: string; filter?: DataFilterInput }
 interface ExecSim { runId: string; items: SimItem[]; base: number; resumedAt: number | null; retried: boolean; credentials: string[]; options?: RunOptions; per: number; dur: number; failing: Set<string> }
 let execSim: ExecSim | null = null;
 let runCounter = 0;
@@ -261,6 +262,24 @@ const deferredReason: Record<string, string> = {
 };
 
 /** What a completed object shows, by type, like the real run. */
+/** The same wording the backend uses for a filter. */
+function describeFilter(f: DataFilterInput): string {
+  const parts: string[] = [];
+  if (f.column) parts.push(`rows with ${f.column} ${[f.from && `on or after ${f.from}`, f.to && `before ${f.to}`].filter(Boolean).join(" and ")}`);
+  if (f.sync) parts.push(`kept in sync by ${f.changeColumn || f.column}`);
+  return parts.join("; ") || "every row";
+}
+
+/** Demo tables' date columns, the same for a table every time: every table records when rows change; facts also carry a business date. */
+function demoDateColumns(name: string): { dateColumns: { name: string; type: string }[]; keyColumns: string[] } {
+  const h = hash(name);
+  const table = name.split(".").pop() ?? name;
+  const dates = [{ name: "CreatedAt", type: "datetime2" }, { name: "ModifiedAt", type: "datetime2" }];
+  if (/fact|trip|order|sale|ticket|event|log/i.test(table) || h % 3 === 0) dates.unshift({ name: h % 2 ? "TripDate" : "BusinessDate", type: "date" });
+  if (h % 5 === 0) dates.push({ name: "DeletedAt", type: "datetime2" });
+  return { dateColumns: dates, keyColumns: h % 4 === 0 ? [] : [`${table.replace(/^(Dim|Fact)/, "")}Id`] };
+}
+
 function outcome(i: SimItem, h: number): { step: string; target: string | null; notes: string[] } {
   const ws = fabric.workspaceName ?? "Fabric_demo";
   const wave = `load_${WAREHOUSE}_wave_${i.wave}`;
@@ -269,8 +288,16 @@ function outcome(i: SimItem, h: number): { step: string; target: string | null; 
     case "Schema": return { step: "Schema created", target: `${WAREHOUSE}.${i.name.split(".").pop()}`, notes: [] };
     case "Table": return { step: "Table created (empty: the Table data stage loads it with a pipeline)", target: `${WAREHOUSE}.${i.name}`, notes: h % 3 === 0 ? ["Key kept as NOT ENFORCED: primary key (demo)."] : [] };
     case "Table data": {
-      const rows = (1000 + (h % 900000)).toLocaleString();
-      return { step: `Loaded ${rows} rows by pipeline; counts match`, target: `${WAREHOUSE}.${i.table}`, notes: [`Pipeline '${wave}' created and run (demo).`] };
+      const f = i.filter;
+      const rows = Math.round((1000 + (h % 900000)) * (f?.column ? 0.4 : 1)).toLocaleString();
+      if (!f) return { step: `Loaded ${rows} rows by pipeline; counts match`, target: `${WAREHOUSE}.${i.table}`, notes: [`Pipeline '${wave}' created and run (demo).`] };
+      const notes = [`Pipeline '${wave}' created and run (demo).`, `Loads ${describeFilter(f)}.`];
+      if (f.sync) {
+        const change = f.changeColumn || f.column;
+        notes.push(`Registered for sync: changes to ${change} after 2026-10-08T09:30:00 are left to the sync pipeline (demo).`,
+          `Sync pipeline 'sync_${WAREHOUSE}' created. Its daily schedule (02:00 UTC) was created switched off: switch it on in Fabric once the first load is done.`);
+      }
+      return { step: `Loaded ${rows} rows by pipeline; counts match${f.column ? " within the filter" : ""}`, target: `${WAREHOUSE}.${i.table}`, notes };
     }
     case "View": case "Stored Procedure": {
       const converted = h % 4 === 0;
@@ -412,7 +439,7 @@ function demoAnalysis(items: PlanItem[], record: boolean, options?: RunOptions):
 
 const DEMO_STAGES: Capabilities["stages"] = [
   { key: "warehouse", label: "Warehouse & schema", summary: "The SQL pool becomes a Fabric Warehouse; its schemas, tables (empty, with their keys), views and stored procedures are created in it. Synapse-only T-SQL in views and procedures is converted first.", types: ["Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure"], needs: [], needsInput: null, creates: "Warehouse, schemas, tables, views, procedures", options: [{ key: "collation", label: "Warehouse collation (set once, when it is created)", default: "match_synapse", choices: [{ value: "match_synapse", label: "Same as Synapse", description: "Case-sensitive only if the Synapse pool was; Synapse's default is case-insensitive." }, { value: "case_insensitive", label: "Case-insensitive", description: "'ABC' equals 'abc' in comparisons and object names, as in most Synapse pools." }, { value: "case_sensitive", label: "Case-sensitive", description: "Fabric's own default: 'ABC' and 'abc' are different." }] }] },
-  { key: "data", label: "Table data", summary: "Loads the rows of each migrated table with Fabric data pipelines: one pipeline per wave, reading the Synapse pool through a Fabric connection and writing the Warehouse. The run then compares row counts.", types: ["Table"], needs: ["warehouse"], needsInput: "credentials", creates: "Data pipelines; rows in the Warehouse tables", options: [{ key: "dataRun", label: "What the stage does", default: "run", choices: [{ value: "run", label: "Create and run", description: "Creates each wave's pipeline, runs it, waits for it, and compares row counts." }, { value: "create", label: "Create only", description: "Creates the pipelines; you run them from Fabric (or a schedule) when you choose." }] }, { key: "dataMode", label: "If a table already has rows", default: "if_empty", choices: [{ value: "if_empty", label: "Skip it (safe)", description: "Never touches data that is already there, so re-runs are safe." }, { value: "replace", label: "Replace it", description: "The pipeline empties the table (TRUNCATE) before loading it again." }] }] },
+  { key: "data", label: "Table data", summary: "Loads the rows of each migrated table with Fabric data pipelines: one pipeline per wave, reading the Synapse pool through a Fabric connection and writing the Warehouse. The run then compares row counts.", types: ["Table"], needs: ["warehouse"], needsInput: "credentials", creates: "Data pipelines; rows in the Warehouse tables", options: [{ key: "dataRun", label: "What the stage does", default: "run", choices: [{ value: "run", label: "Create and run", description: "Creates each wave's pipeline, runs it, waits for it, and compares row counts." }, { value: "create", label: "Create only", description: "Creates the pipelines; you run them from Fabric (or a schedule) when you choose." }] }, { key: "dataMode", label: "If a table already has rows", default: "if_empty", choices: [{ value: "if_empty", label: "Skip it (safe)", description: "Never touches data that is already there, so re-runs are safe." }, { value: "replace", label: "Replace it", description: "The pipeline empties the table (TRUNCATE) before loading it again." }] }, { key: "syncOverlap", label: "Re-read window for tables kept in sync", default: "1h", choices: [{ value: "1h", label: "One hour", description: "Each sync also re-reads the hour before the last one, catching rows committed late. Re-read rows replace themselves, so nothing doubles." }, { value: "1d", label: "One day", description: "Re-reads the day before the last sync: for sources that write rows with older timestamps, or a date-only change column." }, { value: "none", label: "None", description: "Reads only from the last sync onwards. Tables without key columns always work this way." }] }] },
   { key: "spark", label: "Spark pool & environment", summary: "A Spark pool becomes a custom Fabric Spark pool plus a published Environment.", types: ["Spark Pool"], needs: [], needsInput: null, creates: "Spark pool, Environment", options: [] },
   { key: "notebooks", label: "Notebooks", summary: "Synapse notebooks become Fabric notebooks.", types: ["Notebook"], needs: [], needsInput: null, creates: "Notebooks", options: [] },
   { key: "connections", label: "Connections", summary: "Linked services become Fabric connections. Fabric needs their credentials, which Synapse does not give up.", types: ["Linked Service"], needs: [], needsInput: "credentials", creates: "Fabric connections", options: [] },
@@ -667,7 +694,11 @@ export const mockApi: MigrationApi = {
   async getCapabilities() {
     await sleep(60);
     statusNow(); // builds the discovery results if they are due, so the linked services are listed on a first load
+    const kvHint = "The secret stays in Azure Key Vault and never passes through this tool. Create an Azure Key Vault reference in Fabric (Manage connections and gateways, Azure Key Vault references) and enter its alias or ID with the secret's name. Fabric reads the secret's latest version each time it connects.";
     const sqlAuth = [
+      { value: "workspaceIdentity", label: "Workspace identity (no secret)", fields: [], hint: "Nothing to enter: Fabric signs in as the workspace's own identity. It works once a workspace admin has created the workspace identity (Workspace settings, Workspace identity) and a database admin runs CREATE USER [<Fabric workspace name>] FROM EXTERNAL PROVIDER and grants it read access (db_datareader) in the database. Whoever runs the pipelines needs the Admin, Member or Contributor role in the workspace." },
+      { value: "basicKeyVault", label: "SQL login, password in Key Vault", fields: ["username", "keyVault", "secretName"], hint: kvHint },
+      { value: "servicePrincipalKeyVault", label: "Service principal, secret in Key Vault", fields: ["tenantId", "clientId", "keyVault", "secretName"], hint: kvHint },
       { value: "basic", label: "SQL login", fields: ["username", "password"] },
       { value: "servicePrincipal", label: "Service principal", fields: ["tenantId", "clientId", "clientSecret"] },
     ];
@@ -675,7 +706,11 @@ export const mockApi: MigrationApi = {
       name: o.name, type: "AzureSqlDW", fabricType: "SQL", needsPath: false, unsupported: null, authTypes: sqlAuth, stage: "connections",
     }));
     const pool = { name: `synapse-${s.connection.workspace ?? DEMO_SOURCE.workspace}-${s.connection.sqlPool ?? DEMO_SOURCE.sqlPool}`, type: "Synapse dedicated SQL pool", fabricType: "SQL", needsPath: false, unsupported: null, authTypes: sqlAuth, stage: "data" };
-    return { stages: DEMO_STAGES, defaults: { dataMode: "if_empty", dataRun: "run", collation: "match_synapse" }, linkedServices: [pool, ...linked] };
+    const dataTables = (s.objects ?? []).filter((o) => o.type === "Table").map((o) => {
+      const [schema, name] = o.name.includes(".") ? o.name.split(".", 2) : ["dbo", o.name];
+      return { id: o.id, schema, name, key: o.name.toLowerCase(), ...demoDateColumns(o.name) };
+    });
+    return { stages: DEMO_STAGES, defaults: { dataMode: "if_empty", dataRun: "run", collation: "match_synapse", syncOverlap: "1h" }, linkedServices: [pool, ...linked], dataTables };
   },
 
   async analyzePlan(items: PlanItem[], record?: boolean, options?: RunOptions, credentials?: ConnectionCredentials) {
@@ -699,7 +734,7 @@ export const mockApi: MigrationApi = {
       if (on(key)) sim.push({ id: o.id, name: o.name, type: o.type, wave: pi.wave });
       else if (options?.scope === "all") sim.push({ id: o.id, name: o.name, type: o.type, wave: pi.wave });
       // Like the real run: every table gets a data load, done by that wave's pipeline.
-      if (o.type === "Table" && on("data")) sim.push({ id: `${o.id}#data`, name: `${o.name} (data)`, type: "Table data", wave: pi.wave, table: o.name });
+      if (o.type === "Table" && on("data")) sim.push({ id: `${o.id}#data`, name: `${o.name} (data)`, type: "Table data", wave: pi.wave, table: o.name, filter: options?.dataFilters?.[o.name.toLowerCase()] });
     }
     const kept = options?.scope === "automated" ? sim.filter((i) => MIGRATABLE_TYPES.includes(i.type) || i.type === "Table data") : sim;
     if (!kept.length) throw new ApiRequestError("nothing_to_migrate", "No object in the plan can be created by this build. Switch on more stages or choose scope All.", 400);
@@ -716,7 +751,7 @@ export const mockApi: MigrationApi = {
     const failing = new Set([...(rejected && kept.length >= 5 ? [rejected.id] : []), ...others.map((i) => i.id)]);
     runCounter += 1;
     execSim = { runId: String(runCounter).padStart(3, "0"), items: kept, base: 0, resumedAt: Date.now(), retried: false,
-      credentials: Object.keys(credentials ?? {}), options, per, dur: Math.min(600, per * 2), failing };
+      credentials: Object.entries(credentials ?? {}).filter(([, f]) => Object.values(f).some((v) => v.trim())).map(([n]) => n), options, per, dur: Math.min(600, per * 2), failing };
     return runNow();
   },
 

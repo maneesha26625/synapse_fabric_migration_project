@@ -139,8 +139,12 @@ export const realApi: MigrationApi = {
   getExecution: () => request<ExecutionRun>("/api/migration/run"),
   controlExecution: (action) =>
     request<ExecutionRun>("/api/migration/control", { method: "POST", body: JSON.stringify({ action }) }),
-  runValidation: async (items) =>
-    (await request<{ rows: ValidationRow[] }>("/api/migration/validate", { method: "POST", body: JSON.stringify(items?.length ? { items } : {}) })).rows,
+  runValidation: async (items, options) =>
+    (await request<{ rows: ValidationRow[] }>("/api/migration/validate", { method: "POST", body: JSON.stringify({
+      ...(items?.length ? { items } : {}),
+      // Date filters decide which Synapse rows a table should hold, so the counts compare like with like.
+      ...(options?.dataFilters ? { options: { dataFilters: options.dataFilters } } : {}),
+    }) })).rows,
   listSqlPools: async (rg, ws) =>
     (await request<{ items: string[] }>(
       `/api/azure/sql-pools?resourceGroup=${encodeURIComponent(rg)}&workspace=${encodeURIComponent(ws)}`,

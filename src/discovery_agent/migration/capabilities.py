@@ -68,6 +68,11 @@ STAGES: Tuple[Stage, ...] = (
                   ("if_empty", "Skip it (safe)", "Never touches data that is already there, so re-runs are safe."),
                   ("replace", "Replace it", "The pipeline empties the table (TRUNCATE) before loading it again."),
               ), "if_empty"),
+              Option("syncOverlap", "Re-read window for tables kept in sync", (
+                  ("1h", "One hour", "Each sync also re-reads the hour before the last one, catching rows committed late. Re-read rows replace themselves, so nothing doubles."),
+                  ("1d", "One day", "Re-reads the day before the last sync: for sources that write rows with older timestamps, or a date-only change column."),
+                  ("none", "None", "Reads only from the last sync onwards. Tables without key columns always work this way."),
+              ), "1h"),
           )),
     Stage("spark", "Spark pool & environment", "A Spark pool becomes a custom Fabric Spark pool plus a published Environment.",
           ("Spark Pool",), (ENVIRONMENT,), creates="Spark pool, Environment"),

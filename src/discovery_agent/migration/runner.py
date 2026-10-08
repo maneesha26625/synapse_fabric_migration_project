@@ -135,8 +135,8 @@ class MigrationRun:
         self.scope = "all"
         self.stop_on_failure = False
         self.halt_waived = False  # set when the operator resumes past a halt
-        #: Strategy settings for the stages (data mode, data run, collation). Never credentials.
-        self.settings: Dict[str, Any] = {"dataMode": "if_empty", "dataRun": "run", "collation": "match_synapse"}
+        #: Strategy settings for the stages (data mode, data run, collation, sync re-read window). Never credentials.
+        self.settings: Dict[str, Any] = {"dataMode": "if_empty", "dataRun": "run", "collation": "match_synapse", "syncOverlap": "1h"}
         self.stages: List[str] = []
         self.pool_name: str = ""  # the Synapse pool being migrated, for retargeting pipelines
         #: The pool's SQL endpoint and the Fabric connection the data pipelines read it through.

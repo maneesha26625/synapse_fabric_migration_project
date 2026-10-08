@@ -16,7 +16,7 @@ import json
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from discovery_agent.migration import datacopy, environments, jobs, notebooks, pipelines, warehouse_ddl
+from discovery_agent.migration import datacopy, datafilter, environments, jobs, notebooks, pipelines, warehouse_ddl
 from discovery_agent.migration.common import (
     CONNECTION, DATA, DATASET, DEFERRED, ENVIRONMENT, MISSING, NOTEBOOK, PIPELINE, POOL, PROCEDURE, SCHEDULE, SCHEMA, SCRIPT,
     SHORTCUT, SPARKJOB, TABLE, VIEW, Source,
@@ -173,13 +173,13 @@ class Validator:
         r = cur.fetchone()
         return int(r[0]) if r and r[0] is not None else 0
 
-    def source_rows(self, schema: str, name: str) -> Optional[int]:
+    def source_rows(self, schema: str, name: str, predicates: Sequence[str] = ()) -> Optional[int]:
         if self._source is None:
             if self._source_factory is None:
                 return None
             self._source = self._source_factory()
         cur = self._source.cursor()
-        cur.execute(datacopy.count_sql(schema, name))
+        cur.execute(datafilter.count_sql(schema, name, list(predicates)))
         r = cur.fetchone()
         return int(r[0]) if r and r[0] is not None else 0
 
@@ -257,6 +257,8 @@ class Validator:
         if (schema.lower(), name.lower()) not in self.warehouse()["objects"]:
             return [row(s, MISMATCH, "rows", "no table", "The table is not in the Warehouse.", "Data Count")]
         label = s.name.replace(" (data)", "")
+        if s.data_filter is not None:
+            return [{**self._check_filtered(s, schema, name), "object": label}]
         src = self.source_rows(s.payload.key.schema, s.payload.key.name)
         tgt = self.target_rows(schema, name)
         if src is None:
@@ -264,6 +266,52 @@ class Validator:
         status = MATCH if src == tgt else REVIEW if tgt == 0 else MISMATCH
         detail = "Counts agree." if src == tgt else "No rows loaded yet: run the Table data stage." if tgt == 0 else f"{abs(src - tgt):,} row(s) {'missing from' if tgt < src else 'extra in'} Fabric."
         return [{**row(s, status, f"{src:,} rows", f"{tgt:,} rows", detail, "Data Count"), "object": label}]
+
+    def _watermark(self, schema: str, name: str) -> Optional[str]:
+        """A synced table's watermark from the Warehouse control table, or None when it is not registered."""
+        try:
+            cur = self._sql.cursor()
+            cur.execute(warehouse_ddl.EXISTS_QUERY, datafilter.CONTROL)
+            found = cur.fetchone()
+            if not found or found[0] is None:
+                return None
+            cur.execute(datafilter.REGISTERED_SQL, datafilter.table_key(schema, name))
+            row = cur.fetchone()
+            return datafilter.clean_watermark(row[0]) if row and row[0] is not None else None
+        except Exception:  # noqa: BLE001 - an unreadable control table reads as not registered
+            return None
+
+    def _check_filtered(self, s: Source, schema: str, name: str) -> Dict[str, str]:
+        """A filtered table: Synapse is counted with the same filter.
+
+        A synced table is also compared up to its watermark. Synapse keeps changing between syncs, so a
+        Warehouse count between "up to the last sync" and "everything in the filter now" is in step, not wrong.
+        """
+        tgt = self.target_rows(schema, name) or 0
+        try:
+            resolved = datafilter.resolve(s.payload, s.data_filter)
+        except datafilter.FilterError as exc:
+            return row(s, MISMATCH, "filter", f"{tgt:,} rows", f"The date filter does not fit the table: {exc}", "Data Count")
+        how = s.data_filter.describe()
+        scope = datafilter.scope_predicates(resolved)
+        src = self.source_rows(s.payload.key.schema, s.payload.key.name, scope)
+        if src is None:
+            return row(s, REVIEW, "not read", f"{tgt:,} rows", "The Synapse source is not connected, so its row count could not be read.", "Data Count")
+        if src == tgt:
+            return row(s, MATCH, f"{src:,} rows", f"{tgt:,} rows", f"Counts agree ({how}).", "Data Count")
+        watermark = self._watermark(schema, name) if resolved.sync else None
+        if watermark is not None:
+            through = self.source_rows(s.payload.key.schema, s.payload.key.name, datafilter.first_load_predicates(resolved, watermark)) or 0
+            if min(through, src) <= tgt <= max(through, src):
+                return row(s, REVIEW, f"{src:,} rows", f"{tgt:,} rows",
+                           f"In step up to the last sync ({watermark}); rows added or changed in Synapse since then arrive "
+                           "with the next sync run.", "Data Count")
+        if tgt == 0:
+            return row(s, REVIEW, f"{src:,} rows", "0 rows", f"No rows loaded yet: run the Table data stage ({how}).", "Data Count")
+        detail = f"{abs(src - tgt):,} row(s) {'missing from' if tgt < src else 'extra in'} Fabric ({how})."
+        if resolved.sync and tgt > src:
+            detail += " Rows deleted in Synapse stay in the Warehouse: syncs do not carry hard deletes."
+        return row(s, MISMATCH, f"{src:,} rows", f"{tgt:,} rows", detail, "Data Count")
 
     def _module(self, s: Source, kind: str) -> List[Dict[str, str]]:
         if (gate := self._sql_gate(s)):

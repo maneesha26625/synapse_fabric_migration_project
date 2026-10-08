@@ -26,14 +26,48 @@ SUPPORTED = {
     "AzureBlobStorage": ("AzureBlobs", "AzureBlobs"),
 }
 
-#: Credential types per Fabric type, and the fields each needs (name -> label).
-AUTH_FIELDS: Dict[str, Dict[str, Tuple[str, ...]]] = {
-    "SQL": {"basic": ("username", "password"), "servicePrincipal": ("tenantId", "clientId", "clientSecret")},
-    "AzureDataLakeStorage": {"key": ("key",), "servicePrincipal": ("tenantId", "clientId", "clientSecret"), "sas": ("token",)},
-    "AzureBlobs": {"key": ("key",), "servicePrincipal": ("tenantId", "clientId", "clientSecret"), "sas": ("token",)},
+#: Credential types per Fabric type, and the fields each needs, in the order the UI offers them:
+#: the ones that pass no secret through this tool first. ``keyVault`` is a Fabric Azure Key Vault
+#: reference (its alias or ID) and ``secretName`` the secret in that vault; neither is a secret.
+_KV = ("keyVault", "secretName")
+_STORAGE_AUTH: Dict[str, Tuple[str, ...]] = {
+    "workspaceIdentity": (), "keyKeyVault": _KV, "sasKeyVault": _KV, "servicePrincipalKeyVault": ("tenantId", "clientId") + _KV,
+    "key": ("key",), "servicePrincipal": ("tenantId", "clientId", "clientSecret"), "sas": ("token",),
 }
-AUTH_LABELS = {"basic": "SQL login", "key": "Account key", "servicePrincipal": "Service principal", "sas": "SAS token"}
+AUTH_FIELDS: Dict[str, Dict[str, Tuple[str, ...]]] = {
+    "SQL": {"workspaceIdentity": (), "basicKeyVault": ("username",) + _KV, "servicePrincipalKeyVault": ("tenantId", "clientId") + _KV,
+            "basic": ("username", "password"), "servicePrincipal": ("tenantId", "clientId", "clientSecret")},
+    "AzureDataLakeStorage": _STORAGE_AUTH,
+    "AzureBlobs": _STORAGE_AUTH,
+}
+AUTH_LABELS = {
+    "workspaceIdentity": "Workspace identity (no secret)",
+    "basicKeyVault": "SQL login, password in Key Vault", "servicePrincipalKeyVault": "Service principal, secret in Key Vault",
+    "keyKeyVault": "Account key in Key Vault", "sasKeyVault": "SAS token in Key Vault",
+    "basic": "SQL login", "key": "Account key", "servicePrincipal": "Service principal", "sas": "SAS token",
+}
+#: What the operator must have set up for an option that takes no secret, shown beside it.
+_KEY_VAULT_HINT = ("The secret stays in Azure Key Vault and never passes through this tool. Create an Azure Key Vault reference "
+                   "in Fabric (Manage connections and gateways, Azure Key Vault references) and enter its alias or ID with the "
+                   "secret's name. Fabric reads the secret's latest version each time it connects.")
+_IDENTITY_GRANT = {
+    "SQL": "a database admin runs CREATE USER [<Fabric workspace name>] FROM EXTERNAL PROVIDER and grants it read access "
+           "(db_datareader) in the database",
+    "AzureDataLakeStorage": "it is granted Storage Blob Data Reader (or Contributor) on the storage account",
+    "AzureBlobs": "it is granted Storage Blob Data Reader (or Contributor) on the storage account",
+}
+#: A Key Vault secret name: 1-127 letters, digits and dashes.
+_SECRET_NAME = re.compile(r"^[0-9A-Za-z-]{1,127}$")
+_UUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 _MAX_FIELD = 2048
+
+
+def _hint(fabric_type: str, auth: str) -> str:
+    if auth == "workspaceIdentity":
+        return ("Nothing to enter: Fabric signs in as the workspace's own identity. It works once a workspace admin has created "
+                f"the workspace identity (Workspace settings, Workspace identity) and {_IDENTITY_GRANT[fabric_type]}. "
+                "Whoever runs the pipelines needs the Admin, Member or Contributor role in the workspace.")
+    return _KEY_VAULT_HINT if auth.endswith("KeyVault") else ""
 
 
 @dataclass
@@ -54,7 +88,8 @@ class ConnectionPlan:
         """What the UI needs to ask for, and which stage asks. No credential, only the shape of one."""
         return {
             "name": self.name, "type": self.ls_type, "fabricType": self.fabric_type,
-            "authTypes": [{"value": a, "label": AUTH_LABELS[a], "fields": list(AUTH_FIELDS[self.fabric_type][a])} for a in self.auth_types],
+            "authTypes": [{"value": a, "label": AUTH_LABELS[a], "fields": list(AUTH_FIELDS[self.fabric_type][a]),
+                           "hint": _hint(self.fabric_type, a)} for a in self.auth_types],
             "needsPath": self.fabric_type == "AzureDataLakeStorage",
             "unsupported": self.unsupported,
             "stage": stage,
@@ -187,10 +222,44 @@ class CredentialError(Exception):
     pass
 
 
-def credential_body(plan: ConnectionPlan, supplied: Mapping[str, Any]) -> Dict[str, Any]:
-    """The Fabric ``credentials`` object from what the operator typed. Raises CredentialError when incomplete."""
+def _auth_type(plan: ConnectionPlan, supplied: Mapping[str, Any]) -> str:
+    """The chosen credential type: the one named, else the one whose fields were all filled in.
+
+    An option with no fields (workspace identity) is never inferred: it only works once someone has
+    granted the identity access, so it has to be chosen, not assumed.
+    """
+    named = str(supplied.get("authType") or "")
+    if named:
+        return named
     options = AUTH_FIELDS.get(plan.fabric_type or "", {})
-    auth = str(supplied.get("authType") or (plan.auth_types[0] if plan.auth_types else ""))
+    return next((a for a, fields in options.items()
+                 if fields and all(str(supplied.get(f) or "").strip() for f in fields)), "")
+
+
+def _key_vault_reference(plan: ConnectionPlan, values: Mapping[str, str], key_vaults: Mapping[str, str]) -> Dict[str, str]:
+    """A Fabric ``KeyVaultSecretReference``: the Key Vault reference's connection ID and the secret's name."""
+    ref, secret = values["keyVault"].strip(), values["secretName"].strip()
+    if not _SECRET_NAME.match(secret):
+        raise CredentialError(f"The Key Vault secret name for {plan.name} is the secret's name in the vault "
+                              "(letters, digits and dashes), not its value.")
+    if not _UUID.match(ref):
+        found = key_vaults.get(ref.lower())
+        if not found:
+            raise CredentialError(f"No Azure Key Vault reference named '{ref}' is visible in Fabric for {plan.name}. "
+                                  "Create it under Manage connections and gateways, Azure Key Vault references, or enter its ID.")
+        ref = found
+    return {"connectionId": ref, "secretName": secret}
+
+
+def credential_body(plan: ConnectionPlan, supplied: Mapping[str, Any],
+                    key_vaults: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
+    """The Fabric ``credentials`` object from what the operator chose. Raises CredentialError when incomplete.
+
+    ``key_vaults`` maps a Key Vault reference's display name (lowercase) to its connection ID, so the
+    operator can name a reference by its alias instead of its ID.
+    """
+    options = AUTH_FIELDS.get(plan.fabric_type or "", {})
+    auth = _auth_type(plan, supplied)
     if auth not in options:
         raise CredentialError(f"Choose how to sign in to {plan.name}: {', '.join(AUTH_LABELS[a] for a in options)}.")
     values = {f: str(supplied.get(f) or "") for f in options[auth]}
@@ -199,6 +268,18 @@ def credential_body(plan: ConnectionPlan, supplied: Mapping[str, Any]) -> Dict[s
         raise CredentialError(f"{AUTH_LABELS[auth]} for {plan.name} needs: {', '.join(missing)}.")
     if any(len(v) > _MAX_FIELD for v in values.values()):
         raise CredentialError(f"A credential value for {plan.name} is too long.")
+    if auth == "workspaceIdentity":
+        return {"credentialType": "WorkspaceIdentity"}
+    if auth.endswith("KeyVault"):
+        ref = _key_vault_reference(plan, values, key_vaults or {})
+        if auth == "basicKeyVault":
+            return {"credentialType": "Basic", "username": values["username"], "passwordReference": ref}
+        if auth == "keyKeyVault":
+            return {"credentialType": "Key", "keyReference": ref}
+        if auth == "sasKeyVault":
+            return {"credentialType": "SharedAccessSignature", "tokenReference": ref}
+        return {"credentialType": "ServicePrincipal", "tenantId": values["tenantId"],
+                "servicePrincipalClientId": values["clientId"], "servicePrincipalSecretReference": ref}
     if auth == "basic":
         return {"credentialType": "Basic", "username": values["username"], "password": values["password"]}
     if auth == "key":
@@ -209,7 +290,13 @@ def credential_body(plan: ConnectionPlan, supplied: Mapping[str, Any]) -> Dict[s
             "servicePrincipalClientId": values["clientId"], "servicePrincipalSecret": values["clientSecret"]}
 
 
-def create_body(plan: ConnectionPlan, supplied: Mapping[str, Any]) -> Dict[str, Any]:
+def key_vault_ids(connections: Mapping[str, Mapping[str, Any]]) -> Dict[str, str]:
+    """Fabric connections by lowercase display name -> ID, for naming a Key Vault reference by its alias."""
+    return {str(name).lower(): str(c["id"]) for name, c in connections.items() if c.get("id")}
+
+
+def create_body(plan: ConnectionPlan, supplied: Mapping[str, Any],
+                key_vaults: Optional[Mapping[str, str]] = None) -> Dict[str, Any]:
     """The ``POST /v1/connections`` body. The credential goes in here and nowhere else."""
     parameters = [dict(p) for p in plan.parameters]
     path = str(supplied.get("path") or "").strip()
@@ -217,6 +304,7 @@ def create_body(plan: ConnectionPlan, supplied: Mapping[str, Any]) -> Dict[str, 
         if not path:
             raise CredentialError(f"Enter the container or folder path for {plan.name} (for example: mycontainer).")
         parameters.append({"dataType": "Text", "name": "path", "value": path})
+    credentials = credential_body(plan, supplied, key_vaults)
     return {
         "connectivityType": "ShareableCloud",
         "displayName": plan.name,
@@ -225,7 +313,8 @@ def create_body(plan: ConnectionPlan, supplied: Mapping[str, Any]) -> Dict[str, 
         "credentialDetails": {
             "singleSignOnType": "None",
             "connectionEncryption": "NotEncrypted",
-            "skipTestConnection": False,
-            "credentials": credential_body(plan, supplied),
+            # Fabric cannot test a workspace-identity connection, so asking it to fails the create.
+            "skipTestConnection": credentials["credentialType"] == "WorkspaceIdentity",
+            "credentials": credentials,
         },
     }

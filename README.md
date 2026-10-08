@@ -738,10 +738,10 @@ in one place, `migration/capabilities.py`, and the UI reads it from
 | Stage | Synapse object | Becomes in Fabric | Strategy / notes |
 |---|---|---|---|
 | Warehouse & schema | Dedicated SQL pool, schema, table, view, stored procedure | A Warehouse of the same name, its schemas, **empty** tables, views and procedures | Structure only. Tables are rebuilt from discovered columns; storage clauses are dropped and unsupported types mapped, each change noted; primary keys and unique constraints are recreated `NOT ENFORCED`. Views and procedures are created from their own text after the T-SQL rules (below). The Warehouse **collation** is chosen once, at creation: *same as Synapse* (default), case-insensitive or case-sensitive. |
-| Table data | The rows of each migrated table | **Fabric data pipelines**, one per wave, and the rows they load | Data never passes through the accelerator. Each wave gets a metadata-driven pipeline (`load_<warehouse>_wave_<n>`): a ForEach over a `tables` parameter whose Copy activity reads the pool with a typed SELECT through a Fabric SQL connection and writes the Warehouse with the COPY command. *Create and run* (default) runs it, waits, and compares row counts table by table; *create only* leaves running it to you. *Skip* (default) leaves tables that already have rows; *replace* truncates them inside the pipeline first. The connection to the pool is reused if one exists, or created from the SQL login / service principal you enter on this stage. |
+| Table data | The rows of each migrated table | **Fabric data pipelines**, one per wave, and the rows they load | Data never passes through the accelerator. Each wave gets a metadata-driven pipeline (`load_<warehouse>_wave_<n>`): a ForEach over a `tables` parameter whose Copy activity reads the pool with a typed SELECT through a Fabric SQL connection and writes the Warehouse with the COPY command. *Create and run* (default) runs it, waits, and compares row counts table by table; *create only* leaves running it to you. *Skip* (default) leaves tables that already have rows; *replace* truncates them inside the pipeline first. The connection to the pool is reused if one exists, or created from what you choose on this stage (workspace identity, Key Vault, SQL login or service principal). Per-table **date filters** load part of a table and can keep it in sync afterwards: see below. |
 | Spark pool & environment | Spark pool | A custom Spark pool and a published Environment | Node size, autoscale, runtime mapped; libraries are not copied. |
 | Notebooks | Notebook | Fabric Notebook | Cells kept; Spark pool binding and outputs dropped. Python cells: `mssparkutils` becomes `notebookutils`, and the Synapse SQL connector import and reads of the migrated pool are pointed at Fabric's connector and the Warehouse. Other Synapse-only calls (linked-service credentials, `mssparkutils.env`, connector writes, ADLS paths) are flagged. .NET notebooks are deferred. |
-| Connections | Linked service | Fabric connection | Synapse does not give up the secret, so you enter credentials (sent once, held in memory, never stored or returned). SQL, ADLS Gen2 and Blob are converted; a parameterised linked service uses its parameters' default values. Others are created by hand, with the linked service's name so pipelines find them. |
+| Connections | Linked service | Fabric connection | Synapse does not give up the secret, so you choose how Fabric signs in. **Workspace identity** and **Key Vault reference** (an Azure Key Vault reference's alias or ID and the secret's name) pass no secret through the accelerator and are offered first; a SQL login, key, SAS token or service principal secret can still be typed (sent once, held in memory, never stored or returned). SQL, ADLS Gen2 and Blob are converted; a parameterised linked service uses its parameters' default values. Others are created by hand, with the linked service's name so pipelines find them. |
 | Pipelines & datasets | Pipeline, dataset | Fabric data pipeline | Datasets are embedded in each activity; notebook, pipeline and Spark-job references become Fabric ids; anything that read the Synapse pool is pointed at the migrated Warehouse. Azure Function, Databricks, Batch (Custom), HDInsight, Machine Learning and Webhook activities keep their type and point at the connection of the same name. A pipeline with an activity that has no Fabric equivalent (for example a mapping data flow) is **not created**, with the activity names. |
 | Spark job definitions | Spark job definition | Fabric Spark job definition | Main file, class, arguments and libraries kept; attached to the Environment of the same name. |
 | SQL scripts | SQL script | A notebook with a T-SQL cell bound to the Warehouse | The T-SQL rules are applied; what they cannot convert is flagged for review. |
@@ -749,6 +749,51 @@ in one place, `migration/capabilities.py`, and the UI reads it from
 | External tables | External table | A OneLake shortcut in a Lakehouse | The storage location is read from the pool's external data source; needs a Fabric connection to that storage. |
 
 Integration runtimes are always set up by hand.
+
+### Date filters and keeping tables in sync
+
+By default the Table data stage copies every row. Under *Stages & credentials →
+Date filters* a table can instead load part of its rows, and optionally keep
+loading new and changed rows afterwards (`migration/datafilter.py`):
+
+| Setting | What it does |
+|---|---|
+| **Date column, from, until** | The first load copies `WHERE <column> >= from AND <column> < until` (either bound may be empty). The dates are fixed in the plan, never "two years ago", so every run of a plan copies the same rows. Row counts after the load, and in Validate, count Synapse with the same filter. |
+| **Keep in sync** | After the first load, a sync pipeline copies rows whose **change column** (such as `ModifiedAt`) moved since the table's **watermark**, the newest change already loaded. A synced table has no end date. |
+| **Key columns** | Default: the table's primary key or first unique constraint. A changed row replaces the Warehouse row with the same key; without keys it is appended (the planner warns). |
+| **Re-read window** (stage option) | Each sync of a keyed table re-reads one hour (default), one day or nothing before the watermark, to catch rows committed late. Re-read rows replace themselves. |
+
+*For every table with column* sets the same filter on every plan table that has
+that column. Which column to use is a choice: a business date (`OrderDate`)
+scopes what belongs; `CreatedAt` suits append-only tables; `ModifiedAt` is the
+only one that sees updates, so it is the usual change column; `DeletedAt` is not
+a filter: a soft delete that moves the change column is carried over.
+
+How a synced table is set up, by the Table data stage:
+
+1. The newest change in the filter is read from Synapse. That is the watermark.
+2. The first load copies the filter's rows up to the watermark (rows with a NULL
+   change column are included), so the first sync starts exactly where it ends.
+3. The table is registered in the Warehouse control table
+   `migration_sync.sync_tables`: its watermark and the exact SQL each sync runs.
+   An empty staging table `migration_sync.<schema>__<table>` is created.
+4. One sync pipeline per Warehouse, `sync_<warehouse>`, is created with a
+   **daily schedule (02:00 UTC) switched off**. It reads its table list from the
+   control table, so registering a table is adding its row; the pipeline never
+   changes. Tables are synced one after another (each one's transaction writes
+   the control table, and the Warehouse detects write conflicts per table). For
+   each table it looks up the newest change in Synapse, copies the
+   rows changed since the watermark into the staging table, and runs one
+   Warehouse transaction that deletes the matching rows, inserts the staged ones
+   and moves the watermark. A failed step leaves the watermark where it was, so
+   the next run copies the same window again.
+
+Limits: rows deleted in Synapse stay in the Warehouse (hard deletes leave nothing
+to copy); a change column the source does not always update misses those
+changes; a table that already has rows is skipped and is not put in sync until
+it is reloaded with *Replace it*. Validate reports a synced table as in step
+when its count lies between "up to the last sync" and "everything in the filter
+now".
 
 **T-SQL rules** (`migration/tsql_rules.py`), applied to views, procedures and SQL
 scripts before Fabric sees them, each change noted on the object:
@@ -793,7 +838,8 @@ with Synapse's managed identity).
   documented formats and Fabric's documented request bodies; Fabric validates
   each create and each pipeline run, and its own error message is shown if it
   disagrees. The data pipelines' Copy settings (Synapse source, Warehouse sink
-  with staging) should be confirmed on a first real run.
+  with staging), and the sync pipeline's Lookup, Copy and Script activities
+  against the Warehouse, should be confirmed on a first real run.
 
 ### Validation
 

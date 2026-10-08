@@ -83,7 +83,7 @@ class FabricStageMixin:
                 f"Enter credentials for '{plan.name}' in Plan, Stages & credentials (the Connections stage), then run the Connections stage again from Migrate. "
                 "Synapse does not give up the secret, so Fabric cannot be given it automatically."] + plan.notes
         try:
-            body = fabric_connections.create_body(plan, supplied)
+            body = fabric_connections.create_body(plan, supplied, fabric_connections.key_vault_ids(self._connections()))
         except fabric_connections.CredentialError as exc:
             raise MigrationError(str(exc)) from exc
         created = self._client().create("/connections", body)  # type: ignore[attr-defined]

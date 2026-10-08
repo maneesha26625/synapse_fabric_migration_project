@@ -394,6 +394,38 @@ export interface RunOptions {
   dataRun: "run" | "create";
   /** Warehouse: the collation it is created with (it cannot change afterwards). */
   collation: "match_synapse" | "case_insensitive" | "case_sensitive";
+  /** Table data: how far back each sync of a table with key columns re-reads. */
+  syncOverlap?: "1h" | "1d" | "none";
+  /** Table data: which rows each table loads, by "schema.table" (lowercase). A table not listed loads every row. */
+  dataFilters?: Record<string, DataFilterInput>;
+}
+
+/** One table's date filter. Dates are fixed (YYYY-MM-DD), so every run of a plan loads the same rows. */
+export interface DataFilterInput {
+  /** The date column the range applies to; empty to load every row (a synced table may still sync). */
+  column: string;
+  /** Inclusive start date, or "". */
+  from: string;
+  /** Exclusive end date, or "". Not allowed for a table kept in sync. */
+  to: string;
+  /** After the first load, keep loading new and changed rows with the sync pipeline. */
+  sync: boolean;
+  /** The column that moves when a row is added or changed (e.g. modified_at). */
+  changeColumn: string;
+  /** Columns that identify a row, so a changed row replaces the old one. Empty: the table's own key. */
+  keys: string[];
+}
+
+/** A discovered table a date filter can apply to. */
+export interface FilterableTable {
+  id: string;
+  schema: string;
+  name: string;
+  /** "schema.table", lowercase: how its filter is addressed. */
+  key: string;
+  dateColumns: { name: string; type: string }[];
+  /** The table's primary key (or first unique constraint) columns, if it has one. */
+  keyColumns: string[];
 }
 
 // ---- migration stages ------------------------------------------------------------------
@@ -411,7 +443,13 @@ export interface StageDef {
   creates: string;
   options: StageOption[];
 }
-export interface CredentialAuth { value: string; label: string; fields: string[] }
+export interface CredentialAuth {
+  value: string;
+  label: string;
+  fields: string[];
+  /** What must already be set up for an option that takes no secret (workspace identity, Key Vault). */
+  hint?: string;
+}
 export interface LinkedServiceInput {
   name: string;
   type: string;
@@ -427,6 +465,8 @@ export interface Capabilities {
   stages: StageDef[];
   defaults: Record<string, string>;
   linkedServices: LinkedServiceInput[];
+  /** Tables with a date or time column, which a date filter can apply to. */
+  dataTables?: FilterableTable[];
 }
 /** Credentials by linked-service name. Held in memory only: never stored in the browser, never shown again. */
 export type ConnectionCredentials = Record<string, Record<string, string>>;
@@ -514,7 +554,7 @@ export interface MigrationApi {
   /** `reset` forgets the run's record so the next run starts fresh; refused while the run is working. */
   controlExecution(action: RunControl): Promise<ExecutionRun>;
   /** Compares Synapse with Fabric. With no items, every discovered object is checked. */
-  runValidation(items?: PlanItem[]): Promise<ValidationRow[]>;
+  runValidation(items?: PlanItem[], options?: Pick<RunOptions, "dataFilters">): Promise<ValidationRow[]>;
 }
 
 export class ApiRequestError extends Error {

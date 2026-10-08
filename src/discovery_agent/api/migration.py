@@ -21,7 +21,7 @@ from discovery_agent.api.service import ApiError, Session
 from discovery_agent.migration import planner as planning
 from discovery_agent.migration.fabric_rest import NO_CAPACITY, FabricApiError, FabricRestClient
 from discovery_agent.migration.preflight import content_findings, environment_checks
-from discovery_agent.migration import capabilities, datapipeline, fabric_connections, pipelines
+from discovery_agent.migration import capabilities, datafilter, datapipeline, fabric_connections, pipelines
 from discovery_agent.migration.validation import Validator, summarize
 from discovery_agent.migration.runner import (
     CONNECTION,
@@ -50,6 +50,7 @@ from discovery_agent.source_strategy import P0Artifact
 from discovery_agent.sql.auth import AccessTokenAuthentication
 from discovery_agent.sql.config import SqlConnectionConfig
 from discovery_agent.sql.connection import PyodbcConnector
+from discovery_agent.sql.models import SqlTable
 
 MAX_ITEMS = 10000
 #: Runner kinds that this build creates in Fabric (everything else is deferred).
@@ -95,8 +96,20 @@ def parse_options(body: dict) -> dict:
     collation = str(options.get("collation") or "match_synapse")
     if collation not in COLLATIONS:
         raise ApiError(400, "invalid_options", "Choose a Warehouse collation: same as Synapse, case-insensitive or case-sensitive.")
+    overlap = str(options.get("syncOverlap") or "1h")
+    if overlap not in datafilter.OVERLAPS:
+        raise ApiError(400, "invalid_options", "Choose a re-read window for synced tables: none, one hour or one day.")
     return {"scope": scope, "stopOnFailure": bool(options.get("stopOnFailure")), "stages": list(dict.fromkeys(stages)),
-            "dataMode": mode, "dataRun": data_run, "collation": collation}
+            "dataMode": mode, "dataRun": data_run, "collation": collation, "syncOverlap": overlap,
+            "dataFilters": parse_data_filters(options.get("dataFilters"))}
+
+
+def parse_data_filters(raw: Any) -> Dict[str, datafilter.DataFilter]:
+    """Per-table date filters, checked for shape; whether their columns exist is checked against each table later."""
+    try:
+        return datafilter.parse_filters(raw)
+    except datafilter.FilterError as exc:
+        raise ApiError(400, "invalid_filters", str(exc)) from None
 
 
 def parse_credentials(raw: Any) -> Dict[str, Dict[str, str]]:
@@ -110,7 +123,7 @@ def parse_credentials(raw: Any) -> Dict[str, Dict[str, str]]:
         if not isinstance(name, str) or not isinstance(fields, dict):
             raise ApiError(400, "invalid_credentials", "The connection credentials are not in a valid format.")
         clean = {str(k): v for k, v in fields.items() if isinstance(v, str) and len(v) <= MAX_CREDENTIAL_FIELD}
-        if clean:
+        if any(v.strip() for v in clean.values()):  # all blank: nothing chosen, so the connection stays deferred
             out[name] = clean
     return out
 
@@ -120,7 +133,7 @@ def apply_stages(sources: List[Source], options: dict) -> List[Source]:
     stages = set(options["stages"])
     pool = list(sources)
     if "data" in stages:
-        pool += data_sources(sources)
+        pool += data_sources(sources, options.get("dataFilters"))
     kept: List[Source] = []
     for s in pool:
         if s.kind in (DEFERRED, MISSING):
@@ -304,13 +317,31 @@ def sources_for(plan: List[dict], job: Any, pool: Optional[str]) -> List[Source]
     return sources
 
 
-def data_sources(sources: List[Source]) -> List[Source]:
-    """One data-load item per migrated table, in the table's wave. External tables have no rows to load."""
+def data_sources(sources: List[Source], filters: Optional[Dict[str, datafilter.DataFilter]] = None) -> List[Source]:
+    """One data-load item per migrated table, in the table's wave, with its date filter if it has one.
+    External tables have no rows to load."""
     out = []
     for s in sources:
         if s.kind == TABLE and s.payload is not None and not getattr(s.payload, "is_external", False):
+            found = (filters or {}).get(datafilter.table_key(s.schema or "dbo", s.object_name or s.name))
             out.append(Source(f"{s.id}#data", f"{s.name} (data)", "Table data", s.wave, DATA, payload=s.payload,
-                              schema=s.schema, object_name=s.object_name))
+                              schema=s.schema, object_name=s.object_name, data_filter=found))
+    return out
+
+
+def filterable_tables(job: Any) -> List[dict]:
+    """The discovered tables a date filter can apply to: those with a date or time column, with their keys."""
+    out: List[dict] = []
+    for oid, record in sorted((getattr(job, "records_by_id", {}) or {}).items()):
+        table = getattr(record, "content", None)
+        if not isinstance(table, SqlTable) or table.is_external:
+            continue
+        dates = datafilter.date_columns(table)
+        if dates:
+            out.append({"id": oid, "schema": table.key.schema, "name": table.key.name,
+                        "key": datafilter.table_key(table.key.schema, table.key.name),
+                        "dateColumns": [{"name": c.name, "type": c.data_type} for c in dates],
+                        "keyColumns": list(datafilter.table_keys(table))})
     return out
 
 
@@ -374,7 +405,7 @@ class MigrationService:
                                     source_connected=self._source_available() if needs_source else None)
         names = set(credentials) | set(self._credentials)
         result = planning.analyze(objects, content_findings(sources, names, pool or ""), checks)
-        result["options"] = options
+        result["options"] = {**options, "dataFilters": {k: f.to_dict() for k, f in options["dataFilters"].items()}}
         if body.get("record"):
             with self._lock:
                 entry = {
@@ -414,7 +445,8 @@ class MigrationService:
             via = "Azure CLI" if method == "azure_cli" else "Fabric CLI"
             run.scope, run.stop_on_failure = scope, stop_on_failure
             run.stages, run.pool_name = list(options["stages"]), pool or ""
-            run.settings = {"dataMode": options["dataMode"], "dataRun": options["dataRun"], "collation": options["collation"]}
+            run.settings = {"dataMode": options["dataMode"], "dataRun": options["dataRun"], "collation": options["collation"],
+                            "syncOverlap": options["syncOverlap"]}
             self._describe_source(run, job, pool)
             if credentials:
                 self._credentials = credentials
@@ -486,7 +518,10 @@ class MigrationService:
         job, pool = self._session.migration_snapshot()
         workspace_id, workspace_name, _ = self._fabric.migration_target()
         plan = plan or [{"id": i["id"], "wave": 1} for i in job.items]
-        sources = apply_stages(sources_for(plan, job, pool), {"stages": list(capabilities.STAGE_KEYS), "scope": "all"})
+        given = body.get("options") if isinstance(body.get("options"), dict) else {}
+        filters = parse_data_filters(given.get("dataFilters"))
+        sources = apply_stages(sources_for(plan, job, pool),
+                               {"stages": list(capabilities.STAGE_KEYS), "scope": "all", "dataFilters": filters})
         factory = self._source_factory or getattr(self._session, "source_sql_factory", lambda: None)()
         warehouse = warehouse_name_for(pool)
         validator = Validator(
@@ -524,13 +559,16 @@ class MigrationService:
             workspace, server, database = endpoint
             plan = fabric_connections.pool_plan(datapipeline.source_connection_name(workspace, database), server, database)
             linked.append(plan.describe(stage="data"))
+        tables: List[dict] = []
         try:
             job, _ = self._session.migration_snapshot()
             for name, payload in sorted(_artifacts(job).get(P0Artifact.LINKED_SERVICE, {}).items()):
                 linked.append(fabric_connections.parse(payload).describe())
+            tables = filterable_tables(job)
         except ApiError:
             pass
-        return {"stages": capabilities.describe(), "defaults": capabilities.default_settings(), "linkedServices": linked}
+        return {"stages": capabilities.describe(), "defaults": capabilities.default_settings(), "linkedServices": linked,
+                "dataTables": tables}
 
     def _spawn(self, run: MigrationRun) -> None:
         factory = self._source_factory or getattr(self._session, "source_sql_factory", lambda: None)()

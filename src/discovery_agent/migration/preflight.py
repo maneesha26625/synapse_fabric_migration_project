@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Sequence, Set
 
-from discovery_agent.migration import datacopy, environments, fabric_connections, jobs, notebooks, pipelines, tsql_rules, warehouse_ddl
+from discovery_agent.migration import datacopy, datafilter, environments, fabric_connections, jobs, notebooks, pipelines, tsql_rules, warehouse_ddl
 from discovery_agent.migration.common import (
     CONNECTION, DATA, ENVIRONMENT, NOTEBOOK, PIPELINE, PROCEDURE, SCHEDULE, SCRIPT, SPARKJOB, TABLE, VIEW, Source,
 )
@@ -88,9 +88,19 @@ def _environment(source: Source) -> List[Finding]:
 
 def _data(source: Source) -> List[Finding]:
     problem = datacopy.preflight(source.payload)
-    if problem is None or problem[0] == "EXTERNAL":
+    if problem is not None and problem[0] != "EXTERNAL":
+        return [Finding(source.id, "DATA_UNSUPPORTED", HIGH, f"{source.name}: {problem[1]}")]
+    if problem is not None or source.data_filter is None:
         return []
-    return [Finding(source.id, "DATA_UNSUPPORTED", HIGH, f"{source.name}: {problem[1]}")]
+    try:
+        resolved = datafilter.resolve(source.payload, source.data_filter)
+    except datafilter.FilterError as exc:
+        return [Finding(source.id, "FILTER_INVALID", HIGH, f"{source.name}: the date filter does not fit the table. {exc}")]
+    if resolved.sync and not resolved.keys:
+        return [Finding(source.id, "SYNC_APPEND_ONLY", MEDIUM,
+                        f"{source.name}: kept in sync without key columns, so a changed row arrives as a second row instead of "
+                        "replacing the first. Choose key columns unless the table only ever gains rows.")]
+    return []
 
 
 class _Always(dict):

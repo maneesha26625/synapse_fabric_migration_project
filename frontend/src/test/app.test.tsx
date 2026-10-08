@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
@@ -96,6 +96,27 @@ describe("ready demo", () => {
     expect(link).toMatchObject({ status: "DEFERRED", step: "Needs credentials" });
     // The way forward names where credentials are entered: Plan, not the Connections page.
     expect(link.notes?.join(" ")).toMatch(/in Plan, Stages & credentials/);
+  });
+
+  it("loads a filtered table within its filter and registers a synced one with the sync pipeline", async () => {
+    resetDemo();
+    const graph = await mockApi.getDependencies();
+    const [tbl] = graph.nodes.filter((n) => n.type === "Table");
+    const filter = { column: "ModifiedAt", from: "2024-10-08", to: "", sync: true, changeColumn: "ModifiedAt", keys: [] };
+    await mockApi.startExecution([{ id: tbl.id, wave: tbl.wave }], {
+      scope: "automated", stopOnFailure: false, stages: ["data"], dataMode: "if_empty", dataRun: "run", collation: "match_synapse",
+      dataFilters: { [tbl.name.toLowerCase()]: filter },
+    });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(Date.now() + 10 * 60_000);
+      const done = (await mockApi.getExecution()).items.find((i) => i.type === "Table data")!;
+      expect(done.step).toMatch(/counts match within the filter/);
+      expect(done.notes?.join(" ")).toMatch(/Loads rows with ModifiedAt on or after 2024-10-08; kept in sync by ModifiedAt/);
+      expect(done.notes?.join(" ")).toMatch(/Sync pipeline 'sync_.*' created/);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("fails only a few objects on purpose, however large the plan, and Retry Failed clears them", async () => {
@@ -664,6 +685,19 @@ describe("plan step", () => {
     const sections = screen.getAllByText(/Credentials/, { selector: "summary span" });
     expect(sections).toHaveLength(2);
     for (const section of sections) await user.click(section);
+    // Nothing is chosen until the user picks; the options that pass no secret come first.
+    const method = screen.getByLabelText("How to sign in to synapse-demo-synapse-ws-TransportDW");
+    expect(method).toHaveValue("");
+    expect([...(method as HTMLSelectElement).options].slice(1, 4).map((o) => o.value)).toEqual(["workspaceIdentity", "basicKeyVault", "servicePrincipalKeyVault"]);
+    // Workspace identity asks for nothing and says what must be set up instead.
+    await user.selectOptions(method, "workspaceIdentity");
+    expect(screen.queryByLabelText("Password for synapse-demo-synapse-ws-TransportDW")).not.toBeInTheDocument();
+    expect(screen.getByText(/FROM EXTERNAL PROVIDER/)).toBeInTheDocument();
+    // Key Vault asks for a reference and a secret name: plain text, because neither is a secret.
+    await user.selectOptions(method, "basicKeyVault");
+    expect(screen.getByLabelText("Secret name for synapse-demo-synapse-ws-TransportDW")).toHaveAttribute("type", "text");
+    expect(screen.queryByLabelText("Password for synapse-demo-synapse-ws-TransportDW")).not.toBeInTheDocument();
+    await user.selectOptions(method, "basic");
     expect(await screen.findByLabelText("Password for synapse-demo-synapse-ws-TransportDW")).toHaveAttribute("type", "password");
     // Credentials: typed into a password field, kept out of localStorage and sessionStorage.
     const secret = (await screen.findAllByLabelText(/^Password for /))[0];
@@ -671,6 +705,45 @@ describe("plan step", () => {
     await user.type(secret, "S3CRET-NEVER-STORED");
     const kept = JSON.stringify({ ...localStorage }) + JSON.stringify({ ...sessionStorage });
     expect(kept).not.toContain("S3CRET-NEVER-STORED");
+    // Switching to another method blanks what was typed for the old one, so it is not sent along.
+    await user.selectOptions(method, "workspaceIdentity");
+    await user.selectOptions(method, "basic");
+    expect(screen.getByLabelText("Password for synapse-demo-synapse-ws-TransportDW")).toHaveValue("");
+  }, 30000);
+
+  it("sets a date filter per table, keeps a table in sync with a guessed change column, and keeps filters across a reload", async () => {
+    resetDemo();
+    await discovered();
+    const graph = await mockApi.getDependencies();
+    const tables = graph.nodes.filter((n) => n.type === "Table").slice(0, 2);
+    localStorage.setItem(PLAN, JSON.stringify(tables.map((n) => ({ id: n.id, wave: n.wave }))));
+    unlockTo("plan");
+    const user = userEvent.setup();
+    const first = go("/migration?step=plan");
+    await user.click(await screen.findByRole("tab", { name: "Stages & credentials" }, { timeout: 5000 }));
+    await user.click(await screen.findByText(/Date filters for table data/));
+    const name = tables[0].name;
+    const column = screen.getByLabelText(`Date column for ${name}`);
+    // Until a column is chosen the table loads every row and its dates are off.
+    expect(column).toHaveValue("");
+    expect(screen.getByLabelText(`From date for ${name}`)).toBeDisabled();
+    await user.selectOptions(column, "ModifiedAt");
+    // A column without dates is flagged before the run.
+    expect(screen.getByText("Give a start date, an end date or both.")).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText(`From date for ${name}`), { target: { value: "2024-10-08" } });
+    expect(screen.queryByText("Give a start date, an end date or both.")).not.toBeInTheDocument();
+    // Keeping it in sync turns the end date off and guesses the change column.
+    await user.click(screen.getByLabelText(`Keep ${name} in sync`));
+    expect(screen.getByLabelText(`Until date for ${name}`)).toBeDisabled();
+    expect(screen.getByLabelText(`Change column for ${name}`)).toHaveValue("ModifiedAt");
+    expect(screen.getByText(/1 of 2 tables filtered/)).toBeInTheDocument();
+    first.unmount();
+
+    go("/migration?step=plan");
+    await user.click(await screen.findByRole("tab", { name: "Stages & credentials" }, { timeout: 5000 }));
+    await user.click(await screen.findByText(/Date filters for table data/));
+    expect(screen.getByLabelText(`From date for ${name}`)).toHaveValue("2024-10-08");
+    expect(screen.getByLabelText(`Keep ${name} in sync`)).toBeChecked();
   }, 30000);
 
   it("keeps a project's stage options after a reload, including every stage off", async () => {

@@ -50,3 +50,5 @@ class Source:
     reason: Optional[str] = None
     #: Linked services only: the parameter values each pipeline activity or dataset that uses it passes.
     uses: Tuple[Dict[str, Any], ...] = ()
+    #: Table data only: the ``datafilter.DataFilter`` that limits which rows load, or None for every row.
+    data_filter: Any = None
