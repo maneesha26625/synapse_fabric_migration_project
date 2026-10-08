@@ -163,6 +163,9 @@ def test_the_sync_pipeline_reads_its_table_list_from_the_control_table():
     assert [a["type"] for a in (newest, copy, apply)] == ["Lookup", "Copy", "Script"]
     assert copy["dependsOn"][0]["activity"] == "Newest change" and apply["dependsOn"][0]["activity"] == "Copy changes"
     assert "item().watermark" in copy["typeProperties"]["source"]["sqlReaderQuery"]["value"]
+    # an empty scope gives '' (never NULL), and the run then keeps the last watermark
+    assert "if(empty(activity('Newest change').output.firstRow.wm), item().watermark" in apply["typeProperties"]["scripts"][0]["text"]["value"]
+    assert datafilter.watermark_sql(orders(), datafilter.resolve(orders(), SYNCED)).startswith("SELECT COALESCE(CONVERT(varchar(40), MAX([ModifiedAt]), 126), '') AS wm")
     assert copy["typeProperties"]["sink"]["datasetSettings"]["typeProperties"]["schema"] == datafilter.SYNC_SCHEMA
     assert apply["linkedService"]["properties"]["typeProperties"]["artifactId"] == "wh-1"
     body = datapipeline.sync_schedule_body(__import__("datetime").datetime(2026, 10, 8, 12, 0))
@@ -214,7 +217,7 @@ class FilteredSource:
 
             def execute(self, sql, *params):
                 db.seen.append(sql)
-                if sql.startswith("SELECT CONVERT"):
+                if sql.startswith("SELECT COALESCE(CONVERT"):
                     self._row = (db.watermark,)
                 else:
                     self._row = (db.counts.get(sql.split("FROM ")[1], 0),)
@@ -269,6 +272,24 @@ def test_a_synced_table_is_loaded_up_to_its_watermark_registered_and_given_the_s
     assert len(schedules) == 1 and schedules[0]["enabled"] is False
     assert any("Sync pipeline 'sync_pool01' created" in n for n in got.notes)
     assert any("Changed rows replace the Warehouse row with the same OrderId" in n for n in got.notes)
+
+
+def test_a_synced_table_is_not_loaded_while_the_sync_schedule_is_on():
+    db = SyncDb({ORDERS: []})
+    rest = PipelineRest(db, {ORDERS: rows(2)}, dataPipelines=[{"id": "pl-sync", "displayName": "sync_pool01"}])
+    rest.schedules["pl-sync"] = [{"enabled": True}]
+    run = load([item(SYNCED)], db, rest, FilteredSource({}))
+    got = by_id(run)["Orders#data"]
+    assert got.status == FAILED and "Switch the schedule off in Fabric" in got.error
+    assert not db.registered and not rest.runs
+    # switched off: the load goes ahead
+    db = SyncDb({ORDERS: []})
+    rest = PipelineRest(db, {ORDERS: rows(2)}, dataPipelines=[{"id": "pl-sync", "displayName": "sync_pool01"}])
+    rest.schedules["pl-sync"] = [{"enabled": False}]
+    bounded = (f"{ORDERS} WHERE [OrderDate] >= '2024-10-08' AND ([ModifiedAt] <= "
+               "CAST('2026-10-08T09:30:00.0000000' AS datetime2(7)) OR [ModifiedAt] IS NULL)")
+    run = load([item(SYNCED)], db, rest, FilteredSource({bounded: 2}))
+    assert by_id(run)["Orders#data"].status == COMPLETED and len(db.registered) == 1 and rest.runs
 
 
 def test_the_re_read_window_follows_the_stage_option():

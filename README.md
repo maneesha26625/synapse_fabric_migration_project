@@ -791,7 +791,9 @@ How a synced table is set up, by the Table data stage:
 Limits: rows deleted in Synapse stay in the Warehouse (hard deletes leave nothing
 to copy); a change column the source does not always update misses those
 changes; a table that already has rows is skipped and is not put in sync until
-it is reloaded with *Replace it*. Validate reports a synced table as in step
+it is reloaded with *Replace it*; a table kept in sync is not loaded while the
+sync pipeline's schedule is on (a sync during the load would lose or duplicate
+rows), so switch it off before a reload. Validate reports a synced table as in step
 when its count lies between "up to the last sync" and "everything in the filter
 now".
 

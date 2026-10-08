@@ -283,9 +283,14 @@ def count_sql(schema: str, name: str, predicates: List[str]) -> str:
 
 
 def watermark_sql(table: SqlTable, r: Resolved) -> str:
-    """The newest change in the scope, as ISO text (NULL when the scope is empty)."""
+    """The newest change in the scope, as ISO text, or '' when the scope is empty.
+
+    Never NULL: a pipeline Lookup may leave a NULL column out of its output, and the
+    sync pipeline's expression would then fail on a missing property instead of
+    falling back to the last watermark.
+    """
     assert r.change is not None
-    return (f"SELECT CONVERT(varchar(40), MAX({quote(r.change.name)}), 126) AS wm "
+    return (f"SELECT COALESCE(CONVERT(varchar(40), MAX({quote(r.change.name)}), 126), '') AS wm "
             f"FROM {qualified(table.key.schema, table.key.name)}{_where(scope_predicates(r))}")
 
 

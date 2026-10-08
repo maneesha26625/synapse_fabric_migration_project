@@ -173,7 +173,8 @@ def sync_name(warehouse: str) -> str:
 SYNC_TABLES_SQL = (f"SELECT table_name, staging_table, watermark, watermark_query, copy_query, apply_script "
                    f"FROM {datafilter.CONTROL} ORDER BY table_name")
 #: The newest change this run copies up to: Synapse's, or the last watermark when the scope is empty.
-_NEWEST = "coalesce(activity('Newest change').output.firstRow.wm, item().watermark)"
+_NEWEST = ("if(empty(activity('Newest change').output.firstRow.wm), item().watermark, "
+           "activity('Newest change').output.firstRow.wm)")
 
 
 def sync_definition(connection_id: str, warehouse: WarehouseTarget) -> Dict[str, Any]:

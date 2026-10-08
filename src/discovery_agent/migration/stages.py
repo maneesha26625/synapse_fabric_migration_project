@@ -178,6 +178,15 @@ class StageMixin:
             extra[s.id] = datafilter.notes(resolved)
             watermark: Optional[str] = None
             if resolved.sync and resolved.change is not None:
+                if self._sync_schedule_on():
+                    # A sync during this load would interleave with it: a reload's TRUNCATE would wipe rows the
+                    # sync had just applied (past the new watermark, so never copied again), and a first load
+                    # would duplicate the rows the sync re-reads.
+                    results[s.id] = (FAILED, "Switch off the sync schedule first", f"{run.warehouse}.{schema}.{name}", [
+                        f"The schedule of '{datapipeline.sync_name(run.warehouse)}' is on. Loading a table kept in sync while "
+                        "syncs can run would lose or duplicate rows. Switch the schedule off in Fabric, Retry Failed, then "
+                        "switch it back on once the load is done."])
+                    continue
                 if reader is None:
                     results[s.id] = (FAILED, "Needs the Synapse source to start syncing", f"{run.warehouse}.{schema}.{name}", [
                         f"Keeping a table in sync starts from the newest change in Synapse, which could not be read: {unverified}"])
@@ -264,6 +273,15 @@ class StageMixin:
         cursor.execute(datafilter.UNREGISTER_SQL, datafilter.table_key(schema, name))
         cursor.execute(datafilter.REGISTER_SQL, *datafilter.registration(source.payload, resolved, schema, name, watermark, overlap))
         self.run.log("SYNC", source.name, f"Registered for sync with watermark {watermark}")
+
+    def _sync_schedule_on(self) -> bool:
+        """Whether the Warehouse's sync pipeline exists and has a schedule switched on. Read once per pass."""
+        if "_sync_on" not in self.__dict__:
+            run = self.run
+            pipeline_id = self._find(self._ids("dataPipelines"), datapipeline.sync_name(run.warehouse))  # type: ignore[attr-defined]
+            schedules = self._client().list(f"/workspaces/{run.workspace_id}/items/{pipeline_id}/jobs/Pipeline/schedules") if pipeline_id else []  # type: ignore[attr-defined]
+            self.__dict__["_sync_on"] = any(s.get("enabled") for s in schedules)
+        return bool(self.__dict__["_sync_on"])
 
     def _sync_pipeline(self, connection_id: str, warehouse: Any) -> str:
         """The Warehouse's sync pipeline, created once with a daily schedule switched off. A note on where it stands."""
