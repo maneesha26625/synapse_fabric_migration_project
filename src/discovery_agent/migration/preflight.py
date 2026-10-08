@@ -144,9 +144,11 @@ def _schedule(source: Source) -> List[Finding]:
     return []
 
 
-def _connection(source: Source, names: Set[str]) -> List[Finding]:
+def _connection(source: Source, names: Set[str], pool: str = "") -> List[Finding]:
     plan = fabric_connections.parse(source.payload or {})
     if plan.unsupported:
+        if source.uses and all(pipelines.points_at_pool(source.payload or {}, pool, use) for use in source.uses):
+            return []  # every use is the migrated pool: the run replaces it with the Warehouse
         return [Finding(source.id, "CONNECTION_BY_HAND", MEDIUM, f"{source.name}: {plan.unsupported}")]
     if source.name not in names:
         return [Finding(source.id, "NEEDS_CREDENTIALS", MEDIUM,
@@ -158,13 +160,13 @@ _CHECKS = {TABLE: _table, VIEW: _module, PROCEDURE: _module, NOTEBOOK: _notebook
            DATA: _data, PIPELINE: _pipeline, SPARKJOB: _sparkjob, SCRIPT: _script, SCHEDULE: _schedule}
 
 
-def content_findings(sources: Sequence[Source], credential_names: Optional[Set[str]] = None) -> List[Finding]:
-    """Findings for every object whose own content predicts trouble."""
+def content_findings(sources: Sequence[Source], credential_names: Optional[Set[str]] = None, pool: str = "") -> List[Finding]:
+    """Findings for every object whose own content predicts trouble. ``pool`` is the SQL pool being migrated."""
     names = credential_names or set()
     out: List[Finding] = []
     for source in sources:
         if source.kind == CONNECTION:
-            out.extend(_connection(source, names))
+            out.extend(_connection(source, names, pool))
             continue
         check = _CHECKS.get(source.kind)
         if check is not None:

@@ -7,7 +7,7 @@ the runner that imports the stage (which would be a cycle).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Dict, Optional, Tuple
 
 # -- kinds: what the runner does with a plan item --------------------------------
 NOTEBOOK, TABLE, VIEW, PROCEDURE, DEFERRED, MISSING = "notebook", "table", "view", "procedure", "deferred", "missing"
@@ -48,3 +48,5 @@ class Source:
     schema: Optional[str] = None
     object_name: Optional[str] = None
     reason: Optional[str] = None
+    #: Linked services only: the parameter values each pipeline activity or dataset that uses it passes.
+    uses: Tuple[Dict[str, Any], ...] = ()

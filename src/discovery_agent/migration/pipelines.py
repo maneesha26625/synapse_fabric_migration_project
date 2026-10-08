@@ -128,20 +128,24 @@ def _bind_ls_parameters(text: str, ls: Mapping[str, Any], passed: Optional[Mappi
 
 
 def _is_pool_service(ls: Mapping[str, Any], ctx: Context, passed: Optional[Mapping[str, Any]] = None) -> bool:
-    """A linked service that points at the dedicated pool being migrated.
+    return points_at_pool(ls, ctx.pool_name, passed)
 
-    ``passed`` are the parameters the referring activity gives the linked service,
-    which settle a database written as ``@{linkedService().DBName}``.
+
+def points_at_pool(ls: Mapping[str, Any], pool_name: str, passed: Optional[Mapping[str, Any]] = None) -> bool:
+    """Whether a linked service points at the dedicated pool being migrated.
+
+    ``passed`` are the parameters the referring activity or dataset gives the
+    linked service, which settle a database written as ``@{linkedService().DBName}``.
     """
     props = ls.get("properties") or {}
-    if props.get("type") not in _SQL_LS | {"AzureSqlDatabase"} or not ctx.pool_name:
+    if props.get("type") not in _SQL_LS | {"AzureSqlDatabase"} or not pool_name:
         return False
     tp = props.get("typeProperties") or {}
     cs = str(tp.get("connectionString") or "") if isinstance(tp.get("connectionString"), str) else ""
     database = tp.get("database") if isinstance(tp.get("database"), str) else ""
     m = re.search(r"(?:initial catalog|database)\s*=\s*([^;]+)", cs, re.I)
     database = _bind_ls_parameters(database or (m.group(1).strip() if m else ""), ls, passed)
-    return database.lower() == ctx.pool_name.lower()
+    return database.lower() == pool_name.lower()
 
 
 def _warehouse_ref(ctx: Context) -> Dict[str, Any]:
@@ -149,6 +153,17 @@ def _warehouse_ref(ctx: Context) -> Dict[str, Any]:
     assert w is not None
     return {"name": w.name, "properties": {"type": "DataWarehouse", "annotations": [],
             "typeProperties": {"endpoint": w.endpoint, "artifactId": w.artifact_id, "workspaceId": ctx.workspace_id}}}
+
+
+def dataset_linked_service_values(ds: Mapping[str, Any], ref: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    """The parameter values a dataset passes its linked service, ``@dataset().x`` filled from ``ref``.
+
+    A value the reference does not settle stays an expression, which never
+    matches a database name.
+    """
+    ls_ref = (ds.get("properties") or {}).get("linkedServiceName") or {}
+    values = dict(ls_ref.get("parameters") or {})
+    return _substitute(values, dict((ref or {}).get("parameters") or {})) if values else {}
 
 
 def dataset_settings(ref: Mapping[str, Any], ctx: Context, out: Converted) -> Tuple[Optional[Dict[str, Any]], bool]:
@@ -162,19 +177,20 @@ def dataset_settings(ref: Mapping[str, Any], ctx: Context, out: Converted) -> Tu
     params = {k: v for k, v in (ref.get("parameters") or {}).items()}
     ls_name = str((props.get("linkedServiceName") or {}).get("referenceName") or "")
     ls = ctx.linked_services.get(ls_name)
-    ls_values = (props.get("linkedServiceName") or {}).get("parameters") or {}
-    if ls_values:
-        out.notes.append(f"Dataset {name} passes {', '.join(sorted(ls_values))} to linked service {ls_name}; Fabric connections take no "
-                         f"parameters, so it uses the single connection '{ls_name}'. Check it points at the right place.")
+    # What the dataset gives its linked service, with its own parameters filled in by this reference.
+    ls_values = dataset_linked_service_values(ds, ref)
     typeprops = _substitute(copy.deepcopy(props.get("typeProperties") or {}), params)
     schema = props.get("schema") or []
-    if ls is not None and ctx.warehouse is not None and _is_pool_service(ls, ctx):
+    if ls is not None and ctx.warehouse is not None and _is_pool_service(ls, ctx, ls_values):
         table = typeprops.get("table") or typeprops.get("tableName")
         settings = {"annotations": [], "type": "DataWarehouseTable", "schema": schema,
                     "typeProperties": {k: v for k, v in {"schema": typeprops.get("schema"), "table": table}.items() if v},
                     "linkedService": _warehouse_ref(ctx)}
         out.notes.append(f"Dataset {name} now reads and writes the migrated Warehouse '{ctx.warehouse.name}', not the Synapse pool.")
         return settings, True
+    if ls_values:
+        out.notes.append(f"Dataset {name} passes {', '.join(sorted(ls_values))} to linked service {ls_name}; Fabric connections take no "
+                         f"parameters, so it uses the single connection '{ls_name}'. Check it points at the right place.")
     connection = ctx.connections.get(ls_name)
     if not connection:
         out.missing.append(f"connection {ls_name or '(none)'}")
@@ -312,9 +328,10 @@ def _script(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, A
     result = _base(act)
     result["type"] = "Script"
     result["typeProperties"] = copy.deepcopy(act.get("typeProperties") or {})
-    ls_name = str((act.get("linkedServiceName") or {}).get("referenceName") or "")
+    ref = act.get("linkedServiceName") or {}
+    ls_name = str(ref.get("referenceName") or "")
     ls = ctx.linked_services.get(ls_name)
-    if ls is not None and ctx.warehouse is not None and _is_pool_service(ls, ctx):
+    if ls is not None and ctx.warehouse is not None and _is_pool_service(ls, ctx, ref.get("parameters")):
         result["linkedService"] = _warehouse_ref(ctx)
     elif ctx.connections.get(ls_name):
         result["externalReferences"] = {"connection": ctx.connections[ls_name]}

@@ -546,6 +546,55 @@ def test_a_linked_stored_procedure_elsewhere_needs_that_connection():
     assert not linked.missing and act["externalReferences"] == {"connection": "conn-sql"} and "linkedService" not in act
 
 
+DS_ON_DEFAULT = {"name": "DS_SQL_Fact", "properties": {
+    "type": "AzureSqlDWTable", "parameters": {"db": {"type": "String"}},
+    "linkedServiceName": {"referenceName": "ws-WorkspaceDefaultSqlServer", "type": "LinkedServiceReference", "parameters": {"DBName": "@dataset().db"}},
+    "typeProperties": {"schema": "dw", "table": "FactCabTrip"}, "schema": []}}
+
+
+def _lookup_on(db: object) -> dict:
+    return {"properties": {"activities": [{"name": "Count", "type": "Lookup", "typeProperties": {
+        "source": {"type": "SqlDWSource"},
+        "dataset": {"referenceName": "DS_SQL_Fact", "type": "DatasetReference", "parameters": {"db": db}}}}]}}
+
+
+def test_a_dataset_on_the_default_sql_server_given_the_pool_reads_the_warehouse():
+    ctx = context(datasets={"DS_SQL_Fact": DS_ON_DEFAULT}, linked_services={"ws-WorkspaceDefaultSqlServer": DEFAULT_SQL_LS})
+    out = pipelines.convert(_lookup_on("pool01"), ctx)
+    assert not out.missing
+    tp = out.definition["properties"]["activities"][0]["typeProperties"]
+    assert tp["datasetSettings"]["type"] == "DataWarehouseTable" and tp["source"]["type"] == "DataWarehouseSource"
+    assert tp["datasetSettings"]["typeProperties"] == {"schema": "dw", "table": "FactCabTrip"}
+    # Another database still needs that connection.
+    assert pipelines.convert(_lookup_on("otherdb"), ctx).missing == ["connection ws-WorkspaceDefaultSqlServer"]
+
+
+def test_a_parameterised_linked_service_every_pipeline_points_at_the_pool_is_replaced_by_the_warehouse():
+    used_on_pool = Source("ls", "ws-WorkspaceDefaultSqlServer", "Linked Service", 2, CONNECTION, payload=DEFAULT_SQL_LS,
+                          uses=({"DBName": "pool01"}, {"DBName": "pool01"}))
+    run, rest, _ = migrate([used_on_pool])
+    assert one(run).status == COMPLETED and one(run).step == "Replaced by the migrated Warehouse" and not rest.created
+    # One use elsewhere, or none at all, leaves it for a person.
+    for uses in (({"DBName": "pool01"}, {"DBName": "otherdb"}), ()):
+        run, _, _ = migrate([Source("ls", "ws-WorkspaceDefaultSqlServer", "Linked Service", 2, CONNECTION, payload=DEFAULT_SQL_LS, uses=uses)])
+        assert one(run).status == DEFERRED_STATUS and one(run).step == "Create it in Fabric by hand"
+    # The plan's checks agree: no "create it by hand" risk for the replaced one.
+    from discovery_agent.migration.preflight import content_findings
+    assert content_findings([used_on_pool], pool="pool01") == []
+    assert [f.code for f in content_findings([used_on_pool], pool="")] == ["CONNECTION_BY_HAND"]
+
+
+def test_the_values_pipelines_pass_a_linked_service_are_collected_per_use():
+    from discovery_agent.api.migration import linked_service_uses
+    from discovery_agent.source_strategy import P0Artifact
+
+    artifacts = {P0Artifact.DATASET: {"DS_SQL_Fact": DS_ON_DEFAULT},
+                 P0Artifact.PIPELINE: {"a": _linked_proc("pool01"), "b": _lookup_on("pool01"), "c": _lookup_on({"value": "@pipeline().parameters.db", "type": "Expression"})}}
+    uses = linked_service_uses("ws-WorkspaceDefaultSqlServer", artifacts)
+    assert {"DBName": "pool01"} in uses and len(uses) == 3
+    assert [pipelines.points_at_pool(DEFAULT_SQL_LS, "pool01", u) for u in uses].count(True) == 2
+
+
 def test_a_pipeline_reports_missing_dependencies_and_activities_it_cannot_convert():
     out = pipelines.convert(PIPELINE_RES, context(connections={}, notebooks={}, pipelines={}))
     assert {"connection ls_adls", "notebook LoadSales", "pipeline pl_child"} <= set(out.missing)

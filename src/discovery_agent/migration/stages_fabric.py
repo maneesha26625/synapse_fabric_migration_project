@@ -68,6 +68,12 @@ class FabricStageMixin:
         self._need_definition(source, "linked service")
         plan = fabric_connections.parse(source.payload or {})
         if plan.unsupported:
+            pool = getattr(self.run, "pool_name", "") or ""
+            if source.uses and all(pipelines.points_at_pool(source.payload or {}, pool, use) for use in source.uses):
+                # Every pipeline points it at the pool being migrated, and those now use the Warehouse instead.
+                return COMPLETED, "Replaced by the migrated Warehouse", self.run.warehouse, [
+                    f"Every pipeline uses '{plan.name}' to reach the SQL pool '{pool}', which is now the Fabric Warehouse "
+                    f"'{self.run.warehouse}'. The pipelines were pointed at the Warehouse, so no Fabric connection is needed."]
             return DEFERRED_STATUS, "Create it in Fabric by hand", None, [plan.unsupported]
         if self._connections().get(plan.name):
             return SKIPPED, "A connection with this name already exists; left unchanged", plan.name, plan.notes

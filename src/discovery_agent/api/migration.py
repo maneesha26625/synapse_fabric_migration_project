@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import threading
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from discovery_agent.api.fabric import FabricTarget
 from discovery_agent.api.service import ApiError, Session
@@ -203,6 +203,36 @@ def pipeline_bundle(resource: dict, artifacts: Dict[P0Artifact, Dict[str, dict]]
     return {"resource": resource, "datasets": datasets, "linkedServices": services}
 
 
+def linked_service_uses(name: str, artifacts: Dict[P0Artifact, Dict[str, dict]]) -> Tuple[Dict[str, Any], ...]:
+    """The parameter values every pipeline gives linked service ``name``, one entry per use.
+
+    A use is an activity that names it, or a pipeline's reference to a dataset
+    on it, with the dataset's ``@dataset()`` values filled in by that reference.
+    """
+    datasets = artifacts.get(P0Artifact.DATASET, {})
+    uses: List[Dict[str, Any]] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            ref = node.get("linkedServiceName")
+            if isinstance(ref, dict) and ref.get("referenceName") == name:
+                uses.append(dict(ref.get("parameters") or {}))
+            if node.get("type") == "DatasetReference":
+                ds = datasets.get(str(node.get("referenceName") or ""))
+                ds_ref = ((ds or {}).get("properties") or {}).get("linkedServiceName") or {}
+                if ds is not None and ds_ref.get("referenceName") == name:
+                    uses.append(pipelines.dataset_linked_service_values(ds, node))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value)
+
+    for resource in artifacts.get(P0Artifact.PIPELINE, {}).values():
+        walk(resource)
+    return tuple(uses)
+
+
 def sources_for(plan: List[dict], job: Any, pool: Optional[str]) -> List[Source]:
     """Turn plan entries into what the runner needs, from the finished discovery."""
     rows = {item["id"]: item for item in job.items}
@@ -261,7 +291,8 @@ def sources_for(plan: List[dict], job: Any, pool: Optional[str]) -> List[Source]
             resource = by_kind[kind].get(record.identity.name)
             if kind == PIPELINE and resource is not None:
                 resource = pipeline_bundle(resource, artifacts)
-            sources.append(Source(oid, record.identity.name, object_type, wave, kind, payload=resource))
+            uses = linked_service_uses(record.identity.name, artifacts) if kind == CONNECTION else ()
+            sources.append(Source(oid, record.identity.name, object_type, wave, kind, payload=resource, uses=uses))
             continue
         content = record.content
         key = getattr(content, "key", None)
@@ -342,7 +373,7 @@ class MigrationService:
         checks = environment_checks(self._fabric.state(), sql_driver(),
                                     source_connected=self._source_available() if needs_source else None)
         names = set(credentials) | set(self._credentials)
-        result = planning.analyze(objects, content_findings(sources, names), checks)
+        result = planning.analyze(objects, content_findings(sources, names, pool or ""), checks)
         result["options"] = options
         if body.get("record"):
             with self._lock:
