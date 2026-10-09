@@ -1,7 +1,7 @@
-import { AppWindow, CheckCircle2, CircleSlash, FileArchive, GitBranch, SquareTerminal, XCircle } from "lucide-react";
-import { Fragment, useEffect, useState, type ReactNode } from "react";
+import { AppWindow, CheckCircle2, CircleSlash, FileArchive, FileJson, GitBranch, SquareTerminal, X, XCircle } from "lucide-react";
+import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import { useAppState } from "../../state/AppState";
-import type { AuthMethod, ConnectionConfig, ConnectionState } from "../../types";
+import type { AuthMethod, ConnectionConfig, ConnectionState, RepositoryConfig, RepositoryKind, ZipUpload } from "../../types";
 import { Banner, Button, SelectField, TextField, ConfirmDialog } from "../shared/Shared";
 import { MethodTiles, MiniSteps, type MethodOption } from "./MethodTiles";
 
@@ -12,12 +12,17 @@ type SourceMethod = AuthMethod | "zip" | "git";
 const METHODS: MethodOption<SourceMethod>[] = [
   { id: "azure_cli", title: "Azure CLI", desc: "Sign in with your Azure account in a browser window", icon: SquareTerminal },
   { id: "interactive_browser", title: "Interactive browser", desc: "A Microsoft sign-in for the tenant you name; your Azure CLI session is untouched", icon: AppWindow },
-  { id: "zip", title: "Workspace export (ZIP)", desc: "Upload an exported Synapse workspace", icon: FileArchive, soon: true },
-  { id: "git", title: "Git repository", desc: "Read the workspace from its Git repository", icon: GitBranch, soon: true },
+  { id: "zip", title: "Workspace export (ZIP)", desc: "Upload one environment's exported repository folder as a ZIP", icon: FileArchive },
+  { id: "git", title: "Git repository", desc: "Read one environment's branch of the workspace's Git repository", icon: GitBranch },
 ];
 const METHOD_LABEL: Record<AuthMethod, string> = { azure_cli: "Azure CLI", interactive_browser: "Interactive browser" };
+const isRepository = (m: string | undefined): m is RepositoryKind => m === "git" || m === "zip";
+const methodLabel = (m: ConnectionState["method"]) => (m === "azure_cli" || m === "interactive_browser" ? METHOD_LABEL[m] : "—");
 
 /* ---- Form state ------------------------------------------------------------------ */
+
+/** The Azure sign-in method behind a connection; a repository source signs in to Azure only for its SQL pool. */
+const authOf = (m: ConnectionState["method"]): AuthMethod => (m === "interactive_browser" ? "interactive_browser" : "azure_cli");
 
 const GUID = /^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$/;
 const EMPTY: ConnectionConfig = {
@@ -32,7 +37,7 @@ let remembered: ConnectionConfig | null = null;
 export function configFromConnection(c: ConnectionState): ConnectionConfig {
   return {
     ...EMPTY,
-    method: c.method ?? "azure_cli",
+    method: authOf(c.method),
     tenantId: c.tenantId ?? "",
     subscriptionId: c.subscriptionId ?? "",
     resourceGroup: c.resourceGroup ?? "",
@@ -165,6 +170,148 @@ export function SummaryList({ rows }: { rows: [string, ReactNode][] }) {
   );
 }
 
+/* ---- Repository sources: Git, or a ZIP of the repository ---------------------------- */
+
+const ENVIRONMENTS = ["Dev", "Test", "Prod", "Other"];
+
+interface RepoForm {
+  url: string;
+  ref: string;
+  rootFolder: string;
+  environment: string;
+  customEnvironment: string;
+  /** The environment's parameters file: its text and name, held in memory only. */
+  parameters: string;
+  parametersName: string;
+  upload: ZipUpload | null;
+  withPool: boolean;
+}
+const EMPTY_REPO: RepoForm = { url: "", ref: "", rootFolder: "", environment: "", customEnvironment: "", parameters: "", parametersName: "", upload: null, withPool: false };
+// Like the Azure form: kept in memory so it survives navigation, never in browser storage.
+let rememberedRepo: RepoForm = EMPTY_REPO;
+let lastRepositoryRequest: RepositoryConfig | null = null;
+
+type RepoErrors = Partial<Record<"url" | "upload" | "environment" | "parameters" | "pool", string>>;
+
+function environmentOf(f: RepoForm): string {
+  return f.environment === "Other" ? f.customEnvironment.trim() : f.environment;
+}
+
+function validateRepo(kind: RepositoryKind, f: RepoForm, config: ConnectionConfig, signedIn: boolean): RepoErrors {
+  const e: RepoErrors = {};
+  if (kind === "git") {
+    const url = f.url.trim();
+    if (!url) e.url = "Repository URL is required.";
+    else if (!/^(https:\/\/|ssh:\/\/|git@)/.test(url)) e.url = "Use the repository's HTTPS or SSH URL.";
+    else if (/^https:\/\/[^/@]+@/.test(url)) e.url = "Leave credentials out of the URL: git on this machine signs in with your own credential helper or SSH key.";
+  } else if (!f.upload) {
+    e.upload = "Choose the ZIP to upload.";
+  }
+  if (!environmentOf(f)) e.environment = f.environment === "Other" ? "Name the environment." : "Choose the environment.";
+  if (f.withPool && !(signedIn && config.resourceGroup && config.workspace && config.sqlPool)) {
+    e.pool = signedIn ? "Choose the resource group, workspace and SQL pool, or switch the SQL pool off." : "Sign in to Azure to add the SQL pool, or switch it off.";
+  }
+  return e;
+}
+
+function readText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(new Error("The file could not be read."));
+    reader.readAsText(file);
+  });
+}
+
+/** A file chooser with the chosen file's name and a way to clear it. */
+function FilePick({ label, accept, fileName, busy, onPick, onClear, hint, error, icon }: {
+  label: string; accept: string; fileName: string; busy?: boolean; onPick: (f: File) => void; onClear?: () => void; hint?: ReactNode; error?: string; icon: ReactNode;
+}) {
+  const input = useRef<HTMLInputElement>(null);
+  return (
+    <div className="field full">
+      <span className="field-label">{label}</span>
+      <div className="row" style={{ gap: 8 }}>
+        <Button size="small" onClick={() => input.current?.click()} loading={busy}>{icon}{fileName ? "Choose another file" : "Choose file"}</Button>
+        {fileName && <span className="file-chip">{fileName}{onClear && <button type="button" className="file-clear" aria-label={`Remove ${fileName}`} onClick={onClear}><X size={13} /></button>}</span>}
+        <input ref={input} type="file" accept={accept} hidden aria-label={label}
+          onChange={(e) => { const f = e.target.files?.[0]; e.target.value = ""; if (f) onPick(f); }} />
+      </div>
+      {hint && !error && <span className="hint">{hint}</span>}
+      {error && <span className="err">{error}</span>}
+    </div>
+  );
+}
+
+function RepositoryFields({ kind, form, setForm, errors, uploadError, uploading, onUpload }: {
+  kind: RepositoryKind; form: RepoForm; setForm: (p: Partial<RepoForm>) => void; errors: RepoErrors;
+  uploadError: string | null; uploading: boolean; onUpload: (f: File) => void;
+}) {
+  const [paramError, setParamError] = useState<string | null>(null);
+  const pickParameters = async (file: File) => {
+    setParamError(null);
+    try {
+      const text = await readText(file);
+      JSON.parse(text);
+      setForm({ parameters: text, parametersName: file.name });
+    } catch {
+      setParamError("That file is not valid JSON. Choose the environment's ARM parameters file.");
+    }
+  };
+  const found = form.upload ? Object.values(form.upload.counts).reduce((a, b) => a + b, 0) : 0;
+  return (
+    <div className="form-grid">
+      {kind === "git" ? (
+        <>
+          <TextField full label="Repository URL" value={form.url} onChange={(e) => setForm({ url: e.target.value })} error={errors.url}
+            placeholder="https://github.com/contoso/synapse-workspace.git"
+            hint="Cloned by git on this machine with your own credentials (credential helper or SSH key). No token is entered here." />
+          <TextField label="Branch" optional value={form.ref} onChange={(e) => setForm({ ref: e.target.value })} placeholder="main"
+            hint="This environment's branch, e.g. main for Dev or a release branch. Empty: the default branch." />
+          <TextField label="Root folder" optional value={form.rootFolder} onChange={(e) => setForm({ rootFolder: e.target.value })} placeholder="synapse"
+            hint="The root folder in the workspace's Git settings. Empty: found automatically." />
+        </>
+      ) : (
+        <>
+          <FilePick label="Workspace export (ZIP)" accept=".zip,application/zip" fileName={form.upload?.fileName ?? ""} busy={uploading} onPick={onUpload}
+            icon={<FileArchive size={14} aria-hidden="true" />} error={uploadError ?? errors.upload}
+            hint={form.upload
+              ? (form.upload.rootFolder !== null ? `${found.toLocaleString()} definitions found${form.upload.rootFolder ? ` in ${form.upload.rootFolder}/` : ""}.` : form.upload.note ?? "No Synapse folders found yet: name the root folder.")
+              : "A ZIP of the workspace's Git repository (for example the branch downloaded from GitHub or Azure DevOps). Up to 200 MB."} />
+          <TextField label="Root folder" optional value={form.rootFolder} onChange={(e) => setForm({ rootFolder: e.target.value })}
+            placeholder={form.upload?.rootFolder || "synapse"} hint="Where the definitions are inside the ZIP. Empty: found automatically." />
+        </>
+      )}
+      <SelectField label="Environment" value={form.environment} onChange={(v) => setForm({ environment: v })} options={ENVIRONMENTS} placeholder="Choose the environment" error={errors.environment}
+        hint="Which environment these definitions are for. Shown with the connection and in the report." />
+      {form.environment === "Other" && (
+        <TextField label="Environment name" value={form.customEnvironment} onChange={(e) => setForm({ customEnvironment: e.target.value })} placeholder="UAT" />
+      )}
+      <FilePick label="Environment parameters (optional)" accept=".json,application/json" fileName={form.parametersName}
+        onPick={(f) => void pickParameters(f)} onClear={() => setForm({ parameters: "", parametersName: "" })} icon={<FileJson size={14} aria-hidden="true" />}
+        error={paramError ?? errors.parameters}
+        hint="The environment's ARM parameters file, such as TemplateParametersForWorkspace.json or a Test/Prod copy. Its linked-service values (servers, URLs) replace the ones committed in the repository, so migrated connections point at this environment. Without it, the committed values are used." />
+    </div>
+  );
+}
+
+function RepositorySummary({ connection }: { connection: ConnectionState }) {
+  const r = connection.repository!;
+  return (
+    <SummaryList rows={[
+      ["Source", r.kind === "git" ? "Git repository" : "Workspace export (ZIP)"],
+      [r.kind === "git" ? "Repository" : "File", <strong key="l">{r.label}</strong>],
+      ...(r.kind === "git" ? [["Branch", `${r.ref ?? "default"}${r.commit ? ` · ${r.commit.slice(0, 7)}` : ""}`] as [string, ReactNode]] : []),
+      ["Root folder", r.rootFolder ? `${r.rootFolder}/` : "Top level"],
+      ["Environment", <strong key="e">{r.environment}</strong>],
+      ["Parameters", r.parametersName ? `${r.parametersName} · ${r.applied.length} value${r.applied.length === 1 ? "" : "s"} applied${r.unmatched.length ? `, ${r.unmatched.length} not matched` : ""}` : "None: values as committed"],
+      ["Definitions", `${r.artifacts.toLocaleString()} in ${Object.keys(r.counts).length} folders`],
+      ["Dedicated SQL pool", connection.sqlPool ? `${connection.sqlPool} (${connection.workspace})` : "Not added: tables, views, procedures and data are skipped"],
+      ["Last connected", connection.testedAt ? new Date(connection.testedAt).toLocaleString() : "—"],
+    ]} />
+  );
+}
+
 /* ---- The source panel ---------------------------------------------------------------- */
 
 /** Connect Azure Synapse: choose how to sign in, sign in, choose the workspace, test. */
@@ -175,6 +322,16 @@ export function SourceConnectionPanel() {
   const [errors, setErrors] = useState<Errors>({});
   const [changing, setChanging] = useState(false);
   const [confirmSignOut, setConfirmSignOut] = useState(false);
+  // Where the definitions come from: an Azure sign-in method (the live workspace), or a repository.
+  const [source, setSource] = useState<SourceMethod>(() => (isRepository(app.connection.sourceKind) ? app.connection.sourceKind : config.method));
+  const [repo, setRepoState] = useState<RepoForm>(rememberedRepo);
+  const [repoErrors, setRepoErrors] = useState<RepoErrors>({});
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const setRepo = (patch: Partial<RepoForm>) => {
+    setRepoState((f) => { const next = { ...f, ...patch }; rememberedRepo = next; return next; });
+    setRepoErrors({});
+  };
   const discovered = app.discovery.state === "completed" || app.discovery.state === "completed_with_warnings";
   const signOut = () => { setChanging(false); setConfirmSignOut(false); void app.disconnect(); };
 
@@ -191,7 +348,7 @@ export function SourceConnectionPanel() {
   // invalidates the dropdowns until the operator signs in again.
   const signedInHere =
     !!connection.signedIn &&
-    connection.method === config.method &&
+    (connection.signInMethod ?? connection.method) === config.method &&
     !!connection.subscriptionId &&
     connection.subscriptionId.toLowerCase() === config.subscriptionId.trim().toLowerCase();
 
@@ -203,15 +360,46 @@ export function SourceConnectionPanel() {
   // After a reload the backend may still hold a sign-in; pick it back up.
   useEffect(() => {
     if (connection.signedIn && connection.subscriptionId && !config.subscriptionId) {
-      set({ subscriptionId: connection.subscriptionId, method: connection.method ?? "azure_cli", tenantId: connection.tenantId ?? "" });
+      set({ subscriptionId: connection.subscriptionId, method: authOf(connection.method), tenantId: connection.tenantId ?? "" });
     }
   }, [connection.signedIn, connection.subscriptionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const selectMethod = (method: SourceMethod) => {
-    if (method === "zip" || method === "git") return;
     setErrors({});
+    setRepoErrors({});
     app.clearConnectionError();
+    setSource(method);
+    if (isRepository(method)) return;
     setConfig((c) => ({ ...c, method, resourceGroup: "", workspace: "", sqlPool: "" }));
+  };
+
+  const upload = async (file: File) => {
+    setUploading(true);
+    setUploadError(null);
+    try {
+      const found = await app.uploadZip(file);
+      setRepo({ upload: found, rootFolder: found.rootFolder ?? "" });
+    } catch (e) {
+      setUploadError(e instanceof Error ? e.message : "The ZIP could not be uploaded.");
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const connectRepository = async (kind: RepositoryKind) => {
+    const found = validateRepo(kind, repo, config, signedInHere);
+    setRepoErrors(found);
+    if (Object.keys(found).length) return;
+    const request: RepositoryConfig = {
+      kind, environment: environmentOf(repo), rootFolder: repo.rootFolder.trim() || undefined,
+      ...(kind === "git" ? { repositoryUrl: repo.url.trim(), ref: repo.ref.trim() || undefined } : { uploadId: repo.upload!.uploadId, fileName: repo.upload!.fileName }),
+      ...(repo.parameters ? { parameters: repo.parameters, parametersName: repo.parametersName } : {}),
+      ...(repo.withPool ? { resourceGroup: config.resourceGroup, workspace: config.workspace, sqlPool: config.sqlPool } : {}),
+    };
+    lastRepositoryRequest = request;
+    remembered = config;
+    await app.connectRepository(request);
+    setChanging(false);
   };
 
   const submit = async (action: "authenticate" | "test") => {
@@ -223,6 +411,27 @@ export function SourceConnectionPanel() {
     if (action === "test") setChanging(false);
   };
 
+  if (connected && !changing && connection.repository) {
+    return (
+      <div className="stack conn-body">
+        <RepositorySummary connection={connection} />
+        <CheckFold checks={connection.checks} label="Source connection checks" />
+        <div className="row conn-actions">
+          {lastRepositoryRequest && <Button size="small" onClick={() => void app.connectRepository(lastRepositoryRequest!)} loading={connectionBusy === "test"}>Connect again</Button>}
+          <Button size="small" onClick={() => { setSource(connection.repository!.kind); setChanging(true); }}>Change</Button>
+          <Button size="small" variant="ghost" onClick={() => (discovered ? setConfirmSignOut(true) : signOut())} disabled={busy || app.discovery.state === "running"}
+            title={app.discovery.state === "running" ? "Discovery is running; wait for it to finish" : undefined}>Disconnect</Button>
+        </div>
+        {confirmSignOut && (
+          <ConfirmDialog title="Disconnect the repository?" confirmLabel="Disconnect" onConfirm={signOut} onCancel={() => setConfirmSignOut(false)}>
+            <p>The accelerator stops using {connection.repository.label} ({connection.repository.environment}). The repository itself is not changed.</p>
+            <p>The discovered inventory ({(app.discovery.summary?.total ?? 0).toLocaleString()} objects) is cleared as well, so discovery runs again after you reconnect. Your plan, its options and the record of a migration run are kept.</p>
+          </ConfirmDialog>
+        )}
+      </div>
+    );
+  }
+
   if (connected && !changing) {
     return (
       <div className="stack conn-body">
@@ -231,7 +440,7 @@ export function SourceConnectionPanel() {
           ["Resource group", connection.resourceGroup],
           ["Subscription", connection.subscriptionName ?? connection.subscriptionId],
           ["Dedicated SQL pool", connection.sqlPool || "Not configured"],
-          ["Signed in with", connection.method ? METHOD_LABEL[connection.method] : "—"],
+          ["Signed in with", methodLabel(connection.method)],
           ["Last tested", connection.testedAt ? new Date(connection.testedAt).toLocaleString() : "—"],
         ]} />
         <CheckFold checks={connection.checks} label="Source connection checks" />
@@ -251,10 +460,65 @@ export function SourceConnectionPanel() {
     );
   }
 
+  if (isRepository(source)) {
+    const signInFields = config.method === "interactive_browser" ? (
+      <>
+        <TextField label="Tenant ID" value={config.tenantId} onChange={(e) => set({ tenantId: e.target.value })} error={errors.tenantId} placeholder="00000000-0000-0000-0000-000000000000" />
+        <TextField label="Subscription ID" value={config.subscriptionId} onChange={(e) => set({ subscriptionId: e.target.value })} error={errors.subscriptionId} placeholder="00000000-0000-0000-0000-000000000000" />
+      </>
+    ) : (
+      <>
+        <TextField label="Subscription ID" value={config.subscriptionId} onChange={(e) => set({ subscriptionId: e.target.value })} error={errors.subscriptionId} placeholder="00000000-0000-0000-0000-000000000000" />
+        <TextField label="Tenant ID" optional value={config.tenantId} onChange={(e) => set({ tenantId: e.target.value })} error={errors.tenantId} />
+      </>
+    );
+    return (
+      <div className="stack conn-body">
+        <MethodTiles label="How to connect to Azure Synapse" options={METHODS} value={source} onChange={selectMethod} disabled={busy || uploading} />
+        <MiniSteps steps={[source === "git" ? "Repository" : "Upload", "Environment", "Connect"]} current={(source === "git" ? repo.url.trim() : repo.upload) ? (environmentOf(repo) ? 2 : 1) : 0} />
+
+        <RepositoryFields kind={source} form={repo} setForm={setRepo} errors={repoErrors} uploadError={uploadError} uploading={uploading} onUpload={(f) => void upload(f)} />
+
+        <label className="check-row">
+          <input type="checkbox" checked={repo.withPool} onChange={(e) => setRepo({ withPool: e.target.checked })} />
+          <span><strong>Also read the dedicated SQL pool</strong><span className="muted"> — for tables, data loads, date filters and row counts. The repository holds definitions only; without the pool those stages are skipped.</span></span>
+        </label>
+        {repo.withPool && (
+          <div className="stack pool-addon">
+            <div className="form-grid">{signInFields}</div>
+            <div className="row">
+              <Button variant={signedInHere ? "default" : "primary"} size="small" onClick={() => void submit("authenticate")} loading={connectionBusy === "authenticate"} disabled={busy}>
+                {signedInHere ? "Sign in again" : "Sign in with Azure"}
+              </Button>
+              {signedInHere && <span className="muted">Signed in to {connection.subscriptionName ?? connection.subscriptionId}</span>}
+            </div>
+            <ScopeSelectors config={config} errors={errors} set={set} signedIn={signedInHere} />
+            {repoErrors.pool && <p className="err">{repoErrors.pool}</p>}
+          </div>
+        )}
+
+        {connectionError && (
+          <Banner tone="error" title={connectionError.title} actions={<Button size="small" onClick={app.clearConnectionError}>Dismiss</Button>}>
+            {connectionError.hint && <div>{connectionError.hint}</div>}
+            <div className="faint" style={{ marginTop: 4 }}>{connectionError.message}</div>
+          </Banner>
+        )}
+        {!connectionError && connection.checks.length > 0 && !connected && <CheckList checks={connection.checks} label="Source connection checks" />}
+
+        <div className="row conn-actions">
+          <Button variant="primary" onClick={() => void connectRepository(source)} loading={connectionBusy === "test"} disabled={busy || uploading}>
+            {source === "git" ? "Connect repository" : "Connect export"}
+          </Button>
+          {changing && <Button variant="ghost" onClick={() => setChanging(false)}>Cancel</Button>}
+        </div>
+      </div>
+    );
+  }
+
   const stage = signedInHere ? (config.workspace ? 2 : 1) : 0;
   return (
     <div className="stack conn-body">
-      <MethodTiles label="How to connect to Azure Synapse" options={METHODS} value={config.method} onChange={selectMethod} disabled={busy} />
+      <MethodTiles label="How to connect to Azure Synapse" options={METHODS} value={source} onChange={selectMethod} disabled={busy} />
       <MiniSteps steps={["Sign in", "Choose workspace", "Test"]} current={stage} />
 
       {!supported && (

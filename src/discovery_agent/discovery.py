@@ -329,6 +329,8 @@ def run(
     connections: Optional["ConnectionManager"] = None,
     input_root: Optional[Path] = None,
     scan_repository: bool = True,
+    acquire: bool = True,
+    read_workspace: bool = True,
 ) -> DiscoveryRun:
     """Execute a discovery run against a Synapse estate.
 
@@ -347,11 +349,18 @@ def run(
     by preference: acquisition must complete before the configuration is
     validated, because the configuration names a path that acquisition
     creates.
+
+    ``acquire=False`` walks ``config.source`` as it stands, for a repository
+    already on disk (a clone made earlier, or an extracted ZIP).
+    ``read_workspace=False`` reads the dedicated pool through ``connections``
+    but not the live workspace's artifacts: the definitions then come from the
+    repository alone, as they do when an operator chose one environment's
+    repository as the source.
     """
     snapshot: Optional[RepositorySource] = None
     issues: List[ExtractionIssue] = []
 
-    if connections is not None and scan_repository:
+    if connections is not None and scan_repository and acquire:
         # Before config.validate(): the snapshot path does not exist yet.
         try:
             snapshot = _acquire(connections, input_root)
@@ -399,9 +408,10 @@ def run(
     catalog: Optional[SqlCatalogDiscovery] = None
 
     if connections is not None:
-        workspace_discovery, workspace_extraction, workspace_repository = (
-            discover_workspace(connections)
-        )
+        if read_workspace:
+            workspace_discovery, workspace_extraction, workspace_repository = (
+                discover_workspace(connections)
+            )
         catalog, catalog_issue = discover_catalog(connections)
         if catalog_issue is not None:
             issues.append(catalog_issue)

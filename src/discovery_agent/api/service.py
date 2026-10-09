@@ -19,9 +19,11 @@ No request field can carry a secret: an unknown field is refused.
 After any of them the same flow follows: list resource groups, workspaces and
 SQL pools from that identity, then test the connection.
 
-Discovery reuses ``discovery.run`` unchanged, in workspace-only mode
-(``scan_repository=False``): the live Artifacts API and, when a pool is given,
-the dedicated SQL catalog.
+Discovery reuses ``discovery.run``. For a live workspace it runs in
+workspace-only mode (``scan_repository=False``): the live Artifacts API and,
+when a pool is given, the dedicated SQL catalog. For a Git repository or a ZIP
+of one (``repository_source``), it walks that environment's working copy
+instead, and reads the dedicated pool only when the operator added one.
 """
 
 from __future__ import annotations
@@ -34,7 +36,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from discovery_agent import discovery
-from discovery_agent.api import mapping
+from discovery_agent.api import mapping, repository_source
+from discovery_agent.api.repository_source import RepositoryError, RepositorySpec
 from discovery_agent.config import DEFAULT_OUTPUT_DIR, DiscoveryConfig
 from discovery_agent.connections.azure import (
     AzureConnection,
@@ -44,11 +47,13 @@ from discovery_agent.connections.azure import (
     forget_auth_record,
     reset_credentials,
 )
+from discovery_agent.connections.git import GitConnection
 from discovery_agent.connections.manager import ConnectionManager
 from discovery_agent.connections.models import (
     AzureConnectionConfig,
     ConnectionSettings,
     CredentialMethod,
+    GitRepositoryConfig,
     SynapseConnectionConfig,
 )
 from discovery_agent.connections.validation import (
@@ -57,6 +62,7 @@ from discovery_agent.connections.validation import (
     redact,
 )
 from discovery_agent.errors import (
+    AcquisitionError,
     AzureAuthenticationError,
     AzureConnectionError,
     ConfigError,
@@ -106,6 +112,15 @@ METHOD_NOTES = {
 _AUTHENTICATE_FIELDS = frozenset(
     {"method", "tenantId", "subscriptionId", "resourceGroup", "workspace", "workspaceUrl", "sqlPool"}
 )
+
+#: Everything a repository connection request may contain. The parameters file's
+#: text is a deployment file of identifiers and values, never a credential field.
+_REPOSITORY_FIELDS = frozenset(
+    {"kind", "repositoryUrl", "ref", "rootFolder", "uploadId", "fileName", "environment", "parameters",
+     "parametersName", "resourceGroup", "workspace", "sqlPool"}
+)
+SOURCE_KINDS = ("workspace", "git", "zip")
+_FILE_NAME = re.compile(r"[^A-Za-z0-9 ._()-]")
 
 #: What an operator should do about each failure category. Plain language; the
 #: technical message from the connection layer is shown beneath it.
@@ -202,7 +217,8 @@ class _SignIn:
 @dataclass
 class _Connection:
     method: str
-    manager: ConnectionManager
+    #: None for a repository connection without a SQL pool: nothing in Azure is read.
+    manager: Optional[ConnectionManager]
     tenant_id: Optional[str]
     subscription_id: str
     resource_group: str
@@ -212,6 +228,9 @@ class _Connection:
     checks: List[dict] = field(default_factory=list)
     connected: bool = False
     tested_at: Optional[str] = None
+    #: "workspace" (the live Synapse workspace), "git" or "zip".
+    source_kind: str = "workspace"
+    repository: Optional[RepositorySpec] = None
 
 
 @dataclass
@@ -229,6 +248,8 @@ class _Job:
     graph: Optional[dict] = None
     summary: Optional[dict] = None
     workspace: Optional[str] = None
+    #: A repository source's definitions by kind and name, as migration reads them.
+    repository_artifacts: Dict[Any, Dict[str, dict]] = field(default_factory=dict)
 
 
 class Session:
@@ -252,6 +273,8 @@ class Session:
             "capabilities": {
                 # Only what ``credential_provider`` actually implements.
                 "authMethods": list(METHODS),
+                # Where the definitions can come from: the live workspace, or one environment's repository.
+                "sourceKinds": list(SOURCE_KINDS),
                 "authMethodDetails": [{"id": m, **METHOD_NOTES[m]} for m in METHODS],
                 "discoveryScope": [
                     f"{t}s" if not t.endswith("s") else t
@@ -276,7 +299,7 @@ class Session:
         with self._lock:
             if self._job.state == "running":
                 raise ApiError(409, "discovery_running", "Discovery is running; wait for it to finish.")
-            self._connection = None
+            self._replace_connection(None)
             self._signin = None
             self._job = _Job()
             self._detail_cache.clear()
@@ -435,11 +458,159 @@ class Session:
         conn.tested_at = _now()
         failures = [r for r in results if not r.ok and r.connection is not SourceType.SQL]
         with self._lock:
-            self._connection = conn
+            self._replace_connection(conn)
             if not conn.connected:
                 self._job = _Job()
                 self._detail_cache.clear()
         return self._with_error(self._connection_payload(conn), failures)
+
+    # -- repository sources: Git, or a ZIP of the repository ---------------------
+
+    def _replace_connection(self, conn: Optional[_Connection]) -> None:
+        """Swap the connection, discarding the previous repository working copy. Call with the lock held."""
+        old = self._connection
+        if old is not None and old.repository is not None and (conn is None or conn.repository is not old.repository):
+            repository_source.discard(old.repository.path)
+        self._connection = conn
+
+    def upload_zip(self, data: bytes, file_name: str) -> dict:
+        """Extract an uploaded ZIP of a Synapse repository, and say where its definitions are."""
+        try:
+            upload_id, folder = repository_source.extract_zip(data)
+        except RepositoryError as exc:
+            raise ApiError(400, "invalid_zip", str(exc)) from exc
+        name = _FILE_NAME.sub("_", file_name or "")[:120] or "workspace.zip"
+        try:
+            root, relative = repository_source.find_root(folder)
+            found, root_folder, note = repository_source.counts(root), relative, None
+        except RepositoryError as exc:
+            found, root_folder, note = {}, None, str(exc)
+        return {"uploadId": upload_id, "fileName": name, "rootFolder": root_folder, "counts": found, "note": note}
+
+    def connect_repository(self, body: dict) -> dict:
+        """Use one environment's Synapse definitions from Git or an uploaded ZIP, optionally with a live SQL pool.
+
+        Git is reached through the machine's own git and its credential helper; nothing
+        here accepts a token. The environment's parameters file, when given, is applied to
+        a working copy, never to the repository or the upload.
+        """
+        unknown = sorted(set(body) - _REPOSITORY_FIELDS)
+        if unknown:
+            raise ApiError(400, "invalid_configuration", f"Unexpected field(s): {', '.join(unknown)}.")
+        kind = str(body.get("kind") or "")
+        if kind not in ("git", "zip"):
+            raise ApiError(400, "invalid_configuration", "Choose a Git repository or a ZIP export.")
+        try:
+            environment = repository_source.clean_environment(body.get("environment"))
+            text = str(body.get("parameters") or "")
+            parameters = repository_source.parse_parameters(text) if text.strip() else None
+        except RepositoryError as exc:
+            raise ApiError(400, "invalid_configuration", str(exc)) from exc
+        resource_group = _clean(body.get("resourceGroup"), "Resource group", _NAME, required=False)
+        workspace = _clean(body.get("workspace"), "Synapse workspace", _NAME, required=False)
+        sql_pool = _clean(body.get("sqlPool"), "Dedicated SQL pool", _NAME, required=False)
+        with_pool = bool(resource_group or workspace or sql_pool)
+        if with_pool and not (resource_group and workspace and sql_pool):
+            raise ApiError(400, "invalid_configuration", "To add the SQL pool, choose its resource group, workspace and pool.")
+        signin = self._signed_in() if with_pool else None
+        with self._lock:
+            if self._job.state == "running":
+                raise ApiError(409, "discovery_running", "Discovery is running; wait for it to finish.")
+
+        checks: List[dict] = []
+        ref = commit = None
+        if kind == "git":
+            url = str(body.get("repositoryUrl") or "").strip()
+            try:
+                git = GitConnection(GitRepositoryConfig(repository_url=url, ref=str(body.get("ref") or "").strip() or None))
+            except (ConfigError, ValueError) as exc:
+                raise ApiError(400, "invalid_configuration", redact(str(exc))) from exc
+            probe = git.validate()
+            checks.append({"name": "Git repository", "status": probe.status.value, "message": probe.message,
+                           "category": probe.category.value if probe.category else None})
+            if not probe.ok:
+                return self._repository_failure(checks, "Repository not reachable", probe.message,
+                                                "Check the URL and branch, and that `git` on this machine can reach it with your credentials.")
+            try:
+                snapshot = git.acquire()
+            except AcquisitionError as exc:
+                return self._repository_failure(checks, "Repository could not be cloned", redact(str(exc)),
+                                                "Check the branch name and that `git` on this machine can clone it.")
+            base, label, ref, commit = snapshot.local_path, url, snapshot.ref, snapshot.commit_sha
+            display = url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git") or "repository"
+        else:
+            try:
+                base = repository_source.upload_folder(str(body.get("uploadId") or ""))
+            except RepositoryError as exc:
+                raise ApiError(400, "invalid_configuration", str(exc)) from exc
+            label = _FILE_NAME.sub("_", str(body.get("fileName") or ""))[:120] or "workspace.zip"
+            display = label.removesuffix(".zip") or "workspace"
+            checks.append({"name": "ZIP export", "status": "ok", "message": f"{label} extracted", "category": None})
+
+        try:
+            root, relative = repository_source.find_root(base, str(body.get("rootFolder") or ""))
+            path, applied, unmatched = repository_source.prepare(root, parameters)
+        except RepositoryError as exc:
+            checks.append({"name": "Synapse definitions", "status": "failed", "message": str(exc), "category": "configuration"})
+            return self._repository_failure(checks, "No Synapse definitions found", str(exc),
+                                            "Name the root folder the workspace uses (its Git configuration shows it).")
+        spec = RepositorySpec(kind=kind, label=label, environment=environment, root_folder=relative, path=path, ref=ref,
+                              commit=commit, parameters_name=(str(body.get("parametersName") or "")[:120] or None) if parameters else None,
+                              applied=applied, unmatched=unmatched, counts=repository_source.counts(path))
+        where = f"in {relative}/" if relative else "at the top"
+        checks.append({"name": "Synapse definitions", "status": "ok" if spec.artifact_count else "failed", "category": None,
+                       "message": f"{spec.artifact_count:,} definitions in {len(spec.counts)} folders, {where}"})
+        if parameters is None:
+            checks.append({"name": f"{environment} parameters", "status": "skipped", "category": None,
+                           "message": "No parameters file: linked services keep the values committed in the repository"})
+        else:
+            message = f"{len(applied)} of {len(applied) + len(unmatched)} values applied to linked services"
+            if unmatched:
+                message += f"; not matched: {', '.join(unmatched[:5])}{' and more' if len(unmatched) > 5 else ''}"
+            checks.append({"name": f"{environment} parameters", "status": "ok", "message": message, "category": None})
+
+        manager: Optional[ConnectionManager] = None
+        if with_pool and signin is not None:
+            try:
+                manager = ConnectionManager(ConnectionSettings(
+                    azure=signin.azure.config,
+                    synapse=SynapseConnectionConfig(resource_group=resource_group, workspace_name=workspace, sql_pool_name=sql_pool),
+                ), credential=signin.provider)
+            except ConfigError as exc:
+                repository_source.discard(path)
+                raise ApiError(400, "invalid_configuration", redact(str(exc))) from exc
+            sql = manager.validate_sql()
+            checks.append({"name": "Dedicated SQL pool", "status": sql.status.value, "message": sql.message,
+                           "category": sql.category.value if sql.category else None})
+
+        conn = _Connection(
+            method=kind, manager=manager,
+            tenant_id=signin.tenant_id if signin else None, subscription_id=signin.subscription_id if signin else "",
+            resource_group=resource_group or "", workspace=workspace or display, sql_pool=sql_pool if with_pool else None,
+            subscription_name=signin.subscription_name if signin else None,
+            source_kind=kind, repository=spec,
+        )
+        conn.checks = checks
+        # The definitions are what discovery needs; a SQL pool that fails costs only the tables, as for a live workspace.
+        conn.connected = spec.artifact_count > 0
+        conn.tested_at = _now()
+        with self._lock:
+            self._replace_connection(conn)
+            self._job = _Job()
+            self._detail_cache.clear()
+            payload = self._connection_payload(conn)
+        payload["ok"] = conn.connected
+        if not conn.connected:
+            payload["error"] = {"code": "configuration", "title": "No Synapse definitions found",
+                                "hint": "The folder holds no definition files.", "message": checks[-1]["message"]}
+        return payload
+
+    def _repository_failure(self, checks: List[dict], title: str, message: Optional[str], hint: str) -> dict:
+        with self._lock:
+            payload = self._connection_payload(None)
+        payload.update({"checks": checks, "ok": False,
+                        "error": {"code": "configuration", "title": title, "hint": hint, "message": message or title}})
+        return payload
 
     @staticmethod
     def _method(body: dict) -> str:
@@ -482,6 +653,8 @@ class Session:
         base = {
             "ok": True,
             "signedIn": signin is not None,
+            # Which Azure sign-in is held: for a repository source "method" names the repository kind.
+            "signInMethod": signin.method if signin is not None else None,
             "signingIn": self._signing_in,
         }
         if conn is None:
@@ -509,6 +682,8 @@ class Session:
                 "sqlPool": conn.sql_pool,
                 "testedAt": conn.tested_at,
                 "checks": conn.checks,
+                "sourceKind": conn.source_kind,
+                "repository": conn.repository.to_dict() if conn.repository else None,
             }
         )
         return base
@@ -545,8 +720,13 @@ class Session:
 
     def _discover(self, conn: _Connection, job: _Job) -> None:
         try:
-            config = DiscoveryConfig(source=Path("."), out=Path(DEFAULT_OUTPUT_DIR))
-            run = discovery.run(config, connections=conn.manager, scan_repository=False)
+            if conn.repository is not None:
+                # One environment's definitions from its working copy; the pool only when one was added.
+                config = DiscoveryConfig(source=conn.repository.path, out=Path(DEFAULT_OUTPUT_DIR))
+                run = discovery.run(config, connections=conn.manager, scan_repository=True, acquire=False, read_workspace=False)
+            else:
+                config = DiscoveryConfig(source=Path("."), out=Path(DEFAULT_OUTPUT_DIR))
+                run = discovery.run(config, connections=conn.manager, scan_repository=False)
             records = list(run.records.records)
             extras, extra_failures = self._collect_extras(conn, records)
 
@@ -594,6 +774,8 @@ class Session:
                 job.extras_by_id = {e.id: e for e in extras}
                 job.known = known
                 job.referenced_by = referenced_by
+                if conn.repository is not None:
+                    job.repository_artifacts = repository_source.artifacts(conn.repository.path)
                 job.summary = summary
                 job.finished_at = _now()
                 job.state = (
@@ -653,6 +835,18 @@ class Session:
         """
         extras: List[mapping.Extra] = []
         failures: List[dict] = []
+        if conn.repository is not None:
+            # Triggers and integration runtimes are files in the repository; pools are not, so they
+            # come from Azure only when the operator signed in and added the SQL pool.
+            for e in mapping.trigger_extras(repository_source.triggers(conn.repository.path)) + \
+                    mapping.runtime_extras(repository_source.integration_runtimes(conn.repository.path)):
+                if isinstance(e.metadata, dict) and "_from" in e.metadata:
+                    e.metadata["_from"] = "Git repository" if conn.source_kind == "git" else "ZIP export"
+                extras.append(e)
+            if conn.manager is None:
+                extras.extend(mapping.schema_extras(records))
+                extras.extend(mapping.storage_extras(records))
+                return extras, failures
         workspace_id = conn.manager.settings.synapse.workspace_resource_id(conn.subscription_id)
 
         def attempt(label: str, read, build) -> None:
@@ -667,8 +861,9 @@ class Session:
         attempt("Dedicated SQL pools", arm("sqlPools"), mapping.sql_pool_extras)
         attempt("Spark pools", arm("bigDataPools"), mapping.spark_pool_extras)
         attempt("Spark libraries", arm("libraries"), mapping.library_extras)
-        attempt("Integration runtimes", arm("integrationRuntimes"), mapping.runtime_extras)
-        attempt("Triggers", lambda: conn.manager.synapse_artifacts().list_triggers(), mapping.trigger_extras)
+        if conn.repository is None:
+            attempt("Integration runtimes", arm("integrationRuntimes"), mapping.runtime_extras)
+            attempt("Triggers", lambda: conn.manager.synapse_artifacts().list_triggers(), mapping.trigger_extras)
         extras.extend(mapping.schema_extras(records))
         extras.extend(mapping.storage_extras(records))
         return extras, failures
@@ -848,15 +1043,16 @@ class Session:
         The session reuses the sign-in discovery used; nothing here holds a credential."""
         with self._lock:
             conn = self._connection
-        if conn is None:
+        if conn is None or conn.manager is None or not conn.sql_pool:
             return None
-        return lambda: conn.manager.sql().connect()
+        manager = conn.manager
+        return lambda: manager.sql().connect()
 
     def source_endpoint(self) -> Optional[Tuple[str, str, str]]:
         """(workspace, SQL endpoint host, pool) of the connected Synapse source, for the data pipelines' connection. None if unknown."""
         with self._lock:
             conn = self._connection
-        if conn is None or not conn.sql_pool:
+        if conn is None or not conn.sql_pool or conn.manager is None:
             return None
         return conn.workspace, conn.manager.settings.synapse.resolved_sql_endpoint, conn.sql_pool
 

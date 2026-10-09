@@ -260,19 +260,21 @@ describe("start page", () => {
     expect(stored("ma.route")).toEqual({ source: "synapse", destination: "fabric" });
   });
 
-  it("lists every sign-in method, with ZIP and Git shown for later but not selectable", async () => {
+  it("lists every source method, each one selectable, with Git and ZIP asking what their source needs", async () => {
     const user = userEvent.setup();
     localStorage.setItem("ma.route", JSON.stringify({ source: "synapse", destination: "fabric" }));
     go("/");
     const source = await screen.findByRole("radiogroup", { name: "How to connect to Azure Synapse" });
     expect(within(source).getAllByRole("radio")).toHaveLength(4);
-    for (const m of [/^Azure CLI/, /^Interactive browser/]) expect(within(source).getByRole("radio", { name: m })).not.toHaveAttribute("aria-disabled");
-    for (const m of [/Workspace export \(ZIP\)/, /Git repository/]) {
-      const tile = within(source).getByRole("radio", { name: m });
-      expect(tile).toHaveAttribute("aria-disabled", "true");
-      await user.click(tile);
-      expect(tile).toHaveAttribute("aria-checked", "false");
+    for (const m of [/^Azure CLI/, /^Interactive browser/, /Workspace export \(ZIP\)/, /Git repository/]) {
+      expect(within(source).getByRole("radio", { name: m })).not.toHaveAttribute("aria-disabled");
     }
+    await user.click(within(source).getByRole("radio", { name: /Git repository/ }));
+    expect(within(source).getByRole("radio", { name: /Git repository/ })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByLabelText("Repository URL")).toBeInTheDocument();
+    await user.click(within(source).getByRole("radio", { name: /Workspace export \(ZIP\)/ }));
+    expect(screen.getByLabelText("Workspace export (ZIP)")).toBeInTheDocument();
+    await user.click(within(source).getByRole("radio", { name: /^Azure CLI/ }));
     expect(within(source).getByRole("radio", { name: /^Azure CLI/ })).toHaveAttribute("aria-checked", "true");
     for (const gone of [/Service Principal/, /Managed Identity/]) expect(screen.queryByRole("radio", { name: gone })).toBeNull();
 
@@ -283,6 +285,58 @@ describe("start page", () => {
     // No secret is ever typed on this page.
     expect(screen.queryByLabelText(/token|secret|password|Client ID/i)).toBeNull();
   });
+
+  it("connects one environment's Git branch, refusing a URL with credentials, and discovers without SQL pool objects", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem("ma.route", JSON.stringify({ source: "synapse", destination: "fabric" }));
+    go("/");
+    const card = await screen.findByRole("region", { name: /^Source connection/ });
+    await user.click(await within(card).findByRole("radio", { name: /Git repository/ }));
+    await user.click(within(card).getByRole("button", { name: "Connect repository" }));
+    expect(within(card).getByText("Repository URL is required.")).toBeInTheDocument();
+    expect(within(card).getByText("Choose the environment.")).toBeInTheDocument();
+    await user.type(within(card).getByLabelText("Repository URL"), "https://user:ghp_x@github.com/contoso/synapse-ws.git");
+    await user.click(within(card).getByRole("button", { name: "Connect repository" }));
+    expect(within(card).getByText(/Leave credentials out of the URL/)).toBeInTheDocument();
+    await user.clear(within(card).getByLabelText("Repository URL"));
+    await user.type(within(card).getByLabelText("Repository URL"), "https://github.com/contoso/synapse-ws.git");
+    await user.type(within(card).getByLabelText(/^Branch/), "release/prod");
+    await user.selectOptions(within(card).getByLabelText("Environment"), "Prod");
+    await user.click(within(card).getByRole("button", { name: "Connect repository" }));
+    expect(await within(card).findByText("release/prod · 3f9a1c2", {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(within(card).getByText("Prod")).toBeInTheDocument();
+    expect(within(card).getByText(/Not added: tables, views, procedures and data are skipped/)).toBeInTheDocument();
+    // Discovery reads the repository; with no pool there are no tables.
+    await mockApi.startDiscovery();
+    await new Promise((r) => setTimeout(r, 3700));
+    const graph = await mockApi.getDependencies();
+    expect(graph.nodes.some((n) => n.type === "Pipeline")).toBe(true);
+    expect(graph.nodes.some((n) => n.type === "Table" || n.type === "Dedicated SQL Pool")).toBe(false);
+  }, 30000);
+
+  it("uploads a ZIP, applies an environment's parameters file, and asks for an Azure sign-in to add the SQL pool", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem("ma.route", JSON.stringify({ source: "synapse", destination: "fabric" }));
+    go("/");
+    const card = await screen.findByRole("region", { name: /^Source connection/ });
+    await user.click(await within(card).findByRole("radio", { name: /Workspace export \(ZIP\)/ }));
+    fireEvent.change(within(card).getByLabelText("Workspace export (ZIP)"), { target: { files: [new File(["PK"], "contoso-synapse.zip", { type: "application/zip" })] } });
+    expect(await within(card).findByText(/232 definitions found in synapse\//)).toBeInTheDocument();
+    const params = JSON.stringify({ parameters: { ls_sql_connectionString: { value: "Server=prod" }, workspaceName: { value: "prod-ws" } } });
+    fireEvent.change(within(card).getByLabelText("Environment parameters (optional)"), { target: { files: [new File([params], "parameters.prod.json", { type: "application/json" })] } });
+    expect(await within(card).findByText("parameters.prod.json")).toBeInTheDocument();
+    await user.selectOptions(within(card).getByLabelText("Environment"), "Other");
+    await user.type(within(card).getByLabelText("Environment name"), "UAT");
+    // The SQL pool needs an Azure sign-in first.
+    await user.click(within(card).getByRole("checkbox", { name: /Also read the dedicated SQL pool/ }));
+    await user.click(within(card).getByRole("button", { name: "Connect export" }));
+    expect(within(card).getByText("Sign in to Azure to add the SQL pool, or switch it off.")).toBeInTheDocument();
+    await user.click(within(card).getByRole("checkbox", { name: /Also read the dedicated SQL pool/ }));
+    await user.click(within(card).getByRole("button", { name: "Connect export" }));
+    expect(await within(card).findByText("UAT", {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(within(card).getByText("parameters.prod.json · 1 value applied, 1 not matched")).toBeInTheDocument();
+    expect(within(card).getByText("contoso-synapse.zip")).toBeInTheDocument();
+  }, 30000);
 
   it("requires the tenant for the browser sign-in and says where the window opens", async () => {
     const user = userEvent.setup();

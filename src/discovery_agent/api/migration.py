@@ -184,6 +184,9 @@ def _artifacts(job: Any) -> Dict[P0Artifact, Dict[str, dict]]:
     synapse = getattr(job.run, "synapse", None) if getattr(job, "run", None) is not None else None
     for artifact in getattr(synapse, "artifacts", ()) or ():
         out.setdefault(artifact.artifact, {})[artifact.name] = dict(artifact.payload)
+    # A Git or ZIP source: the environment's definitions, its parameters already applied.
+    for kind, by_name in (getattr(job, "repository_artifacts", None) or {}).items():
+        out.setdefault(kind, {}).update(by_name)
     return out
 
 

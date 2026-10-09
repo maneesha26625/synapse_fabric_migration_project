@@ -16,6 +16,7 @@ import {
   type ResultsPage,
   type ResultsQuery,
   type ValidationRow,
+  type ZipUpload,
 } from "../types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -102,6 +103,14 @@ export const realApi: MigrationApi = {
       method: "POST",
       body: JSON.stringify(connectionBody(c)),
     }),
+  uploadZip: (file) =>
+    request<ZipUpload>(`/api/connections/upload?name=${encodeURIComponent(file.name)}`, {
+      method: "POST",
+      body: file,
+      headers: { "Content-Type": "application/zip" },
+    }),
+  connectRepository: (c) =>
+    request<ConnectionState>("/api/connections/repository", { method: "POST", body: JSON.stringify(c) }),
   disconnect: () => request<ConnectionState>("/api/connections", { method: "DELETE" }),
   startDiscovery: () => request<DiscoveryStatus>("/api/discovery/start", { method: "POST" }),
   getDiscoveryStatus: () => request<DiscoveryStatus>("/api/discovery/status"),

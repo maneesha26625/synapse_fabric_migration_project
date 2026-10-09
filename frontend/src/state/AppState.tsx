@@ -19,8 +19,10 @@ import {
   type Health,
   type MigrationApi,
   type ObjectDetail,
+  type RepositoryConfig,
   type ResultsPage,
   type ResultsQuery,
+  type ZipUpload,
 } from "../types";
 
 const DISCONNECTED: ConnectionState = { status: "disconnected", ok: true, checks: [] };
@@ -53,6 +55,10 @@ interface AppStateValue {
   clearConnectionError: () => void;
   authenticate: (config: ConnectionConfig) => Promise<void>;
   testConnection: (config: ConnectionConfig) => Promise<void>;
+  /** Connect one environment's repository (Git or an uploaded ZIP) as the source. */
+  connectRepository: (config: RepositoryConfig) => Promise<void>;
+  /** Upload a ZIP export; the caller shows what was found, or the error. */
+  uploadZip: (file: File) => Promise<ZipUpload>;
   disconnect: () => Promise<void>;
   isConnected: boolean;
   discovery: DiscoveryStatus;
@@ -198,6 +204,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
 
   const authenticate = useCallback((c: ConnectionConfig) => run("authenticate", () => api.authenticate(c)), [api, run]);
   const testConnection = useCallback((c: ConnectionConfig) => run("test", () => api.testConnection(c)), [api, run]);
+  const connectRepository = useCallback((c: RepositoryConfig) => run("test", () => api.connectRepository(c)), [api, run]);
+  const uploadZip = useCallback((file: File) => api.uploadZip(file), [api]);
   const disconnect = useCallback(async () => {
     await run("disconnect", () => api.disconnect());
     setDiscovery(IDLE);
@@ -259,6 +267,8 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     clearConnectionError: () => setConnectionError(null),
     authenticate,
     testConnection,
+    connectRepository,
+    uploadZip,
     disconnect,
     isConnected: connection.status === "connected",
     discovery,

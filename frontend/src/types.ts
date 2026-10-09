@@ -38,8 +38,11 @@ export interface ConnectionState {
   ok: boolean;
   /** An Azure identity has been proven on the backend for `method`. */
   signedIn?: boolean;
+  /** The Azure sign-in method held, when `method` names a repository source instead. */
+  signInMethod?: AuthMethod | null;
   signingIn?: boolean;
-  method?: AuthMethod;
+  /** How the source was connected: an Azure sign-in method, or a Git / ZIP repository source. */
+  method?: AuthMethod | RepositoryKind;
   sourcePlatform?: string;
   workspace?: string;
   resourceGroup?: string;
@@ -50,11 +53,61 @@ export interface ConnectionState {
   testedAt?: string | null;
   checks: ConnectionCheck[];
   error?: ConnectionError;
+  /** Where the definitions come from: the live workspace, or one environment's repository. */
+  sourceKind?: SourceKind;
+  repository?: RepositoryInfo | null;
+}
+
+export type SourceKind = "workspace" | RepositoryKind;
+export type RepositoryKind = "git" | "zip";
+
+/** A Git or ZIP source, as connected: never a credential. */
+export interface RepositoryInfo {
+  kind: RepositoryKind;
+  /** The repository URL, or the ZIP's file name. */
+  label: string;
+  environment: string;
+  /** The folder the Synapse definitions are in, relative to the repository or ZIP root. */
+  rootFolder: string;
+  ref?: string | null;
+  commit?: string | null;
+  parametersName?: string | null;
+  /** Parameters written into linked services, and those that matched no property. */
+  applied: string[];
+  unmatched: string[];
+  /** Definition files per Synapse folder. */
+  counts: Record<string, number>;
+  artifacts: number;
+}
+
+/** What the backend found in an uploaded ZIP. */
+export interface ZipUpload {
+  uploadId: string;
+  fileName: string;
+  rootFolder: string | null;
+  counts: Record<string, number>;
+  note?: string | null;
+}
+
+/** A repository connection request. `parameters` is the environment's parameters file text. */
+export interface RepositoryConfig {
+  kind: RepositoryKind;
+  environment: string;
+  repositoryUrl?: string;
+  ref?: string;
+  rootFolder?: string;
+  uploadId?: string;
+  fileName?: string;
+  parameters?: string;
+  parametersName?: string;
+  resourceGroup?: string;
+  workspace?: string;
+  sqlPool?: string;
 }
 
 export interface Health {
   status: "ok";
-  capabilities: { authMethods: AuthMethod[]; authMethodDetails?: AuthMethodDetail[]; discoveryScope: string[]; migratableTypes?: string[] };
+  capabilities: { authMethods: AuthMethod[]; authMethodDetails?: AuthMethodDetail[]; discoveryScope: string[]; migratableTypes?: string[]; sourceKinds?: SourceKind[] };
 }
 
 /** What the backend says about one sign-in method. */
@@ -528,6 +581,10 @@ export interface MigrationApi {
   getConnection(): Promise<ConnectionState>;
   authenticate(config: ConnectionConfig): Promise<ConnectionState>;
   testConnection(config: ConnectionConfig): Promise<ConnectionState>;
+  /** Extract an uploaded ZIP of a Synapse repository on the backend. */
+  uploadZip(file: File): Promise<ZipUpload>;
+  /** Use one environment's definitions from Git or an uploaded ZIP, optionally with a live SQL pool. */
+  connectRepository(config: RepositoryConfig): Promise<ConnectionState>;
   disconnect(): Promise<ConnectionState>;
   startDiscovery(): Promise<DiscoveryStatus>;
   getDiscoveryStatus(): Promise<DiscoveryStatus>;

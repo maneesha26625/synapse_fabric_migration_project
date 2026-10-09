@@ -21,6 +21,7 @@ import {
   type ConnectionCredentials,
   type ConnectionState,
   type DataFilterInput,
+  type RepositoryConfig,
   type DependencyGraph,
   type DiscoveryStatus,
   type ExecItem,
@@ -195,6 +196,22 @@ function statusNow(): DiscoveryStatus {
   return { state: warn ? "completed_with_warnings" : "completed", startedAt: s.startedIso, finishedAt, error: null, workspace, progress, summary: s.summary };
 }
 
+/** What lives in the dedicated SQL pool: absent when a repository source has no pool added. */
+const POOL_TYPES = new Set(["Table", "External Table", "View", "Stored Procedure", "Schema", "Dedicated SQL Pool"]);
+
+function withoutPool(objects: ObjectDetail[]): ObjectDetail[] {
+  const kept = objects.filter((o) => !POOL_TYPES.has(o.type));
+  const ids = new Set(kept.map((o) => o.id));
+  return kept.map((o) => ({
+    ...o,
+    dependencies: o.dependencies.map((d) => (d.objectId && !ids.has(d.objectId) ? { ...d, objectId: null } : d)),
+    referencedBy: o.referencedBy.filter((r) => !r.objectId || ids.has(r.objectId)),
+  }));
+}
+
+/** The demo repository's folders, as an upload or a clone would report them. */
+const DEMO_REPO_COUNTS: Record<string, number> = { linkedService: 24, dataset: 60, pipeline: 40, notebook: 55, sqlscript: 30, sparkJobDefinition: 12, trigger: 8, integrationRuntime: 3 };
+
 function buildResult() {
   const w = s.scenario.toLowerCase();
   if (w.includes("fail")) {
@@ -211,14 +228,15 @@ function buildResult() {
   const objects = w.includes("empty")
     ? []
     : generateObjects({ workspace: s.connection.workspace ?? "demo", omitCategories: partial ? ["Spark"] : [] });
-  s.objects = objects;
+  s.objects = s.connection.repository && !s.connection.sqlPool ? withoutPool(objects) : objects;
+  const kept = s.objects;
   const tally = (pick: (o: ObjectDetail) => string) => {
     const out: Record<string, number> = {};
-    for (const o of objects) out[pick(o)] = (out[pick(o)] ?? 0) + 1;
+    for (const o of kept) out[pick(o)] = (out[pick(o)] ?? 0) + 1;
     return out;
   };
   s.summary = {
-    total: objects.length,
+    total: kept.length,
     byCategory: tally((o) => o.category),
     byType: tally((o) => o.type),
     byWorkstream: tally((o) => o.workstream),
@@ -460,6 +478,7 @@ export const mockApi: MigrationApi = {
       status: "ok",
       capabilities: {
         authMethods: ["azure_cli", "interactive_browser"],
+        sourceKinds: ["workspace", "git", "zip"],
         authMethodDetails: [
           { id: "azure_cli", label: "Azure CLI", detail: "Opens a sign-in window each time; nothing is kept between sign-ins." },
           {
@@ -520,6 +539,62 @@ export const mockApi: MigrationApi = {
       s.startedAt = null;
       s.objects = null;
     }
+    return s.connection;
+  },
+
+  async uploadZip(file: File) {
+    await sleep(500);
+    if (!/\.zip$/i.test(file.name)) throw new ApiRequestError("invalid_zip", "The file is not a valid ZIP archive.", 400);
+    return { uploadId: "d".repeat(32), fileName: file.name, rootFolder: "synapse", counts: { ...DEMO_REPO_COUNTS }, note: null };
+  },
+
+  async connectRepository(c: RepositoryConfig) {
+    await sleep(900);
+    if (!c.environment?.trim()) throw new ApiRequestError("invalid_configuration", "Choose the environment these definitions are for.", 400);
+    const withPool = !!(c.resourceGroup || c.workspace || c.sqlPool);
+    if (withPool && !(c.resourceGroup && c.workspace && c.sqlPool)) throw new ApiRequestError("invalid_configuration", "To add the SQL pool, choose its resource group, workspace and pool.", 400);
+    if (withPool && !s.signedIn) throw new ApiRequestError("sign_in_required", "Sign in to Azure first.", 409);
+    const url = (c.repositoryUrl ?? "").trim();
+    if (c.kind === "git" && !/^(https:\/\/|git@|ssh:\/\/)/.test(url)) throw new ApiRequestError("invalid_configuration", "Enter the repository's HTTPS or SSH URL.", 400);
+    if (c.kind === "zip" && !c.uploadId) throw new ApiRequestError("invalid_configuration", "The upload is not known. Upload the ZIP again.", 400);
+    const label = c.kind === "git" ? url : (c.fileName || "workspace.zip");
+    const firstCheck = c.kind === "git"
+      ? { category: null, name: "Git repository", status: "ok" as const, message: `${url} reachable (demo)` }
+      : { category: null, name: "ZIP export", status: "ok" as const, message: `${label} extracted (demo)` };
+    if (c.kind === "git" && /missing|denied/i.test(url)) {
+      s.connection = { status: "disconnected", ok: false, signedIn: !!s.signedIn, checks: [{ ...firstCheck, status: "failed", message: "Repository not found (demo)" }],
+        error: { code: "configuration", title: "Repository not reachable", hint: "Check the URL and branch, and that git on this machine can reach it.", message: "Repository not found (demo)" } };
+      return s.connection;
+    }
+    const params = c.parameters ? Object.keys(((): Record<string, unknown> => { try { const d = JSON.parse(c.parameters!); return (d.parameters ?? d) as Record<string, unknown>; } catch { return {}; } })()) : [];
+    const applied = params.filter((n) => /^ls_/i.test(n));
+    const unmatched = params.filter((n) => !/^ls_/i.test(n));
+    const rootFolder = (c.rootFolder ?? "").trim() || "synapse";
+    const counts = { ...DEMO_REPO_COUNTS };
+    const artifacts = Object.values(counts).reduce((a, b) => a + b, 0);
+    const display = c.kind === "git" ? (url.replace(/\/+$/, "").split("/").pop() ?? "repository").replace(/\.git$/, "") : label.replace(/\.zip$/i, "");
+    s.connection = {
+      status: "connected", ok: true, signedIn: !!s.signedIn, signInMethod: s.signedIn ? "azure_cli" : null, method: c.kind, sourceKind: c.kind, sourcePlatform: "Azure Synapse",
+      workspace: c.workspace || display, resourceGroup: c.resourceGroup ?? "", subscriptionId: s.signedIn?.subscriptionId ?? "",
+      subscriptionName: s.signedIn ? "Demo subscription" : null, tenantId: s.signedIn?.tenantId ?? null,
+      sqlPool: withPool ? c.sqlPool! : null, testedAt: new Date().toISOString(),
+      checks: [
+        firstCheck,
+        { category: null, name: "Synapse definitions", status: "ok", message: `${artifacts} definitions in ${Object.keys(counts).length} folders, in ${rootFolder}/ (demo)` },
+        c.parameters
+          ? { category: null, name: `${c.environment} parameters`, status: "ok", message: `${applied.length} of ${params.length} values applied to linked services (demo)` }
+          : { category: null, name: `${c.environment} parameters`, status: "skipped", message: "No parameters file: linked services keep the values committed in the repository" },
+        ...(withPool ? [{ category: null, name: "Dedicated SQL pool", status: "ok" as const, message: `${c.sqlPool} reachable (demo)` }] : []),
+      ],
+      repository: {
+        kind: c.kind, label, environment: c.environment.trim(), rootFolder, ref: c.kind === "git" ? (c.ref?.trim() || "main") : null,
+        commit: c.kind === "git" ? "3f9a1c2" : null, parametersName: c.parameters ? (c.parametersName ?? "parameters.json") : null,
+        applied, unmatched, counts, artifacts,
+      },
+    };
+    s.scenario = "repository";
+    s.startedAt = null;
+    s.objects = null;
     return s.connection;
   },
 

@@ -7,6 +7,8 @@ web framework would be the first. The surface is small and fixed.
     GET    /api/connections               current connection state
     POST   /api/connections/authenticate  prove an Azure identity
     POST   /api/connections/test          prove workspace access; enables discovery
+    POST   /api/connections/upload        a ZIP of a Synapse repository (application/zip)
+    POST   /api/connections/repository    use one environment's definitions from Git or an uploaded ZIP
     DELETE /api/connections               forget the connection
     POST   /api/discovery/start
     GET    /api/discovery/status
@@ -32,9 +34,10 @@ Security posture, in order of importance:
 
 * Binds to loopback by default, and rejects a ``Host`` header that is not
   loopback (DNS-rebinding defence).
-* State-changing requests must be ``application/json``. A cross-site HTML form
-  cannot send that without a CORS preflight, which is never granted, so a
-  malicious page cannot drive the API through the operator's browser.
+* State-changing requests must be ``application/json`` (a ZIP upload,
+  ``application/zip``). A cross-site HTML form cannot send either without a
+  CORS preflight, which is never granted, so a malicious page cannot drive
+  the API through the operator's browser.
 * Request bodies are capped, never logged, and never echoed. Error responses
   carry a stable code and a message written for a person -- no traceback.
 * No token, secret or authorization header is ever returned: the connection
@@ -52,11 +55,15 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qsl, unquote, urlsplit
 
+from discovery_agent.api.repository_source import MAX_PARAMETERS_BYTES, MAX_ZIP_BYTES
+
 from discovery_agent.api.fabric import FabricError, FabricTarget
 from discovery_agent.api.migration import MigrationService
 from discovery_agent.api.service import ApiError, Session
 
 MAX_BODY_BYTES = 64 * 1024
+#: A repository request may carry an environment's parameters file.
+MAX_REPOSITORY_BODY_BYTES = MAX_PARAMETERS_BYTES + 64 * 1024
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 RESULTS_PREFIX = "/api/discovery/results/"
 
@@ -99,11 +106,11 @@ def make_handler(
             host = header.split("]")[0] + "]" if header.startswith("[") else header.rsplit(":", 1)[0]
             return host in _LOOPBACK_HOSTS
 
-        def _json_body(self) -> dict:
+        def _json_body(self, limit: int = MAX_BODY_BYTES) -> dict:
             if "application/json" not in (self.headers.get("Content-Type") or ""):
                 raise ApiError(415, "unsupported_media_type", "Requests must be application/json.")
             length = int(self.headers.get("Content-Length") or 0)
-            if length > MAX_BODY_BYTES:
+            if length > limit:
                 raise ApiError(413, "body_too_large", "The request is too large.")
             raw = self.rfile.read(length) if length else b"{}"
             try:
@@ -113,6 +120,16 @@ def make_handler(
             if not isinstance(body, dict):
                 raise ApiError(400, "invalid_json", "The request body must be a JSON object.")
             return body
+
+        def _zip_body(self) -> bytes:
+            if (self.headers.get("Content-Type") or "").split(";")[0].strip() != "application/zip":
+                raise ApiError(415, "unsupported_media_type", "Upload the export as application/zip.")
+            length = int(self.headers.get("Content-Length") or 0)
+            if not length:
+                raise ApiError(400, "invalid_zip", "The upload is empty.")
+            if length > MAX_ZIP_BYTES:
+                raise ApiError(413, "body_too_large", f"The ZIP is larger than {MAX_ZIP_BYTES // (1024 * 1024)} MB.")
+            return self.rfile.read(length)
 
         def _dispatch(self, handler) -> None:
             if not self._host_ok():
@@ -167,6 +184,8 @@ def make_handler(
             routes = {
                 "/api/connections/authenticate": lambda: session.authenticate(self._json_body()),
                 "/api/connections/test": lambda: session.test(self._json_body()),
+                "/api/connections/repository": lambda: session.connect_repository(self._json_body(MAX_REPOSITORY_BODY_BYTES)),
+                "/api/connections/upload": lambda: session.upload_zip(self._zip_body(), dict(parse_qsl(urlsplit(self.path).query)).get("name", "")),
                 "/api/fabric/authenticate": lambda: fabric.authenticate(self._json_body()),
                 "/api/fabric/workspaces": lambda: fabric.refresh_workspaces(self._json_body()),
                 "/api/fabric/test": lambda: fabric.test(self._json_body()),

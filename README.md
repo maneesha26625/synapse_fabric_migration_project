@@ -112,7 +112,7 @@ migration starts, and **Migration**, where it runs.
 
    | Side | Sign-in methods |
    |---|---|
-   | Azure Synapse (source) | **Azure CLI**; **Interactive browser** (for a tenant your `az login` cannot reach; asks only for Tenant ID and Subscription ID); *Workspace export (ZIP)* and *Git repository*, shown as coming soon |
+   | Azure Synapse (source) | **Azure CLI**; **Interactive browser** (for a tenant your `az login` cannot reach; asks only for Tenant ID and Subscription ID); **Git repository** and **Workspace export (ZIP)**, for one environment (see below) |
    | Microsoft Fabric (destination) | **Azure CLI**; **Fabric CLI** |
 
    After sign-in, Synapse asks for the resource group, workspace and
@@ -126,6 +126,40 @@ migration starts, and **Migration**, where it runs.
    chosen and both sides are connected and tested, with a capacity on the
    Fabric workspace. A checklist beside it says what is still missing. If the
    migration is already under way, the button reads *Continue migration*.
+
+### Git repository or ZIP export, per environment
+
+Instead of the live workspace, the definitions can come from the workspace's
+Git repository or a ZIP of it (`api/repository_source.py`):
+
+* **Git repository:** the URL, the **branch** for the environment (for
+  example `main` for Dev, a release branch for Prod) and, optionally, the
+  workspace's Git **root folder**. It is cloned by `git` on the machine running
+  the API, with your own credential helper or SSH key; no token is entered,
+  and a URL with credentials in it is refused.
+* **Workspace export (ZIP):** a ZIP of the repository folder (for example a
+  branch downloaded from GitHub or Azure DevOps), up to 200 MB. It is
+  extracted safely (no paths outside its folder, no symbolic links, size and
+  file-count limits), and the folder holding `pipeline/`, `linkedService/` and
+  the others is found automatically, or named.
+* **Environment:** Dev, Test, Prod or a named one, shown with the connection.
+  An optional **parameters file** (`TemplateParametersForWorkspace.json`, or an
+  environment's copy) replaces the linked-service values committed in the
+  repository, which are usually Dev's, with that environment's: parameters
+  named `<linked service>_connectionString` or
+  `<linked service>_properties_typeProperties_<property>`. They are applied to
+  a working copy under `input/environments/`; the repository and the upload
+  are never changed. A parameter that matches no existing property is listed,
+  not guessed at.
+* **Optional SQL pool:** the repository holds definitions only. To also
+  migrate tables and data, sign in to Azure in the same card and choose the
+  dedicated SQL pool; only the pool is read from Azure, the definitions still
+  come from the repository. Without it, tables, data loads, date filters and
+  row counts are skipped.
+
+Triggers and integration runtimes are read from the repository's own
+folders. Spark pools and libraries are not in a repository, so they appear
+only when the SQL pool's workspace is signed in to.
 
 ### Migration: the six steps
 
@@ -243,7 +277,7 @@ All under `/api`, JSON in and out. Nothing returns a token or a secret.
 | Area | Endpoints |
 |---|---|
 | Health | `GET /health`: the sign-in methods this backend supports, what discovery reads, and the types a run migrates |
-| Synapse connection | `GET /connections` · `POST /connections/authenticate` · `POST /connections/test` · `DELETE /connections` · `GET /azure/<subscriptions, resource groups, workspaces, pools>` for the dropdowns |
+| Synapse connection | `GET /connections` · `POST /connections/authenticate` · `POST /connections/test` · `POST /connections/upload` (a ZIP, `application/zip`) · `POST /connections/repository` (Git or the uploaded ZIP, for one environment) · `DELETE /connections` · `GET /azure/<subscriptions, resource groups, workspaces, pools>` for the dropdowns |
 | Discovery | `POST /discovery/start` · `GET /discovery/status` · `GET /discovery/results` (filter, sort, page) · `GET /discovery/results/<id>` · `GET /discovery/export` · `DELETE /discovery` (forget the results; refused while discovery runs) |
 | Mapping and waves | `GET /mapping/components` · `GET /dependencies` |
 | Fabric connection | `GET /fabric/connection` · `POST /fabric/authenticate` · `POST /fabric/workspaces` · `POST /fabric/test` · `DELETE /fabric/connection` |
@@ -270,9 +304,7 @@ views, `sys.pdw_*` system views and `COPY INTO` with Synapse's managed
 identity; security, networking and workload management.
 
 **Shown in the UI, not built yet:** sources and destinations other than
-Synapse and Fabric; connecting from a workspace ZIP export or a Git repository
-in the UI (the discovery engine can already read a repository from the command
-line); the migration assistant's conversation.
+Synapse and Fabric; the migration assistant's conversation.
 
 ## Discovery engine
 
