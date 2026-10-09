@@ -1,5 +1,5 @@
-import { AlertTriangle, ArrowLeft, ArrowRight, Check, CheckCircle2, Circle, Download, Lock, Pause, PartyPopper, PlugZap, ServerCrash, Settings2 } from "lucide-react";
-import { useEffect, useRef, type ReactNode } from "react";
+import { AlertTriangle, ArrowLeft, ArrowRight, Check, CheckCircle2, Circle, Download, Lock, PanelLeftClose, PanelLeftOpen, Pause, PartyPopper, PlugZap, ServerCrash, Settings2 } from "lucide-react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { AssessPanel } from "../components/journey/panels/AssessPanel";
 import { DiscoverPanel } from "../components/journey/panels/DiscoverPanel";
@@ -7,6 +7,7 @@ import { MigratePanel } from "../components/journey/panels/MigratePanel";
 import { PlanPanel } from "../components/journey/panels/PlanPanel";
 import { CompletionSummary, ValidatePanel } from "../components/journey/panels/ValidatePanel";
 import { WavesPanel } from "../components/journey/panels/WavesPanel";
+import { WorkspaceExplorer } from "../components/journey/WorkspaceExplorer";
 import { downloadReport } from "../components/journey/report";
 import { ResetStepButton } from "../components/journey/ResetStep";
 import { useJourney, type StepStatus } from "../components/journey/useJourney";
@@ -163,6 +164,20 @@ function CompletionCard() {
   );
 }
 
+const EXPLORER_KEY = "ma.explorer";
+
+/** Whether the explorer is shown: a per-browser preference, on unless it was closed. */
+function useExplorerOpen(): [boolean, (open: boolean) => void] {
+  const [open, setOpen] = useState(() => {
+    try { return localStorage.getItem(EXPLORER_KEY) !== "closed"; } catch { return true; }
+  });
+  const set = (next: boolean) => {
+    setOpen(next);
+    try { localStorage.setItem(EXPLORER_KEY, next ? "open" : "closed"); } catch { /* storage unavailable: kept for this visit */ }
+  };
+  return [open, set];
+}
+
 export function Workspace() {
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
@@ -170,6 +185,7 @@ export function Workspace() {
   const { fabric, resetNonce } = useMigration();
   const { steps, current, finished } = useJourney();
   const flow = useRef<HTMLDivElement>(null);
+  const [explorerOpen, setExplorerOpen] = useExplorerOpen();
 
   const requested = params.get("step") as StepKey | null;
   const selected = steps.find((s) => s.key === requested && !s.locked)?.key ?? current;
@@ -243,6 +259,9 @@ export function Workspace() {
           <span className="ws-meter"><span style={{ width: `${(done / steps.length) * 100}%` }} /></span>
           <strong>{done}/{steps.length}</strong>
         </div>
+        <Button size="small" variant="ghost" aria-pressed={explorerOpen} onClick={() => setExplorerOpen(!explorerOpen)}>
+          {explorerOpen ? <PanelLeftClose size={14} aria-hidden="true" /> : <PanelLeftOpen size={14} aria-hidden="true" />}{explorerOpen ? "Hide explorer" : "Show explorer"}
+        </Button>
         <Button size="small" variant="ghost" onClick={() => navigate("/")}><Settings2 size={14} aria-hidden="true" />Connections</Button>
       </div>
 
@@ -253,23 +272,28 @@ export function Workspace() {
         </Banner>
       )}
 
-      <div ref={flow} className="journey-anchor"><JourneyFlow steps={steps} selected={selected} onSelect={select} /></div>
+      <div className={`ws-body${explorerOpen ? " with-explorer" : ""}`}>
+        {explorerOpen && <WorkspaceExplorer />}
+        <div className="ws-main">
+          <div ref={flow} className="journey-anchor"><JourneyFlow steps={steps} selected={selected} onSelect={select} /></div>
 
-      {finished && <CompletionCard />}
+          {finished && <CompletionCard />}
 
-      <section className="step-panel" aria-labelledby="step-title">
-        <header className="step-head">
-          <span className="step-head-icon" aria-hidden="true"><step.icon size={20} /></span>
-          <div className="step-head-text">
-            <span className="eyebrow">Step {step.index + 1} of {steps.length}{mode === "mock" ? " · demo data" : ""}</span>
-            <h2 id="step-title">{step.title}</h2>
-            <p className="muted">{step.purpose}.</p>
-          </div>
-          <ResetStepButton step={selected} />
-        </header>
-        <div className="step-body" key={`${selected}-${resetNonce}`}>{PANELS[selected]()}</div>
-        <NextBar step={step} steps={steps} onGo={select} />
-      </section>
+          <section className="step-panel" aria-labelledby="step-title">
+            <header className="step-head">
+              <span className="step-head-icon" aria-hidden="true"><step.icon size={20} /></span>
+              <div className="step-head-text">
+                <span className="eyebrow">Step {step.index + 1} of {steps.length}{mode === "mock" ? " · demo data" : ""}</span>
+                <h2 id="step-title">{step.title}</h2>
+                <p className="muted">{step.purpose}.</p>
+              </div>
+              <ResetStepButton step={selected} />
+            </header>
+            <div className="step-body" key={`${selected}-${resetNonce}`}>{PANELS[selected]()}</div>
+            <NextBar step={step} steps={steps} onGo={select} />
+          </section>
+        </div>
+      </div>
     </div>
   );
 }

@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
 import { buildReport } from "../components/journey/report";
+import { buildTree } from "../components/journey/WorkspaceExplorer";
 import { mockApi, resetDemo } from "../mock/mockApi";
 import type { ConnectionConfig, ExecutionRun, FabricConfig, ResultsQuery } from "../types";
 
@@ -769,6 +770,56 @@ describe("plan step", () => {
     expect(await screen.findByRole("checkbox", { name: "Include Notebooks" })).not.toBeChecked();
     expect(screen.getByRole("checkbox", { name: "Include Warehouse & schema" })).not.toBeChecked();
   }, 25000);
+});
+
+describe("workspace explorer", () => {
+  it("files discovered objects like a Synapse repository, with the SQL pool by schema", () => {
+    const node = (id: string, name: string, type: string) =>
+      ({ id, name, type, category: "", classification: "DIRECT" as const, fabricTarget: "", wave: 1, dependsOn: 0, dependedOnBy: 0 });
+    const tree = buildTree([
+      node("p1", "PL_Load", "Pipeline"), node("p2", "PL_Archive", "Pipeline"), node("ls", "ls_blob", "Linked Service"),
+      node("pool", "TransportDW", "Dedicated SQL Pool"), node("s", "TransportDW.sales", "Schema"),
+      node("t1", "sales.Orders", "Table"), node("v1", "sales.vOrders", "View"), node("t2", "dbo.Trips", "Table"),
+      node("x", "fw-rule", "Networking Configuration"),
+    ]);
+    expect(tree.map((n) => n.label)).toEqual(["linkedService", "pipeline", "sqlPool", "other"]);
+    expect(tree[1].children!.map((n) => n.label)).toEqual(["PL_Archive", "PL_Load"]);
+    const pool = tree[2].children![0];
+    expect(pool.label).toBe("TransportDW");
+    expect(pool.children!.map((n) => n.label)).toEqual(["dbo", "sales"]);
+    const sales = pool.children![1];
+    expect(sales.children!.map((n) => `${n.label}:${n.children!.map((c) => c.label).join(",")}`)).toEqual(["Tables:Orders", "Views:vOrders"]);
+    expect(tree[3].children![0].label).toBe("Networking Configuration");
+    // every object is counted exactly once: the pool and the schema as the folders they are
+    expect(tree.reduce((sum, n) => sum + n.count, 0)).toBe(9);
+    expect([pool.objectId, sales.objectId]).toEqual(["pool", "s"]);
+  });
+
+  it("shows the discovered workspace beside the steps, filters it, opens an object, and can be hidden", async () => {
+    await discovered();
+    unlockTo("assess");
+    const user = userEvent.setup();
+    const first = go("/migration?step=discover");
+    const explorer = await screen.findByRole("complementary", { name: "Workspace explorer" }, { timeout: 5000 });
+    const pipelines = await within(explorer).findByRole("button", { name: /^pipeline/ }, { timeout: 5000 });
+    expect(pipelines).toHaveAttribute("aria-expanded", "false");
+    await user.click(pipelines);
+    expect(pipelines).toHaveAttribute("aria-expanded", "true");
+    expect(within(explorer).getByRole("button", { name: "PL_Master (Pipeline)" })).toBeInTheDocument();
+    // filtering opens the folders on the way to each match and hides the rest
+    await user.type(within(explorer).getByLabelText("Filter the workspace explorer"), "PL_Master");
+    expect(within(explorer).queryByRole("button", { name: /^linkedService/ })).not.toBeInTheDocument();
+    await user.click(within(explorer).getByRole("button", { name: "PL_Master (Pipeline)" }));
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    // hidden stays hidden after a reload
+    await user.click(screen.getByRole("button", { name: "Hide explorer" }));
+    expect(screen.queryByRole("complementary", { name: "Workspace explorer" })).not.toBeInTheDocument();
+    first.unmount();
+    go("/migration?step=discover");
+    expect(await screen.findByRole("button", { name: "Show explorer" }, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.queryByRole("complementary", { name: "Workspace explorer" })).not.toBeInTheDocument();
+  }, 30000);
 });
 
 describe("migrate step", () => {

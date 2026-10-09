@@ -604,6 +604,33 @@ html, body, #root { height: auto; min-height: 100%; }
 .jstep.selected button { border-color: var(--accent); background: linear-gradient(180deg, rgba(79, 140, 255, .12), transparent 75%), var(--surface); box-shadow: 0 0 0 3px var(--accent-soft), 0 12px 30px rgba(79, 140, 255, .14); }
 
 .journey-anchor { scroll-margin-top: 76px; }
+
+/* The workspace explorer: the discovered objects as a repository tree, beside the steps. */
+.ws-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; align-items: start; }
+.ws-body.with-explorer { grid-template-columns: 280px minmax(0, 1fr); }
+.ws-main { display: flex; flex-direction: column; gap: 20px; min-width: 0; }
+.explorer { position: sticky; top: calc(var(--header-h) + 16px); max-height: calc(100vh - var(--header-h) - 32px); display: flex; flex-direction: column; gap: 10px; padding: 12px 10px; border-radius: 14px; border: 1px solid var(--border); background: var(--surface); min-width: 0; }
+.explorer-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; padding: 0 6px; font-size: 13px; }
+.explorer-search { height: 34px; }
+.explorer-tree { overflow: auto; min-height: 0; margin: 0 -4px; padding: 0 4px; }
+.explorer-note { display: flex; gap: 8px; align-items: center; margin: 6px; font-size: 13.5px; color: var(--text-muted); }
+.explorer-note.err { color: var(--error); }
+.tree-list { list-style: none; margin: 0; padding: 0; }
+.tree-row { display: flex; align-items: center; gap: 6px; width: 100%; min-height: 28px; padding: 3px 8px; border: 0; border-radius: 6px; background: none; color: var(--text); font: inherit; font-size: 13.5px; text-align: left; cursor: pointer; }
+.tree-row:hover { background: var(--surface-2); }
+.tree-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.tree-row.selected { background: var(--accent-soft); }
+.tree-caret { width: 14px; flex: none; display: inline-flex; color: var(--text-faint); }
+.tree-icon { flex: none; color: var(--text-muted); }
+.tree-icon.folder { color: var(--warning); }
+.tree-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tree-label.strong { font-weight: 600; }
+.tree-count { flex: none; font-size: 12px; font-variant-numeric: tabular-nums; color: var(--text-faint); }
+.tree-more { color: var(--accent); font-size: 13px; }
+@media (max-width: 1100px) {
+  .ws-body.with-explorer { grid-template-columns: minmax(0, 1fr); }
+  .explorer { position: static; max-height: 360px; }
+}
 .step-panel { border-radius: 18px; border: 1px solid var(--border); background: var(--surface); }
 .step-head { display: flex; gap: 14px; align-items: flex-start; padding: 22px 26px 0; }
 .step-head-icon { width: 42px; height: 42px; flex: none; border-radius: 12px; display: grid; place-items: center; color: #fff; background: var(--accent-grad); }
