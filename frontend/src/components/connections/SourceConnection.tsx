@@ -1,7 +1,7 @@
-import { AppWindow, CheckCircle2, CircleSlash, FileArchive, FileJson, GitBranch, SquareTerminal, X, XCircle } from "lucide-react";
+import { CheckCircle2, CircleSlash, FileArchive, FileJson, GitBranch, SquareTerminal, X, XCircle } from "lucide-react";
 import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import { useAppState } from "../../state/AppState";
-import type { AuthMethod, ConnectionConfig, ConnectionState, RepositoryConfig, RepositoryKind, ZipUpload } from "../../types";
+import type { AuthMethod, AzureSubscription, ConnectionConfig, ConnectionState, RepositoryConfig, RepositoryKind, ZipUpload } from "../../types";
 import { Banner, Button, SelectField, TextField, ConfirmDialog } from "../shared/Shared";
 import { MethodTiles, MiniSteps, type MethodOption } from "./MethodTiles";
 
@@ -10,10 +10,9 @@ import { MethodTiles, MiniSteps, type MethodOption } from "./MethodTiles";
 type SourceMethod = AuthMethod | "zip" | "git";
 
 const METHODS: MethodOption<SourceMethod>[] = [
-  { id: "azure_cli", title: "Azure CLI", desc: "Sign in with your Azure account in a browser window", icon: SquareTerminal },
-  { id: "interactive_browser", title: "Interactive browser", desc: "A Microsoft sign-in for the tenant you name; your Azure CLI session is untouched", icon: AppWindow },
-  { id: "zip", title: "Workspace export (ZIP)", desc: "Upload one environment's exported repository folder as a ZIP", icon: FileArchive },
+  { id: "azure_cli", title: "Azure CLI", desc: "Sign in with your Microsoft account, then pick the subscription and workspace", icon: SquareTerminal },
   { id: "git", title: "Git repository", desc: "Read one environment's branch of the workspace's Git repository", icon: GitBranch },
+  { id: "zip", title: "Workspace export (ZIP)", desc: "Upload one environment's exported repository folder as a ZIP", icon: FileArchive },
 ];
 const METHOD_LABEL: Record<AuthMethod, string> = { azure_cli: "Azure CLI", interactive_browser: "Interactive browser" };
 const isRepository = (m: string | undefined): m is RepositoryKind => m === "git" || m === "zip";
@@ -24,7 +23,6 @@ const methodLabel = (m: ConnectionState["method"]) => (m === "azure_cli" || m ==
 /** The Azure sign-in method behind a connection; a repository source signs in to Azure only for its SQL pool. */
 const authOf = (m: ConnectionState["method"]): AuthMethod => (m === "interactive_browser" ? "interactive_browser" : "azure_cli");
 
-const GUID = /^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$/;
 const EMPTY: ConnectionConfig = {
   method: "azure_cli", tenantId: "", subscriptionId: "", resourceGroup: "", workspace: "",
   workspaceUrl: "", sqlPool: "", resource: "",
@@ -48,44 +46,42 @@ export function configFromConnection(c: ConnectionState): ConnectionConfig {
 
 type Errors = Partial<Record<keyof ConnectionConfig, string>>;
 
+/** The sign-in needs nothing typed; testing needs the subscription, resource group and workspace chosen. */
 function validate(c: ConnectionConfig, action: "authenticate" | "test"): Errors {
   const e: Errors = {};
-  const need = (k: keyof ConnectionConfig, label: string) => { if (!c[k].trim()) e[k] = `${label} is required.`; };
-  const guid = (k: keyof ConnectionConfig, label: string) => { if (c[k].trim() && !GUID.test(c[k].trim())) e[k] = `${label} must be a GUID.`; };
-  need("subscriptionId", "Subscription ID"); guid("subscriptionId", "Subscription ID");
-  guid("tenantId", "Tenant ID");
-  if (action === "authenticate") {
-    // The browser sign-in must open against the operator's own tenant.
-    if (c.method === "interactive_browser") need("tenantId", "Tenant ID");
-  } else {
-    need("resourceGroup", "Resource group");
-    need("workspace", "Synapse workspace");
-  }
+  if (action === "authenticate") return e;
+  const need = (k: keyof ConnectionConfig, label: string) => { if (!c[k].trim()) e[k] = `Choose the ${label}.`; };
+  need("subscriptionId", "subscription");
+  need("resourceGroup", "resource group");
+  need("workspace", "Synapse workspace");
   return e;
 }
 
-/* ---- Scope: resource group -> workspace -> SQL pool -------------------------------- */
+/* ---- Scope: subscription -> resource group -> workspace -> SQL pool --------------- */
 
 interface ScopeProps {
   config: ConnectionConfig;
   errors: Errors;
   set: (patch: Partial<ConnectionConfig>) => void;
   signedIn: boolean;
+  /** Changes when signing in to another directory adds subscriptions, so the list is read again. */
+  version?: number;
 }
 
 /**
  * Every dropdown is filled from the signed-in identity, so nothing is typed
  * that could be misspelt, and only what that identity can see is offered.
  */
-function ScopeSelectors({ config, errors, set, signedIn }: ScopeProps) {
+function ScopeSelectors({ config, errors, set, signedIn, version = 0 }: ScopeProps) {
   const { azureLists } = useAppState();
+  const [subscriptions, setSubscriptions] = useState<AzureSubscription[]>([]);
   const [groups, setGroups] = useState<string[]>([]);
   const [workspaces, setWorkspaces] = useState<string[]>([]);
   const [pools, setPools] = useState<string[]>([]);
-  const [loading, setLoading] = useState<"groups" | "workspaces" | "pools" | null>(null);
+  const [loading, setLoading] = useState<"subscriptions" | "groups" | "workspaces" | "pools" | null>(null);
   const [listError, setListError] = useState<string | null>(null);
 
-  const load = async (kind: "groups" | "workspaces" | "pools", fn: () => Promise<string[]>, apply: (v: string[]) => void) => {
+  const load = async <T,>(kind: "subscriptions" | "groups" | "workspaces" | "pools", fn: () => Promise<T[]>, apply: (v: T[]) => void) => {
     setLoading(kind);
     setListError(null);
     try { apply(await fn()); } catch (e) { setListError(e instanceof Error ? e.message : "The list could not be loaded."); apply([]); }
@@ -95,36 +91,54 @@ function ScopeSelectors({ config, errors, set, signedIn }: ScopeProps) {
   // A list with exactly one entry is chosen for the operator: nobody should have to
   // open a dropdown to pick its only item, and the SQL pool is never skipped by accident.
   useEffect(() => {
-    if (!signedIn) { setGroups([]); return; }
-    void load("groups", () => azureLists.listResourceGroups(), (v) => {
+    if (!signedIn) { setSubscriptions([]); return; }
+    void load("subscriptions", () => azureLists.listSubscriptions(), (v) => {
+      setSubscriptions(v);
+      // Keep a subscription chosen earlier only if this account can still see it.
+      if (config.subscriptionId && !v.some((x) => x.id === config.subscriptionId)) set({ subscriptionId: "", resourceGroup: "", workspace: "", sqlPool: "" });
+      else if (v.length === 1 && !config.subscriptionId) set({ subscriptionId: v[0].id, resourceGroup: "", workspace: "", sqlPool: "" });
+    });
+  }, [signedIn, version]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // With subscriptions from several directories, each is named with its directory.
+  const directoryCount = new Set(subscriptions.map((x) => x.tenantId)).size;
+
+  useEffect(() => {
+    setGroups([]); setWorkspaces([]); setPools([]);
+    if (!signedIn || !config.subscriptionId) return;
+    void load("groups", () => azureLists.listResourceGroups(config.subscriptionId), (v) => {
       setGroups(v);
       if (v.length === 1 && !config.resourceGroup) set({ resourceGroup: v[0], workspace: "", sqlPool: "" });
     });
-  }, [signedIn]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [signedIn, config.subscriptionId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     setWorkspaces([]); setPools([]);
-    if (!signedIn || !config.resourceGroup) return;
-    void load("workspaces", () => azureLists.listWorkspaces(config.resourceGroup), (v) => {
+    if (!signedIn || !config.subscriptionId || !config.resourceGroup) return;
+    void load("workspaces", () => azureLists.listWorkspaces(config.subscriptionId, config.resourceGroup), (v) => {
       setWorkspaces(v);
       if (v.length === 1 && !config.workspace) set({ workspace: v[0], sqlPool: "" });
     });
-  }, [signedIn, config.resourceGroup]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [signedIn, config.subscriptionId, config.resourceGroup]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     setPools([]);
-    if (!signedIn || !config.resourceGroup || !config.workspace) return;
-    void load("pools", () => azureLists.listSqlPools(config.resourceGroup, config.workspace), (v) => {
+    if (!signedIn || !config.subscriptionId || !config.resourceGroup || !config.workspace) return;
+    void load("pools", () => azureLists.listSqlPools(config.subscriptionId, config.resourceGroup, config.workspace), (v) => {
       setPools(v);
       if (v.length === 1 && !config.sqlPool) set({ sqlPool: v[0] });
     });
-  }, [signedIn, config.resourceGroup, config.workspace]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [signedIn, config.subscriptionId, config.resourceGroup, config.workspace]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!signedIn) return null;
   return (
     <>
       <div className="form-grid">
-        <SelectField label="Resource group" value={config.resourceGroup} onChange={(v) => set({ resourceGroup: v, workspace: "", sqlPool: "" })} options={groups} loading={loading === "groups"} placeholder="Select a resource group" error={errors.resourceGroup} />
+        <SelectField label="Subscription" value={config.subscriptionId} onChange={(v) => set({ subscriptionId: v, resourceGroup: "", workspace: "", sqlPool: "" })}
+          options={subscriptions.map((x) => ({ value: x.id, label: directoryCount > 1 && x.tenantName ? `${x.name} · ${x.tenantName}` : x.name }))} loading={loading === "subscriptions"}
+          placeholder={subscriptions.length || loading ? "Select a subscription" : "No subscriptions for this account"} error={errors.subscriptionId} />
+        <SelectField label="Resource group" value={config.resourceGroup} onChange={(v) => set({ resourceGroup: v, workspace: "", sqlPool: "" })} options={groups} loading={loading === "groups"}
+          disabled={!config.subscriptionId} placeholder={config.subscriptionId ? "Select a resource group" : "Select a subscription first"} error={errors.resourceGroup} />
         <SelectField label="Synapse workspace" value={config.workspace} onChange={(v) => set({ workspace: v, sqlPool: "" })} options={workspaces} loading={loading === "workspaces"} disabled={!config.resourceGroup} placeholder={config.resourceGroup ? (workspaces.length ? "Select a workspace" : "No Synapse workspaces in this group") : "Select a resource group first"} error={errors.workspace} />
         <SelectField label="Dedicated SQL pool" optional value={config.sqlPool} onChange={(v) => set({ sqlPool: v })} options={pools} loading={loading === "pools"} disabled={!config.workspace} placeholder={config.workspace ? "None (skip tables, views, procedures)" : "Select a workspace first"} hint="Needed for tables, views and stored procedures." />
       </div>
@@ -208,8 +222,8 @@ function validateRepo(kind: RepositoryKind, f: RepoForm, config: ConnectionConfi
     e.upload = "Choose the ZIP to upload.";
   }
   if (!environmentOf(f)) e.environment = f.environment === "Other" ? "Name the environment." : "Choose the environment.";
-  if (f.withPool && !(signedIn && config.resourceGroup && config.workspace && config.sqlPool)) {
-    e.pool = signedIn ? "Choose the resource group, workspace and SQL pool, or switch the SQL pool off." : "Sign in to Azure to add the SQL pool, or switch it off.";
+  if (f.withPool && !(signedIn && config.subscriptionId && config.resourceGroup && config.workspace && config.sqlPool)) {
+    e.pool = signedIn ? "Choose the subscription, resource group, workspace and SQL pool, or switch the SQL pool off." : "Sign in to Azure to add the SQL pool, or switch it off.";
   }
   return e;
 }
@@ -338,19 +352,31 @@ export function SourceConnectionPanel() {
   const connected = app.isConnected;
   const supported = mode === "mock" || !health || health.capabilities.authMethods.includes(config.method);
   const busy = connectionBusy !== null;
-  const browser = config.method === "interactive_browser";
 
   // The backend may have been restarted since this page loaded; ask again
   // whenever the method changes so a stale answer never blocks a working option.
   useEffect(() => { void app.refreshHealth(); }, [config.method]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Signed in *as this method, for the subscription shown*: changing either
-  // invalidates the dropdowns until the operator signs in again.
-  const signedInHere =
-    !!connection.signedIn &&
-    (connection.signInMethod ?? connection.method) === config.method &&
-    !!connection.subscriptionId &&
-    connection.subscriptionId.toLowerCase() === config.subscriptionId.trim().toLowerCase();
+  // One sign-in reaches every subscription the account can see; the subscription is chosen after it.
+  const signedInHere = !!connection.signedIn && (connection.signInMethod ?? connection.method) === config.method;
+  const signedInAs = signedInHere && (
+    <p className="signed-in-as muted"><CheckCircle2 size={14} className="tone-success" aria-hidden="true" /> Signed in as <strong>{connection.account ?? "your Microsoft account"}</strong></p>
+  );
+  // Directories the account belongs to whose policy wants their own sign-in before showing subscriptions.
+  const locked = signedInHere ? (connection.directories ?? []).filter((d) => d.needsSignIn) : [];
+  const otherDirectories = locked.length > 0 && (
+    <div className="directory-signins" role="group" aria-label="Other directories">
+      <span className="muted">
+        {locked.length === 1 ? "Your account also belongs to a directory" : `Your account also belongs to ${locked.length} directories`} that
+        {locked.length === 1 ? " asks" : " ask"} for its own sign-in before showing subscriptions:
+      </span>
+      {locked.map((d) => (
+        <Button key={d.id} size="small" onClick={() => void app.authenticateDirectory(d.id)} loading={connectionBusy === "authenticate"} disabled={busy}>
+          Sign in to {d.name}
+        </Button>
+      ))}
+    </div>
+  );
 
   const set = (patch: Partial<ConnectionConfig>) => {
     setConfig((c) => ({ ...c, ...patch }));
@@ -394,7 +420,7 @@ export function SourceConnectionPanel() {
       kind, environment: environmentOf(repo), rootFolder: repo.rootFolder.trim() || undefined,
       ...(kind === "git" ? { repositoryUrl: repo.url.trim(), ref: repo.ref.trim() || undefined } : { uploadId: repo.upload!.uploadId, fileName: repo.upload!.fileName }),
       ...(repo.parameters ? { parameters: repo.parameters, parametersName: repo.parametersName } : {}),
-      ...(repo.withPool ? { resourceGroup: config.resourceGroup, workspace: config.workspace, sqlPool: config.sqlPool } : {}),
+      ...(repo.withPool ? { subscriptionId: config.subscriptionId, resourceGroup: config.resourceGroup, workspace: config.workspace, sqlPool: config.sqlPool } : {}),
     };
     lastRepositoryRequest = request;
     remembered = config;
@@ -440,7 +466,7 @@ export function SourceConnectionPanel() {
           ["Resource group", connection.resourceGroup],
           ["Subscription", connection.subscriptionName ?? connection.subscriptionId],
           ["Dedicated SQL pool", connection.sqlPool || "Not configured"],
-          ["Signed in with", methodLabel(connection.method)],
+          ["Signed in as", connection.account ?? methodLabel(connection.method)],
           ["Last tested", connection.testedAt ? new Date(connection.testedAt).toLocaleString() : "—"],
         ]} />
         <CheckFold checks={connection.checks} label="Source connection checks" />
@@ -461,17 +487,6 @@ export function SourceConnectionPanel() {
   }
 
   if (isRepository(source)) {
-    const signInFields = config.method === "interactive_browser" ? (
-      <>
-        <TextField label="Tenant ID" value={config.tenantId} onChange={(e) => set({ tenantId: e.target.value })} error={errors.tenantId} placeholder="00000000-0000-0000-0000-000000000000" />
-        <TextField label="Subscription ID" value={config.subscriptionId} onChange={(e) => set({ subscriptionId: e.target.value })} error={errors.subscriptionId} placeholder="00000000-0000-0000-0000-000000000000" />
-      </>
-    ) : (
-      <>
-        <TextField label="Subscription ID" value={config.subscriptionId} onChange={(e) => set({ subscriptionId: e.target.value })} error={errors.subscriptionId} placeholder="00000000-0000-0000-0000-000000000000" />
-        <TextField label="Tenant ID" optional value={config.tenantId} onChange={(e) => set({ tenantId: e.target.value })} error={errors.tenantId} />
-      </>
-    );
     return (
       <div className="stack conn-body">
         <MethodTiles label="How to connect to Azure Synapse" options={METHODS} value={source} onChange={selectMethod} disabled={busy || uploading} />
@@ -485,14 +500,14 @@ export function SourceConnectionPanel() {
         </label>
         {repo.withPool && (
           <div className="stack pool-addon">
-            <div className="form-grid">{signInFields}</div>
             <div className="row">
               <Button variant={signedInHere ? "default" : "primary"} size="small" onClick={() => void submit("authenticate")} loading={connectionBusy === "authenticate"} disabled={busy}>
                 {signedInHere ? "Sign in again" : "Sign in with Azure"}
               </Button>
-              {signedInHere && <span className="muted">Signed in to {connection.subscriptionName ?? connection.subscriptionId}</span>}
+              {signedInAs}
             </div>
-            <ScopeSelectors config={config} errors={errors} set={set} signedIn={signedInHere} />
+            {otherDirectories}
+            <ScopeSelectors config={config} errors={errors} set={set} signedIn={signedInHere} version={connection.subscriptionCount ?? 0} />
             {repoErrors.pool && <p className="err">{repoErrors.pool}</p>}
           </div>
         )}
@@ -525,27 +540,19 @@ export function SourceConnectionPanel() {
         <Banner tone="warning" title="Not available in this backend">The running backend does not support {METHOD_LABEL[config.method]}. Restart it from the latest code.</Banner>
       )}
 
-      <div className="form-grid">
-        {browser ? (
-          <>
-            <TextField label="Tenant ID" value={config.tenantId} onChange={(e) => set({ tenantId: e.target.value })} error={errors.tenantId} placeholder="00000000-0000-0000-0000-000000000000" hint="The sign-in window opens against this tenant." />
-            <TextField label="Subscription ID" value={config.subscriptionId} onChange={(e) => set({ subscriptionId: e.target.value })} error={errors.subscriptionId} placeholder="00000000-0000-0000-0000-000000000000" />
-          </>
-        ) : (
-          <>
-            <TextField label="Subscription ID" value={config.subscriptionId} onChange={(e) => set({ subscriptionId: e.target.value })} error={errors.subscriptionId} placeholder="00000000-0000-0000-0000-000000000000" />
-            <TextField label="Tenant ID" optional value={config.tenantId} onChange={(e) => set({ tenantId: e.target.value })} error={errors.tenantId} hint="Found from the subscription; enter it only if sign-in picks the wrong tenant." />
-          </>
-        )}
-      </div>
+      {!signedInHere && connectionBusy !== "authenticate" && (
+        <p className="muted" style={{ margin: 0 }}>Sign in with your Microsoft account. Your subscriptions, resource groups and workspaces are then listed to choose from.</p>
+      )}
+      {signedInAs}
 
       {connectionBusy === "authenticate" && (
         <Banner tone="info" title="Waiting for you to sign in">
-          {browser ? "A sign-in window should open on the machine running the accelerator. Complete it there; this page continues on its own." : "A sign-in window has opened in your browser. Complete it there; this page continues on its own."}
+          A Microsoft sign-in window has opened. Enter your email, password and any MFA prompt there; this page continues on its own.
         </Banner>
       )}
 
-      <ScopeSelectors config={config} errors={errors} set={set} signedIn={signedInHere} />
+      {otherDirectories}
+      <ScopeSelectors config={config} errors={errors} set={set} signedIn={signedInHere} version={connection.subscriptionCount ?? 0} />
 
       {connectionError && (
         <Banner tone="error" title={connectionError.title} actions={<><Button size="small" onClick={() => void submit(signedInHere ? "test" : "authenticate")} disabled={busy}>Retry</Button><Button size="small" onClick={app.clearConnectionError}>Dismiss</Button></>}>
@@ -557,7 +564,7 @@ export function SourceConnectionPanel() {
 
       <div className="row conn-actions">
         <Button variant={signedInHere ? "default" : "primary"} onClick={() => void submit("authenticate")} loading={connectionBusy === "authenticate"} disabled={busy || !supported}>
-          {signedInHere ? "Sign in again" : browser ? "Authenticate" : "Sign in with Azure"}
+          {signedInHere ? "Sign in again" : "Sign in with Azure"}
         </Button>
         <Button variant={signedInHere ? "primary" : "default"} onClick={() => void submit("test")} loading={connectionBusy === "test"} disabled={busy || !supported || !(signedInHere && config.workspace)}>Test connection</Button>
         {changing && <Button variant="ghost" onClick={() => setChanging(false)}>Cancel</Button>}

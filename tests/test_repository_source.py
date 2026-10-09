@@ -237,11 +237,12 @@ def test_requests_are_checked_before_anything_runs():
         session.connect_repository({"kind": "ftp", "environment": "Dev"})
     with pytest.raises(ApiError, match="Choose the environment"):
         session.connect_repository({"kind": "zip", "uploadId": "x"})
-    with pytest.raises(ApiError, match="choose its resource group, workspace and pool"):
+    with pytest.raises(ApiError, match="choose its subscription, resource group, workspace and pool"):
         session.connect_repository({"kind": "zip", "environment": "Dev", "sqlPool": "pool01"})
     # adding the pool needs an Azure sign-in first
     with pytest.raises(ApiError, match="Sign in to Azure first"):
-        session.connect_repository({"kind": "zip", "environment": "Dev", "resourceGroup": "rg", "workspace": "ws", "sqlPool": "pool01"})
+        session.connect_repository({"kind": "zip", "environment": "Dev", "subscriptionId": "10eb96c3-ba3c-492e-b95b-e9f1d6d85d70",
+                                    "resourceGroup": "rg", "workspace": "ws", "sqlPool": "pool01"})
     with pytest.raises(ApiError, match="Upload the ZIP again"):
         session.connect_repository({"kind": "zip", "environment": "Dev", "uploadId": "0" * 32})
 

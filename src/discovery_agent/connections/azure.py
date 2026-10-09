@@ -31,6 +31,7 @@ every import in this package is absolute. Do not add a relative one.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -1069,6 +1070,193 @@ class AzureConnection:
             f"({self.config.subscription_id}), state {state}",
             **details,
         )
+
+
+# --- one sign-in, every directory the account belongs to ----------------------
+
+
+class DirectorySignInRequired(AzureAuthenticationError):
+    """A directory will not issue a token without its own sign-in (its MFA or access policy)."""
+
+    def __init__(self, tenant_id: str) -> None:
+        super().__init__(f"the directory {tenant_id} needs its own sign-in")
+        self.tenant_id = tenant_id
+
+
+class MultiTenantSignIn:
+    """One Microsoft sign-in that reaches every directory (tenant) the account belongs to.
+
+    The window opens once, against the account's own directory. Tokens for any
+    other directory the account is a member or guest of are then requested
+    *silently* from the same sign-in; a directory whose policy insists on its own
+    sign-in raises ``DirectorySignInRequired`` instead of opening a window nobody
+    asked for, and ``sign_in(tenant_id)`` opens one for it on request.
+
+    Nothing is persisted: tokens live in this object's memory and the SDK's
+    in-memory cache, and are gone with it.
+    """
+
+    method = CredentialMethod.INTERACTIVE_BROWSER
+
+    def __init__(self, credential: Any = None, timeout_seconds: int = INTERACTIVE_TIMEOUT_SECONDS) -> None:
+        self._credential = credential
+        self.timeout_seconds = timeout_seconds
+        self._cache: Dict[Tuple[str, str], AccessToken] = {}
+        self._lock = threading.Lock()
+
+    def _sdk(self) -> Any:
+        if self._credential is None:
+            try:
+                from azure.identity import InteractiveBrowserCredential  # noqa: PLC0415 - optional dependency
+            except ImportError as exc:
+                raise AzureDependencyNotAvailableError(
+                    "azure-identity is required to authenticate to Azure and is not installed; "
+                    "install the optional extra with `pip install -e .[azure]`"
+                ) from exc
+            self._credential = InteractiveBrowserCredential(
+                timeout=self.timeout_seconds,
+                # Any directory the account belongs to, but only ever silently: a window
+                # opens only through sign_in().
+                additionally_allowed_tenants=["*"],
+                disable_automatic_authentication=True,
+            )
+        return self._credential
+
+    def sign_in(self, tenant_id: Optional[str] = None) -> None:
+        """Open the Microsoft sign-in window: for the account's own directory, or the one named."""
+        with self._lock:
+            try:
+                self._sdk().authenticate(scopes=[ARM_SCOPE], tenant_id=tenant_id)
+            except (AzureAuthenticationError, AzureDependencyNotAvailableError):
+                raise
+            except Exception as exc:  # ClientAuthenticationError, timeout, cancelled
+                raise AzureAuthenticationError(
+                    f"the Azure sign-in did not complete: {type(exc).__name__}: {exc}. "
+                    f"{InteractiveBrowserCredentialProvider.guidance_for(exc)}"
+                ) from exc
+            # A directory signed into now may issue tokens it refused before.
+            self._cache = {k: v for k, v in self._cache.items() if k[1] != (tenant_id or "").lower()}
+
+    def token(self, scope: str, tenant_id: Optional[str] = None) -> AccessToken:
+        """A token for ``scope`` in one directory (the account's own when None), without any window."""
+        key = (scope, (tenant_id or "").lower())
+        with self._lock:
+            cached = self._cache.get(key)
+            if cached is not None and cached.is_valid():
+                return cached
+            try:
+                acquired = self._sdk().get_token(scope, tenant_id=tenant_id) if tenant_id else self._sdk().get_token(scope)
+            except (AzureAuthenticationError, AzureDependencyNotAvailableError):
+                raise
+            except Exception as exc:
+                if type(exc).__name__ == "AuthenticationRequiredError":
+                    raise DirectorySignInRequired(tenant_id or "home") from exc
+                raise AzureAuthenticationError(
+                    f"no token for {scope}{f' in directory {tenant_id}' if tenant_id else ''}: {type(exc).__name__}: {exc}"
+                ) from exc
+            token = AccessToken(value=acquired.token, expires_on=acquired.expires_on, scope=scope)
+            self._cache[key] = token
+            return token
+
+    def for_tenant(self, tenant_id: Optional[str]) -> "AzureCredentialProvider":
+        """This sign-in as a credential for one directory: what an ``AzureConnection`` or a SQL session uses."""
+        return _DirectoryCredential(self, tenant_id)
+
+
+class _DirectoryCredential(AzureCredentialProvider):
+    """A ``MultiTenantSignIn`` bound to one directory, so every audience is asked for there."""
+
+    method = CredentialMethod.INTERACTIVE_BROWSER
+
+    def __init__(self, sign_in: MultiTenantSignIn, tenant_id: Optional[str]) -> None:
+        self.sign_in = sign_in
+        self.tenant_id = tenant_id
+
+    def token(self, scope: str) -> AccessToken:
+        return self.sign_in.token(scope, self.tenant_id)
+
+    def describe(self) -> str:
+        return f"Microsoft sign-in (directory {self.tenant_id})" if self.tenant_id else "Microsoft sign-in"
+
+
+def list_tenants(
+    credential: AzureCredentialProvider, transport: Optional[ArmTransport] = None
+) -> List[Dict[str, str]]:
+    """Every directory the signed-in account belongs to (its own and any it is a guest of). GET only."""
+    transport = transport or RequestsArmTransport()
+    url: Optional[str] = arm_url("/tenants", SUBSCRIPTION_API_VERSION)
+    found: List[Dict[str, str]] = []
+    while url:
+        if not url.startswith(ARM_ENDPOINT + "/"):
+            raise AzureConnectionError("Azure returned a paging link outside Resource Manager")
+        response = transport.get(url, credential.token(ARM_SCOPE))
+        if not response.ok:
+            raise AzureConnectionError(f"could not list directories: {response.message()} (HTTP {response.status_code})")
+        for item in response.payload.get("value") or []:
+            if item.get("tenantId"):
+                found.append({
+                    "id": str(item["tenantId"]),
+                    "name": str(item.get("displayName") or item.get("defaultDomain") or item["tenantId"]),
+                    "domain": str(item.get("defaultDomain") or ""),
+                })
+        url = response.payload.get("nextLink")
+    return found
+
+
+# --- what a sign-in can see ---------------------------------------------------
+
+
+def list_subscriptions(
+    credential: AzureCredentialProvider, transport: Optional[ArmTransport] = None
+) -> List[Dict[str, str]]:
+    """Every usable subscription the signed-in identity can see, by name. GET only.
+
+    This is what lets a sign-in come first: the operator signs in, then picks a
+    subscription from what their account can actually reach, instead of typing
+    an id. Subscriptions that are disabled or deleted are left out; nothing can
+    be discovered in them.
+    """
+    transport = transport or RequestsArmTransport()
+    url: Optional[str] = arm_url("/subscriptions", SUBSCRIPTION_API_VERSION)
+    found: List[Dict[str, str]] = []
+    while url:
+        if not url.startswith(ARM_ENDPOINT + "/"):
+            raise AzureConnectionError("Azure returned a paging link outside Resource Manager")
+        response = transport.get(url, credential.token(ARM_SCOPE))
+        if not response.ok:
+            raise AzureConnectionError(
+                f"could not list subscriptions: {response.message()} (HTTP {response.status_code})"
+            )
+        for item in response.payload.get("value") or []:
+            state = str(item.get("state") or "")
+            if state.lower() in ("disabled", "deleted") or not item.get("subscriptionId"):
+                continue
+            found.append({
+                "id": str(item["subscriptionId"]),
+                "name": str(item.get("displayName") or item["subscriptionId"]),
+                "tenantId": str(item.get("tenantId") or ""),
+                "state": state,
+            })
+        url = response.payload.get("nextLink")
+    return sorted(found, key=lambda s: (s["name"].lower(), s["id"]))
+
+
+def token_identity(token: AccessToken) -> Tuple[Optional[str], Optional[str]]:
+    """(account, tenant id) from a token's claims, for showing who signed in.
+
+    Read only for display: the token is not verified here (Azure verifies it on
+    every call) and nothing from it is kept but these two names.
+    """
+    try:
+        part = token.value.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+    except (IndexError, ValueError, TypeError):
+        return None, None
+    if not isinstance(claims, dict):
+        return None, None
+    account = next((claims[k] for k in ("upn", "preferred_username", "unique_name", "email", "name") if claims.get(k)), None)
+    tenant = claims.get("tid")
+    return (str(account) if account else None), (str(tenant) if tenant else None)
 
 
 def token_audiences() -> Tuple[str, ...]:

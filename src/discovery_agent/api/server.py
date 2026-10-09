@@ -7,6 +7,7 @@ web framework would be the first. The surface is small and fixed.
     GET    /api/connections               current connection state
     POST   /api/connections/authenticate  prove an Azure identity
     POST   /api/connections/test          prove workspace access; enables discovery
+    POST   /api/connections/authenticate-directory  sign in to one more directory the account belongs to
     POST   /api/connections/upload        a ZIP of a Synapse repository (application/zip)
     POST   /api/connections/repository    use one environment's definitions from Git or an uploaded ZIP
     DELETE /api/connections               forget the connection
@@ -184,6 +185,7 @@ def make_handler(
             routes = {
                 "/api/connections/authenticate": lambda: session.authenticate(self._json_body()),
                 "/api/connections/test": lambda: session.test(self._json_body()),
+                "/api/connections/authenticate-directory": lambda: session.authenticate_directory(self._json_body()),
                 "/api/connections/repository": lambda: session.connect_repository(self._json_body(MAX_REPOSITORY_BODY_BYTES)),
                 "/api/connections/upload": lambda: session.upload_zip(self._zip_body(), dict(parse_qsl(urlsplit(self.path).query)).get("name", "")),
                 "/api/fabric/authenticate": lambda: fabric.authenticate(self._json_body()),

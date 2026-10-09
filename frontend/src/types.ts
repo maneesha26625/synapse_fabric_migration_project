@@ -40,6 +40,12 @@ export interface ConnectionState {
   signedIn?: boolean;
   /** The Azure sign-in method held, when `method` names a repository source instead. */
   signInMethod?: AuthMethod | null;
+  /** Who signed in (their sign-in name), for display. */
+  account?: string | null;
+  /** Every directory (tenant) the signed-in account belongs to. */
+  directories?: AzureDirectory[];
+  /** How many subscriptions the sign-in can see across them; changes when a directory is signed in to. */
+  subscriptionCount?: number;
   signingIn?: boolean;
   /** How the source was connected: an Azure sign-in method, or a Git / ZIP repository source. */
   method?: AuthMethod | RepositoryKind;
@@ -59,6 +65,27 @@ export interface ConnectionState {
 }
 
 export type SourceKind = "workspace" | RepositoryKind;
+
+/** A subscription the signed-in account can see. */
+export interface AzureSubscription {
+  id: string;
+  name: string;
+  tenantId: string;
+  /** The directory it belongs to, by name. */
+  tenantName?: string;
+  state: string;
+}
+
+/** A directory (tenant) the signed-in account belongs to. */
+export interface AzureDirectory {
+  id: string;
+  name: string;
+  domain: string;
+  subscriptions: number;
+  /** Its policy wants its own sign-in before it shows anything. */
+  needsSignIn: boolean;
+  error?: string;
+}
 export type RepositoryKind = "git" | "zip";
 
 /** A Git or ZIP source, as connected: never a credential. */
@@ -100,6 +127,7 @@ export interface RepositoryConfig {
   fileName?: string;
   parameters?: string;
   parametersName?: string;
+  subscriptionId?: string;
   resourceGroup?: string;
   workspace?: string;
   sqlPool?: string;
@@ -581,6 +609,8 @@ export interface MigrationApi {
   getConnection(): Promise<ConnectionState>;
   authenticate(config: ConnectionConfig): Promise<ConnectionState>;
   testConnection(config: ConnectionConfig): Promise<ConnectionState>;
+  /** Sign in to one more directory the account belongs to, chosen from `directories`. */
+  authenticateDirectory(tenantId: string): Promise<ConnectionState>;
   /** Extract an uploaded ZIP of a Synapse repository on the backend. */
   uploadZip(file: File): Promise<ZipUpload>;
   /** Use one environment's definitions from Git or an uploaded ZIP, optionally with a live SQL pool. */
@@ -593,9 +623,11 @@ export interface MigrationApi {
   getResults(query: ResultsQuery): Promise<ResultsPage>;
   getObject(id: string): Promise<ObjectDetail>;
   /** Dropdown contents. Each needs a completed sign-in. */
-  listResourceGroups(): Promise<string[]>;
-  listWorkspaces(resourceGroup: string): Promise<string[]>;
-  listSqlPools(resourceGroup: string, workspace: string): Promise<string[]>;
+  /** The subscriptions the signed-in account can see, by name. */
+  listSubscriptions(): Promise<AzureSubscription[]>;
+  listResourceGroups(subscriptionId: string): Promise<string[]>;
+  listWorkspaces(subscriptionId: string, resourceGroup: string): Promise<string[]>;
+  listSqlPools(subscriptionId: string, resourceGroup: string, workspace: string): Promise<string[]>;
   getDependencies(): Promise<DependencyGraph>;
   getComponents(): Promise<ComponentRow[]>;
   exportMetadata(): Promise<MetadataExport>;

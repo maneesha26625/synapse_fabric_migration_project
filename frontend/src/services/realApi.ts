@@ -1,5 +1,6 @@
 import {
   ApiRequestError,
+  type AzureSubscription,
   type ComponentRow,
   type DependencyGraph,
   type MetadataExport,
@@ -96,8 +97,11 @@ export const realApi: MigrationApi = {
   authenticate: (c) =>
     request<ConnectionState>("/api/connections/authenticate", {
       method: "POST",
-      body: JSON.stringify(connectionBody(c)),
+      // The sign-in takes nothing but the method: the subscription is chosen after it, from a list.
+      body: JSON.stringify({ method: c.method }),
     }),
+  authenticateDirectory: (tenantId) =>
+    request<ConnectionState>("/api/connections/authenticate-directory", { method: "POST", body: JSON.stringify({ tenantId }) }),
   testConnection: (c) =>
     request<ConnectionState>("/api/connections/test", {
       method: "POST",
@@ -118,9 +122,11 @@ export const realApi: MigrationApi = {
   getResults: (q) => request<ResultsPage>(`/api/discovery/results?${toQueryString(q)}`),
   getObject: (id) =>
     request<ObjectDetail>(`/api/discovery/results/${encodeURIComponent(id)}`),
-  listResourceGroups: async () => (await request<{ items: string[] }>("/api/azure/resource-groups")).items,
-  listWorkspaces: async (rg) =>
-    (await request<{ items: string[] }>(`/api/azure/workspaces?resourceGroup=${encodeURIComponent(rg)}`)).items,
+  listSubscriptions: async () => (await request<{ items: AzureSubscription[] }>("/api/azure/subscriptions")).items,
+  listResourceGroups: async (sub) =>
+    (await request<{ items: string[] }>(`/api/azure/resource-groups?subscriptionId=${encodeURIComponent(sub)}`)).items,
+  listWorkspaces: async (sub, rg) =>
+    (await request<{ items: string[] }>(`/api/azure/workspaces?subscriptionId=${encodeURIComponent(sub)}&resourceGroup=${encodeURIComponent(rg)}`)).items,
   getDependencies: () => request<DependencyGraph>("/api/dependencies"),
   getComponents: async () => (await request<{ components: ComponentRow[] }>("/api/mapping/components")).components,
   exportMetadata: () => request<MetadataExport>("/api/discovery/export"),
@@ -154,9 +160,9 @@ export const realApi: MigrationApi = {
       // Date filters decide which Synapse rows a table should hold, so the counts compare like with like.
       ...(options?.dataFilters ? { options: { dataFilters: options.dataFilters } } : {}),
     }) })).rows,
-  listSqlPools: async (rg, ws) =>
+  listSqlPools: async (sub, rg, ws) =>
     (await request<{ items: string[] }>(
-      `/api/azure/sql-pools?resourceGroup=${encodeURIComponent(rg)}&workspace=${encodeURIComponent(ws)}`,
+      `/api/azure/sql-pools?subscriptionId=${encodeURIComponent(sub)}&resourceGroup=${encodeURIComponent(rg)}&workspace=${encodeURIComponent(ws)}`,
     )).items,
 };
 

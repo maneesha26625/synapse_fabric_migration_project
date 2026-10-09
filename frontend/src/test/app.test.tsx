@@ -265,10 +265,13 @@ describe("start page", () => {
     localStorage.setItem("ma.route", JSON.stringify({ source: "synapse", destination: "fabric" }));
     go("/");
     const source = await screen.findByRole("radiogroup", { name: "How to connect to Azure Synapse" });
-    expect(within(source).getAllByRole("radio")).toHaveLength(4);
-    for (const m of [/^Azure CLI/, /^Interactive browser/, /Workspace export \(ZIP\)/, /Git repository/]) {
-      expect(within(source).getByRole("radio", { name: m })).not.toHaveAttribute("aria-disabled");
-    }
+    // Azure CLI, then Git in the place Interactive browser had, then ZIP.
+    expect(within(source).getAllByRole("radio").map((r) => r.textContent?.match(/^(Azure CLI|Git repository|Workspace export \(ZIP\))/)?.[0]))
+      .toEqual(["Azure CLI", "Git repository", "Workspace export (ZIP)"]);
+    for (const r of within(source).getAllByRole("radio")) expect(r).not.toHaveAttribute("aria-disabled");
+    expect(within(source).queryByRole("radio", { name: /Interactive browser/ })).toBeNull();
+    // Nothing to type before signing in.
+    expect(screen.queryByLabelText(/Subscription ID|Tenant ID/)).toBeNull();
     await user.click(within(source).getByRole("radio", { name: /Git repository/ }));
     expect(within(source).getByRole("radio", { name: /Git repository/ })).toHaveAttribute("aria-checked", "true");
     expect(screen.getByLabelText("Repository URL")).toBeInTheDocument();
@@ -338,20 +341,42 @@ describe("start page", () => {
     expect(within(card).getByText("contoso-synapse.zip")).toBeInTheDocument();
   }, 30000);
 
-  it("requires the tenant for the browser sign-in and says where the window opens", async () => {
+  it("signs in with nothing typed, then lists the account's subscriptions, and each one its own resource groups", async () => {
     const user = userEvent.setup();
     localStorage.setItem("ma.route", JSON.stringify({ source: "synapse", destination: "fabric" }));
     go("/");
     const card = await screen.findByRole("region", { name: /^Source connection/ });
-    await user.click(await within(card).findByRole("radio", { name: /Interactive browser/ }));
-    await user.type(within(card).getByLabelText("Subscription ID"), CONFIG.subscriptionId);
-    await user.click(within(card).getByRole("button", { name: "Authenticate" }));
-    expect(await within(card).findByText("Tenant ID is required.")).toBeInTheDocument();
-    await user.type(within(card).getByLabelText("Tenant ID"), "8a24d8ed-7a4b-45b3-b56b-d781dd225aa1");
-    await user.click(within(card).getByRole("button", { name: "Authenticate" }));
-    expect(await within(card).findByText(/A sign-in window should open on the machine running the accelerator/)).toBeInTheDocument();
-    await within(card).findByLabelText("Resource group", {}, { timeout: 4000 });
-  }, 15000);
+    await user.click(await within(card).findByRole("button", { name: "Sign in with Azure" }));
+    expect(await within(card).findByText(/Enter your email, password and any MFA prompt there/)).toBeInTheDocument();
+    expect(await within(card).findByText("demo.user@contoso.com", {}, { timeout: 4000 })).toBeInTheDocument();
+    const subscription = await within(card).findByLabelText("Subscription");
+    await waitFor(() => expect(within(subscription).getAllByRole("option").map((o) => o.textContent))
+      .toEqual(["Select a subscription", "Contoso HR (demo)", "Demo subscription"]));
+    // Until a subscription is chosen there is nothing to list below it.
+    expect(within(card).getByLabelText("Resource group")).toBeDisabled();
+    await user.selectOptions(subscription, "Contoso HR (demo)");
+    const group = within(card).getByLabelText("Resource group");
+    await waitFor(() => expect(group).toHaveValue("rg-hr-analytics")); // its only group, chosen without asking
+    await user.selectOptions(subscription, "Demo subscription");
+    await waitFor(() => expect(within(group).getAllByRole("option").map((o) => o.textContent)).toContain("rg-demo-migration"));
+  }, 20000);
+
+  it("lists subscriptions from every directory, and signs in to one that asks for its own sign-in on request", async () => {
+    const user = userEvent.setup();
+    localStorage.setItem("ma.route", JSON.stringify({ source: "synapse", destination: "fabric" }));
+    go("/");
+    const card = await screen.findByRole("region", { name: /^Source connection/ });
+    await user.click(await within(card).findByRole("button", { name: "Sign in with Azure" }));
+    const others = await within(card).findByRole("group", { name: "Other directories" }, { timeout: 4000 });
+    expect(within(others).getByText(/asks for its own sign-in before showing subscriptions/)).toBeInTheDocument();
+    await user.click(within(others).getByRole("button", { name: "Sign in to Partner directory" }));
+    const subscription = within(card).getByLabelText("Subscription");
+    // Once a second directory answers, every subscription is named with its directory.
+    await waitFor(() => expect(within(subscription).getAllByRole("option").map((o) => o.textContent)).toEqual([
+      "Select a subscription", "Contoso HR (demo) · Demo directory", "Demo subscription · Demo directory", "Partner analytics (demo) · Partner directory",
+    ]), { timeout: 4000 });
+    expect(within(card).queryByRole("group", { name: "Other directories" })).toBeNull();
+  }, 20000);
 
   it("keeps Start migration disabled until both sides are signed in, chosen and tested", async () => {
     const user = userEvent.setup();
@@ -364,10 +389,11 @@ describe("start page", () => {
     // Source: sign in, choose the workspace, test.
     expect(await within(source).findByRole("button", { name: "Test connection" })).toBeDisabled();
     await user.click(within(source).getByRole("radio", { name: /^Azure CLI/ })); // the form remembers the last method
-    await user.clear(within(source).getByLabelText("Subscription ID"));
-    await user.type(within(source).getByLabelText("Subscription ID"), CONFIG.subscriptionId);
     await user.click(within(source).getByRole("button", { name: "Sign in with Azure" }));
-    const group = await within(source).findByLabelText("Resource group", {}, { timeout: 4000 });
+    const subscription = await within(source).findByLabelText("Subscription", {}, { timeout: 4000 });
+    await waitFor(() => expect(within(subscription).getAllByRole("option").length).toBeGreaterThan(1));
+    await user.selectOptions(subscription, "Demo subscription");
+    const group = within(source).getByLabelText("Resource group");
     await waitFor(() => expect(within(group).getAllByRole("option").length).toBeGreaterThan(1));
     await user.selectOptions(group, "rg-demo-migration");
     const ws = within(source).getByLabelText("Synapse workspace");

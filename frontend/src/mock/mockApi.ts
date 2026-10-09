@@ -70,12 +70,29 @@ interface Session {
   objects: ObjectDetail[] | null;
   summary: DiscoverySummary | null;
   error: string | null;
-  signedIn: { subscriptionId: string; tenantId: string } | null;
+  signedIn: { account: string; tenantId: string } | null;
 }
 
 const DEMO_TENANT = "00000000-0000-0000-0000-000000000000";
+const DEMO_ACCOUNT = "demo.user@contoso.com";
+/** What the demo sign-in can see. */
+const DEMO_PARTNER_TENANT = "22222222-2222-2222-2222-222222222222";
+const DEMO_SUBSCRIPTIONS = [
+  { id: "10eb96c3-ba3c-492e-b95b-e9f1d6d85d70", name: "Demo subscription", tenantId: DEMO_TENANT, tenantName: "Demo directory", state: "Enabled" },
+  { id: "20eb96c3-ba3c-492e-b95b-e9f1d6d85d71", name: "Contoso HR (demo)", tenantId: DEMO_TENANT, tenantName: "Demo directory", state: "Enabled" },
+];
+/** Shown once the partner directory is signed in to: it asks for its own sign-in first. */
+const DEMO_PARTNER_SUBSCRIPTION = { id: "30eb96c3-ba3c-492e-b95b-e9f1d6d85d72", name: "Partner analytics (demo)", tenantId: DEMO_PARTNER_TENANT, tenantName: "Partner directory", state: "Enabled" };
+let demoPartnerSignedIn = false;
+// By name, as the backend lists them.
+const demoSubscriptions = () => [...DEMO_SUBSCRIPTIONS, ...(demoPartnerSignedIn ? [DEMO_PARTNER_SUBSCRIPTION] : [])]
+  .sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+const demoDirectories = () => [
+  { id: DEMO_TENANT, name: "Demo directory", domain: "contoso.com", subscriptions: DEMO_SUBSCRIPTIONS.length, needsSignIn: false },
+  { id: DEMO_PARTNER_TENANT, name: "Partner directory", domain: "partner.com", subscriptions: demoPartnerSignedIn ? 1 : 0, needsSignIn: !demoPartnerSignedIn },
+];
 const DEMO_SOURCE: ConnectionConfig = {
-  method: "azure_cli", tenantId: DEMO_TENANT, subscriptionId: "11111111-2222-3333-4444-555555555555",
+  method: "azure_cli", tenantId: DEMO_TENANT, subscriptionId: "10eb96c3-ba3c-492e-b95b-e9f1d6d85d70",
   resourceGroup: "rg-demo-migration", workspace: "demo-synapse-ws", workspaceUrl: "", sqlPool: "TransportDW", resource: "",
 };
 const DEMO_FABRIC_WORKSPACES = [{ id: "3f2a9c1e-7b64-4d0a-9a55-1c2e8b7d4f10", name: "Fabric_demo" }, { id: "9b1d5e22-0c3a-4f7e-8d11-6a4c2e9f0b33", name: "My workspace" }];
@@ -121,7 +138,7 @@ const ready = (): Session => {
     objects: null,
     summary: null,
     error: null,
-    signedIn: { subscriptionId: DEMO_SOURCE.subscriptionId, tenantId: DEMO_TENANT },
+    signedIn: { account: DEMO_ACCOUNT, tenantId: DEMO_TENANT },
   };
 };
 let s = ready();
@@ -136,8 +153,9 @@ function connectionFor(c: ConnectionConfig, connected: boolean, error?: Connecti
     workspace: ws,
     resourceGroup: c.resourceGroup.trim(),
     subscriptionId: c.subscriptionId.trim(),
-    subscriptionName: "Demo subscription",
-    tenantId: c.tenantId.trim() || DEMO_TENANT,
+    subscriptionName: demoSubscriptions().find((x) => x.id === c.subscriptionId.trim())?.name ?? "Demo subscription",
+    tenantId: DEMO_TENANT,
+    account: DEMO_ACCOUNT,
     sqlPool: c.sqlPool.trim() || null,
     testedAt: connected ? new Date().toISOString() : null,
     checks: error
@@ -394,6 +412,7 @@ export function resetDemo(): void {
   fabric = readyFabric();
   execSim = null;
   plannerHistory = [];
+  demoPartnerSignedIn = false;
 }
 
 /** A small stand-in for the backend planner so the demo page is fully populated. */
@@ -499,25 +518,45 @@ export const mockApi: MigrationApi = {
   },
 
   async authenticate(c) {
-    // Stands in for the browser sign-in window.
-    await sleep(c.method === "azure_cli" ? 1500 : 800);
-    if (!c.subscriptionId.trim()) throw new ApiRequestError("invalid_configuration", "Subscription ID is required.");
-    if (c.method === "interactive_browser" && !c.tenantId.trim()) throw new ApiRequestError("invalid_configuration", "Tenant ID is required.");
-    s.signedIn = { subscriptionId: c.subscriptionId.trim(), tenantId: c.tenantId.trim() || DEMO_TENANT };
-    s.connection = { status: "disconnected", ok: true, signedIn: true, method: c.method, subscriptionId: s.signedIn.subscriptionId, subscriptionName: "Demo subscription", tenantId: s.signedIn.tenantId, checks: [] };
+    // Stands in for the Microsoft sign-in window: nothing is typed in the app.
+    await sleep(1500);
+    if (c.method !== "azure_cli") throw new ApiRequestError("invalid_configuration", "Choose an authentication method.");
+    s.signedIn = { account: DEMO_ACCOUNT, tenantId: DEMO_TENANT };
+    demoPartnerSignedIn = false;
+    s.connection = { status: "disconnected", ok: true, signedIn: true, method: "azure_cli", account: DEMO_ACCOUNT, tenantId: DEMO_TENANT,
+      directories: demoDirectories(), subscriptionCount: demoSubscriptions().length,
+      checks: [{ name: "Azure authentication", status: "ok", message: `Signed in as ${DEMO_ACCOUNT}; ${DEMO_SUBSCRIPTIONS.length} subscriptions in 2 directories; Partner directory needs its own sign-in`, category: null }] };
     return s.connection;
   },
 
-  async listResourceGroups() {
-    await sleep(300);
+  async authenticateDirectory(tenantId: string) {
+    await sleep(1200);
     if (!s.signedIn) throw new ApiRequestError("sign_in_required", "Sign in to Azure first.", 409);
-    return ["rg-demo-analytics", "rg-demo-migration", "TransportationMigrationRG"];
+    if (tenantId !== DEMO_PARTNER_TENANT) throw new ApiRequestError("invalid_configuration", "Choose a directory from the list your account belongs to.", 400);
+    demoPartnerSignedIn = true;
+    s.connection = { ...s.connection, directories: demoDirectories(), subscriptionCount: demoSubscriptions().length,
+      checks: [{ name: "Sign-in to Partner directory", status: "ok", message: "1 subscription in Partner directory", category: null }] };
+    return s.connection;
   },
 
-  async listWorkspaces(rg) {
+  async listSubscriptions() {
+    await sleep(200);
+    if (!s.signedIn) throw new ApiRequestError("sign_in_required", "Sign in to Azure first.", 409);
+    return demoSubscriptions().map((x) => ({ ...x }));
+  },
+
+  async listResourceGroups(sub) {
+    await sleep(300);
+    if (!s.signedIn) throw new ApiRequestError("sign_in_required", "Sign in to Azure first.", 409);
+    // The second demo subscription holds one group of its own, so switching subscription visibly changes the list.
+    return sub === DEMO_SUBSCRIPTIONS[1].id ? ["rg-hr-analytics"] : ["rg-demo-analytics", "rg-demo-migration", "TransportationMigrationRG"];
+  },
+
+  async listWorkspaces(_sub, rg) {
     await sleep(300);
     const byGroup: Record<string, string[]> = {
       "rg-demo-analytics": ["analytics-synapse-prod"],
+      "rg-hr-analytics": ["hr-synapse"],
       // Names double as demo scenarios: see the header of this file.
       "rg-demo-migration": ["demo-synapse-ws", "partial-ws", "empty-ws", "fail-ws", "denied-ws"],
       TransportationMigrationRG: ["transportationsynapsemigration"],
@@ -525,7 +564,7 @@ export const mockApi: MigrationApi = {
     return byGroup[rg] ?? [];
   },
 
-  async listSqlPools(_rg, ws) {
+  async listSqlPools(_sub, _rg, ws) {
     await sleep(250);
     return ws.includes("empty") ? [] : ["TransportDW"];
   },
@@ -551,8 +590,8 @@ export const mockApi: MigrationApi = {
   async connectRepository(c: RepositoryConfig) {
     await sleep(900);
     if (!c.environment?.trim()) throw new ApiRequestError("invalid_configuration", "Choose the environment these definitions are for.", 400);
-    const withPool = !!(c.resourceGroup || c.workspace || c.sqlPool);
-    if (withPool && !(c.resourceGroup && c.workspace && c.sqlPool)) throw new ApiRequestError("invalid_configuration", "To add the SQL pool, choose its resource group, workspace and pool.", 400);
+    const withPool = !!(c.subscriptionId || c.resourceGroup || c.workspace || c.sqlPool);
+    if (withPool && !(c.subscriptionId && c.resourceGroup && c.workspace && c.sqlPool)) throw new ApiRequestError("invalid_configuration", "To add the SQL pool, choose its subscription, resource group, workspace and pool.", 400);
     if (withPool && !s.signedIn) throw new ApiRequestError("sign_in_required", "Sign in to Azure first.", 409);
     const url = (c.repositoryUrl ?? "").trim();
     if (c.kind === "git" && !/^(https:\/\/|git@|ssh:\/\/)/.test(url)) throw new ApiRequestError("invalid_configuration", "Enter the repository's HTTPS or SSH URL.", 400);
@@ -575,8 +614,9 @@ export const mockApi: MigrationApi = {
     const display = c.kind === "git" ? (url.replace(/\/+$/, "").split("/").pop() ?? "repository").replace(/\.git$/, "") : label.replace(/\.zip$/i, "");
     s.connection = {
       status: "connected", ok: true, signedIn: !!s.signedIn, signInMethod: s.signedIn ? "azure_cli" : null, method: c.kind, sourceKind: c.kind, sourcePlatform: "Azure Synapse",
-      workspace: c.workspace || display, resourceGroup: c.resourceGroup ?? "", subscriptionId: s.signedIn?.subscriptionId ?? "",
-      subscriptionName: s.signedIn ? "Demo subscription" : null, tenantId: s.signedIn?.tenantId ?? null,
+      workspace: c.workspace || display, resourceGroup: c.resourceGroup ?? "", subscriptionId: c.subscriptionId ?? "",
+      subscriptionName: demoSubscriptions().find((x) => x.id === c.subscriptionId)?.name ?? null, tenantId: s.signedIn?.tenantId ?? null,
+      account: s.signedIn?.account ?? null,
       sqlPool: withPool ? c.sqlPool! : null, testedAt: new Date().toISOString(),
       checks: [
         firstCheck,

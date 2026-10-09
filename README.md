@@ -112,7 +112,7 @@ migration starts, and **Migration**, where it runs.
 
    | Side | Sign-in methods |
    |---|---|
-   | Azure Synapse (source) | **Azure CLI**; **Interactive browser** (for a tenant your `az login` cannot reach; asks only for Tenant ID and Subscription ID); **Git repository** and **Workspace export (ZIP)**, for one environment (see below) |
+   | Azure Synapse (source) | **Azure CLI**: *Sign in with Azure*, then choose the subscription, resource group, workspace and SQL pool from lists (nothing typed); **Git repository** and **Workspace export (ZIP)**, for one environment (see below) |
    | Microsoft Fabric (destination) | **Azure CLI**; **Fabric CLI** |
 
    After sign-in, Synapse asks for the resource group, workspace and
@@ -493,40 +493,36 @@ Token handling is automatic and invisible:
 access token, refresh token or client secret, and a repository URL with
 credentials embedded in it is rejected at construction.
 
-### Sign-in methods: Azure CLI and Interactive browser
+### Signing in to the Synapse source
 
-The UI offers two ways to sign in to Azure.
+The source card signs in first and asks for no ids:
 
-| Method | What happens | Use it when |
-| --- | --- | --- |
-| **Azure CLI** (`azure_cli`) | A sign-in window opens each time you authenticate. Nothing is kept between sign-ins. | The default. |
-| **Interactive browser** (`interactive_browser`) | A Microsoft sign-in window opens against the **tenant you name**. You pick or type your own account there (MFA included); no account is pre-selected. One sign-in serves every audience: ARM, Synapse, SQL and Fabric. | A tenant your `az login` cannot reach, or when you want to leave your Azure CLI session alone. |
+1. **Sign in with Azure** opens a Microsoft sign-in window. The email,
+   password and MFA are entered there, in Microsoft's page, never in the
+   accelerator. The sign-in goes to the account's own directory, so no tenant
+   is asked for.
+2. The account's **subscriptions** are listed by name (`GET /api/azure/subscriptions`);
+   disabled ones are left out.
+3. Choosing one lists its **resource groups**, then **workspaces**, then
+   **dedicated SQL pools**; a list with one entry is chosen automatically.
+4. **Test connection** checks the chain.
 
-Interactive browser never runs `az` and never reads or writes the Azure CLI's
-token cache: `az account show` reports the same account before and after.
-
+* **Nothing is kept between sign-ins**: each one opens the window again, and
+  the existing `az login` session is neither used nor changed.
 * **The window opens on the machine running the server**, not necessarily the
-  one your browser is on. If the API runs elsewhere (a VM, a container,
-  headless), use Azure CLI instead. You have 120 seconds to finish the sign-in.
-* **The form asks for two things only: Tenant ID and Subscription ID**, both
-  required. There are no optional fields. If the tenant answers
-  `access_denied`, it has not consented to Microsoft's default developer
-  sign-in app; its administrator needs to allow that app. (The command line
-  still accepts `--client-id` for a tenant that requires its own app.)
-* **It survives a server restart without a new window.** Tokens go into the
-  SDK's encrypted token cache (`synapse-discovery-agent`; DPAPI on Windows,
-  Keychain on macOS, libsecret on Linux), never in plaintext. If no keyring is
-  available, the cache stays in memory only. An *authentication record*
-  (username, home account id, authority, tenant, client id; **no token**) is
-  kept at `~/.synapse-discovery/authentication-record.json`, or under
-  `$SYNAPSE_DISCOVERY_HOME`. azure-identity needs that record to sign in
-  silently from its cache.
+  one your browser is on. You have 120 seconds to finish the sign-in.
+* **Every directory the account belongs to is searched.** The window signs in
+  to the account's own directory; the subscriptions of every other directory it
+  is a member or guest of are then read from the same sign-in, silently, and
+  each is shown with its directory's name. A directory whose policy (MFA,
+  conditional access) wants its own sign-in is offered as a **Sign in to
+  \<directory\>** button; no window opens unless that button is pressed.
+  Each subscription is then read with tokens for its own directory.
 * **Signing out** (Disconnect in the UI, `DELETE /api/connections`) drops the
-  identities the server holds and deletes the record, so the next sign-in
-  opens the window again. The Azure CLI session is untouched.
+  identity the server holds.
 
-From the command line: `--credential-method interactive_browser --tenant <id>
-[--client-id <id>]`.
+The command line still accepts `--credential-method interactive_browser
+--tenant <id> [--client-id <id>]` for a named tenant.
 
 ### Git: providers, transports and credentials
 

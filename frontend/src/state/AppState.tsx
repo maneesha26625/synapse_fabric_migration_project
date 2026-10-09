@@ -55,6 +55,8 @@ interface AppStateValue {
   clearConnectionError: () => void;
   authenticate: (config: ConnectionConfig) => Promise<void>;
   testConnection: (config: ConnectionConfig) => Promise<void>;
+  /** Sign in to one more directory the account belongs to. */
+  authenticateDirectory: (tenantId: string) => Promise<void>;
   /** Connect one environment's repository (Git or an uploaded ZIP) as the source. */
   connectRepository: (config: RepositoryConfig) => Promise<void>;
   /** Upload a ZIP export; the caller shows what was found, or the error. */
@@ -73,7 +75,7 @@ interface AppStateValue {
   getResults: (query: ResultsQuery) => Promise<ResultsPage>;
   getObject: (id: string) => Promise<ObjectDetail>;
   /** Dropdown contents for the Azure source form. */
-  azureLists: Pick<import("../types").MigrationApi, "listResourceGroups" | "listWorkspaces" | "listSqlPools">;
+  azureLists: Pick<import("../types").MigrationApi, "listSubscriptions" | "listResourceGroups" | "listWorkspaces" | "listSqlPools">;
 }
 
 const AppState = createContext<AppStateValue | null>(null);
@@ -204,6 +206,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
 
   const authenticate = useCallback((c: ConnectionConfig) => run("authenticate", () => api.authenticate(c)), [api, run]);
   const testConnection = useCallback((c: ConnectionConfig) => run("test", () => api.testConnection(c)), [api, run]);
+  const authenticateDirectory = useCallback((tenantId: string) => run("authenticate", () => api.authenticateDirectory(tenantId)), [api, run]);
   const connectRepository = useCallback((c: RepositoryConfig) => run("test", () => api.connectRepository(c)), [api, run]);
   const uploadZip = useCallback((file: File) => api.uploadZip(file), [api]);
   const disconnect = useCallback(async () => {
@@ -267,6 +270,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     clearConnectionError: () => setConnectionError(null),
     authenticate,
     testConnection,
+    authenticateDirectory,
     connectRepository,
     uploadZip,
     disconnect,

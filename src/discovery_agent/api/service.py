@@ -4,20 +4,16 @@ A single-operator, single-process model on purpose. The migration accelerator
 is a local tool today; the connection lives in this process's memory and is
 gone when the process ends. Nothing here writes a credential anywhere.
 
-Two ways to prove an identity, both built by the connection layer:
+The identity is proven first, with nothing typed but in Microsoft's own
+window: **Azure CLI** opens a Microsoft sign-in (not the ambient `az login`
+session) against the account's own directory, where the operator gives their
+email, password and MFA. Nothing is kept between sign-ins. The app never sees
+a password; no request field can carry a secret, and an unknown field is
+refused.
 
-* **Azure CLI** -- an interactive browser sign-in (not the ambient `az
-  login` session); the operator authenticates each time and nothing is kept.
-* **Interactive browser** -- a Microsoft sign-in window against the tenant
-  named. The connection layer holds the signed-in identity for the process
-  and keeps an authentication record (no token), so a restarted server signs
-  in silently. Disconnecting forgets both. The Azure CLI session is never
-  read or written.
-
-No request field can carry a secret: an unknown field is refused.
-
-After any of them the same flow follows: list resource groups, workspaces and
-SQL pools from that identity, then test the connection.
+Then everything is chosen from what that account can see: its subscriptions,
+then a subscription's resource groups, workspaces and SQL pools, and the
+connection is tested.
 
 Discovery reuses ``discovery.run``. For a live workspace it runs in
 workspace-only mode (``scan_repository=False``): the live Artifacts API and,
@@ -40,12 +36,15 @@ from discovery_agent.api import mapping, repository_source
 from discovery_agent.api.repository_source import RepositoryError, RepositorySpec
 from discovery_agent.config import DEFAULT_OUTPUT_DIR, DiscoveryConfig
 from discovery_agent.connections.azure import (
+    ARM_SCOPE,
     AzureConnection,
-    AzureCredentialProvider,
-    credential_provider,
-    discover_tenant_id,
+    DirectorySignInRequired,
+    MultiTenantSignIn,
     forget_auth_record,
+    list_subscriptions,
+    list_tenants,
     reset_credentials,
+    token_identity,
 )
 from discovery_agent.connections.git import GitConnection
 from discovery_agent.connections.manager import ConnectionManager
@@ -91,33 +90,26 @@ _WORKSPACE_URL = re.compile(
     r"^https://(?P<name>[A-Za-z0-9-]+)\.dev\.azuresynapse\.net/?$", re.IGNORECASE
 )
 
-METHODS = ("azure_cli", "interactive_browser")
+METHODS = ("azure_cli",)
 
 #: What the UI shows for each method. Plain language, no secret anywhere.
 METHOD_NOTES = {
     "azure_cli": {
         "label": "Azure CLI",
-        "detail": "Opens a sign-in window each time; nothing is kept between sign-ins.",
-    },
-    "interactive_browser": {
-        "label": "Interactive browser",
-        "detail": "Opens a sign-in window against the tenant you name, and leaves your Azure CLI session untouched.",
-        "bestFor": "A tenant your `az login` cannot reach.",
+        "detail": "Opens a Microsoft sign-in window; then lists your subscriptions. Nothing is kept between sign-ins.",
         "caveat": "The window opens on the machine running this server.",
     },
 }
 
 #: Everything an authenticate request may contain: only what the sign-in
 #: needs. Anything else -- a secret above all -- is refused, not dropped.
-_AUTHENTICATE_FIELDS = frozenset(
-    {"method", "tenantId", "subscriptionId", "resourceGroup", "workspace", "workspaceUrl", "sqlPool"}
-)
+_AUTHENTICATE_FIELDS = frozenset({"method"})
 
 #: Everything a repository connection request may contain. The parameters file's
 #: text is a deployment file of identifiers and values, never a credential field.
 _REPOSITORY_FIELDS = frozenset(
     {"kind", "repositoryUrl", "ref", "rootFolder", "uploadId", "fileName", "environment", "parameters",
-     "parametersName", "resourceGroup", "workspace", "sqlPool"}
+     "parametersName", "subscriptionId", "resourceGroup", "workspace", "sqlPool"}
 )
 SOURCE_KINDS = ("workspace", "git", "zip")
 _FILE_NAME = re.compile(r"[^A-Za-z0-9 ._()-]")
@@ -203,15 +195,18 @@ def _clean(value: Any, name: str, pattern: re.Pattern, required: bool = True) ->
 
 @dataclass
 class _SignIn:
-    """A completed interactive sign-in for one subscription. Holds no token
+    """A completed sign-in and the subscriptions it can see. Holds no token
     itself: the provider caches those in memory, inside the connection layer."""
 
     method: str
-    provider: AzureCredentialProvider
-    azure: AzureConnection
-    subscription_id: str
+    sign_in: MultiTenantSignIn
+    #: The account's own directory.
     tenant_id: Optional[str]
-    subscription_name: Optional[str]
+    account: Optional[str]
+    #: Each: {id, name, tenantId, tenantName, state}, from every directory that answered.
+    subscriptions: List[Dict[str, str]]
+    #: Each directory the account belongs to: {id, name, domain, subscriptions, needsSignIn, error?}.
+    directories: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -271,7 +266,7 @@ class Session:
         return {
             "status": "ok",
             "capabilities": {
-                # Only what ``credential_provider`` actually implements.
+                # Only what the connection layer actually implements.
                 "authMethods": list(METHODS),
                 # Where the definitions can come from: the live workspace, or one environment's repository.
                 "sourceKinds": list(SOURCE_KINDS),
@@ -310,74 +305,177 @@ class Session:
         return payload
 
     def authenticate(self, body: dict) -> dict:
-        """Prove an Azure identity for one subscription.
+        """Sign in, then list the subscriptions the account can see.
 
-        * ``azure_cli`` opens a sign-in window on the machine running the API
-          and blocks until the operator finishes. It deliberately does not
-          reuse an existing ``az login`` session: every call asks.
-        * ``interactive_browser`` signs in against the named tenant through
-          the identity the connection layer holds, so a repeat -- or a
-          restarted server with a stored record -- does not prompt again.
+        Nothing is typed here but the choice of method: the Microsoft window asks for
+        the email, password and MFA, against the account's own directory. The window
+        opens on the machine running the API and blocks until the operator finishes;
+        it does not reuse an existing ``az login`` session, and keeps nothing after.
         """
         unknown = sorted(set(body) - _AUTHENTICATE_FIELDS)
         if unknown:
             # Names only, never values: a refused field may be a secret.
             raise ApiError(400, "invalid_configuration", f"Unexpected field(s): {', '.join(unknown)}.")
         method = self._method(body)
-        browser = method == "interactive_browser"
-        subscription = _clean(body.get("subscriptionId"), "Subscription ID", _GUID)
-        tenant = _clean(body.get("tenantId"), "Tenant ID", _GUID, required=browser)
         with self._lock:
             if self._signing_in:
                 raise ApiError(409, "sign_in_in_progress", "A sign-in is already waiting for you in a browser window.")
             if self._job.state == "running":
                 raise ApiError(409, "discovery_running", "Discovery is running; wait for it to finish.")
             self._signing_in = True
+        check = {"name": "Azure authentication", "status": "ok", "message": "", "category": None}
+        error: Optional[dict] = None
+        signin: Optional[_SignIn] = None
         try:
-            # Sending the operator to the right tenant's sign-in page is what
-            # lets a subscription id alone be enough.
-            tenant = tenant or discover_tenant_id(subscription)
-            # Both are a browser sign-in. "azure_cli" keeps nothing, as it
-            # always has; "interactive_browser" uses the held identity.
-            credential_method = CredentialMethod.INTERACTIVE_BROWSER
+            signer = MultiTenantSignIn()
             try:
-                config = AzureConnectionConfig(
-                    subscription_id=subscription,
-                    tenant_id=tenant,
-                    credential_method=credential_method,
-                )
-                provider = credential_provider(
-                    method=credential_method,
-                    tenant_id=tenant,
-                    remember=browser,
-                )
-                provider.start_attempt()  # an explicit attempt retries a refused one
-                azure = AzureConnection(config, credential=provider)
-            except (ConfigError, AzureAuthenticationError) as exc:
-                raise ApiError(400, "invalid_configuration", redact(str(exc))) from exc
-            result = azure.validate()  # for azure_cli, this call opens the browser
+                signer.sign_in()  # opens the window, for the account's own directory
+                token = signer.token(ARM_SCOPE)
+                account, tenant = token_identity(token)
+                signin = _SignIn(method=method, sign_in=signer, tenant_id=tenant, account=account, subscriptions=[])
+                self._read_directories(signin)
+            except AzureAuthenticationError as exc:
+                signin, category, message = None, ErrorCategory.AUTHENTICATION, redact(str(exc))
+            except AzureConnectionError as exc:
+                signin, category, message = None, ErrorCategory.NETWORK, redact(str(exc))
+            else:
+                category, message = None, self._sign_in_summary(signin)
+            if category is not None:
+                title, hint = _CATEGORY_HELP[category]
+                check.update(status="failed", message=message, category=category.value)
+                error = {"code": category.value, "title": title, "hint": hint, "message": message}
+            elif signin is not None and not signin.subscriptions and not any(d["needsSignIn"] for d in signin.directories):
+                check.update(status="failed", message=message, category=ErrorCategory.AUTHORIZATION.value)
+                count = len(signin.directories)
+                error = {"code": ErrorCategory.AUTHORIZATION.value, "title": "No subscriptions",
+                         "hint": f"This account belongs to {count} director{'y' if count == 1 else 'ies'} and none of them shows a "
+                                 "subscription it can read. Ask for the Reader role on the subscription that holds the Synapse "
+                                 "workspace, then sign in again.",
+                         "message": message}
+            else:
+                check["message"] = message
         finally:
             with self._lock:
                 self._signing_in = False
 
         with self._lock:
-            self._connection = None
+            self._replace_connection(None)
             self._job = _Job()
             self._detail_cache.clear()
-            if result.ok:
-                self._signin = _SignIn(
-                    method=method,
-                    provider=provider,
-                    azure=azure,
-                    subscription_id=subscription,
-                    tenant_id=result.details.get("tenant_id") or tenant,
-                    subscription_name=result.details.get("subscription_name"),
-                )
-            else:
-                self._signin = None
+            self._signin = signin
             payload = self._connection_payload(None)
-        payload["checks"] = [self._check(result)]
-        return self._with_error(payload, [] if result.ok else [result], tenant_hint=not tenant)
+        payload["checks"] = [check]
+        payload["ok"] = error is None
+        if error is not None:
+            payload["error"] = error
+        return payload
+
+    @staticmethod
+    def _read_directories(signin: "_SignIn") -> None:
+        """Every directory the account belongs to, and the subscriptions each lets it read.
+
+        The account's own directory is read with the sign-in just made; every other one
+        silently, from the same sign-in. A directory whose policy wants its own sign-in is
+        listed as such rather than opening a window nobody asked for.
+        """
+        signer = signin.sign_in
+        tenants = list_tenants(signer.for_tenant(None))
+        if signin.tenant_id and not any(t["id"].lower() == signin.tenant_id.lower() for t in tenants):
+            tenants.insert(0, {"id": signin.tenant_id, "name": "Your directory", "domain": ""})
+        home = (signin.tenant_id or "").lower()
+        tenants.sort(key=lambda t: (t["id"].lower() != home, t["name"].lower()))
+        seen = {s["id"].lower() for s in signin.subscriptions}
+        directories: List[Dict[str, Any]] = []
+        for tenant in tenants:
+            entry: Dict[str, Any] = {**tenant, "subscriptions": 0, "needsSignIn": False}
+            try:
+                found = list_subscriptions(signer.for_tenant(tenant["id"]))
+            except DirectorySignInRequired:
+                entry["needsSignIn"] = True
+            except (AzureAuthenticationError, AzureConnectionError) as exc:
+                entry["error"] = redact(str(exc))[:300]
+            else:
+                entry["subscriptions"] = len(found)
+                for sub in found:
+                    if sub["id"].lower() not in seen:
+                        seen.add(sub["id"].lower())
+                        signin.subscriptions.append({**sub, "tenantId": sub.get("tenantId") or tenant["id"], "tenantName": tenant["name"]})
+            directories.append(entry)
+        signin.directories = directories
+        signin.subscriptions.sort(key=lambda x: (x["name"].lower(), x["id"]))
+
+    @staticmethod
+    def _sign_in_summary(signin: "_SignIn") -> str:
+        subs, dirs = len(signin.subscriptions), len(signin.directories)
+        text = (f"Signed in as {signin.account or 'your account'}; {subs} subscription{'' if subs == 1 else 's'} "
+                f"in {dirs} director{'y' if dirs == 1 else 'ies'}")
+        locked = [d["name"] for d in signin.directories if d["needsSignIn"]]
+        if locked:
+            text += (f"; {', '.join(locked[:3])}{' and more' if len(locked) > 3 else ''} "
+                     f"{'needs its' if len(locked) == 1 else 'need their'} own sign-in")
+        return text
+
+    def authenticate_directory(self, body: dict) -> dict:
+        """Sign in to one more directory the account belongs to, chosen from the list, and add its subscriptions."""
+        unknown = sorted(set(body) - {"tenantId"})
+        if unknown:
+            raise ApiError(400, "invalid_configuration", f"Unexpected field(s): {', '.join(unknown)}.")
+        signin = self._signed_in()
+        wanted = str(body.get("tenantId") or "").lower()
+        directory = next((d for d in signin.directories if d["id"].lower() == wanted), None)
+        if directory is None:
+            raise ApiError(400, "invalid_configuration", "Choose a directory from the list your account belongs to.")
+        with self._lock:
+            if self._signing_in:
+                raise ApiError(409, "sign_in_in_progress", "A sign-in is already waiting for you in a browser window.")
+            self._signing_in = True
+        check = {"name": f"Sign-in to {directory['name']}", "status": "ok", "message": "", "category": None}
+        try:
+            signin.sign_in.sign_in(directory["id"])  # opens the window, for that directory
+            found = list_subscriptions(signin.sign_in.for_tenant(directory["id"]))
+        except (AzureAuthenticationError, AzureConnectionError) as exc:
+            check.update(status="failed", message=redact(str(exc)), category=ErrorCategory.AUTHENTICATION.value)
+        else:
+            known = {s["id"].lower() for s in signin.subscriptions}
+            for sub in found:
+                if sub["id"].lower() not in known:
+                    signin.subscriptions.append({**sub, "tenantId": sub.get("tenantId") or directory["id"], "tenantName": directory["name"]})
+            signin.subscriptions.sort(key=lambda x: (x["name"].lower(), x["id"]))
+            directory.update(needsSignIn=False, subscriptions=len(found))
+            directory.pop("error", None)
+            check["message"] = f"{len(found)} subscription{'' if len(found) == 1 else 's'} in {directory['name']}"
+        finally:
+            with self._lock:
+                self._signing_in = False
+        with self._lock:
+            payload = self._connection_payload(self._connection)
+        payload["checks"] = [check]
+        payload["ok"] = check["status"] == "ok"
+        if not payload["ok"]:
+            title, hint = _CATEGORY_HELP[ErrorCategory.AUTHENTICATION]
+            payload["error"] = {"code": "authentication", "title": title, "hint": hint, "message": check["message"]}
+        return payload
+
+    def _subscription(self, subscription_id: Any) -> Tuple["_SignIn", Dict[str, str]]:
+        """The signed-in identity and one of its subscriptions, chosen from the list it saw."""
+        signin = self._signed_in()
+        wanted = _clean(subscription_id, "Subscription", _GUID)
+        found = next((s for s in signin.subscriptions if s["id"].lower() == str(wanted).lower()), None)
+        if found is None:
+            raise ApiError(400, "invalid_configuration", "Choose a subscription from the list your account can see.")
+        return signin, found
+
+    def _azure_for(self, subscription_id: Any) -> Tuple["_SignIn", Dict[str, str], AzureConnection]:
+        signin, found = self._subscription(subscription_id)
+        try:
+            azure = AzureConnection(
+                AzureConnectionConfig(subscription_id=found["id"], tenant_id=found.get("tenantId") or signin.tenant_id,
+                                      credential_method=CredentialMethod.INTERACTIVE_BROWSER),
+                credential=signin.sign_in.for_tenant(found.get("tenantId") or signin.tenant_id),
+            )
+        except ConfigError as exc:
+            raise ApiError(400, "invalid_configuration", redact(str(exc))) from exc
+        return signin, found, azure
 
     def _signed_in(self) -> "_SignIn":
         with self._lock:
@@ -386,19 +484,21 @@ class Session:
             return self._signin
 
     def azure_options(self, kind: str, query: Dict[str, str]) -> dict:
-        """Dropdown contents: resource groups, then workspaces, then SQL pools."""
-        signin = self._signed_in()
+        """Dropdown contents: subscriptions, then a subscription's resource groups, workspaces and SQL pools."""
+        if kind == "subscriptions":
+            return {"items": [dict(s) for s in self._signed_in().subscriptions]}
+        if kind not in ("resource-groups", "workspaces", "sql-pools"):
+            raise ApiError(404, "not_found", "No such list.")
+        _, _, azure = self._azure_for(query.get("subscriptionId"))
         resource_group = _clean(query.get("resourceGroup"), "Resource group", _NAME, required=kind != "resource-groups")
         workspace = _clean(query.get("workspace"), "Synapse workspace", _NAME, required=kind == "sql-pools")
         try:
             if kind == "resource-groups":
-                items = signin.azure.list_resource_groups()
+                items = azure.list_resource_groups()
             elif kind == "workspaces":
-                items = signin.azure.list_synapse_workspaces(resource_group)
-            elif kind == "sql-pools":
-                items = signin.azure.list_sql_pools(resource_group, workspace)
+                items = azure.list_synapse_workspaces(resource_group)
             else:
-                raise ApiError(404, "not_found", "No such list.")
+                items = azure.list_sql_pools(resource_group, workspace)
         except AzureAuthenticationError as exc:
             raise ApiError(401, "authentication", redact(str(exc))) from exc
         except AzureConnectionError as exc:
@@ -411,30 +511,31 @@ class Session:
         signin = self._signed_in()
         if signin.method != method:
             raise ApiError(409, "sign_in_required", "Authenticate with the selected method first.")
+        signin, subscription, azure = self._azure_for(body.get("subscriptionId"))
         resource_group = _clean(body.get("resourceGroup"), "Resource group", _NAME)
         workspace = _clean(body.get("workspace"), "Synapse workspace", _NAME)
         sql_pool = _clean(body.get("sqlPool"), "Dedicated SQL pool", _NAME, required=False)
         try:
             settings = ConnectionSettings(
-                azure=signin.azure.config,
+                azure=azure.config,
                 synapse=SynapseConnectionConfig(
                     resource_group=resource_group, workspace_name=workspace, sql_pool_name=sql_pool
                 ),
             )
             # The manager is handed the signed-in credential, so nothing below
             # can prompt again or fall back to a different identity.
-            manager = ConnectionManager(settings, credential=signin.provider)
+            manager = ConnectionManager(settings, credential=azure.credential)
         except ConfigError as exc:
             raise ApiError(400, "invalid_configuration", redact(str(exc))) from exc
         conn = _Connection(
             method=signin.method,
             manager=manager,
-            tenant_id=signin.tenant_id,
-            subscription_id=signin.subscription_id,
+            tenant_id=subscription.get("tenantId") or signin.tenant_id,
+            subscription_id=subscription["id"],
             resource_group=resource_group,
             workspace=workspace,
             sql_pool=sql_pool,
-            subscription_name=signin.subscription_name,
+            subscription_name=subscription["name"],
         )
 
         results: List[ConnectionValidation] = []
@@ -509,10 +610,10 @@ class Session:
         resource_group = _clean(body.get("resourceGroup"), "Resource group", _NAME, required=False)
         workspace = _clean(body.get("workspace"), "Synapse workspace", _NAME, required=False)
         sql_pool = _clean(body.get("sqlPool"), "Dedicated SQL pool", _NAME, required=False)
-        with_pool = bool(resource_group or workspace or sql_pool)
-        if with_pool and not (resource_group and workspace and sql_pool):
-            raise ApiError(400, "invalid_configuration", "To add the SQL pool, choose its resource group, workspace and pool.")
-        signin = self._signed_in() if with_pool else None
+        with_pool = bool(body.get("subscriptionId") or resource_group or workspace or sql_pool)
+        if with_pool and not (body.get("subscriptionId") and resource_group and workspace and sql_pool):
+            raise ApiError(400, "invalid_configuration", "To add the SQL pool, choose its subscription, resource group, workspace and pool.")
+        signin, subscription, azure = self._azure_for(body.get("subscriptionId")) if with_pool else (None, None, None)
         with self._lock:
             if self._job.state == "running":
                 raise ApiError(409, "discovery_running", "Discovery is running; wait for it to finish.")
@@ -570,12 +671,12 @@ class Session:
             checks.append({"name": f"{environment} parameters", "status": "ok", "message": message, "category": None})
 
         manager: Optional[ConnectionManager] = None
-        if with_pool and signin is not None:
+        if with_pool and signin is not None and azure is not None:
             try:
                 manager = ConnectionManager(ConnectionSettings(
-                    azure=signin.azure.config,
+                    azure=azure.config,
                     synapse=SynapseConnectionConfig(resource_group=resource_group, workspace_name=workspace, sql_pool_name=sql_pool),
-                ), credential=signin.provider)
+                ), credential=azure.credential)
             except ConfigError as exc:
                 repository_source.discard(path)
                 raise ApiError(400, "invalid_configuration", redact(str(exc))) from exc
@@ -585,9 +686,10 @@ class Session:
 
         conn = _Connection(
             method=kind, manager=manager,
-            tenant_id=signin.tenant_id if signin else None, subscription_id=signin.subscription_id if signin else "",
+            tenant_id=(subscription.get("tenantId") or signin.tenant_id) if signin and subscription else None,
+            subscription_id=subscription["id"] if subscription else "",
             resource_group=resource_group or "", workspace=workspace or display, sql_pool=sql_pool if with_pool else None,
-            subscription_name=signin.subscription_name if signin else None,
+            subscription_name=subscription["name"] if subscription else None,
             source_kind=kind, repository=spec,
         )
         conn.checks = checks
@@ -660,14 +762,9 @@ class Session:
         if conn is None:
             base.update({"status": "disconnected", "checks": []})
             if signin is not None:
-                base.update(
-                    {
-                        "method": signin.method,
-                        "subscriptionId": signin.subscription_id,
-                        "subscriptionName": signin.subscription_name,
-                        "tenantId": signin.tenant_id,
-                    }
-                )
+                base.update({"method": signin.method, "account": signin.account, "tenantId": signin.tenant_id,
+                             "directories": [dict(d) for d in signin.directories],
+                             "subscriptionCount": len(signin.subscriptions)})
             return base
         base.update(
             {
@@ -682,6 +779,9 @@ class Session:
                 "sqlPool": conn.sql_pool,
                 "testedAt": conn.tested_at,
                 "checks": conn.checks,
+                "account": signin.account if signin is not None else None,
+                "directories": [dict(d) for d in signin.directories] if signin is not None else [],
+                "subscriptionCount": len(signin.subscriptions) if signin is not None else 0,
                 "sourceKind": conn.source_kind,
                 "repository": conn.repository.to_dict() if conn.repository else None,
             }

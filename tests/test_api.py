@@ -64,20 +64,14 @@ VALID = {
 }
 
 
-def test_health_advertises_the_two_source_methods(server):
+def test_health_advertises_the_azure_sign_in_and_the_source_kinds(server):
     status, body = call(server, "GET", "/api/health")
     assert status == 200
-    assert body["capabilities"]["authMethods"] == ["azure_cli", "interactive_browser"]
-
-
-def test_the_catalog_lists_interactive_browser_without_a_client_id(server):
-    _, body = call(server, "GET", "/api/health")
+    assert body["capabilities"]["authMethods"] == ["azure_cli"]
+    assert body["capabilities"]["sourceKinds"] == ["workspace", "git", "zip"]
     details = {d["id"]: d for d in body["capabilities"]["authMethodDetails"]}
-    browser = details["interactive_browser"]
-    assert browser["label"] == "Interactive browser"
-    assert "Azure CLI session untouched" in browser["detail"]
-    assert "server" in browser["caveat"] and "Client ID" not in browser["caveat"]
-    assert "managed_identity" not in details
+    assert set(details) == {"azure_cli"}
+    assert "subscriptions" in details["azure_cli"]["detail"] and "server" in details["azure_cli"]["caveat"]
 
 
 def test_starts_disconnected(server):
@@ -132,97 +126,192 @@ def test_service_principal_is_not_offered_and_never_echoes_a_secret(server):
     assert "s3cr3t-value" not in json.dumps(body)
 
 
-@pytest.mark.parametrize("method", ["interactive_browser"])
+def test_the_retired_interactive_browser_method_is_refused(server):
+    status, body = call(server, "POST", "/api/connections/authenticate", {"method": "interactive_browser"})
+    assert status == 400 and body["error"]["code"] == "invalid_configuration"
+
+
+@pytest.mark.parametrize("method", ["azure_cli"])
 def test_testing_with_any_method_requires_authenticating_first(server, method):
     status, body = call(server, "POST", "/api/connections/test", {**VALID, "method": method})
     assert status == 409 and body["error"]["code"] == "sign_in_required"
 
 
-@pytest.mark.parametrize("patch", [{"subscriptionId": "not-a-guid"}, {"subscriptionId": ""}, {"tenantId": "x"}])
-def test_sign_in_input_is_validated_before_anything_is_contacted(server, patch):
-    status, body = call(server, "POST", "/api/connections/authenticate", {**VALID, **patch})
-    assert status == 400
-    assert body["error"]["code"] == "invalid_configuration"
-
-
-BROWSER = {**VALID, "method": "interactive_browser", "tenantId": "8a24d8ed-7a4b-45b3-b56b-d781dd225aa1"}
-
-
 def test_managed_identity_is_no_longer_offered(server):
-    status, body = call(server, "POST", "/api/connections/authenticate", {**VALID, "method": "managed_identity"})
+    status, body = call(server, "POST", "/api/connections/authenticate", {"method": "managed_identity"})
     assert status == 400 and body["error"]["code"] == "invalid_configuration"
 
 
-def test_interactive_browser_needs_the_tenant_it_opens_against(server):
-    status, body = call(server, "POST", "/api/connections/authenticate", {**BROWSER, "tenantId": ""})
-    assert status == 400 and "Tenant ID" in body["error"]["message"]
-
-
-def test_the_sign_in_body_refuses_a_client_id(server):
-    status, body = call(server, "POST", "/api/connections/authenticate", {**BROWSER, "clientId": "11111111-2222-3333-4444-555555555555"})
-    assert status == 400 and "clientId" in body["error"]["message"]
-
-
-@pytest.mark.parametrize("field", ["clientSecret", "password", "accessToken", "username", "loginHint", "anything"])
-def test_the_sign_in_body_refuses_unknown_and_secret_fields_without_echoing_them(server, field):
-    status, body = call(server, "POST", "/api/connections/authenticate", {**BROWSER, field: "s3cr3t-value"})
+@pytest.mark.parametrize("field", ["subscriptionId", "tenantId", "clientId", "clientSecret", "password", "accessToken",
+                                   "username", "loginHint", "anything"])
+def test_the_sign_in_body_takes_only_the_method_and_never_echoes_a_refused_value(server, field):
+    status, body = call(server, "POST", "/api/connections/authenticate", {"method": "azure_cli", field: "s3cr3t-value"})
     assert status == 400 and body["error"]["code"] == "invalid_configuration"
     assert field in body["error"]["message"]
     assert "s3cr3t-value" not in json.dumps(body)
 
 
-class _FakeAzure:
-    """Stands in for AzureConnection so a sign-in completes with no network."""
+# ---- sign in first, then choose a subscription, from every directory -------------------------
 
-    providers = []
+HOME = "436c36aa-85c9-4a5d-8b1e-7ba4285bce82"
+GUEST = "b886bb14-1c62-46be-8466-473864afcd1c"
+LOCKED = "c886bb14-1c62-46be-8466-473864afcd1d"
+SUB_A = {"id": "10eb96c3-ba3c-492e-b95b-e9f1d6d85d70", "name": "Azure subscription 1", "tenantId": GUEST, "state": "Enabled"}
+SUB_B = {"id": "20eb96c3-ba3c-492e-b95b-e9f1d6d85d71", "name": "Partner analytics", "tenantId": LOCKED, "state": "Enabled"}
+DIRECTORIES = [{"id": GUEST, "name": "Contoso", "domain": "contoso.com"}, {"id": HOME, "name": "PAL", "domain": "pal.tech"},
+               {"id": LOCKED, "name": "Partner", "domain": "partner.com"}]
+
+
+def _jwt(claims):
+    import base64
+
+    part = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
+    return f"header.{part}.signature"
+
+
+class _FakeSignIn:
+    """One sign-in with no window: the home directory has no subscription, a guest directory has one,
+    and a third directory answers only after its own sign-in, as an MFA policy would."""
+
+    built = []
+
+    def __init__(self, fail=None, locked=(LOCKED,)):
+        self.fail, self.locked, self.windows = fail, set(locked), []
+        _FakeSignIn.built.append(self)
+
+    def sign_in(self, tenant_id=None):
+        from discovery_agent.errors import AzureAuthenticationError
+
+        if self.fail:
+            raise AzureAuthenticationError(self.fail)
+        self.windows.append(tenant_id)
+        self.locked.discard(tenant_id)
+
+    def token(self, scope, tenant_id=None):
+        from discovery_agent.connections.azure import AccessToken, DirectorySignInRequired
+
+        if tenant_id in self.locked:
+            raise DirectorySignInRequired(tenant_id)
+        return AccessToken(_jwt({"upn": "maneesha@pal.tech", "tid": tenant_id or HOME}), 9999999999, scope)
+
+    def for_tenant(self, tenant_id):
+        from discovery_agent.connections.azure import _DirectoryCredential
+
+        return _DirectoryCredential(self, tenant_id)
+
+
+def _subscriptions_of(credential):
+    credential.token("arm")  # a locked directory refuses here, as the real one would
+    return {GUEST: [dict(SUB_A)], LOCKED: [dict(SUB_B)]}.get(credential.tenant_id, [])
+
+
+class _FakeAzure:
+    """Stands in for AzureConnection: lists per subscription, records the directory it was given."""
+
+    built = []
 
     def __init__(self, config, credential=None):
-        self.config = config
-        self.credential = credential
-        _FakeAzure.providers.append(credential)
+        self.config, self.credential = config, credential
+        _FakeAzure.built.append((config.subscription_id, credential.tenant_id))
 
-    def validate(self):
-        from discovery_agent.connections.validation import ok
-
-        return ok(SourceType.AZURE, "signed in", tenant_id=self.config.tenant_id, subscription_name="Demo")
+    def list_resource_groups(self):
+        return ["rg-" + self.config.subscription_id[:2]]
 
 
-def test_interactive_browser_reuses_the_held_identity_and_azure_cli_keeps_nothing(monkeypatch):
+@pytest.fixture()
+def signed_in(monkeypatch):
     from discovery_agent.api import service as service_module
 
+    _FakeSignIn.built, _FakeAzure.built = [], []
+    monkeypatch.setattr(service_module, "MultiTenantSignIn", lambda: _FakeSignIn())
+    monkeypatch.setattr(service_module, "list_tenants", lambda credential: [dict(d) for d in DIRECTORIES])
+    monkeypatch.setattr(service_module, "list_subscriptions", _subscriptions_of)
     monkeypatch.setattr(service_module, "AzureConnection", _FakeAzure)
-    _FakeAzure.providers = []
     session = Session()
-    for _ in range(2):
-        assert session.authenticate(dict(BROWSER))["signedIn"] is True
-    assert _FakeAzure.providers[0] is _FakeAzure.providers[1]
-    assert _FakeAzure.providers[0].remember is True
-
-    _FakeAzure.providers = []
-    for _ in range(2):
-        session.authenticate({**VALID, "tenantId": BROWSER["tenantId"]})
-    assert _FakeAzure.providers[0] is not _FakeAzure.providers[1]
-    assert _FakeAzure.providers[0].remember is False
+    return session, session.authenticate({"method": "azure_cli"})
 
 
-def test_sign_out_forgets_the_record_and_the_held_identity_but_not_the_cli(monkeypatch):
-    from discovery_agent.api import service as service_module
-    from discovery_agent.connections.azure import auth_record_path
+def test_one_sign_in_lists_subscriptions_from_every_directory_not_just_the_home_one(signed_in):
+    session, payload = signed_in
+    # The home directory (PAL) has none; the guest directory's subscription is found anyway.
+    assert payload["ok"] and payload["signedIn"] and payload["account"] == "maneesha@pal.tech"
+    assert [(d["name"], d["subscriptions"], d["needsSignIn"]) for d in payload["directories"]] == [
+        ("PAL", 0, False), ("Contoso", 1, False), ("Partner", 0, True)]
+    assert payload["checks"][0]["message"] == (
+        "Signed in as maneesha@pal.tech; 1 subscription in 3 directories; Partner needs its own sign-in")
+    items = session.azure_options("subscriptions", {})["items"]
+    assert [(s["name"], s["tenantName"]) for s in items] == [("Azure subscription 1", "Contoso")]
+    assert _FakeSignIn.built[0].windows == [None]  # one window, for the home directory only
 
-    monkeypatch.setattr(service_module, "AzureConnection", _FakeAzure)
-    _FakeAzure.providers = []
-    session = Session()
-    session.authenticate(dict(BROWSER))
-    record = auth_record_path()
-    record.parent.mkdir(parents=True, exist_ok=True)
-    record.write_text("{}", encoding="utf-8")
 
+def test_a_subscription_is_read_with_its_own_directorys_tokens(signed_in):
+    session, _ = signed_in
+    assert session.azure_options("resource-groups", {"subscriptionId": SUB_A["id"]})["items"] == ["rg-10"]
+    assert _FakeAzure.built == [(SUB_A["id"], GUEST)]
+
+
+def test_a_directory_that_needs_its_own_sign_in_is_opened_on_request_and_adds_its_subscriptions(signed_in):
+    session, _ = signed_in
+    payload = session.authenticate_directory({"tenantId": LOCKED})
+    assert payload["ok"] and payload["checks"][0]["message"] == "1 subscription in Partner"
+    assert _FakeSignIn.built[0].windows == [None, LOCKED]
+    assert [s["name"] for s in session.azure_options("subscriptions", {})["items"]] == ["Azure subscription 1", "Partner analytics"]
+    assert next(d for d in payload["directories"] if d["id"] == LOCKED)["needsSignIn"] is False
+    with pytest.raises(ApiError, match="Choose a directory from the list"):
+        session.authenticate_directory({"tenantId": "00000000-0000-0000-0000-000000000000"})
+    with pytest.raises(ApiError, match="Unexpected field"):
+        session.authenticate_directory({"tenantId": LOCKED, "password": "x"})
+
+
+def test_a_subscription_the_account_did_not_list_is_refused(signed_in):
+    session, _ = signed_in
+    with pytest.raises(ApiError, match="Choose a subscription from the list"):
+        session.azure_options("resource-groups", {"subscriptionId": SUB_B["id"]})  # its directory is not signed in yet
+    with pytest.raises(ApiError, match="Subscription is required"):
+        session.azure_options("workspaces", {"resourceGroup": "rg"})
+
+
+def test_each_sign_in_is_a_fresh_identity_and_sign_out_forgets_it(signed_in):
+    session, _ = signed_in
+    session.authenticate({"method": "azure_cli"})
+    assert _FakeSignIn.built[0] is not _FakeSignIn.built[1]
     payload = session.disconnect()
+    assert payload["signedIn"] is False and "Azure CLI session is untouched" in payload["note"]
+    with pytest.raises(ApiError, match="Sign in to Azure first"):
+        session.azure_options("subscriptions", {})
 
-    assert not record.exists()
-    assert "Azure CLI session is untouched" in payload["note"]
-    session.authenticate(dict(BROWSER))
-    assert _FakeAzure.providers[0] is not _FakeAzure.providers[1]  # a fresh identity, so a fresh window
+
+def test_a_refused_sign_in_and_an_account_without_any_subscription_say_what_to_do(monkeypatch):
+    from discovery_agent.api import service as service_module
+
+    monkeypatch.setattr(service_module, "MultiTenantSignIn", lambda: _FakeSignIn(fail="user cancelled"))
+    session = Session()
+    refused = session.authenticate({"method": "azure_cli"})
+    assert not refused["ok"] and not refused["signedIn"] and refused["error"]["title"] == "Authentication failed"
+
+    monkeypatch.setattr(service_module, "MultiTenantSignIn", lambda: _FakeSignIn(locked=()))
+    monkeypatch.setattr(service_module, "list_tenants", lambda credential: [{"id": HOME, "name": "PAL", "domain": ""}])
+    monkeypatch.setattr(service_module, "list_subscriptions", lambda credential: [])
+    empty = session.authenticate({"method": "azure_cli"})
+    assert not empty["ok"] and empty["error"]["title"] == "No subscriptions"
+    assert "belongs to 1 directory" in empty["error"]["hint"] and "Reader" in empty["error"]["hint"]
+
+
+def test_the_subscriptions_helper_lists_usable_ones_by_name_and_reads_the_account():
+    from discovery_agent.connections.azure import AccessToken, ArmResponse, list_subscriptions, token_identity
+
+    class Transport:
+        def get(self, url, token):
+            return ArmResponse(200, {"value": [
+                {"subscriptionId": "b", "displayName": "Zeta", "tenantId": "t", "state": "Enabled"},
+                {"subscriptionId": "a", "displayName": "alpha", "tenantId": "t", "state": "Warned"},
+                {"subscriptionId": "c", "displayName": "Old", "tenantId": "t", "state": "Disabled"},
+            ]})
+
+    provider = _FakeSignIn().for_tenant(None)
+    assert [s["name"] for s in list_subscriptions(provider, Transport())] == ["alpha", "Zeta"]
+    assert token_identity(provider.token("x")) == ("maneesha@pal.tech", HOME)
+    assert token_identity(AccessToken("not-a-jwt", 1, "x")) == (None, None)
 
 
 def test_testing_a_workspace_requires_a_sign_in_first(server):
@@ -243,7 +332,7 @@ def test_azure_cli_is_found_in_standard_windows_install_location(monkeypatch, tm
     assert fabric._require("az", "Azure CLI") == str(cli_path)
 
 
-@pytest.mark.parametrize("kind", ["resource-groups", "workspaces", "sql-pools"])
+@pytest.mark.parametrize("kind", ["subscriptions", "resource-groups", "workspaces", "sql-pools"])
 def test_dropdown_lists_require_a_sign_in(server, kind):
     status, body = call(server, "GET", f"/api/azure/{kind}?resourceGroup=rg&workspace=ws")
     assert status == 409 and body["error"]["code"] == "sign_in_required"
@@ -343,3 +432,37 @@ def test_detail_never_carries_credential_shaped_text():
     cleaned = mapping.sanitize({"note": f"Authorization: Bearer {secret}", "n": [f"password={secret}"]})
     assert secret not in json.dumps(cleaned)
 
+
+
+def test_the_multi_directory_sign_in_opens_one_window_and_never_prompts_for_another_directory():
+    from types import SimpleNamespace
+
+    from discovery_agent.connections.azure import DirectorySignInRequired, MultiTenantSignIn
+
+    class AuthenticationRequiredError(Exception):
+        pass
+
+    class FakeSdk:
+        def __init__(self):
+            self.windows, self.calls = [], []
+
+        def authenticate(self, scopes, tenant_id=None):
+            self.windows.append(tenant_id)
+
+        def get_token(self, scope, tenant_id=None):
+            self.calls.append((scope, tenant_id))
+            if tenant_id == LOCKED and LOCKED not in self.windows:
+                raise AuthenticationRequiredError("interaction required")
+            return SimpleNamespace(token=f"t-{tenant_id}", expires_on=9999999999)
+
+    sdk = FakeSdk()
+    signer = MultiTenantSignIn(credential=sdk)
+    signer.sign_in()
+    assert signer.token("arm").value == "t-None" and signer.for_tenant(GUEST).token("arm").value == f"t-{GUEST}"
+    signer.for_tenant(GUEST).token("arm")
+    assert sdk.calls.count(("arm", GUEST)) == 1  # cached per directory
+    with pytest.raises(DirectorySignInRequired) as locked:
+        signer.for_tenant(LOCKED).token("arm")
+    assert locked.value.tenant_id == LOCKED and sdk.windows == [None]  # no window opened by a token request
+    signer.sign_in(LOCKED)
+    assert signer.for_tenant(LOCKED).token("arm").value == f"t-{LOCKED}" and sdk.windows == [None, LOCKED]

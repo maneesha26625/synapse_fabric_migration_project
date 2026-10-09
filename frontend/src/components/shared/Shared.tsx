@@ -195,7 +195,8 @@ type SelectFieldProps = {
   label: string;
   value: string;
   onChange: (value: string) => void;
-  options: string[];
+  /** Plain names, or a value with the label shown for it (a subscription's id, shown by its name). */
+  options: (string | { value: string; label: string })[];
   placeholder: string;
   loading?: boolean;
   disabled?: boolean;
@@ -215,7 +216,9 @@ export function SelectField({ label, value, onChange, options, placeholder, load
       </label>
       <select id={id} className="select" style={{ width: "100%" }} value={value} disabled={disabled || loading} aria-invalid={error ? true : undefined} aria-busy={loading || undefined} onChange={(e) => onChange(e.target.value)}>
         <option value="">{loading ? "Loading…" : placeholder}</option>
-        {options.map((o) => <option key={o} value={o}>{o}</option>)}
+        {options.map((o) => (typeof o === "string"
+          ? <option key={o} value={o}>{o}</option>
+          : <option key={o.value} value={o.value}>{o.label}</option>))}
       </select>
       {hint && !error && <span className="hint">{hint}</span>}
       {error && <span className="err">{error}</span>}
