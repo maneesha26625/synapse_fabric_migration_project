@@ -8,6 +8,7 @@ import { PlanPanel } from "../components/journey/panels/PlanPanel";
 import { CompletionSummary, ValidatePanel } from "../components/journey/panels/ValidatePanel";
 import { WavesPanel } from "../components/journey/panels/WavesPanel";
 import { WorkspaceExplorer } from "../components/journey/WorkspaceExplorer";
+import { ReleasePath } from "../components/journey/ReleasePath";
 import { downloadReport } from "../components/journey/report";
 import { ResetStepButton } from "../components/journey/ResetStep";
 import { useJourney, type StepStatus } from "../components/journey/useJourney";
@@ -276,6 +277,7 @@ export function Workspace() {
         {explorerOpen && <WorkspaceExplorer />}
         <div className="ws-main">
           <div ref={flow} className="journey-anchor"><JourneyFlow steps={steps} selected={selected} onSelect={select} /></div>
+          <ReleasePath stepsDone={done} stepsTotal={steps.length} />
 
           {finished && <CompletionCard />}
 

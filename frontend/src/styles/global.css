@@ -611,6 +611,37 @@ html, body, #root { height: auto; min-height: 100%; }
 
 .journey-anchor { scroll-margin-top: 76px; }
 
+/* The release path: where this migration sits on the way from Dev to Prod. */
+.release-path { border: 1px solid var(--border); border-radius: 14px; background: var(--surface); padding: 10px 14px; }
+.release-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.release-title { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--text-faint); }
+.release-stages { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; list-style: none; margin: 0; padding: 0; flex: 1; min-width: 0; }
+.release-stage { display: inline-flex; align-items: center; gap: 6px; }
+.release-arrow { color: var(--text-faint); flex: none; }
+.release-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--surface-2); font-size: 13px; max-width: 280px; }
+.release-label { font-weight: 600; white-space: nowrap; }
+.release-detail { color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.release-icon { display: inline-grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; flex: none; color: var(--text-faint); }
+.release-stage.done .release-icon { background: var(--success-soft); color: var(--success); }
+.release-stage.current .release-chip { border-color: var(--accent); background: var(--accent-soft); }
+.release-stage.todo .release-chip { border-style: dashed; background: transparent; }
+.release-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+.release-toggle { display: inline-flex; align-items: center; gap: 4px; border: 0; background: none; color: var(--accent); font: inherit; font-size: 13.5px; cursor: pointer; padding: 4px 2px; }
+.release-body { display: flex; flex-direction: column; gap: 14px; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border); }
+.release-lanes { display: grid; grid-template-columns: 1fr; gap: 10px; }
+.release-lane { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border-radius: var(--radius-sm); background: var(--surface-2); }
+.release-lane .eyebrow { display: inline-flex; align-items: center; gap: 6px; }
+.release-flow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13.5px; }
+.release-flow > span { padding: 2px 8px; border-radius: 6px; background: var(--surface-3); }
+.release-flow > svg { color: var(--text-faint); }
+.release-checklist { list-style: none; margin: 0; padding: 0; }
+.release-glossary summary { cursor: pointer; color: var(--accent); font-size: 13.5px; }
+.release-glossary dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 10px 0 0; font-size: 13.5px; }
+.release-glossary dl > div { display: contents; }
+.release-glossary dt { font-weight: 600; }
+.release-glossary dd { margin: 0; color: var(--text-muted); }
+@media (max-width: 720px) { .release-glossary dl { grid-template-columns: 1fr; } .release-chip { max-width: 100%; } }
+
 /* The workspace explorer: the discovered objects as a repository tree, beside the steps. */
 .ws-body { display: grid; grid-template-columns: minmax(0, 1fr); gap: 20px; align-items: start; }
 .ws-body.with-explorer { grid-template-columns: 280px minmax(0, 1fr); }

@@ -876,6 +876,44 @@ describe("workspace explorer", () => {
   }, 30000);
 });
 
+describe("release path", () => {
+  it("shows where the migration sits on the way to Prod, below the six steps, with a checklist kept per project", async () => {
+    await discovered();
+    unlockTo("assess");
+    const user = userEvent.setup();
+    const first = go("/migration?step=discover");
+    const path = await screen.findByRole("region", { name: "Release path" }, { timeout: 5000 });
+    const stages = within(path).getByRole("list", { name: "From the source to production" });
+    expect(within(stages).getAllByRole("listitem").map((li) => li.querySelector(".release-label")?.textContent))
+      .toEqual(["Synapse workspace", "This migration", "Fabric Dev", "Fabric Git", "Fabric Test", "Fabric Prod"]);
+    // The six steps are unchanged.
+    expect(within(screen.getByRole("navigation", { name: "Migration steps" })).getAllByRole("listitem")).toHaveLength(6);
+    await user.click(within(path).getByRole("button", { name: /What comes next · 0\/6/ }));
+    expect(within(path).getByText(/Getting them to Test and Prod is not a second migration/)).toBeInTheDocument();
+    await user.click(within(path).getByRole("checkbox", { name: /Connect the Fabric workspace to Git/ }));
+    expect(within(stages).getByText(/Fabric Git/).closest("li")).toHaveClass("done");
+    first.unmount();
+    go("/migration?step=discover");
+    const again = await screen.findByRole("region", { name: "Release path" }, { timeout: 5000 });
+    expect(within(again).getByRole("button", { name: /What comes next · 1\/6/ })).toBeInTheDocument();
+  }, 30000);
+
+  it("follows a repository source's environment: Prod definitions have nothing left to promote", async () => {
+    await mockApi.connectRepository({ kind: "git", repositoryUrl: "https://github.com/contoso/synapse-ws.git", ref: "release/prod", environment: "Prod" });
+    await mockApi.startDiscovery();
+    await new Promise((r) => setTimeout(r, 3700));
+    unlockTo("assess");
+    const user = userEvent.setup();
+    go("/migration?step=discover");
+    const path = await screen.findByRole("region", { name: "Release path" }, { timeout: 5000 });
+    const labels = [...path.querySelectorAll(".release-label")].map((e) => e.textContent);
+    expect(labels).toEqual(["Synapse Prod", "This migration", "Fabric Prod", "Fabric Git"]);
+    expect(within(path).getByText("Git · release/prod")).toBeInTheDocument();
+    await user.click(within(path).getByRole("button", { name: /What comes next/ }));
+    expect(within(path).getByText(/nothing to promote after it/)).toBeInTheDocument();
+  }, 30000);
+});
+
 describe("migrate step", () => {
   it("offers to run every stage or a single one, here and not in Plan", async () => {
     resetDemo();
