@@ -1,4 +1,4 @@
-import { CheckCircle2, CircleAlert, Pause, Play, RotateCcw, ScrollText, XCircle } from "lucide-react";
+import { CheckCircle2, CircleAlert, GitPullRequest, Pause, Play, RotateCcw, ScrollText, XCircle } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { MetricCard } from "../shared/Metrics";
@@ -76,6 +76,68 @@ function RunProgress({ done, deferred, failed, total }: { done: number; deferred
   );
 }
 
+const plural = (n: number, word: string) => `${n.toLocaleString()} ${word}${n === 1 ? "" : "s"}`;
+
+/**
+ * What the commit to Fabric Git did once the run completed: the commit and the pull request
+ * to open, or what stopped it and a way to commit again. A commit problem never fails the run.
+ */
+function GitRunBanner() {
+  const { execution: run, options, fabricGit, fabricGitError, commitFabricGit } = useMigration();
+  if (run.state !== "completed") return null;
+  const git = run.git ?? null;
+  const off = (run.options?.gitCommit ?? options.gitCommit) === "off";
+  if (!git && !off) return null; // a backend without Fabric Git says nothing about it
+  const committing = git?.state === "committing" || !!fabricGit?.committing;
+  const branch = git?.branch ?? fabricGit?.branch ?? "the branch";
+  const target = fabricGit?.targetBranch ?? "main";
+  const pr = git?.pullRequestUrl ?? fabricGit?.pullRequestUrl ?? null;
+  const prLink = pr && (
+    <a className="btn small" href={pr} target="_blank" rel="noopener noreferrer"><GitPullRequest size={14} aria-hidden="true" />Open pull request {branch} → {target}</a>
+  );
+  const commitNow = <Button size="small" onClick={() => void commitFabricGit()} disabled={committing}>Commit now</Button>;
+  const error = fabricGitError && <div className="faint" style={{ marginTop: 4 }}>{fabricGitError}</div>;
+
+  if (committing) {
+    return <Banner tone="info" title="Committing to Fabric Git">Committing what the run created to {branch}…</Banner>;
+  }
+  if (git?.state === "committed") {
+    const left = git.skipped?.length ?? 0;
+    return (
+      <Banner tone="success" title={`Committed ${plural(git.items ?? 0, "item")} to ${branch}${git.commit ? ` (${git.commit.slice(0, 7)})` : ""}`}
+        actions={<>{prLink}{git.commitUrl && <a className="btn small ghost" href={git.commitUrl} target="_blank" rel="noopener noreferrer">View commit</a>}</>}>
+        {left > 0 && `Left out ${plural(left, "data-load pipeline")}: they are rebuilt per environment. `}
+        Review and merge them with a pull request from {branch} to {target}.
+        {error}
+      </Banner>
+    );
+  }
+  if (git?.state === "nothing") {
+    return (
+      <Banner tone="info" title="Nothing new to commit to Fabric Git" actions={prLink || undefined}>
+        {git.message ?? `${branch} already has everything this run created.`}{error}
+      </Banner>
+    );
+  }
+  if (git) {
+    const title = git.state === "skipped" ? "Not committed: the workspace is not connected to Git"
+      : git.state === "failed" ? "The commit to Fabric Git failed" : "Not committed to Fabric Git yet";
+    return (
+      <Banner tone="warning" title={title} actions={<>{commitNow}{prLink}</>}>
+        {git.message}{git.state === "failed" ? " The migration itself is complete." : ""}{error}
+      </Banner>
+    );
+  }
+  // Committing was switched off for this run: say what waits, and commit on request.
+  const waiting = fabricGit?.state === "connected" && fabricGit.uncommitted ? ` ${plural(fabricGit.uncommitted, "item")} wait to be committed to ${branch}.` : "";
+  return (
+    <Banner tone="info" title="Not committed to Fabric Git" actions={fabricGit?.state === "connected" ? <>{commitNow}{prLink}</> : undefined}>
+      Commit to Fabric Git was off for this run.{waiting}
+      {fabricGit?.state === "not_connected" && " The target workspace is not connected to Git."}{error}
+    </Banner>
+  );
+}
+
 /** Run the migration: what to run, the controls, one card per wave, and the state of every object. */
 export function RunPanel() {
   const { mode } = useAppState();
@@ -125,6 +187,7 @@ export function RunPanel() {
         {mode === "real" && <Banner tone="info" title="What a run does">Each stage you switched on is carried out in dependency order: Warehouse and schema, table data, Spark, notebooks, connections, pipelines, jobs, scripts, schedules and shortcuts. Nothing already in Fabric is overwritten, so a run can be repeated safely.{fabric.method === "fabric_cli" && " With the Fabric CLI the first SQL object opens one Microsoft sign-in window on the machine running the server."}</Banner>}
         {executionError && <Banner tone="error" title="Execution">{executionError}</Banner>}
         {run.haltedReason && run.state === "paused" && <Banner tone="warning" title="Run stopped at a wave boundary">{run.haltedReason}</Banner>}
+        <GitRunBanner />
         {planChanged && run.state === "completed" && <Banner tone="info" title="The plan has changed since this run">Press Start new run to migrate the current plan.</Banner>}
         {!ready && !started && (scoring ? (
           <p className="muted" role="status"><span className="spinner" aria-hidden="true" /> Checking the plan…</p>
@@ -156,7 +219,7 @@ export function RunPanel() {
           <Button onClick={() => void controlExecution("retry")} disabled={!run.failed || running}><RotateCcw size={14} aria-hidden="true" />Retry failed</Button>
           <Button onClick={() => setLogs(true)} disabled={!started}><ScrollText size={14} aria-hidden="true" />View logs</Button>
           <span className="spacer" />
-          <span className="muted">{options.stages.length} stage{options.stages.length === 1 ? "" : "s"} on · {options.scope === "automated" ? "automated objects only" : "everything in the plan"}{options.stopOnFailure ? " · stop on failure" : ""} · change in Plan</span>
+          <span className="muted">{options.stages.length} stage{options.stages.length === 1 ? "" : "s"} on · {options.scope === "automated" ? "automated objects only" : "everything in the plan"}{options.stopOnFailure ? " · stop on failure" : ""}{options.gitCommit === "off" ? " · no Git commit" : ""} · change in Plan</span>
         </div>
       </Card>
 

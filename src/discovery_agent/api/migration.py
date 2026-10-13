@@ -17,13 +17,13 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from discovery_agent.api.fabric import FabricTarget
+from discovery_agent.api.fabric import FabricError, FabricTarget
 from discovery_agent.api.service import ApiError, Session
 from discovery_agent.migration import planner as planning
 from discovery_agent.migration.fabric_rest import NO_CAPACITY, FabricApiError, FabricRestClient
 from discovery_agent.migration.preflight import code_text as preflight_code_text
 from discovery_agent.migration.preflight import content_findings, environment_checks
-from discovery_agent.migration import capabilities, datafilter, datapipeline, fabric_connections, pipelines, storage_remap
+from discovery_agent.migration import capabilities, datafilter, datapipeline, fabric_connections, fabric_git, pipelines, storage_remap
 from discovery_agent.migration.onelake import OneLakeFiles
 from discovery_agent.migration.runtime_checks import RuntimeOptions
 from discovery_agent.migration.validation import Validator, summarize
@@ -63,6 +63,8 @@ MAX_ITEMS = 10000
 _AUTOMATED_KINDS = frozenset(MIGRATABLE.values()) | {DATA}
 DATA_MODES = ("if_empty", "replace")
 DATA_RUNS = ("run", "create")
+#: After a run completes: commit what it created to the workspace's Fabric Git branch, or leave it.
+GIT_COMMITS = ("auto", "off")
 MAX_CREDENTIALS = 100
 MAX_CREDENTIAL_FIELD = 2048
 MAX_HISTORY = 20
@@ -111,9 +113,12 @@ def parse_options(body: dict) -> dict:
     overlap = str(options.get("syncOverlap") or "1h")
     if overlap not in datafilter.OVERLAPS:
         raise ApiError(400, "invalid_options", "Choose a re-read window for synced tables: none, one hour or one day.")
+    git_commit = str(options.get("gitCommit") or "auto")
+    if git_commit not in GIT_COMMITS:
+        raise ApiError(400, "invalid_options", "Choose to commit to Fabric Git after the run (auto) or not (off).")
     return {"scope": scope, "stopOnFailure": bool(options.get("stopOnFailure")), "stages": list(dict.fromkeys(stages)),
             "dataMode": mode, "dataRun": data_run, "collation": collation, "syncOverlap": overlap, "existing": existing,
-            "storageRoutes": routes,
+            "storageRoutes": routes, "gitCommit": git_commit,
             "dataFilters": parse_data_filters(options.get("dataFilters"))}
 
 
@@ -213,7 +218,7 @@ def plan_objects(plan: List[dict], job: Any, sources: List[Source], stages: Opti
 
 IDLE = {
     "runId": "", "state": "idle", "total": 0, "completed": 0, "inProgress": 0, "failed": 0,
-    "pending": 0, "skipped": 0, "deferred": 0, "workspace": None, "warehouse": None, "items": [], "logs": [],
+    "pending": 0, "skipped": 0, "deferred": 0, "workspace": None, "warehouse": None, "git": None, "items": [], "logs": [],
 }
 
 
@@ -469,6 +474,9 @@ class MigrationService:
         #: The background validation: its state, progress and, once finished, its rows.
         self._validation: Dict[str, Any] = {"state": "idle"}
         self._validation_thread: Optional[threading.Thread] = None
+        #: The last Fabric Git commit (after a run, or by hand), and the thread of one made by hand.
+        self._last_commit: Optional[dict] = None
+        self._git_thread: Optional[threading.Thread] = None
         self._rest_factory = rest_factory or fabric.rest_client
         self._sql_factory = sql_factory or self._open_sql
 
@@ -592,7 +600,7 @@ class MigrationService:
             run.stages, run.pool_name = list(options["stages"]), pool or ""
             run.settings = {"dataMode": options["dataMode"], "dataRun": options["dataRun"], "collation": options["collation"],
                             "existing": options["existing"], "storageRoutes": options["storageRoutes"],
-                            "syncOverlap": options["syncOverlap"]}
+                            "syncOverlap": options["syncOverlap"], "gitCommit": options["gitCommit"]}
             self._describe_source(run, job, pool)
             if credentials:
                 self._credentials = credentials
@@ -659,7 +667,11 @@ class MigrationService:
     # -- internals ---------------------------------------------------------
 
     def _busy(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        """A pass is working on objects. Once the run reports completed or paused, its thread only
+        tidies up (closing sessions, handing the commit to its own thread), so the run is free."""
+        if self._thread is None or not self._thread.is_alive():
+            return False
+        return self._run is None or self._run.state == "running"
 
     def start_validation(self, body: dict) -> dict:
         """Validate in the background, so runs in Fabric can be followed for as long as they take. Poll ``validation_state``."""
@@ -766,8 +778,117 @@ class MigrationService:
                 files = None
         migrator = Migrator(run, self._rest_factory, self._sql_factory, sleep=_sleep,
                             source_factory=factory, credentials=self._credentials, onelake=files)
-        self._thread = threading.Thread(target=migrator.execute, name=f"migration-{run.run_id}", daemon=True)
+
+        def work() -> None:
+            migrator.execute()
+            # A pause or a stop-on-failure halt returns early; Resume and Retry come back
+            # through here, so the commit happens whenever the run actually completes.
+            if run.state == "completed" and run.settings.get("gitCommit", "auto") == "auto":
+                self._start_commit_after_run(run)
+
+        self._thread = threading.Thread(target=work, name=f"migration-{run.run_id}", daemon=True)
         self._thread.start()
+
+    def _start_commit_after_run(self, run: MigrationRun) -> None:
+        """Commit on a thread of its own, so the run is free (Retry, Reset) the moment it completes.
+
+        The thread is registered before the run says "committing", under the same lock that
+        `git_state` reads it with, so the two never disagree."""
+        with self._lock:
+            if self._git_thread is not None and self._git_thread.is_alive():
+                with run.lock:
+                    run.git = {"state": "blocked", "message": "Another commit was still running. Use Commit now when it finishes."}
+                return
+            self._git_thread = threading.Thread(target=self._commit_after_run, args=(run,), name=f"fabric-git-{run.run_id}", daemon=True)
+            with run.lock:
+                run.git = {"state": "committing", "message": "Committing the migrated items to Fabric Git…"}
+            self._git_thread.start()
+
+    # -- Fabric Git ----------------------------------------------------------
+
+    def _git_comment(self, run: Optional[MigrationRun]) -> str:
+        if run is None:
+            return "Synapse to Fabric migration: commit from the Migration Accelerator"
+        made = sum(1 for i in run.items if i.status == "COMPLETED")
+        return f"Synapse to Fabric migration run {run.run_id}: {made} object(s) created in {run.workspace_name}"
+
+    def _commit(self, workspace_id: str, comment: str) -> dict:
+        """Commit the workspace's migrated items to its Fabric Git branch. Never raises: the answer says what happened."""
+        started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            client = self._rest_factory()
+            conn = fabric_git.connection(client, workspace_id)
+            if not conn.connected:
+                return {"state": "skipped", "message": fabric_git.KNOWN_NOT_CONNECTED, "at": started}
+            result = fabric_git.commit(client, workspace_id, comment)
+            out = {"state": result.state, "items": result.items, "skipped": result.skipped, "commit": result.commit,
+                   "branch": conn.branch, "commitUrl": fabric_git.commit_url(conn, result.commit),
+                   "pullRequestUrl": fabric_git.pull_request_url(conn), "at": started}
+            out["message"] = (f"Committed {result.items} item(s) to {conn.branch}." if result.state == "committed"
+                              else "Nothing new to commit: the branch already has everything the run created.")
+            if result.skipped:
+                out["message"] += f" Left out {len(result.skipped)} data-load pipeline(s): they are rebuilt per environment."
+            return out
+        except fabric_git.GitNotReady as exc:
+            return {"state": "blocked", "message": str(exc), "at": started}
+        except FabricApiError as exc:
+            return {"state": "failed", "message": exc.message, "code": exc.code, "at": started}
+        except Exception as exc:  # noqa: BLE001 - a commit problem is reported, never raised into the run
+            return {"state": "failed", "message": f"The commit could not be made: {type(exc).__name__}.", "at": started}
+
+    def _commit_after_run(self, run: MigrationRun) -> None:
+        result = self._commit(run.workspace_id, self._git_comment(run))
+        with run.lock:
+            run.git = result
+        run.log("GIT", "run", result.get("message") or result.get("state", ""))
+        with self._lock:
+            self._last_commit = result
+
+    def git_state(self) -> dict:
+        """Where the target workspace is connected in Fabric Git, what waits to be committed, and the
+        pull-request link. Reads only."""
+        try:
+            workspace_id, workspace_name, _ = self._fabric.migration_target()
+        except FabricError:
+            return {"state": "no_target", "message": "Connect the Fabric target workspace first."}
+        with self._lock:
+            committing = self._git_thread is not None and self._git_thread.is_alive()
+            last = dict(self._last_commit) if self._last_commit else None
+        try:
+            out = fabric_git.describe(self._rest_factory(), workspace_id)
+        except FabricApiError as exc:
+            out = {"state": "error", "message": exc.message, "code": exc.code}
+        except Exception as exc:  # noqa: BLE001 - the page shows a reason, never a traceback
+            out = {"state": "error", "message": f"The Git status could not be read: {type(exc).__name__}."}
+        out["workspace"] = workspace_name
+        out["committing"] = committing
+        out["lastCommit"] = last
+        return out
+
+    def git_commit(self, body: dict) -> dict:
+        """Commit the target workspace's migrated items to its Fabric Git branch, on a background thread."""
+        unknown = sorted(set(body) - {"comment"})
+        if unknown:
+            raise ApiError(400, "invalid_request", f"Unexpected field(s): {', '.join(unknown)}.")
+        workspace_id, _, _ = self._fabric.migration_target()
+        comment = str(body.get("comment") or "").strip() or self._git_comment(self._run)
+        with self._lock:
+            if self._busy():
+                raise ApiError(409, "run_in_progress", "A migration run is working. It commits by itself when it completes.")
+            if self._git_thread is not None and self._git_thread.is_alive():
+                raise ApiError(409, "commit_in_progress", "A commit is already running.")
+
+            def work() -> None:
+                result = self._commit(workspace_id, comment)
+                with self._lock:
+                    self._last_commit = result
+                    if self._run is not None and self._run.workspace_id == workspace_id:
+                        with self._run.lock:
+                            self._run.git = result
+
+            self._git_thread = threading.Thread(target=work, name="fabric-git-commit", daemon=True)
+            self._git_thread.start()
+        return self.git_state()
 
 
 def _sleep(seconds: float) -> None:

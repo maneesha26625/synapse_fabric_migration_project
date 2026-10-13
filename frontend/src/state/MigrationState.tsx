@@ -13,6 +13,7 @@ import {
   type DependencyGraph,
   type ExecutionRun,
   type FabricConfig,
+  type FabricGitState,
   type FabricTarget,
   type Capabilities,
   type ConnectionCredentials,
@@ -57,7 +58,7 @@ function save(key: string, value: unknown) {
 
 const DEFAULT_PROJECT: Project = { id: "default", name: "Synapse to Fabric migration", createdAt: new Date(0).toISOString() };
 
-const DEFAULT_OPTIONS: RunOptions = { scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", dataRun: "run", collation: "match_synapse", syncOverlap: "1h", existing: "skip", dataFilters: {} };
+const DEFAULT_OPTIONS: RunOptions = { scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", dataRun: "run", collation: "match_synapse", syncOverlap: "1h", existing: "skip", dataFilters: {}, gitCommit: "auto" };
 
 const EMPTY_RUN: ExecutionRun = { runId: "", state: "idle", total: 0, completed: 0, inProgress: 0, failed: 0, pending: 0, skipped: 0, deferred: 0, items: [], logs: [] };
 
@@ -95,6 +96,13 @@ interface MigrationStateValue {
   authenticateFabric: (c: FabricConfig) => Promise<void>;
   testFabric: (c: FabricConfig) => Promise<void>;
   disconnectFabric: () => Promise<void>;
+
+  /** The target workspace's Fabric Git branch and what waits to be committed. Null until read. */
+  fabricGit: FabricGitState | null;
+  fabricGitError: string | null;
+  refreshFabricGit: () => Promise<void>;
+  /** Commit the migrated items to the workspace's Fabric Git branch now. */
+  commitFabricGit: () => Promise<void>;
 
   /** The planner's strategy, risks and checks for the current plan. Recomputed when the plan or target changes. */
   analysis: PlanAnalysis | null;
@@ -287,6 +295,31 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   const testFabric = useCallback((c: FabricConfig) => fabricCall("test", () => api.testFabric(c)), [api, fabricCall]);
   const disconnectFabric = useCallback(async () => { setFabric(await api.disconnectFabric()); setFabricError(null); }, [api]);
 
+  // ---- Fabric Git (read whenever the target workspace changes; polled while a commit runs)
+  const [fabricGit, setFabricGit] = useState<FabricGitState | null>(null);
+  const [fabricGitError, setFabricGitError] = useState<string | null>(null);
+  const refreshFabricGit = useCallback(async () => {
+    try {
+      setFabricGit(await api.getFabricGit());
+      setFabricGitError(null);
+    } catch (e) {
+      setFabricGitError(messageOf(e));
+    }
+  }, [api]);
+  useEffect(() => {
+    if (fabric.status !== "connected") { setFabricGit(null); return; }
+    void refreshFabricGit();
+  }, [fabric.status, fabric.workspaceId, refreshFabricGit]);
+  const commitFabricGit = useCallback(async () => {
+    setFabricGitError(null);
+    try { setFabricGit(await api.commitFabricGit()); } catch (e) { setFabricGitError(messageOf(e)); }
+  }, [api]);
+  useEffect(() => {
+    if (!fabricGit?.committing) return;
+    const id = setInterval(() => { void refreshFabricGit(); }, 1000);
+    return () => clearInterval(id);
+  }, [fabricGit?.committing, refreshFabricGit]);
+
   // ---- planner (read-only analysis of the plan)
   const [analysis, setAnalysis] = useState<PlanAnalysis | null>(null);
   const [analysisBusy, setAnalysisBusy] = useState(false);
@@ -359,11 +392,25 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     if (!executionReady) return;
     api.getExecution().then(setExecution, () => undefined);
   }, [connection.status, discovery.state]); // eslint-disable-line react-hooks/exhaustive-deps
+  // Keep reading while the run works, and after it completes while its commit to Fabric Git finishes.
+  const committingAfterRun = execution.git?.state === "committing";
   useEffect(() => {
-    if (execution.state !== "running") return;
+    if (execution.state !== "running" && !committingAfterRun) return;
     const id = setInterval(() => { api.getExecution().then(setExecution, () => undefined); }, 900);
     return () => clearInterval(id);
-  }, [api, execution.state]);
+  }, [api, execution.state, committingAfterRun]);
+  // Once the run's commit settles, the branch has moved: read the Git state again.
+  const runGitState = execution.git?.state;
+  useEffect(() => {
+    if (runGitState && runGitState !== "committing" && fabric.status === "connected") void refreshFabricGit();
+  }, [runGitState]); // eslint-disable-line react-hooks/exhaustive-deps
+  // A commit made by hand also lands on the run's record: read the run when it finishes.
+  const gitCommitting = !!fabricGit?.committing;
+  const wasCommitting = useRef(false);
+  useEffect(() => {
+    if (wasCommitting.current && !gitCommitting) api.getExecution().then(setExecution, () => undefined);
+    wasCommitting.current = gitCommitting;
+  }, [api, gitCommitting]);
 
   const startExecution = useCallback(async (only?: string) => {
     setExecutionError(null);
@@ -453,6 +500,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     graph, graphError, graphLoading, reloadGraph: () => setGraphEpoch((n) => n + 1),
     plan, addToPlan, addAllToPlan, removeFromPlan, setPlanWave, movePlanItem, clearPlan, inPlan, planStatus,
     fabric, fabricReady, fabricBusy, fabricError, authenticateFabric, testFabric, disconnectFabric,
+    fabricGit, fabricGitError, refreshFabricGit, commitFabricGit,
     analysis, analysisBusy, analysisError, analyze, options, setOptions, capabilities, credentials, setCredential, clearCredentials,
     execution, executionReady, executionError, startExecution, controlExecution,
     validation, validationError, validationBusy, validationProgress, validationRuntime, setValidationRuntime, runValidation,

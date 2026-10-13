@@ -29,6 +29,7 @@ generated sample data, with no Azure, Synapse or Fabric needed.
 [Connection architecture](#connection-architecture) ·
 [Migration](#migration) ·
 [LLM-assisted transformation](#llm-assisted-transformation) ·
+[Fabric Git (Dev)](#fabric-git-dev) ·
 [Tests](#tests)
 
 ## What it does
@@ -42,7 +43,7 @@ before the next one opens.
 | 2 | **Assess** | Classifies every object by how it moves: **Direct** (a matching Fabric component exists), **Reconfigure** (same idea, configured differently), **Transform** (code or settings change), **Manual** (needs a person), **Review** (no reliable one-to-one mapping). Also shows the Synapse → Fabric component mapping. | Nothing |
 | 3 | **Waves** | Builds the dependency graph and groups objects into waves, so nothing is created before what it depends on. | Nothing |
 | 4 | **Plan** | Chooses what moves. A deterministic planner gives each object a strategy, lists risks by severity, estimates effort and scores readiness (0–100). Stages, their options and any credentials are set here. | Nothing |
-| 5 | **Migrate** | Pre-run checks, then the run, wave by wave: Warehouse and schemas, empty tables, views, procedures, data pipelines that load the rows, notebooks, connections, pipelines, Spark, jobs, scripts, schedules and shortcuts. Safe to re-run; Retry failed re-runs only the failures. | **Fabric only** |
+| 5 | **Migrate** | Pre-run checks, then the run, wave by wave: Warehouse and schemas, empty tables, views, procedures, data pipelines that load the rows, notebooks, connections, pipelines, Spark, jobs, scripts, schedules and shortcuts. Safe to re-run; Retry failed re-runs only the failures. When the Fabric workspace is connected to Git, the run is then committed to its branch (`dev`), ready for a pull request. | **Fabric only** (and, through Fabric, its Git branch) |
 | 6 | **Validate** | Compares Synapse with Fabric, object by object: columns and types, row counts, definitions, notebook cells, pipeline activities. It also checks each object **runs in Fabric**: tables and views are queried, procedures compiled, and pipelines, notebooks and Spark jobs judged by their latest run (or run now, on request). | Nothing, unless you ask it to run items or procedures (procedures are rolled back) |
 
 ## Principles
@@ -57,7 +58,9 @@ before the next one opens.
   get their new definition and keep their id. Tables are never replaced. The one exception is
   Validate: when you tick it, it runs migrated pipelines, notebooks or Spark
   jobs in Fabric to prove they work. It runs procedures only inside a
-  transaction that is rolled back.
+  transaction that is rolled back. The one write beyond the workspace is the
+  commit to its Fabric Git branch after a run, made by Fabric itself and only
+  to the branch the workspace is connected to; it can be switched off.
 * **Structure is migrated; data moves through Fabric data pipelines.** Rows go
   from the Synapse pool to the Fabric Warehouse inside Fabric, never through
   the accelerator.
@@ -135,18 +138,19 @@ migration starts, and **Migration**, where it runs.
    BigQuery as sources; Azure Databricks, Snowflake, Azure SQL Database and
    Google BigQuery as destinations.
 2. **Connect both sides.** Each side is a card that shows its status, and
-   connecting is three steps: sign in, choose the workspace, test.
+   connecting is three steps: sign in, choose the workspace, connect.
 
-   | Side | Sign-in methods |
+   | Side | How it connects |
    |---|---|
-   | Azure Synapse (source) | **Azure CLI**: *Sign in with Azure*, then choose the subscription, resource group, workspace and SQL pool from lists (nothing typed); **Git repository** and **Workspace export (ZIP)**, for one environment (see below) |
+   | Azure Synapse (source) | **Synapse workspace**: *Sign in with Azure*, then choose the subscription, resource group, workspace and SQL pool from lists (nothing typed). If the workspace is connected to Git, its definitions are read from its **Git repository** (recommended, chosen for you) or, if you choose, the **live workspace**. **Workspace export (ZIP)**: one environment's export, uploaded (see below) |
    | Microsoft Fabric (destination) | **Azure CLI**; **Fabric CLI** |
 
    After sign-in, Synapse asks for the resource group, workspace and
    (optional) dedicated SQL pool; Fabric asks for the workspace. A list with a
    single entry is chosen for you, so a workspace's only SQL pool is never
-   skipped by accident. Test runs real checks: ARM and data-plane access, the
-   SQL pool, and for Fabric the workspace and its **capacity**. While the page
+   skipped by accident. Connecting runs real checks: ARM and data-plane access
+   (live) or the clone (Git), the SQL pool, and for Fabric the workspace and its
+   **capacity**. While the page
    first reads both sides it says *Checking…* rather than *Not connected*.
    Disconnecting the source asks first when discovery results would be lost.
 3. **Start migration.** The button at the bottom is enabled once the route is
@@ -154,23 +158,55 @@ migration starts, and **Migration**, where it runs.
    Fabric workspace. A checklist beside it says what is still missing. If the
    migration is already under way, the button reads *Continue migration*.
 
-### Git repository or ZIP export, per environment
+### Git repository, live workspace or ZIP export
 
-Instead of the live workspace, the definitions can come from the workspace's
-Git repository or a ZIP of it (`api/repository_source.py`):
+The **Synapse workspace** option asks for three things: *Sign in with Azure*,
+the workspace (subscription, resource group and workspace lists; a list with
+one entry is chosen for you) and **Connect**. The definitions (pipelines,
+notebooks, scripts and so on) then come from one of two places, shown as one
+choice, **Read definitions from**:
 
-* **Git repository:** the URL, the **branch** for the environment (for
-  example `main` for Dev, a release branch for Prod) and, optionally, the
-  workspace's Git **root folder**. It is cloned by `git` on the machine running
-  the API, with your own credential helper or SSH key; no token is entered,
-  and a URL with credentials in it is refused.
+| | Git repository (recommended) | Live workspace |
+|---|---|---|
+| Read from | The repository's collaboration branch, cloned by `git` on this machine (`api/repository_source.py`) | What is published in the workspace, through Synapse's APIs |
+| Includes work merged but not yet published | Yes | No |
+| Records the commit migrated | Yes (`main · 3f9a1c2`) | No |
+| Other environments | Any branch, plus a parameters file | Only the workspace chosen |
+| Access needed | Reader on the resource group, and Git access to the repository | A Synapse role such as Synapse Artifact User |
+
+Tables, views, procedures and data come from the dedicated SQL pool either way.
+
+* **Git is chosen for you, nothing typed.** Choosing the workspace reads its
+  Git integration from Azure (`GET /api/azure/workspace-git`, an ARM read of
+  `workspaceRepositoryConfiguration`) and, when it has one, shows the
+  repository, the **collaboration branch** and the **root folder** with *Git
+  repository* selected. A workspace without Git integration says so and is
+  read live, with nothing to choose. The workspace's dedicated SQL pool is
+  chosen with it, so tables come along (*None* in that list leaves them out).
+  The environment is **Dev**. Azure reports no credential, and none is asked
+  for.
+* **More options** (shown with Git, folded, with what will be used beside it):
+  another branch (for example a release branch for Prod), the root folder, the
+  environment, and an environment's parameters file. Choices made for one
+  workspace are cleared when another workspace is chosen.
+* **A repository URL** is typed only on request: **Use another repository**
+  (under the Git choice), or **Enter a repository URL instead**, which needs
+  no Azure sign-in (and then reads no SQL pool). It is cloned by `git` on the
+  machine running the API, with your own credential helper or SSH key; no
+  token is entered, and a URL with credentials in it is refused. Clone the
+  repository once in a terminal (`git clone <url>`) so Git Credential Manager
+  remembers your sign-in; the API's own clones then need nothing typed.
+* **A workspace connected live** that is in Git shows its *Git integration*
+  row and **Use its Git repository instead**, which reopens the form with the
+  Git choice made and the same workspace and SQL pool chosen.
 * **Workspace export (ZIP):** a ZIP of the repository folder (for example a
   branch downloaded from GitHub or Azure DevOps), up to 200 MB. It is
   extracted safely (no paths outside its folder, no symbolic links, size and
   file-count limits), and the folder holding `pipeline/`, `linkedService/` and
   the others is found automatically, or named.
-* **Environment:** Dev, Test, Prod or a named one, shown with the connection.
-  An optional **parameters file** (`TemplateParametersForWorkspace.json`, or an
+* **Environment:** Dev unless another is chosen under *More options* (Test,
+  Prod or a named one); shown with the connection. An optional **parameters
+  file** (`TemplateParametersForWorkspace.json`, or an
   environment's copy) replaces the linked-service values committed in the
   repository, which are usually Dev's, with that environment's: parameters
   named `<linked service>_connectionString` or
@@ -179,10 +215,10 @@ Git repository or a ZIP of it (`api/repository_source.py`):
   are never changed. A parameter that matches no existing property is listed,
   not guessed at.
 * **Optional SQL pool:** the repository holds definitions only. To also
-  migrate tables and data, sign in to Azure in the same card and choose the
-  dedicated SQL pool; only the pool is read from Azure, the definitions still
-  come from the repository. Without it, tables, data loads, date filters and
-  row counts are skipped.
+  migrate tables and data, the dedicated SQL pool is read from Azure (for Git,
+  the one chosen in the pool list; for a ZIP, tick *Also read the dedicated SQL
+  pool* and sign in); the definitions still come from the repository. Without
+  it, tables, data loads, date filters and row counts are skipped.
 
 Triggers and integration runtimes are read from the repository's own
 folders. Spark pools and libraries are not in a repository, so they appear
@@ -206,7 +242,7 @@ so the page stays readable:
 | Assess | A tile and percentage per class, and a bar across all of them | By workstream, Objects, Component mapping |
 | Waves | Objects, dependencies, waves | Waves (one row per wave with its object types), Dependency graph |
 | Plan | Readiness, objects, automated, needs a person, effort, blocking | Readiness & risks, Objects in plan, Strategy by type, Stages & credentials (configuration only: nothing runs from Plan) |
-| Migrate | Pre-run checks, then the run: every stage that is on or a single stage, progress by wave, every object's result, pause, resume, Retry failed | — |
+| Migrate | Pre-run checks, then the run: every stage that is on or a single stage, progress by wave, every object's result, pause, resume, Retry failed; once it completes, the commit to Fabric Git with **Open pull request dev → main**, or **Commit now** | — |
 | Validate | Checks, match, review, mismatch (each one filters) | One tab per category |
 
 The bar at the foot of every step says where it stands and how to move on:
@@ -235,6 +271,28 @@ validation results in the page's. When a confirmed step's results are gone
 its box says *Run again* (*Rebuild* for an empty plan), the steps after it wait,
 and *Migration complete* is hidden until it has been redone; the later steps
 then come back by themselves.
+
+**Workspace explorer.** Beside the steps, the discovered workspace is shown as
+a repository tree: artifacts in the folders a Synapse Git repository uses
+(`linkedService`, `dataset`, `pipeline`, `notebook`, `sqlscript`,
+`sparkJobDefinition`, `trigger`, `integrationRuntime`, …), the dedicated SQL
+pool nested by schema (tables, external tables, views, procedures, functions),
+and anything else under *other*, so every object appears once and the total
+matches Discover. Folders show counts; a name filter keeps only matches;
+clicking an object opens its details. *Hide explorer* is remembered per
+browser; below 1100 px wide it sits above the steps.
+
+**Release path.** Under the steps, one strip shows where this migration sits on
+the way from Dev to Prod: the Synapse source (its environment, and branch or
+ZIP), this migration, the Fabric workspace, **Fabric Git**, and the
+environments still ahead (none after Prod). The Fabric Git chip is read live
+from the target workspace: *dev @ 1a2b3c4 · 0 uncommitted* with a **Pull
+request dev → main** link beside it, or *Not connected: connect the Dev
+workspace to Git in Fabric*. *What comes next* opens the one-time migration and
+the ongoing CI/CD flow, a six-item checklist kept per project in this browser
+(its Git row follows Fabric once Fabric can be read) and a short glossary.
+Test and Prod stay *to do*: whether they were deployed is not something the
+app can see yet.
 
 ### Migration assistant (preview)
 
@@ -272,10 +330,13 @@ data**.
     ├─ discovery, extractors/, records, sql/, synapse/   read the source into Unified Discovery Records
     ├─ mapping/              Synapse → Fabric mapping, classification, dependency waves
     ├─ api/fabric.py         Fabric sign-in through the Azure CLI or the Fabric CLI
-    └─ migration/            planner, stages, T-SQL rules, Fabric REST, data pipelines, validation
+    └─ migration/            planner, stages, T-SQL rules, Fabric REST, data pipelines, validation, Fabric Git
              │
              ▼
- Microsoft Fabric: REST API, Warehouse SQL endpoint, data pipelines
+ Microsoft Fabric: REST API, Warehouse SQL endpoint, data pipelines, Git integration
+             │  (commits made by Fabric, to the branch the workspace is connected to)
+             ▼
+ Azure DevOps / GitHub: the Fabric repository (dev → pull request → main)
 ```
 
 The UI talks to one interface, `MigrationApi` (`frontend/src/types.ts`). In
@@ -290,7 +351,7 @@ Live mode that is `realApi.ts` and the local API; in Demo mode it is
 | `src/discovery_agent/connections/` | Authentication and every external connection. The only place that signs in. |
 | `src/discovery_agent/discovery.py`, `records.py`, `extractors/`, `sql/`, `synapse/`, `acquisition/`, `artifacts/` | The discovery engine: what the workspace, the SQL pool and the Git repository say, merged into one record per object. |
 | `src/discovery_agent/mapping/` | `synapse_fabric_mapping.py` (Fabric target, classification and workstream for each object type and pipeline activity) and `waves.py` (dependency waves). |
-| `src/discovery_agent/migration/` | The planner, the eleven stages, the T-SQL rules, Fabric REST calls, data pipelines and validation. See [Migration](#migration). |
+| `src/discovery_agent/migration/` | The planner, the eleven stages, the T-SQL rules, Fabric REST calls, data pipelines, validation, and `fabric_git.py` (the target workspace's Fabric Git: status, commit, pull-request link). See [Migration](#migration) and [Fabric Git (Dev)](#fabric-git-dev). |
 | `src/discovery_agent/api/` | The local HTTP API: `service.py` (connections, discovery, results), `fabric.py` (Fabric sign-in), `migration.py` (plan, run, validate), `mapping.py`, `server.py`. |
 | `prompts/transform/` | The prompt templates for LLM-assisted transformation: `base.md`, one file per object type, and `project.md` for your project's own rules. |
 | `transforms/` | Drafts and accepted LLM-assisted transforms, one JSON file per object (created on first use; git-ignored, because it holds the client's code). |
@@ -306,12 +367,13 @@ All under `/api`, JSON in and out. Nothing returns a token or a secret.
 | Area | Endpoints |
 |---|---|
 | Health | `GET /health`: the sign-in methods this backend supports, what discovery reads, and the types a run migrates |
-| Synapse connection | `GET /connections` · `POST /connections/authenticate` · `POST /connections/test` · `POST /connections/upload` (a ZIP, `application/zip`) · `POST /connections/repository` (Git or the uploaded ZIP, for one environment) · `DELETE /connections` · `GET /azure/<subscriptions, resource groups, workspaces, pools>` for the dropdowns |
+| Synapse connection | `GET /connections` · `POST /connections/authenticate` · `POST /connections/test` · `POST /connections/upload` (a ZIP, `application/zip`) · `POST /connections/repository` (Git or the uploaded ZIP, for one environment) · `DELETE /connections` · `GET /azure/<subscriptions, resource-groups, workspaces, sql-pools>` for the dropdowns · `GET /azure/workspace-git?subscriptionId=&resourceGroup=&workspace=` (the workspace's Git integration: `configured`, `provider`, `repositoryUrl`, `branch`, `rootFolder`, `lastCommit`; never a credential) |
 | Discovery | `POST /discovery/start` · `GET /discovery/status` · `GET /discovery/results` (filter, sort, page) · `GET /discovery/results/<id>` · `GET /discovery/export` · `DELETE /discovery` (forget the results; refused while discovery runs) |
 | Mapping and waves | `GET /mapping/components` · `GET /dependencies` |
 | Fabric connection | `GET /fabric/connection` · `POST /fabric/authenticate` · `POST /fabric/workspaces` · `POST /fabric/test` · `DELETE /fabric/connection` |
 | LLM transformation | `GET /transform/settings` · `GET /transform` · `GET /transform/objects/<id>` · `GET /transform/prompt/<id>` · `POST /transform/generate` (`ids`) · `POST /transform/accept` (`id`, optional edited `code`) · `POST /transform/discard` (`id`, `scope`: `draft` or `all`) · `GET /transform/candidates` · `GET`/`POST /transform/project` |
-| Migration | `GET /migration/capabilities` · `POST /migration/plan` · `POST /migration/start` · `GET /migration/run` · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: forget the run's record, refused while it is working) · `POST /migration/validate` (starts it in the background) · `GET /migration/validation` |
+| Migration | `GET /migration/capabilities` · `POST /migration/plan` · `POST /migration/start` · `GET /migration/run` (with `git`: the commit after the run) · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: forget the run's record, refused while it is working) · `POST /migration/validate` (starts it in the background) · `GET /migration/validation` |
+| Fabric Git | `GET /fabric/git` (the target workspace's branch, head, uncommitted / incoming / conflicting items, data-load pipelines kept out, the pull-request link, the last commit) · `POST /fabric/git/commit` (`{comment?}`; commits in the background, refused while a run or another commit is working) |
 
 ## What is automated, manual, or coming
 
@@ -371,6 +433,19 @@ CREDENTIAL = (IDENTITY = 'Managed Identity')` loses the credential, so it reads
 as the identity that runs it. `SET IDENTITY_INSERT` is kept, because tables keep
 IDENTITY; it is removed only for a Warehouse table that has none (one created
 before IDENTITY was kept), where Fabric would reject it.
+
+**Automated around the run:** filling in the Git source from the Synapse
+workspace's own Git integration; committing what the run created to the Fabric
+workspace's Git branch, with the pull-request link (see
+[Fabric Git (Dev)](#fabric-git-dev)).
+
+**Set up by hand, once:** the Fabric repository and its branches, the Fabric
+tenant setting for Git, and connecting the Dev workspace to Git (see
+[Fabric Git (Dev)](#fabric-git-dev)).
+
+**Coming next:** deploying from Git to Fabric Test and Prod (with
+`fabric-cicd`): each environment's workspace, connections, Warehouse schema
+and data loads, and schedules switched on only where they should run.
 
 **Shown in the UI, not built yet:** sources and destinations other than
 Synapse and Fabric; the migration assistant's conversation.
@@ -982,12 +1057,85 @@ starts it, and `GET /api/migration/validation` reports its progress and then its
 
 API: `GET /api/migration/capabilities`, `POST /api/migration/plan`,
 `POST /api/migration/validate`, `POST /api/migration/start` (`{items, options: {scope, stages, dataMode,
-dataRun, collation, stopOnFailure}, credentials}`), `GET /api/migration/run` and
-`POST /api/migration/control` (`pause|resume|retry`). Code:
+dataRun, collation, stopOnFailure, gitCommit}, credentials}`), `GET /api/migration/run` and
+`POST /api/migration/control` (`pause|resume|retry|reset`). Code:
 `src/discovery_agent/migration/` (`runner.py`, `stages.py`, `stages_fabric.py`,
 `capabilities.py`, `planner.py`, `preflight.py`, `datacopy.py`, `datapipeline.py`, `tsql_rules.py`,
 `fabric_connections.py`, `pipelines.py`, `jobs.py`, `notebooks.py`,
-`environments.py`, `warehouse_ddl.py`, `fabric_rest.py`) and `api/migration.py`.
+`environments.py`, `warehouse_ddl.py`, `fabric_rest.py`, `fabric_git.py`) and `api/migration.py`.
+
+## Fabric Git (Dev)
+
+The migration lands in a Fabric **Dev** workspace connected to Fabric's own Git
+repository (not the Synapse one). After each run, what the run created is
+committed to that workspace's branch, so every migration is reviewed in a pull
+request before it reaches `main`. Deploying from Git to Test and Prod (with
+`fabric-cicd`) is the next round and is not built yet.
+
+```
+Synapse Git (collaboration branch) ──discover──▶ this app ──migrate──▶ Fabric Dev workspace
+                                                                         │ commit after each run
+                                                                         ▼
+                                     Fabric repository:  dev ──pull request + review──▶ main
+```
+
+**Set up once, by hand:**
+
+1. **Azure DevOps** (or GitHub): a repository for Fabric, for example
+   `fabric-migration`, with branches `dev`, `main` and `prod`. Protect `main`
+   and `prod` with a pull request and a reviewer; leave `dev` without a policy,
+   because Fabric commits to it directly.
+2. **Fabric admin portal** (a tenant admin): enable *Users can synchronize
+   workspace items with their Git repositories*.
+3. **Fabric:** create the Dev workspace on a capacity, with you as Admin. Then
+   *Workspace settings → Git integration*: Azure DevOps, the repository,
+   branch `dev`, folder `fabric`, *Connect and sync*. Do this before the run.
+4. **This machine:** `az login` as the same Microsoft account. For Azure
+   DevOps, Fabric commits with that account (single sign-on; the accelerator
+   sets the workspace's Git credentials to *Automatic* when they are missing),
+   so no token is entered anywhere. A GitHub repository needs your GitHub
+   account connected once in Fabric (*Source control → Accounts*); the
+   accelerator never handles a GitHub token.
+
+**After each run** (`api/migration.py`, `migration/fabric_git.py`, through
+Fabric's Git REST APIs):
+
+* When the run completes and **Commit to Fabric Git after the run** is on
+  (Plan → *Stages & credentials*; on by default; run option
+  `gitCommit: "auto" | "off"`), the accelerator reads the workspace's Git
+  connection and status and makes a **selective commit** of the items the
+  workspace added or changed, with the message *Synapse to Fabric migration
+  run 00N: X object(s) created in &lt;workspace&gt;*.
+* **Left out on purpose:** the per-wave data-load pipelines
+  (`load_<warehouse>_wave_<n>`) and the sync pipeline (`sync_<warehouse>`).
+  They are rebuilt per environment, so they never go through Git. Deletions
+  are not committed either.
+* **Stops and says so** rather than forcing anything: when the branch has
+  changes the workspace has not taken yet (*Update all* in Fabric first) or
+  there are conflicts (resolve them in Fabric's Source control panel). A head
+  that moved while committing is retried once; a commit that is too large is
+  split into batches.
+* A commit problem **never fails the run**. The Migrate step says what
+  happened: *Committed 12 items to dev (1a2b3c4)* with **Open pull request dev
+  → main** and **View commit**; *Nothing new to commit*; *Not committed: the
+  workspace is not connected to Git*; or the error. Anything not committed has
+  **Commit now** to try again. The commit runs on its own thread, so Retry
+  failed and Reset are free the moment the run completes.
+* **Commit now** (`POST /api/fabric/git/commit`) commits by hand: after a run
+  with committing switched off, or to retry.
+* The pull-request link opens Azure DevOps' (or GitHub's) *create pull
+  request* page from the workspace's branch into `main`; the review and the
+  merge happen there.
+
+The Release path's **Fabric Git** chip shows the branch, the last commit and
+what waits to be committed, read live from Fabric (`GET /api/fabric/git`).
+
+**Permissions:** Admin in the Fabric workspace to connect it to Git (once);
+Admin, Member or Contributor to commit; and write access to the `dev` branch.
+
+**Not in Git, by design:** connections (each environment has its own) and
+data. Some items' Git support in Fabric is still in preview (for example the
+Warehouse); that is Fabric's limit, listed on Microsoft Learn.
 
 ## LLM-assisted transformation
 
@@ -1059,9 +1207,14 @@ connection string or table data is ever sent. If this client's code must not lea
 ## Tests
 
 ```
-pytest                                  # backend: 1,304 tests
-cd frontend && npm run typecheck && npm test   # UI: type check and 43 tests
+pytest                                  # backend: 1,508 tests pass, 104 skipped (below)
+cd frontend && npm run typecheck && npm test   # UI: type check and 70 tests
 ```
+
+The skipped backend tests are the two opt-in integration suites (39 tests,
+below), 63 that read a local snapshot of a sample repository
+(`input/repository/Test-Drive-Azure-Synapse-with-a-1-click-POC`) when it has
+been cloned there, and 2 that need permission to create symbolic links.
 
 Tests run fully offline — no network access, no Azure subscription, no ODBC
 driver and no dependency on any real repository. Every credential, ARM call,
@@ -1078,11 +1231,26 @@ SYNAPSE_SQL_INTEGRATION=1 SYNAPSE_SQL_SERVER=... SYNAPSE_SQL_DATABASE=... pytest
 CONNECTIONS_INTEGRATION=1 AZURE_SUBSCRIPTION_ID=... SYNAPSE_RESOURCE_GROUP=...   SYNAPSE_WORKSPACE_NAME=... SYNAPSE_SQL_POOL=... pytest
 ```
 
+The Fabric Git tests (`tests/test_fabric_git.py`) use a fake Fabric REST
+client: the connection and status (including a status that answers 202 and is
+followed), a selective commit that leaves out data-load pipelines and
+deletions, Azure DevOps single sign-on set when missing and GitHub refused with
+the way forward, conflicts and incoming changes refused, a moved head retried
+once, a commit too large split into batches, error messages without a token,
+the pull-request links, and the run: committed after it completes, free for
+Retry while the commit finishes, switched off, and a commit failure kept as a
+note that never fails the run.
+
 The UI tests run against Demo data in a simulated browser: choosing the
-route (only Synapse and Fabric selectable), the sign-in methods (ZIP and Git
-shown but not selectable), Start migration staying disabled until both sides
-are connected and tested, the step lock and Next, resetting a step, results
-that disappear (*Run again*), stage options kept per project, the project menu,
-the backend-unavailable bar, the dialogs that ask first, every step's panel, the
-assistant, the old page addresses, and that a typed credential never reaches
-browser storage.
+route (only Synapse and Fabric selectable), the two source options (the
+workspace and a ZIP), a workspace's Git repository found and chosen with
+nothing typed (a workspace without one read live, and the live workspace
+chosen instead), a typed repository URL, swapping a connected live workspace
+for its Git repository, Start migration staying disabled until both sides are connected
+and tested, the step lock and Next, resetting a step, results that disappear
+(*Run again*), stage options kept per project, the project menu, the
+backend-unavailable bar, the dialogs that ask first, every step's panel, the
+workspace explorer, the release path (with its live Fabric Git chip), a run
+committed to Fabric Git with its pull-request link, *Commit now* after a run
+with committing off, the assistant, the old page addresses, and that a typed
+credential never reaches browser storage.

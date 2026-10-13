@@ -77,7 +77,7 @@ function CredentialForm({ service }: { service: LinkedServiceInput }) {
  * Plan step. The Migrate step runs every stage that is on, or one on its own.
  */
 export function StagesPanel() {
-  const { capabilities, options, setOptions, graph, plan, execution: run, credentials, clearCredentials } = useMigration();
+  const { capabilities, options, setOptions, graph, plan, execution: run, credentials, clearCredentials, fabricGit } = useMigration();
 
   const nodes = useMemo(() => new Map((graph?.nodes ?? []).map((n) => [n.id, n])), [graph]);
   const typesInPlan = useMemo(() => {
@@ -204,6 +204,13 @@ export function StagesPanel() {
             Any edit someone made in Fabric to a view, procedure, notebook, pipeline, SQL script or Spark job in this plan is replaced by the migrated version.
           </Banner>
         )}
+        <label className="check-row">
+          <input type="checkbox" checked={options.gitCommit !== "off"} onChange={(e) => setOptions({ gitCommit: e.target.checked ? "auto" : "off" })} />
+          <span><strong>Commit to Fabric Git after the run</strong><span className="muted"> — what the run created is committed to the target workspace's Git branch, ready for a pull request. Data-load pipelines are left out: they are rebuilt per environment. Off: commit by hand from the Migrate step.</span>
+            {fabricGit?.state === "connected" && <span className="faint git-where"> {fabricGit.workspace ?? "The workspace"} commits to <strong>{fabricGit.branch}</strong> in {fabricGit.repository}.</span>}
+            {fabricGit?.state === "not_connected" && <span className="faint git-where"> {fabricGit.workspace ?? "The target workspace"} is not connected to Git yet, so the commit is skipped; the run says so.</span>}
+          </span>
+        </label>
       </div>
     </Card>
   );

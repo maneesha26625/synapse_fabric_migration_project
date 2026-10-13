@@ -849,8 +849,10 @@ def test_objects_run_in_the_order_they_depend_on_each_other():
 def test_run_options_are_validated_and_credentials_are_checked_for_shape_only():
     defaults = parse_options({})
     assert defaults["stages"] == list(capabilities.STAGE_KEYS) and defaults["dataMode"] == "if_empty"
-    assert defaults["dataRun"] == "run" and defaults["collation"] == "match_synapse"
-    for bad in ({"stages": ["nope"]}, {"stages": "data"}, {"dataMode": "wipe"}, {"dataRun": "later"}, {"collation": "binary"}, {"scope": "x"}):
+    assert defaults["dataRun"] == "run" and defaults["collation"] == "match_synapse" and defaults["gitCommit"] == "auto"
+    assert parse_options({"options": {"gitCommit": "off"}})["gitCommit"] == "off"
+    for bad in ({"stages": ["nope"]}, {"stages": "data"}, {"dataMode": "wipe"}, {"dataRun": "later"}, {"collation": "binary"}, {"scope": "x"},
+                {"gitCommit": "sometimes"}):
         with pytest.raises(ApiError) as exc:
             parse_options({"options": bad})
         assert exc.value.code == "invalid_options"

@@ -510,6 +510,64 @@ export interface RunOptions {
   syncOverlap?: "1h" | "1d" | "none";
   /** Table data: which rows each table loads, by "schema.table" (lowercase). A table not listed loads every row. */
   dataFilters?: Record<string, DataFilterInput>;
+  /** After the run completes, commit what it created to the workspace's Fabric Git branch (auto) or not (off). */
+  gitCommit?: "auto" | "off";
+}
+
+// ---- Git: the Synapse workspace's repository, and the Fabric workspace's branch ---------------
+
+/** The Git repository a Synapse workspace is integrated with, as Azure reports it. Never a credential. */
+export interface WorkspaceGit {
+  workspace: string;
+  configured: boolean;
+  provider?: "AzureDevOps" | "GitHub" | string;
+  repositoryUrl?: string;
+  /** The collaboration branch: where the workspace's definitions are committed. */
+  branch?: string | null;
+  /** Without leading or trailing slashes; empty when the definitions are at the top of the repository. */
+  rootFolder?: string;
+  lastCommit?: string | null;
+}
+
+/** What a commit to Fabric Git did (after a run, or by hand). */
+export interface GitCommitResult {
+  state: "committing" | "committed" | "nothing" | "skipped" | "blocked" | "failed";
+  message?: string;
+  items?: number;
+  /** Data-load pipelines left out: they are rebuilt per environment. */
+  skipped?: string[];
+  commit?: string | null;
+  branch?: string | null;
+  commitUrl?: string | null;
+  pullRequestUrl?: string | null;
+  at?: string;
+  code?: string;
+}
+
+/** The target workspace's Fabric Git branch and what waits to be committed. */
+export interface FabricGitState {
+  state: "connected" | "not_connected" | "no_target" | "error";
+  message?: string;
+  workspace?: string;
+  provider?: string | null;
+  organization?: string | null;
+  project?: string | null;
+  repository?: string | null;
+  branch?: string | null;
+  folder?: string | null;
+  head?: string | null;
+  lastSync?: string | null;
+  repositoryUrl?: string | null;
+  commitUrl?: string | null;
+  pullRequestUrl?: string | null;
+  targetBranch?: string;
+  uncommitted?: number;
+  incoming?: number;
+  conflicts?: number;
+  /** Uncommitted data-load pipelines, which are never committed. */
+  plumbing?: number;
+  committing?: boolean;
+  lastCommit?: GitCommitResult | null;
 }
 
 /** One table's date filter. Dates are fixed (YYYY-MM-DD), so every run of a plan loads the same rows. */
@@ -618,6 +676,8 @@ export interface ExecutionRun {
   options?: RunOptions;
   /** Set when a stop-on-failure run paused itself, with the reason. */
   haltedReason?: string | null;
+  /** The commit to Fabric Git once the run completed; null until it is tried. */
+  git?: GitCommitResult | null;
   items: ExecItem[];
   logs: string[];
 }
@@ -791,6 +851,8 @@ export interface MigrationApi {
   listResourceGroups(subscriptionId: string): Promise<string[]>;
   listWorkspaces(subscriptionId: string, resourceGroup: string): Promise<string[]>;
   listSqlPools(subscriptionId: string, resourceGroup: string, workspace: string): Promise<string[]>;
+  /** The Git repository a Synapse workspace is integrated with, to fill in the Git source. */
+  getWorkspaceGit(subscriptionId: string, resourceGroup: string, workspace: string): Promise<WorkspaceGit>;
   getDependencies(): Promise<DependencyGraph>;
   getComponents(): Promise<ComponentRow[]>;
   exportMetadata(): Promise<MetadataExport>;
@@ -799,6 +861,10 @@ export interface MigrationApi {
   authenticateFabric(config: FabricConfig): Promise<FabricTarget>;
   testFabric(config: FabricConfig): Promise<FabricTarget>;
   disconnectFabric(): Promise<FabricTarget>;
+  /** The target workspace's Fabric Git branch, its uncommitted changes and the pull-request link. */
+  getFabricGit(): Promise<FabricGitState>;
+  /** Commit the migrated items to that branch (in the background; poll `getFabricGit`). */
+  commitFabricGit(comment?: string): Promise<FabricGitState>;
   getCapabilities(): Promise<Capabilities>;
   analyzePlan(items: PlanItem[], record?: boolean, options?: RunOptions, credentials?: ConnectionCredentials): Promise<PlanAnalysis>;
   startExecution(items: PlanItem[], options?: RunOptions, credentials?: ConnectionCredentials): Promise<ExecutionRun>;

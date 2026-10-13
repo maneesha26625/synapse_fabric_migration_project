@@ -19,11 +19,15 @@ web framework would be the first. The surface is small and fixed.
     GET    /api/dependencies              dependency graph + suggested waves
     GET    /api/mapping/components        Synapse -> Fabric component table
     GET    /api/discovery/export          the whole inventory, for download
+    GET    /api/azure/{subscriptions|resource-groups|workspaces|sql-pools}   pickers, from the Azure sign-in
+    GET    /api/azure/workspace-git       the Git repository a Synapse workspace is integrated with
     GET    /api/fabric/connection         Fabric target state (never a token)
     POST   /api/fabric/authenticate       Azure CLI / Fabric CLI login + workspace list
     POST   /api/fabric/workspaces         refresh the workspace list
     POST   /api/fabric/test               verify the selected workspace
     DELETE /api/fabric/connection         forget the Fabric target
+    GET    /api/fabric/git                the target workspace's Fabric Git branch, changes, pull-request link
+    POST   /api/fabric/git/commit         commit the migrated items to that branch (background)
     GET    /api/migration/capabilities    the migration stages, their options and the linked services
     GET    /api/migration/run             the current migration run
     POST   /api/migration/plan            planner: strategy, risks, effort, checks (read-only)
@@ -175,6 +179,8 @@ def make_handler(
                 self._dispatch(session.connection_state)
             elif path == "/api/fabric/connection":
                 self._dispatch(fabric.state)
+            elif path == "/api/fabric/git":
+                self._dispatch(migration.git_state)
             elif path == "/api/migration/capabilities":
                 self._dispatch(migration.capabilities)
             elif path == "/api/migration/validation":
@@ -224,6 +230,7 @@ def make_handler(
                 "/api/fabric/authenticate": lambda: fabric.authenticate(self._json_body()),
                 "/api/fabric/workspaces": lambda: fabric.refresh_workspaces(self._json_body()),
                 "/api/fabric/test": lambda: fabric.test(self._json_body()),
+                "/api/fabric/git/commit": lambda: migration.git_commit(self._json_body()),
                 "/api/migration/plan": lambda: migration.analyze(self._json_body()),
                 "/api/migration/validate": lambda: migration.start_validation(self._json_body()),
                 "/api/migration/start": lambda: migration.start(self._json_body()),

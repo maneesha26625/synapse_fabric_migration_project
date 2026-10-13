@@ -4,10 +4,22 @@ The web application for the Synapse → Fabric accelerator. It has two pages and
 no sidebar:
 
 * **Connections** (`/`): choose the route (source and destination dropdowns),
-  connect both sides, then **Start migration**.
+  connect both sides, then **Start migration**. The Synapse source is the
+  **Synapse workspace** (sign in and choose it; when it is connected to Git its
+  definitions are read from its **Git repository**, recommended and chosen for
+  you, or from the **live workspace** if you choose) or a **ZIP export**.
 * **Migration** (`/migration?step=…`): the six steps (Discover, Assess, Waves,
   Plan, Migrate, Validate) side by side. Click a step to see its details below;
-  each step is confirmed with Next before the following one opens.
+  each step is confirmed with Next before the following one opens. Beside the
+  steps, the **workspace explorer** shows the discovered workspace as a
+  repository tree; under them, the **release path** shows the way from Dev to
+  Prod, with a live **Fabric Git** chip (branch, last commit, what waits to be
+  committed, and the pull request to open).
+
+When a run completes, the Migrate step shows its **commit to Fabric Git**:
+*Committed 12 items to dev (1a2b3c4)* with **Open pull request dev → main**, or
+what stopped it with **Commit now**. *Commit to Fabric Git after the run* is a
+run option in Plan → Stages & credentials (on by default).
 
 Every step has **Reset step** in its header: after a dialog that lists what
 will go, it clears that step and every step after it so they can be done again
@@ -49,7 +61,9 @@ python -m discovery_agent.api            # open http://127.0.0.1:8001
 ```
 
 On Windows, `..\start-ui.ps1` starts both. Checks: `npm run typecheck`,
-`npm test` (43 tests, on Demo data), and `pytest tests/test_api.py` for the API.
+`npm test` (70 tests, on Demo data), and `pytest tests/test_api.py
+tests/test_fabric_git.py` for the API. After pulling backend changes, restart
+the API: the UI dev server reloads by itself, the API does not.
 
 ## Data layer: Live vs Demo
 
@@ -82,6 +96,17 @@ confirmed, and Migrate and Validate say *Run again* until they are. A run fails
 three objects on purpose and validation finds three short tables, so Retry
 failed and the filters have something to show.
 
+Git in Demo data: choosing a demo workspace finds
+`https://dev.azure.com/contoso/Synapse/_git/<workspace>` (branch `main`, folder
+`synapse`) for most of them, with *Git repository* chosen; one whose name
+contains `analytics` has no Git integration (it is read live), and `denied`
+cannot be read. `Fabric_demo` is connected to the
+`dev` branch of `contoso/Migration/fabric-migration` (folder `fabric`), so a
+completed run is committed a moment later with a pull-request link; choosing
+*My workspace* as the target shows what happens when the workspace is not
+connected to Git. With *Commit to Fabric Git after the run* off, the run's
+items wait and **Commit now** commits them.
+
 ## Design
 
 * **One flow, one place for detail.** The Migration page shows the whole
@@ -93,10 +118,14 @@ failed and the filters have something to show.
   stands and offers *Looks good, continue to …*, *Continue anyway* when there
   is something worth a look, or a disabled button with the reason. Plan cannot
   be confirmed while a risk is blocking.
-* **Roadmap visible, not selectable.** Platforms and sign-in methods that are
-  not built yet (other sources and destinations, Workspace export (ZIP), Git
-  repository) are listed, dimmed and marked *Coming soon*. They are announced
-  as unavailable to screen readers and ignore clicks and keys.
+* **Roadmap visible, not selectable.** Platforms that are not built yet (other
+  sources and destinations) are listed, dimmed and marked *Coming soon*. They
+  are announced as unavailable to screen readers and ignore clicks and keys.
+* **Nothing typed that can be read.** Lists are filled from the signed-in
+  account, and a Git source is found from the workspace's own Git integration;
+  a list with one entry is chosen for you. Choices with good defaults (branch,
+  root folder, environment, parameters file) sit folded under *More options*,
+  which says what will be used; a field appears only when it is needed.
 * **Accessible.** The dropdowns are listboxes with full keyboard support,
   method tiles are radio groups, step boxes say their state in their label,
   and focus, contrast and reduced motion are respected.
@@ -133,11 +162,17 @@ No secret is read from, or written to, any environment variable or storage.
 
 ## Security notes
 
-- Azure Synapse offers **Azure CLI** and **Interactive browser**; Microsoft
-  Fabric offers **Azure CLI** and **Fabric CLI**. There is no password or token
-  field for signing in. Interactive browser asks only for Tenant ID and
-  Subscription ID, and the backend refuses any sign-in field it does not
-  expect.
+- Azure Synapse offers the **Synapse workspace** (a Microsoft sign-in window,
+  then the subscription, resource group, workspace and pool chosen from lists;
+  its definitions read from its Git repository or the live workspace) and
+  **Workspace export (ZIP)**; Microsoft Fabric offers **Azure CLI** and
+  **Fabric CLI**. There is no password or token field for signing
+  in, and the backend refuses any sign-in field it does not expect.
+- Git is reached with the machine's own credential helper or SSH key: a
+  repository URL with credentials in it is refused, the workspace's Git
+  integration is read from Azure without any credential, and Fabric commits to
+  its branch with the signed-in account (Azure DevOps single sign-on). No Git
+  token passes through the UI.
 - The UI reads `/api/health` (`authMethods`, `authMethodDetails`) and disables a
   method the running backend does not support.
 - Tokens never reach the browser: the backend holds them, and its responses are
@@ -160,9 +195,9 @@ src/
   components/
     setup/        platforms list, PlatformPicker (route dropdowns)
     connections/  SourceConnection (Synapse), TargetConnection (Fabric), MethodTiles
-    journey/      steps, useJourney (each step's state), ResetStep, report (CSV), panels/ (one per step)
+    journey/      steps, useJourney (each step's state), ResetStep, report (CSV), WorkspaceExplorer, ReleasePath, panels/ (one per step)
     discovery/    Inventory, object details, summaries, mapping, dependency graph
-    migrate/      planner runs, stages and credentials, strategy, run panel
+    migrate/      planner runs, stages and credentials (and the Fabric Git option), strategy, run panel (and its Git banner)
     layout/       Layout (top bar, project menu, backend bar), Assistant (launcher and panel)
     shared/       buttons, fields, banners, tabs, metrics, dialogs, notify (toasts)
   state/        AppState (connection, discovery), MigrationState (projects, plan, run, journey)

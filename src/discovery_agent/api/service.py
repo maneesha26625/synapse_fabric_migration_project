@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 import threading
+import urllib.parse
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -49,6 +50,7 @@ from discovery_agent.connections.azure import (
 )
 from discovery_agent.connections.git import GitConnection
 from discovery_agent.connections.manager import ConnectionManager
+from discovery_agent.connections.synapse import SynapseWorkspaceConnection
 from discovery_agent.connections.models import (
     AzureConnectionConfig,
     ConnectionSettings,
@@ -514,9 +516,12 @@ class Session:
             return self._signin
 
     def azure_options(self, kind: str, query: Dict[str, str]) -> dict:
-        """Dropdown contents: subscriptions, then a subscription's resource groups, workspaces and SQL pools."""
+        """Dropdown contents: subscriptions, then a subscription's resource groups, workspaces and SQL pools.
+        ``workspace-git`` is the Git repository a workspace is integrated with."""
         if kind == "subscriptions":
             return {"items": [dict(s) for s in self._signed_in().subscriptions]}
+        if kind == "workspace-git":
+            return self._workspace_git(query)
         if kind not in ("resource-groups", "workspaces", "sql-pools"):
             raise ApiError(404, "not_found", "No such list.")
         _, _, azure = self._azure_for(query.get("subscriptionId"))
@@ -534,6 +539,43 @@ class Session:
         except AzureConnectionError as exc:
             raise ApiError(502, "azure_error", redact(str(exc))) from exc
         return {"items": items}
+
+    def _workspace_git(self, query: Dict[str, str]) -> dict:
+        """The Git repository a Synapse workspace is integrated with, as Azure Resource Manager reports it.
+
+        This is what fills the Git source in from the workspace itself: the repository,
+        the collaboration branch (the branch people work on, not the publish branch,
+        which holds ARM templates) and the root folder. Azure reports no credential here,
+        and none is asked for: the clone uses this machine's own Git sign-in.
+        """
+        _, _, azure = self._azure_for(query.get("subscriptionId"))
+        resource_group = _clean(query.get("resourceGroup"), "Resource group", _NAME)
+        workspace = _clean(query.get("workspace"), "Synapse workspace", _NAME)
+        try:
+            config = SynapseConnectionConfig(resource_group=resource_group, workspace_name=workspace)
+            repository = SynapseWorkspaceConnection(config, azure).metadata().repository
+        except ConfigError as exc:
+            raise ApiError(400, "invalid_configuration", redact(str(exc))) from exc
+        except AzureAuthenticationError as exc:
+            raise ApiError(401, "authentication", redact(str(exc))) from exc
+        except (AzureConnectionError, SynapseConnectionError) as exc:
+            raise ApiError(502, "azure_error", redact(str(exc))) from exc
+        url = repository.repository_url if repository is not None else None
+        if repository is None or not url:
+            return {"workspace": workspace, "configured": False}
+        # Azure DevOps project names may hold spaces ("Data Platform"): git needs them encoded.
+        url = urllib.parse.quote(url, safe=":/")
+        provider = "AzureDevOps" if repository.is_azure_devops else "GitHub" if repository.is_github else repository.kind
+        return {
+            "workspace": workspace,
+            "configured": True,
+            "provider": provider,
+            "repositoryUrl": url,
+            "branch": repository.collaboration_branch,
+            # Synapse writes the root folder as "/" or "/synapse"; the source form takes it without slashes.
+            "rootFolder": (repository.root_folder or "").strip().strip("/"),
+            "lastCommit": repository.last_commit_id,
+        }
 
     def test(self, body: dict) -> dict:
         """The full chain: Azure, then the workspace, its artifacts, and the pool."""

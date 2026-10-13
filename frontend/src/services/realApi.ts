@@ -9,8 +9,10 @@ import {
   type DiscoveryStatus,
   type Capabilities,
   type ExecutionRun,
+  type FabricGitState,
   type PlanAnalysis,
   type FabricTarget,
+  type WorkspaceGit,
   type Health,
   type MigrationApi,
   type ObjectDetail,
@@ -153,6 +155,9 @@ export const realApi: MigrationApi = {
       body: JSON.stringify({ method: c.method, workspaceId: c.workspaceId.trim() }),
     }),
   disconnectFabric: () => request<FabricTarget>("/api/fabric/connection", { method: "DELETE" }),
+  getFabricGit: () => request<FabricGitState>("/api/fabric/git"),
+  commitFabricGit: (comment) =>
+    request<FabricGitState>("/api/fabric/git/commit", { method: "POST", body: JSON.stringify(comment ? { comment } : {}) }),
   getCapabilities: () => request<Capabilities>("/api/migration/capabilities"),
   analyzePlan: (items, record, options, credentials) =>
     request<PlanAnalysis>("/api/migration/plan", {
@@ -203,5 +208,9 @@ export const realApi: MigrationApi = {
     (await request<{ items: string[] }>(
       `/api/azure/sql-pools?subscriptionId=${encodeURIComponent(sub)}&resourceGroup=${encodeURIComponent(rg)}&workspace=${encodeURIComponent(ws)}`,
     )).items,
+  getWorkspaceGit: (sub, rg, ws) =>
+    request<WorkspaceGit>(
+      `/api/azure/workspace-git?subscriptionId=${encodeURIComponent(sub)}&resourceGroup=${encodeURIComponent(rg)}&workspace=${encodeURIComponent(ws)}`,
+    ),
 };
 

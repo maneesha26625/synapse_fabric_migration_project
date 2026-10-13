@@ -27,7 +27,10 @@ import {
   type ExecItem,
   type ExecutionRun,
   type FabricConfig,
+  type FabricGitState,
   type FabricTarget,
+  type GitCommitResult,
+  type WorkspaceGit,
   type PlanAnalysis,
   type PlanItem,
   type PlanRisk,
@@ -117,11 +120,31 @@ const readyFabric = (): FabricTarget => ({
 
 // Demo-only simulation state for the later phases.
 let fabric: FabricTarget = readyFabric();
+
+const hash = (text: string) => [...text].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
+
+// Fabric Git (demo): Fabric_demo is connected to the dev branch of an Azure DevOps repository;
+// "My workspace" is not connected, to show what the page says then.
+const DEMO_GIT_REPO = { organization: "contoso", project: "Migration", repository: "fabric-migration", branch: "dev", folder: "fabric" };
+const DEMO_REPO_URL = `https://dev.azure.com/${DEMO_GIT_REPO.organization}/${DEMO_GIT_REPO.project}/_git/${DEMO_GIT_REPO.repository}`;
+const DEMO_PR_URL = `${DEMO_REPO_URL}/pullrequestcreate?sourceRef=dev&targetRef=main`;
+const demoSha = (seed: string) => Array.from({ length: 40 }, (_, i) => "0123456789abcdef"[hash(`${seed}:${i}`) % 16]).join("");
+/** A commit made by hand in the demo: when it was asked for, and how many items it takes. */
+interface DemoManualCommit { at: number; items: number; comment: string }
+let demoGitHead = demoSha("initial");
+let demoLastCommit: GitCommitResult | null = null;
+let demoManualCommit: DemoManualCommit | null = null;
+/** Items the last run created that are not committed yet (the run had Commit to Fabric Git switched off). */
+let demoUncommitted = 0;
+/** Runs (by id and retry) whose items a commit by hand already took. */
+const demoCommittedRuns = new Set<string>();
+const demoRunKey = (sim: { runId: string; retried: boolean }) => `${sim.runId}-${sim.retried}`;
+const COMMIT_MS = 1200;
+const gitConnected = () => fabric.status === "connected" && fabric.workspaceId === DEMO_FABRIC_WORKSPACES[0].id;
 interface SimItem { id: string; name: string; type: string; wave: number; table?: string; filter?: DataFilterInput }
 interface ExecSim { runId: string; items: SimItem[]; base: number; resumedAt: number | null; retried: boolean; credentials: string[]; options?: RunOptions; per: number; dur: number; failing: Set<string> }
 let execSim: ExecSim | null = null;
 let runCounter = 0;
-const hash = (text: string) => [...text].reduce((a, c) => (a * 31 + c.charCodeAt(0)) >>> 0, 7);
 
 const fresh = (): Session => ({
   connection: { status: "disconnected", ok: true, checks: [] },
@@ -416,12 +439,69 @@ function runNow(): ExecutionRun {
   const n = (st: ExecItem["status"]) => items.filter((i) => i.status === st).length;
   const allDone = items.every((i) => i.status !== "PENDING" && i.status !== "IN PROGRESS");
   if (allDone) logs.push(line(elapsed, "DONE", "run", "every pending object was processed"));
+  const git = allDone ? demoRunCommit(sim, items, Math.max(0, (slot - 1) * sim.per + sim.dur), elapsed) : null;
+  if (git && git.state !== "committing") logs.push(line(elapsed, "GIT", "run", git.message ?? git.state));
   return {
     runId: sim.runId,
     state: allDone ? "completed" : sim.resumedAt === null ? "paused" : "running",
     total: items.length, completed: n("COMPLETED"), inProgress: n("IN PROGRESS"), failed: n("FAILED"), pending: n("PENDING"),
     skipped: n("SKIPPED"), deferred: n("DEFERRED"), workspace: fabric.workspaceName ?? null, warehouse: WAREHOUSE,
-    options: sim.options, items, logs,
+    options: sim.options, git, items, logs,
+  };
+}
+
+/** The demo commit once a run completes: like the backend, a moment of "committing", then the result. */
+function demoRunCommit(sim: ExecSim, items: ExecItem[], doneAt: number, elapsed: number): GitCommitResult | null {
+  // Fabric items the run created; table data goes through load pipelines, which are never committed.
+  const created = items.filter((i) => i.status === "COMPLETED" && i.type !== "Table data" && i.type !== "Dataset").length;
+  const loadPipelines = new Set(items.filter((i) => i.type === "Table data" && i.status === "COMPLETED").map((i) => i.wave)).size;
+  if (sim.options?.gitCommit === "off") {
+    // Left for a commit by hand; once made, the run's record shows it, as the backend's does.
+    const committedByHand = demoCommittedRuns.has(demoRunKey(sim));
+    demoUncommitted = committedByHand ? 0 : created;
+    return committedByHand ? demoLastCommit : null;
+  }
+  if (!gitConnected()) return { state: "skipped", message: "The Fabric workspace is not connected to Git (demo). In Fabric, open Workspace settings, Git integration, and connect it to your repository's dev branch; then commit again." };
+  if (elapsed < doneAt + COMMIT_MS) return { state: "committing", message: "Committing the migrated items to Fabric Git…" };
+  const commit = demoSha(`run-${sim.runId}-${sim.retried}`);
+  const result: GitCommitResult = {
+    state: created ? "committed" : "nothing", items: created, branch: DEMO_GIT_REPO.branch, commit,
+    commitUrl: `${DEMO_REPO_URL}/commit/${commit}`, pullRequestUrl: DEMO_PR_URL,
+    skipped: Array.from({ length: loadPipelines }, (_, k) => `load_${WAREHOUSE}_wave_${k + 1}`),
+    message: created ? `Committed ${created} item(s) to dev (demo).${loadPipelines ? ` Left out ${loadPipelines} data-load pipeline(s): they are rebuilt per environment.` : ""}`
+      : "Nothing new to commit: the branch already has everything the run created (demo).",
+  };
+  if (created) demoGitHead = commit;
+  demoLastCommit = result;
+  demoUncommitted = 0;
+  return result;
+}
+
+/** The demo Fabric Git state: Fabric_demo on the dev branch, any other workspace not connected. */
+function demoGitState(): FabricGitState {
+  if (fabric.status !== "connected") return { state: "no_target", message: "Connect the Fabric target workspace first." };
+  if (!gitConnected()) {
+    return { state: "not_connected", workspace: fabric.workspaceName ?? undefined,
+      message: "The Fabric workspace is not connected to Git. In Fabric, open Workspace settings, Git integration, and connect it to your repository's dev branch; then commit again." };
+  }
+  const manual = demoManualCommit;
+  const committing = !!manual && Date.now() - manual.at < COMMIT_MS;
+  if (manual && !committing) {
+    const commit = demoSha(`manual-${manual.at}`);
+    demoLastCommit = manual.items
+      ? { state: "committed", items: manual.items, branch: "dev", commit, commitUrl: `${DEMO_REPO_URL}/commit/${commit}`, pullRequestUrl: DEMO_PR_URL,
+          message: `Committed ${manual.items} item(s) to dev (demo).` }
+      : { state: "nothing", message: "Nothing new to commit: the branch already has everything the run created (demo)." };
+    if (manual.items) demoGitHead = commit;
+    demoUncommitted = 0;
+    demoManualCommit = null;
+    if (execSim) demoCommittedRuns.add(demoRunKey(execSim));
+  }
+  return {
+    state: "connected", workspace: fabric.workspaceName ?? undefined, provider: "AzureDevOps", ...DEMO_GIT_REPO,
+    head: demoGitHead, lastSync: new Date().toISOString(), repositoryUrl: DEMO_REPO_URL, commitUrl: `${DEMO_REPO_URL}/commit/${demoGitHead}`,
+    pullRequestUrl: DEMO_PR_URL, targetBranch: "main", uncommitted: demoUncommitted, incoming: 0, conflicts: 0,
+    plumbing: 0, committing, lastCommit: demoLastCommit,
   };
 }
 
@@ -436,6 +516,11 @@ export function resetDemo(): void {
   demoPartnerSignedIn = false;
   transforms.clear();
   projectText = DEMO_PROJECT;
+  demoGitHead = demoSha("initial");
+  demoLastCommit = null;
+  demoManualCommit = null;
+  demoUncommitted = 0;
+  demoCommittedRuns.clear();
 }
 
 /** A small stand-in for the backend planner so the demo page is fully populated. */
@@ -597,6 +682,16 @@ export const mockApi: MigrationApi = {
   async listSqlPools(_sub, _rg, ws) {
     await sleep(250);
     return ws.includes("empty") ? [] : ["TransportDW"];
+  },
+
+  async getWorkspaceGit(_sub, _rg, ws): Promise<WorkspaceGit> {
+    await sleep(250);
+    if (!s.signedIn) throw new ApiRequestError("sign_in_required", "Sign in to Azure first.", 409);
+    if (ws.includes("denied")) throw new ApiRequestError("azure_error", "The workspace could not be read: the identity has no access to it (demo).", 502);
+    // The analytics workspace is live-only, to show what the form says when there is no Git integration.
+    if (ws.includes("analytics")) return { workspace: ws, configured: false };
+    return { workspace: ws, configured: true, provider: "AzureDevOps", repositoryUrl: `https://dev.azure.com/contoso/Synapse/_git/${ws}`,
+      branch: "main", rootFolder: "synapse", lastCommit: demoSha(`synapse-${ws}`) };
   },
   async testConnection(c) {
     await sleep(700);
@@ -834,6 +929,20 @@ export const mockApi: MigrationApi = {
   async disconnectFabric() {
     fabric = { status: "disconnected" };
     return fabric;
+  },
+
+  async getFabricGit() {
+    await sleep(120);
+    return demoGitState();
+  },
+
+  async commitFabricGit(comment?: string) {
+    await sleep(150);
+    if (fabric.status !== "connected") throw new ApiRequestError("target_not_connected", "Connect the Fabric target first.", 409);
+    if (runNow().state === "running") throw new ApiRequestError("run_in_progress", "A migration run is working. It commits by itself when it completes.", 409);
+    if (!gitConnected()) return demoGitState();
+    demoManualCommit = { at: Date.now(), items: demoUncommitted, comment: comment ?? "" };
+    return demoGitState();
   },
 
   async getCapabilities() {

@@ -332,7 +332,64 @@ def test_azure_cli_is_found_in_standard_windows_install_location(monkeypatch, tm
     assert fabric._require("az", "Azure CLI") == str(cli_path)
 
 
-@pytest.mark.parametrize("kind", ["subscriptions", "resource-groups", "workspaces", "sql-pools"])
+def _git_azure(configuration=None, status=200):
+    """An AzureConnection stand-in whose workspace reports ``configuration`` as its Git integration."""
+    from discovery_agent.connections.azure import ArmResponse
+
+    class GitAzure(_FakeAzure):
+        reads = []
+
+        def get_resource(self, resource_id, api_version):
+            GitAzure.reads.append(resource_id)
+            if status != 200:
+                return ArmResponse(status, {"error": {"message": "The workspace could not be found."}})
+            properties = {"workspaceRepositoryConfiguration": configuration} if configuration else {}
+            return ArmResponse(200, {"name": "ws", "id": resource_id, "properties": properties})
+
+    return GitAzure
+
+
+DEVOPS_GIT = {"type": "WorkspaceVSTSConfiguration", "accountName": "contoso", "projectName": "Data Platform",
+              "repositoryName": "synapse", "collaborationBranch": "main", "rootFolder": "/synapse", "lastCommitId": "abc123",
+              "tenantId": GUEST}
+
+
+def test_the_git_source_is_filled_in_from_the_workspaces_own_git_integration(signed_in, monkeypatch):
+    from discovery_agent.api import service as service_module
+
+    session, _ = signed_in
+    azure = _git_azure(DEVOPS_GIT)
+    monkeypatch.setattr(service_module, "AzureConnection", azure)
+    found = session.azure_options("workspace-git", {"subscriptionId": SUB_A["id"], "resourceGroup": "rg", "workspace": "ws"})
+    assert found == {"workspace": "ws", "configured": True, "provider": "AzureDevOps",
+                     "repositoryUrl": "https://dev.azure.com/contoso/Data%20Platform/_git/synapse",
+                     "branch": "main", "rootFolder": "synapse", "lastCommit": "abc123"}
+    assert azure.reads == [f"/subscriptions/{SUB_A['id']}/resourceGroups/rg/providers/Microsoft.Synapse/workspaces/ws"]
+    # GitHub, with the root folder at the top of the repository.
+    monkeypatch.setattr(service_module, "AzureConnection", _git_azure(
+        {"type": "WorkspaceGitHubConfiguration", "accountName": "contoso", "repositoryName": "synapse-ws",
+         "collaborationBranch": "develop", "rootFolder": "/"}))
+    github = session.azure_options("workspace-git", {"subscriptionId": SUB_A["id"], "resourceGroup": "rg", "workspace": "ws"})
+    assert (github["provider"], github["repositoryUrl"], github["branch"], github["rootFolder"]) == (
+        "GitHub", "https://github.com/contoso/synapse-ws", "develop", "")
+
+
+def test_a_workspace_without_git_or_one_that_cannot_be_read_says_so(signed_in, monkeypatch):
+    from discovery_agent.api import service as service_module
+
+    session, _ = signed_in
+    query = {"subscriptionId": SUB_A["id"], "resourceGroup": "rg", "workspace": "ws"}
+    monkeypatch.setattr(service_module, "AzureConnection", _git_azure(None))
+    assert session.azure_options("workspace-git", query) == {"workspace": "ws", "configured": False}
+    monkeypatch.setattr(service_module, "AzureConnection", _git_azure(DEVOPS_GIT, status=404))
+    with pytest.raises(ApiError) as missing:
+        session.azure_options("workspace-git", query)
+    assert missing.value.status == 502 and missing.value.code == "azure_error"
+    with pytest.raises(ApiError, match="Synapse workspace is not in a valid format"):
+        session.azure_options("workspace-git", {**query, "workspace": "../etc"})
+
+
+@pytest.mark.parametrize("kind", ["subscriptions", "resource-groups", "workspaces", "sql-pools", "workspace-git"])
 def test_dropdown_lists_require_a_sign_in(server, kind):
     status, body = call(server, "GET", f"/api/azure/{kind}?resourceGroup=rg&workspace=ws")
     assert status == 409 and body["error"]["code"] == "sign_in_required"

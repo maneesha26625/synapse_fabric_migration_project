@@ -74,8 +74,8 @@ interface AppStateValue {
   reload: () => void;
   getResults: (query: ResultsQuery) => Promise<ResultsPage>;
   getObject: (id: string) => Promise<ObjectDetail>;
-  /** Dropdown contents for the Azure source form. */
-  azureLists: Pick<import("../types").MigrationApi, "listSubscriptions" | "listResourceGroups" | "listWorkspaces" | "listSqlPools">;
+  /** Dropdown contents for the Azure source form, and the chosen workspace's Git integration. */
+  azureLists: Pick<import("../types").MigrationApi, "listSubscriptions" | "listResourceGroups" | "listWorkspaces" | "listSqlPools" | "getWorkspaceGit">;
 }
 
 const AppState = createContext<AppStateValue | null>(null);

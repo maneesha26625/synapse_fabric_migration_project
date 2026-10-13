@@ -147,7 +147,8 @@ class MigrationRun:
         self.stop_on_failure = False
         self.halt_waived = False  # set when the operator resumes past a halt
         #: Strategy settings for the stages (data mode, data run, collation, sync re-read window). Never credentials.
-        self.settings: Dict[str, Any] = {"dataMode": "if_empty", "dataRun": "run", "collation": "match_synapse", "syncOverlap": "1h"}
+        self.settings: Dict[str, Any] = {"dataMode": "if_empty", "dataRun": "run", "collation": "match_synapse", "syncOverlap": "1h",
+                                         "gitCommit": "auto"}
         self.stages: List[str] = []
         self.pool_name: str = ""  # the Synapse pool being migrated, for retargeting pipelines
         #: The pool's SQL endpoint and the Fabric connection the data pipelines read it through.
@@ -156,6 +157,8 @@ class MigrationRun:
         self.source_connection_name: str = ""
         self.source_collation: Optional[str] = None
         self.halted_reason: Optional[str] = None
+        #: What the commit to the workspace's Fabric Git branch did once the run completed (None: not tried yet).
+        self.git: Optional[Dict[str, Any]] = None
         for item in self.items:
             if item.source.kind == DEFERRED:
                 item.status, item.step, item.error = DEFERRED_STATUS, "Not migrated in this session", item.source.reason
@@ -176,6 +179,7 @@ class MigrationRun:
                 "workspace": self.workspace_name, "warehouse": self.warehouse,
                 "options": {"scope": self.scope, "stopOnFailure": self.stop_on_failure, "stages": list(self.stages), **self.settings},
                 "haltedReason": self.halted_reason,
+                "git": dict(self.git) if self.git else None,
                 "items": [i.to_dict() for i in self.items], "logs": list(self.logs[-2000:]),
             }
 

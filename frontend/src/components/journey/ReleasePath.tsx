@@ -1,4 +1,4 @@
-import { ArrowRight, Check, ChevronDown, ChevronRight, CircleDashed, GitBranch, Route } from "lucide-react";
+import { ArrowRight, Check, ChevronDown, ChevronRight, CircleDashed, GitBranch, GitPullRequest, Route } from "lucide-react";
 import { useState } from "react";
 import { useAppState } from "../../state/AppState";
 import { useMigration } from "../../state/MigrationState";
@@ -18,7 +18,7 @@ interface Stage {
 /** What comes after this migration, ticked off per project in this browser. */
 const CHECKLIST: { id: string; title: string; detail: string }[] = [
   { id: "git", title: "Connect the Fabric workspace to Git",
-    detail: "Workspace settings → Git integration, on the main branch. From then on the workspace's items are versioned in Fabric's own repository (not the Synapse one)." },
+    detail: "In Fabric, Workspace settings → Git integration: Fabric's own repository (not the Synapse one), branch dev, folder fabric. Each run is then committed to dev, and a pull request takes it to main." },
   { id: "workspaces", title: "Create the Test and Prod workspaces",
     detail: "One Fabric workspace per environment, each on a capacity. Nothing reaches Prod without passing Test." },
   { id: "connections", title: "Create each environment's connections",
@@ -71,7 +71,7 @@ function environmentOf(name: string | undefined): { name: string; index: number 
  */
 export function ReleasePath({ stepsDone, stepsTotal }: { stepsDone: number; stepsTotal: number }) {
   const { connection } = useAppState();
-  const { fabric, project } = useMigration();
+  const { fabric, project, fabricGit } = useMigration();
   const [open, setOpen] = useState(false);
   const [done, setDone] = useState<Set<string>>(() => loadDone(project.id));
   const [shownFor, setShownFor] = useState(project.id);
@@ -83,6 +83,22 @@ export function ReleasePath({ stepsDone, stepsTotal }: { stepsDone: number; step
   const later = env.index >= 0 ? ENVIRONMENTS.slice(env.index + 1) : ["Test", "Prod"];
   const fabricName = fabric.workspaceName ?? "Fabric workspace";
 
+  // Fabric Git as Fabric reports it, when it can be read; otherwise the operator's own tick.
+  const live = fabricGit?.state === "connected" || fabricGit?.state === "not_connected" ? fabricGit : null;
+  const linked = live?.state === "connected" ? live : null;
+  const gitDone = live ? !!linked : done.has("git");
+  const pending = linked ? (linked.committing ? "committing…" : `${(linked.uncommitted ?? 0).toLocaleString()} uncommitted`) : "";
+  const gitStage: Stage = linked
+    ? { key: "git", state: linked.committing || (linked.uncommitted ?? 0) > 0 ? "current" : "done", label: "Fabric Git",
+        detail: `${linked.branch ?? "branch"}${linked.head ? ` @ ${linked.head.slice(0, 7)}` : ""} · ${pending}` }
+    : live
+      ? { key: "git", state: "todo", label: "Fabric Git", detail: `Not connected: connect the ${env.name} workspace to Git in Fabric` }
+      : { key: "git", state: gitDone ? "done" : "todo", label: "Fabric Git", detail: "Workspace connected to Git" };
+  const target = linked?.targetBranch ?? "main";
+  const gitDetail = linked
+    ? `Connected: ${fabricName} commits to ${linked.branch} in ${linked.repository}${linked.folder ? `, folder ${linked.folder}` : ""}. Each run is committed there; a pull request takes it to ${target}.`
+    : null;
+
   const stages: Stage[] = [
     {
       key: "source", state: "done",
@@ -93,7 +109,7 @@ export function ReleasePath({ stepsDone, stepsTotal }: { stepsDone: number; step
     },
     { key: "app", state: migrated ? "done" : "current", label: "This migration", detail: `${stepsDone} of ${stepsTotal} steps done` },
     { key: "target", state: migrated ? "done" : "todo", label: `Fabric ${env.name}`, detail: fabricName },
-    { key: "git", state: done.has("git") ? "done" : "todo", label: "Fabric Git", detail: "Workspace connected to Git" },
+    gitStage,
     ...later.map((e): Stage => ({
       // Whether anything was deployed there is not something this app can see, so it stays "to do".
       key: `env-${e}`, state: "todo",
@@ -109,7 +125,8 @@ export function ReleasePath({ stepsDone, stepsTotal }: { stepsDone: number; step
       return next;
     });
   };
-  const ticked = CHECKLIST.filter((c) => done.has(c.id)).length;
+  const isDone = (id: string) => (id === "git" ? gitDone : done.has(id));
+  const ticked = CHECKLIST.filter((c) => isDone(c.id)).length;
 
   return (
     <section className="release-path" aria-label="Release path">
@@ -130,6 +147,11 @@ export function ReleasePath({ stepsDone, stepsTotal }: { stepsDone: number; step
             </li>
           ))}
         </ol>
+        {linked?.pullRequestUrl && (
+          <a className="release-toggle" href={linked.pullRequestUrl} target="_blank" rel="noopener noreferrer">
+            <GitPullRequest size={14} aria-hidden="true" />Pull request {linked.branch} → {target}
+          </a>
+        )}
         <button type="button" className="release-toggle" aria-expanded={open} onClick={() => setOpen(!open)}>
           {open ? <ChevronDown size={14} aria-hidden="true" /> : <ChevronRight size={14} aria-hidden="true" />}
           {open ? "Hide the flow" : `What comes next · ${ticked}/${CHECKLIST.length}`}
@@ -173,19 +195,43 @@ export function ReleasePath({ stepsDone, stepsTotal }: { stepsDone: number; step
               </div>
               <span className="faint">Each environment has its own workspace and its own connections; Git stores the definitions once and never the connections.</span>
             </div>
+            {linked && (
+              <div className="release-lane">
+                <span className="eyebrow"><GitBranch size={12} aria-hidden="true" /> Fabric Git · {linked.repository}</span>
+                <div className="release-flow">
+                  <span>{fabricName}</span>
+                  <ArrowRight size={13} aria-hidden="true" />
+                  <span>{linked.branch}: each run is committed</span>
+                  <ArrowRight size={13} aria-hidden="true" />
+                  <span>pull request: review</span>
+                  <ArrowRight size={13} aria-hidden="true" />
+                  <span>{target}</span>
+                </div>
+                <span className="faint">
+                  {linked.head ? `Last commit ${linked.head.slice(0, 7)} · ` : ""}{pending}
+                  {(linked.plumbing ?? 0) > 0 ? ` · ${linked.plumbing} data-load pipeline${linked.plumbing === 1 ? "" : "s"} kept out of Git` : ""}
+                  {linked.repositoryUrl && <> · <a href={linked.repositoryUrl} target="_blank" rel="noopener noreferrer">Open the repository</a></>}
+                </span>
+              </div>
+            )}
           </div>
 
           <div>
             <span className="eyebrow">What comes next</span>
             <ul className="release-checklist">
-              {CHECKLIST.map((c) => (
-                <li key={c.id}>
-                  <label className="check-row" style={{ marginTop: 8 }}>
-                    <input type="checkbox" checked={done.has(c.id)} onChange={() => toggle(c.id)} />
-                    <span><strong>{c.title}</strong><span className="muted"> — {c.detail}</span></span>
-                  </label>
-                </li>
-              ))}
+              {CHECKLIST.map((c) => {
+                // The Git row follows Fabric once it can be read; it is not ticked by hand then.
+                const fromFabric = c.id === "git" && !!live;
+                return (
+                  <li key={c.id}>
+                    <label className="check-row" style={{ marginTop: 8 }}>
+                      <input type="checkbox" checked={isDone(c.id)} onChange={() => toggle(c.id)} disabled={fromFabric}
+                        title={fromFabric ? "Read from the Fabric workspace's Git connection" : undefined} />
+                      <span><strong>{c.title}</strong><span className="muted"> — {(c.id === "git" && gitDetail) || c.detail}</span></span>
+                    </label>
+                  </li>
+                );
+              })}
             </ul>
           </div>
 

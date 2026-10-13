@@ -38,6 +38,13 @@ KNOWN_ERRORS = {
     "FeatureNotAvailable": NO_CAPACITY,
     "CapacityNotActive": "The workspace's Fabric capacity is paused. Resume it in the Azure portal, then retry",
     "InsufficientPrivileges": "The signed-in account needs Contributor or higher on the Fabric workspace",
+    # Fabric Git integration (commit and status).
+    "WorkspaceNotConnectedToGit": (
+        "The Fabric workspace is not connected to Git. In Fabric, open Workspace settings, Git integration, "
+        "and connect it to the repository's branch (for example dev)"),
+    "WorkspaceHeadMismatch": "The workspace changed while the commit was being prepared. Commit again",
+    "WorkspacePreviousOperationInProgress": (
+        "Fabric is still finishing an earlier Git operation on this workspace. Wait a minute, then commit again"),
 }
 
 #: (method, url, headers, body) -> (status, lower-cased headers, body bytes)
@@ -155,13 +162,24 @@ class FabricRestClient:
         _, _, payload = self.request("GET", path)
         return payload if isinstance(payload, dict) else {}
 
+    def get_lro(self, path: str, what: str = "the request") -> dict:
+        """GET a result Fabric may compute as a long-running operation (``202``), such as a
+        workspace's Git status: the operation is followed and its result returned."""
+        status, headers, payload = self.request("GET", path)
+        return self._follow(status, headers, payload, what)
+
     def patch(self, path: str, body: dict) -> dict:
         _, _, payload = self.request("PATCH", path, body)
         return payload if isinstance(payload, dict) else {}
 
-    def create(self, path: str, body: dict) -> dict:
-        """POST a new item and wait for it. Returns the created item when Fabric reports it."""
+    def create(self, path: str, body: dict, what: str = "creating the item") -> dict:
+        """POST a new item (or any operation, such as a Git commit) and wait for it.
+        Returns the created item, or the operation's result, when Fabric reports one."""
         status, headers, payload = self.request("POST", path, body)
+        return self._follow(status, headers, payload, what)
+
+    def _follow(self, status: int, headers: Mapping[str, str], payload: Any, what: str) -> dict:
+        """The answer to a request, following a ``202`` long-running operation to its result."""
         if status != 202:
             return payload if isinstance(payload, dict) else {}
         location = headers.get("location")
@@ -178,7 +196,7 @@ class FabricRestClient:
             if not operation:
                 return {}
             location = f"{FABRIC_API}/operations/{operation}"
-        return self._wait(location, self._retry_after(headers, default=2.0))
+        return self._wait(location, self._retry_after(headers, default=2.0), what)
 
     def run_job(self, path: str, body: Optional[dict] = None) -> str:
         """Start an on-demand job (``POST .../jobs/instances?jobType=...``) and return the path to follow it.
@@ -191,7 +209,7 @@ class FabricRestClient:
             raise FabricApiError(status, "job_not_started", "Fabric accepted the run but did not say where to follow it. Check the item's run history in Fabric.")
         return match.group(1)
 
-    def _wait(self, location: str, delay: float) -> dict:
+    def _wait(self, location: str, delay: float, what: str = "creating the item") -> dict:
         deadline = self._clock() + OPERATION_TIMEOUT_SECONDS
         while True:
             self._sleep(delay)
@@ -207,5 +225,5 @@ class FabricRestClient:
                 error = (state or {}).get("error") or {}
                 raise FabricApiError(400, str(error.get("errorCode") or "operation_failed"), str(error.get("message") or "Fabric reported the operation as failed.")[:500])
             if self._clock() > deadline:
-                raise FabricApiError(504, "operation_timeout", "Fabric did not finish creating the item in time. Check the workspace, then retry.")
+                raise FabricApiError(504, "operation_timeout", f"Fabric did not finish {what} in time. Check the workspace, then retry.")
             delay = self._retry_after(headers, default=min(delay * 1.5, 15.0))
