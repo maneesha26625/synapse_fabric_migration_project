@@ -10,3 +10,7 @@ dist/
 discovery-output/
 .vscode/
 .idea/
+# Saved between API restarts: the last discovery and the Fabric target selection (no secrets).
+.accelerator/
+# LLM drafts and accepted transforms: they hold the client's code, so they stay on this machine.
+transforms/

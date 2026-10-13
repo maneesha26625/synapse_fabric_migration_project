@@ -570,7 +570,9 @@ def test_a_pipeline_is_rebuilt_for_fabric_with_inline_datasets_ids_and_the_wareh
     nb = acts["RunNb"]
     assert nb["type"] == "TridentNotebook" and nb["typeProperties"]["notebookId"] == "nb-1" and nb["typeProperties"]["workspaceId"] == WS
     inner = acts["Loop"]["typeProperties"]["activities"][0]
-    assert inner["type"] == "InvokePipeline" and inner["typeProperties"]["pipelineId"] == "pl-9"
+    # Execute Pipeline, by id: the newer InvokePipeline needs a Fabric connection and fails at run time without one.
+    assert inner["type"] == "ExecutePipeline" and inner["typeProperties"]["pipeline"] == {"referenceName": "pl-9", "type": "PipelineReference"}
+    assert "externalReferences" not in inner
     assert acts["Proc"]["type"] == "SqlServerStoredProcedure" and acts["Proc"]["linkedService"]["properties"]["type"] == "DataWarehouse"
     assert out.definition["properties"]["parameters"] == {"f": {"type": "String"}}
     assert any("Warehouse 'pool01'" in n for n in out.notes)

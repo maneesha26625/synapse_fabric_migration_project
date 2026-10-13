@@ -12,6 +12,7 @@ polls ``GET /api/migration/run``. Only one run at a time.
 
 from __future__ import annotations
 
+import re
 import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -20,8 +21,11 @@ from discovery_agent.api.fabric import FabricTarget
 from discovery_agent.api.service import ApiError, Session
 from discovery_agent.migration import planner as planning
 from discovery_agent.migration.fabric_rest import NO_CAPACITY, FabricApiError, FabricRestClient
+from discovery_agent.migration.preflight import code_text as preflight_code_text
 from discovery_agent.migration.preflight import content_findings, environment_checks
-from discovery_agent.migration import capabilities, datafilter, datapipeline, fabric_connections, pipelines
+from discovery_agent.migration import capabilities, datafilter, datapipeline, fabric_connections, pipelines, storage_remap
+from discovery_agent.migration.onelake import OneLakeFiles
+from discovery_agent.migration.runtime_checks import RuntimeOptions
 from discovery_agent.migration.validation import Validator, summarize
 from discovery_agent.migration.runner import (
     CONNECTION,
@@ -64,6 +68,8 @@ MAX_HISTORY = 20
 VALIDATION_ORDER = ("Warehouse", "Schema", "Tables", "Data Count", "Views", "Stored Procedures", "Spark", "Notebooks", "Connections",
                     "Pipelines", "Spark Jobs", "SQL Scripts", "Schedules", "Shortcuts", "Manual")
 SCOPES = ("automated", "all")
+#: An object already in Fabric: left as it is (the default), or updated in place. Tables are never replaced.
+EXISTING = ("skip", "update")
 
 
 def sql_driver() -> str:
@@ -96,12 +102,43 @@ def parse_options(body: dict) -> dict:
     collation = str(options.get("collation") or "match_synapse")
     if collation not in COLLATIONS:
         raise ApiError(400, "invalid_options", "Choose a Warehouse collation: same as Synapse, case-insensitive or case-sensitive.")
+    existing = str(options.get("existing") or "skip")
+    if existing not in EXISTING:
+        raise ApiError(400, "invalid_options", "Choose to skip or update objects that are already in Fabric.")
+    routes = parse_storage_routes(options.get("storageRoutes"))
     overlap = str(options.get("syncOverlap") or "1h")
     if overlap not in datafilter.OVERLAPS:
         raise ApiError(400, "invalid_options", "Choose a re-read window for synced tables: none, one hour or one day.")
     return {"scope": scope, "stopOnFailure": bool(options.get("stopOnFailure")), "stages": list(dict.fromkeys(stages)),
-            "dataMode": mode, "dataRun": data_run, "collation": collation, "syncOverlap": overlap,
+            "dataMode": mode, "dataRun": data_run, "collation": collation, "syncOverlap": overlap, "existing": existing,
+            "storageRoutes": routes,
             "dataFilters": parse_data_filters(options.get("dataFilters"))}
+
+
+_ACCOUNT_NAME = re.compile(r"^[a-z0-9]{3,24}$")
+_CONTAINER_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$")
+_CONNECTION_ID = re.compile(r"^[0-9a-fA-F-]{36}$")
+
+
+def parse_storage_routes(raw: Any) -> List[Dict[str, str]]:
+    """Storage locations to route through OneLake shortcuts: [{account, container, connectionId? | linkedService?}]."""
+    if raw in (None, []):
+        return []
+    if not isinstance(raw, list) or len(raw) > 50:
+        raise ApiError(400, "invalid_options", "The storage routes are not in a valid format.")
+    out: List[Dict[str, str]] = []
+    for r in raw:
+        if not isinstance(r, dict):
+            raise ApiError(400, "invalid_options", "The storage routes are not in a valid format.")
+        account, container = str(r.get("account") or "").lower(), str(r.get("container") or "").lower()
+        cid, ls = str(r.get("connectionId") or ""), str(r.get("linkedService") or "")
+        if not _ACCOUNT_NAME.match(account) or not _CONTAINER_NAME.match(container):
+            raise ApiError(400, "invalid_options", f"'{container}' on '{account}' is not a storage account and container name.")
+        if (cid and not _CONNECTION_ID.match(cid)) or len(ls) > 260 or not (cid or ls):
+            raise ApiError(400, "invalid_options", f"Choose a Fabric connection for {container} on {account}.")
+        out.append({"account": account, "container": container, **({"connectionId": cid} if cid else {}),
+                    **({"linkedService": ls} if ls else {})})
+    return out
 
 
 def parse_data_filters(raw: Any) -> Dict[str, datafilter.DataFilter]:
@@ -356,9 +393,12 @@ class MigrationService:
         rest_factory: Optional[Callable[[], FabricRestClient]] = None,
         sql_factory: Optional[Callable[[str, str], Any]] = None,
         source_factory: Optional[Callable[[], Any]] = None,
+        transforms: Any = None,
     ) -> None:
         self._session = session
         self._source_factory = source_factory
+        #: The TransformService, when LLM-assisted transforms are wired in: it attaches accepted ones to the plan items.
+        self._transforms = transforms
         #: Connection credentials for the run's life. Memory only: never logged, returned or written.
         self._credentials: Dict[str, Dict[str, str]] = {}
         self._fabric = fabric
@@ -367,6 +407,9 @@ class MigrationService:
         self._thread: Optional[threading.Thread] = None
         self._counter = 0
         self._history: List[dict] = []
+        #: The background validation: its state, progress and, once finished, its rows.
+        self._validation: Dict[str, Any] = {"state": "idle"}
+        self._validation_thread: Optional[threading.Thread] = None
         self._rest_factory = rest_factory or fabric.rest_client
         self._sql_factory = sql_factory or self._open_sql
 
@@ -402,12 +445,15 @@ class MigrationService:
         every = sources_for(plan, job, pool)
         stages = set(options["stages"])
         sources = apply_stages(every, {**options, "scope": "automated"})
+        if self._transforms is not None:
+            self._transforms.apply(sources)
         objects = plan_objects(plan, job, every, stages)
         needs_source = bool(stages & {"data", "shortcuts"})
         checks = environment_checks(self._fabric.state(), sql_driver(),
                                     source_connected=self._source_available() if needs_source else None)
         names = set(credentials) | set(self._credentials)
-        result = planning.analyze(objects, content_findings(sources, names, pool or ""), checks)
+        result = planning.analyze(objects, content_findings(sources, names, pool or "", options["storageRoutes"]), checks)
+        result["storage"] = self._storage_suggestions(sources, job)
         result["options"] = {**options, "dataFilters": {k: f.to_dict() for k, f in options["dataFilters"].items()}}
         if body.get("record"):
             with self._lock:
@@ -422,6 +468,33 @@ class MigrationService:
         with self._lock:
             result["history"] = list(reversed(self._history))
         return result
+
+    def _storage_suggestions(self, sources: List[Source], job: Any) -> List[dict]:
+        """Storage locations the plan's code reads directly, each with the connection a OneLake shortcut can use.
+
+        Candidates: the Fabric ADLS / Blob connections already there (when the target is connected), then the Synapse
+        storage linked services, whose connections the Connections stage creates in the same run."""
+        texts = [preflight_code_text(s) for s in sources]
+        found = storage_remap.locations(texts)
+        if not found and not any(storage_remap.uses_storage(t) for t in texts):
+            return []
+        candidates: List[Dict[str, Any]] = []
+        try:
+            if self._fabric.state().get("status") == "connected":
+                for c in self._rest_factory().list("/connections"):
+                    details = c.get("connectionDetails") or {}
+                    if storage_remap.connection_location(str(details.get("path") or "")):
+                        candidates.append({"id": str(c.get("id") or ""), "name": str(c.get("displayName") or ""),
+                                           "path": str(details.get("path") or "")})
+        except Exception:  # noqa: BLE001 - suggestions only; the Synapse linked services still count
+            pass
+        known = {c["name"] for c in candidates}
+        for name, ls in (_artifacts(job).get(P0Artifact.LINKED_SERVICE) or {}).items():
+            props = (ls.get("properties") or {})
+            url = str((props.get("typeProperties") or {}).get("url") or "")
+            if props.get("type") in ("AzureBlobFS", "AzureBlobStorage") and storage_remap.connection_location(url) and name not in known:
+                candidates.append({"id": None, "name": f"{name} (created by the Connections stage)", "path": url, "linkedService": name})
+        return storage_remap.suggest(found, candidates)
 
     def start(self, body: dict) -> dict:
         plan = body.get("items")
@@ -444,16 +517,23 @@ class MigrationService:
             sources = apply_stages(sources_for(plan, job, pool), options)
             if not [s for s in sources if s.kind not in (DEFERRED, MISSING)]:
                 raise ApiError(400, "nothing_to_migrate", "No object in the plan can be created by this build. Choose scope All to see them listed as deferred.")
+            transform_log = self._transforms.apply(sources) if self._transforms is not None else []
             run = MigrationRun(f"{self._counter:03d}", sources, workspace_id, workspace_name, warehouse_name_for(pool))
             via = "Azure CLI" if method == "azure_cli" else "Fabric CLI"
             run.scope, run.stop_on_failure = scope, stop_on_failure
             run.stages, run.pool_name = list(options["stages"]), pool or ""
             run.settings = {"dataMode": options["dataMode"], "dataRun": options["dataRun"], "collation": options["collation"],
+                            "existing": options["existing"], "storageRoutes": options["storageRoutes"],
                             "syncOverlap": options["syncOverlap"]}
             self._describe_source(run, job, pool)
             if credentials:
                 self._credentials = credentials
             run.log("RUN", "run", f"{len(sources)} objects, workspace {workspace_name}, warehouse {run.warehouse}, signed in with {via}")
+            reviewed = sum(1 for s in sources if s.override)
+            if reviewed:
+                run.log("NOTE", "run", f"{reviewed} object{'s' if reviewed != 1 else ''} use{'s' if reviewed == 1 else ''} an accepted LLM-assisted transform")
+            for line in transform_log:
+                run.log("NOTE", "run", line)
             self._run = run
             self._spawn(run)
             return run.to_dict()
@@ -513,8 +593,41 @@ class MigrationService:
     def _busy(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def validate(self, body: dict) -> dict:
-        """Compare the discovered Synapse objects with what is now in Fabric. Reads both sides, writes neither."""
+    def start_validation(self, body: dict) -> dict:
+        """Validate in the background, so runs in Fabric can be followed for as long as they take. Poll ``validation_state``."""
+        self._session.migration_snapshot()       # refuse now, not in the thread, when there is nothing to validate
+        self._fabric.migration_target()
+        with self._lock:
+            if self._validation_thread is not None and self._validation_thread.is_alive():
+                raise ApiError(409, "validation_running", "Validation is already running; wait for it to finish.")
+            started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self._validation = {"state": "running", "progress": "Starting", "startedAt": started}
+
+            def work() -> None:
+                def progress(text: str) -> None:
+                    self._validation = {**self._validation, "progress": text}
+                try:
+                    out = self.validate(body, progress=progress)
+                    self._validation = {"state": "completed", "startedAt": started,
+                                        "finishedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), **out}
+                except ApiError as exc:
+                    self._validation = {"state": "failed", "startedAt": started, "error": {"code": exc.code, "message": exc.message}}
+                except Exception as exc:  # noqa: BLE001 - reported, never raised into the thread
+                    self._validation = {"state": "failed", "startedAt": started,
+                                        "error": {"code": "validation_failed", "message": f"Validation stopped: {type(exc).__name__}: {str(exc)[:300]}"}}
+
+            snapshot = dict(self._validation)  # before the thread starts: a quick validation may finish first
+            self._validation_thread = threading.Thread(target=work, name="validation", daemon=True)
+            self._validation_thread.start()
+            return snapshot
+
+    def validation_state(self) -> dict:
+        return dict(self._validation)
+
+    def validate(self, body: dict, progress: Optional[Callable[[str], None]] = None) -> dict:
+        """Compare the discovered Synapse objects with what is now in Fabric, and (with ``runtime``) whether they run there.
+
+        Reads both sides. Writes nothing, unless ``runtime.run`` names kinds to run now in Fabric."""
         plan = body.get("items")
         if plan is not None and (not isinstance(plan, list) or not all(isinstance(p, dict) for p in plan) or len(plan) > MAX_ITEMS):
             raise ApiError(400, "invalid_plan", "The list of objects to validate is not in a valid format.")
@@ -529,7 +642,9 @@ class MigrationService:
         warehouse = warehouse_name_for(pool)
         validator = Validator(
             self._rest_factory(), workspace_id, workspace_name, warehouse, self._sql_factory, factory,
-            artifacts={"pipelines": _artifacts(job).get(P0Artifact.PIPELINE, {})})
+            artifacts={"pipelines": _artifacts(job).get(P0Artifact.PIPELINE, {})},
+            runtime=RuntimeOptions.parse(body["runtime"]) if isinstance(body.get("runtime"), dict) else None,
+            progress=progress or (lambda text: None))
         rows = validator.run(sources)
         order = {c: n for n, c in enumerate(VALIDATION_ORDER)}
         rows.sort(key=lambda r: (order.get(r["category"], len(order)), r["object"].lower()))
@@ -575,8 +690,14 @@ class MigrationService:
 
     def _spawn(self, run: MigrationRun) -> None:
         factory = self._source_factory or getattr(self._session, "source_sql_factory", lambda: None)()
+        files = None
+        if run.settings.get("storageRoutes"):
+            try:
+                files = OneLakeFiles(self._fabric.storage_token_provider())
+            except Exception:  # noqa: BLE001 - only Spark job main files need it; without it they are reported, not copied
+                files = None
         migrator = Migrator(run, self._rest_factory, self._sql_factory, sleep=_sleep,
-                            source_factory=factory, credentials=self._credentials)
+                            source_factory=factory, credentials=self._credentials, onelake=files)
         self._thread = threading.Thread(target=migrator.execute, name=f"migration-{run.run_id}", daemon=True)
         self._thread.start()
 

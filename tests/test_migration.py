@@ -165,7 +165,7 @@ def test_a_notebook_keeps_its_cells_and_drops_what_only_synapse_understands():
     assert "bigDataPool" not in json.dumps(document) and "sessionProperties" not in json.dumps(document)
     joined = " ".join(notes)
     assert "sparkpool01" in joined and "session size" in joined and "outputs were not copied" in joined
-    assert "ADLS paths" in joined
+    assert "direct storage paths" in joined
 
 
 @pytest.mark.parametrize("synapse, fabric", [("scala", "scala"), ("sparksql", "sql"), ("r", "r"), ("pyspark", "python")])

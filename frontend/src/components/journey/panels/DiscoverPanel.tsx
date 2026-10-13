@@ -93,11 +93,17 @@ export function DiscoverPanel() {
   return (
     <div className="stack panel-body">
       <div className="panel-toolbar">
-        <span className="muted">{connection.workspace ?? "Workspace"} · read {discovery.finishedAt ? new Date(discovery.finishedAt).toLocaleString() : "—"}</span>
+        <span className="muted">{connection.workspace ?? discovery.restoredFrom?.workspace ?? "Workspace"} · read {discovery.finishedAt ? new Date(discovery.finishedAt).toLocaleString() : "—"}</span>
         <span className="spacer" />
         <Button size="small" onClick={() => (laterConfirmed ? setAskRerun(true) : void run())} disabled={!isConnected}
           title={isConnected ? "Read the workspace again" : "Connect the source to run discovery again"}><RefreshCw size={13} aria-hidden="true" />Run again</Button>
       </div>
+      {discovery.restored && !isConnected && (
+        <Banner tone="info" title="Restored from your last session">
+          These results were kept when the accelerator restarted, so every step works on them. Sign in to
+          {" "}{discovery.restoredFrom?.workspace ?? "the source"} again only to run discovery again, load table data, or count Synapse rows in Validate.
+        </Banner>
+      )}
       {askRerun && (
         <ConfirmDialog title="Run discovery again?" confirmLabel="Run discovery again" danger={false}
           onConfirm={() => { setAskRerun(false); void run(); }} onCancel={() => setAskRerun(false)}>

@@ -37,7 +37,7 @@ _REVIEW = (
     (re.compile(r"\.write\b[^\n]*?\.synapsesql\s*\("), "synapsesql writes (Fabric's connector writes with a different call; point them at the Warehouse)"),
     (re.compile(r"mssparkutils\.credentials\.getConnectionStringOrCreds|getSecretWithLS|getPropertiesAll"), "linked-service credentials (no linked services in Fabric)"),
     (re.compile(r"\bmssparkutils\.env\b"), "mssparkutils.env (Synapse workspace details)"),
-    (re.compile(r"\.dfs\.core\.windows\.net"), "ADLS paths (still reachable, consider OneLake shortcuts)"),
+    (re.compile(r"\.dfs\.core\.windows\.net"), "direct storage paths (route the storage account through a OneLake shortcut in Plan)"),
 )
 
 
@@ -173,3 +173,55 @@ def create_body(display_name: str, document: Mapping[str, Any], description: str
     if description:
         body["description"] = description[:256]
     return body
+
+
+# ---- LLM-assisted transforms -------------------------------------------------------------
+#
+# A notebook goes to the model, and comes back, as ``{"language": ..., "cells": [{"cell_type",
+# "language", "source"}]}``: only what a person would edit, never Synapse's metadata.
+
+
+def cells_document(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """The editable part of a Synapse notebook: its language and its cells, sources as text."""
+    properties = payload.get("properties") or {}
+    metadata = properties.get("metadata") or {}
+    language = str((metadata.get("language_info") or {}).get("name") or (metadata.get("kernelspec") or {}).get("language") or "python").lower()
+    cells = []
+    for cell in properties.get("cells") or []:
+        kind = cell.get("cell_type") if cell.get("cell_type") in ("code", "markdown", "raw") else "code"
+        entry: Dict[str, Any] = {"cell_type": kind, "source": "".join(_lines(cell.get("source")))}
+        override = ((cell.get("metadata") or {}).get("microsoft") or {}).get("language")
+        if kind == "code" and override:
+            entry["language"] = str(override)
+        cells.append(entry)
+    return {"language": language, "cells": cells}
+
+
+def with_cells(payload: Mapping[str, Any], code: str) -> Dict[str, Any]:
+    """The Synapse notebook resource with its language and cells replaced by an accepted transform.
+
+    Raises ``NotebookNotMigratable`` when the transform is not in the expected shape."""
+    try:
+        edited = json.loads(code)
+    except ValueError as exc:
+        raise NotebookNotMigratable(f"The accepted transform is not valid JSON ({exc}).") from exc
+    if not isinstance(edited, dict) or not isinstance(edited.get("cells"), list):
+        raise NotebookNotMigratable('The accepted transform has no "cells" list.')
+    resource = json.loads(json.dumps(payload))  # a deep copy of plain JSON
+    properties = resource.setdefault("properties", {})
+    if edited.get("language"):
+        metadata = properties.setdefault("metadata", {})
+        metadata["language_info"] = {**(metadata.get("language_info") or {}), "name": str(edited["language"])}
+        if isinstance(metadata.get("kernelspec"), dict):
+            metadata["kernelspec"].pop("language", None)
+    cells = []
+    for i, cell in enumerate(edited["cells"], 1):
+        if not isinstance(cell, dict) or not isinstance(cell.get("source"), str):
+            raise NotebookNotMigratable(f"Cell {i} of the accepted transform has no source text.")
+        kind = cell.get("cell_type") if cell.get("cell_type") in ("code", "markdown", "raw") else "code"
+        out: Dict[str, Any] = {"cell_type": kind, "source": cell["source"].splitlines(keepends=True), "metadata": {}}
+        if kind == "code" and cell.get("language"):
+            out["metadata"]["microsoft"] = {"language": str(cell["language"])}
+        cells.append(out)
+    properties["cells"] = cells
+    return resource

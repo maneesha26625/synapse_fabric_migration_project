@@ -263,14 +263,17 @@ def _notebook(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str,
 
 
 def _invoke(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, Any]:
+    # Fabric's newer "Invoke pipeline" activity (InvokePipeline / InvokeFabricPipeline) authenticates through a Fabric
+    # connection, and fails at run time without one ("The external references connection cannot be found"). The
+    # Execute Pipeline activity calls a pipeline in the same workspace by its id and needs no connection.
     result = _base(act)
-    result["type"] = "InvokePipeline"
+    result["type"] = "ExecutePipeline"
     tp = act.get("typeProperties") or {}
     name = str((tp.get("pipeline") or {}).get("referenceName") or "")
     pipeline_id = ctx.pipelines.get(name)
     if not pipeline_id:
         out.missing.append(f"pipeline {name}")
-    result["typeProperties"] = {"pipelineId": pipeline_id or "", "workspaceId": ctx.workspace_id, "operationType": "InvokeFabricPipeline",
+    result["typeProperties"] = {"pipeline": {"referenceName": pipeline_id or "", "type": "PipelineReference"},
                                 "waitOnCompletion": tp.get("waitOnCompletion", True), "parameters": copy.deepcopy(tp.get("parameters") or {})}
     return result
 

@@ -34,6 +34,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from discovery_agent import discovery
 from discovery_agent.api import mapping, repository_source
 from discovery_agent.api.repository_source import RepositoryError, RepositorySpec
+from discovery_agent.api.persist import StateStore
 from discovery_agent.config import DEFAULT_OUTPUT_DIR, DiscoveryConfig
 from discovery_agent.connections.azure import (
     ARM_SCOPE,
@@ -247,16 +248,42 @@ class _Job:
     repository_artifacts: Dict[Any, Dict[str, dict]] = field(default_factory=dict)
 
 
+#: The saved discovery's name in the state store.
+DISCOVERY_STATE = "discovery"
+
+
 class Session:
     """The connection and the last discovery, guarded by one lock."""
 
-    def __init__(self) -> None:
+    def __init__(self, store: Optional[StateStore] = None) -> None:
         self._lock = threading.RLock()
         self._connection: Optional[_Connection] = None
         self._signin: Optional[_SignIn] = None
         self._signing_in = False
         self._job = _Job()
         self._detail_cache: Dict[str, dict] = {}
+        #: Where the last discovery is kept between starts (``persist``). None: nothing is kept.
+        self._store = store
+        #: The source a discovery loaded at start was read from ({"workspace", "pool"}), until a live one replaces it.
+        self._restored: Optional[Dict[str, Optional[str]]] = None
+        saved = store.load(DISCOVERY_STATE) if store is not None else None
+        if isinstance(saved, dict) and isinstance(saved.get("job"), _Job) and saved["job"].state in ("completed", "completed_with_warnings"):
+            self._job = saved["job"]
+            self._restored = {"workspace": saved.get("workspace"), "pool": saved.get("pool")}
+
+    # -- what survives a restart -----------------------------------------------
+
+    def _save_discovery(self, job: "_Job", conn: "_Connection") -> None:
+        if self._store is not None:
+            self._store.save(DISCOVERY_STATE, {"job": job, "workspace": conn.workspace, "pool": conn.sql_pool})
+
+    def _drop_discovery(self) -> None:
+        """Forget the discovery in memory and on disk. Call with the lock held."""
+        self._job = _Job()
+        self._detail_cache.clear()
+        self._restored = None
+        if self._store is not None:
+            self._store.forget(DISCOVERY_STATE)
 
     # -- capabilities ------------------------------------------------------
 
@@ -296,8 +323,7 @@ class Session:
                 raise ApiError(409, "discovery_running", "Discovery is running; wait for it to finish.")
             self._replace_connection(None)
             self._signin = None
-            self._job = _Job()
-            self._detail_cache.clear()
+            self._drop_discovery()
             reset_credentials()
             forget_auth_record()
             payload = self._connection_payload(None)
@@ -360,8 +386,12 @@ class Session:
 
         with self._lock:
             self._replace_connection(None)
-            self._job = _Job()
-            self._detail_cache.clear()
+            if self._restored is None:
+                # A new sign-in starts over; a discovery restored at start is kept until the source it came from is
+                # connected again (then it is live) or a different one is (then it is dropped), so signing in again
+                # after a restart does not cost the results.
+                self._job = _Job()
+                self._detail_cache.clear()
             self._signin = signin
             payload = self._connection_payload(None)
         payload["checks"] = [check]
@@ -560,9 +590,16 @@ class Session:
         failures = [r for r in results if not r.ok and r.connection is not SourceType.SQL]
         with self._lock:
             self._replace_connection(conn)
+            restored = self._restored
             if not conn.connected:
-                self._job = _Job()
-                self._detail_cache.clear()
+                self._drop_discovery()
+            elif restored is not None:
+                same = (restored.get("workspace") or "").lower() == conn.workspace.lower() \
+                    and (restored.get("pool") or "").lower() == (conn.sql_pool or "").lower()
+                if same:
+                    self._restored = None  # the restored discovery now belongs to a live connection
+                else:
+                    self._drop_discovery()
         return self._with_error(self._connection_payload(conn), failures)
 
     # -- repository sources: Git, or a ZIP of the repository ---------------------
@@ -698,8 +735,7 @@ class Session:
         conn.tested_at = _now()
         with self._lock:
             self._replace_connection(conn)
-            self._job = _Job()
-            self._detail_cache.clear()
+            self._drop_discovery()
             payload = self._connection_payload(conn)
         payload["ok"] = conn.connected
         if not conn.connected:
@@ -814,8 +850,7 @@ class Session:
         with self._lock:
             if self._job.state == "running":
                 raise ApiError(409, "discovery_running", "Discovery is running; wait for it to finish.")
-            self._job = _Job()
-            self._detail_cache.clear()
+            self._drop_discovery()
         return self.discovery_status()
 
     def _discover(self, conn: _Connection, job: _Job) -> None:
@@ -881,6 +916,8 @@ class Session:
                 job.state = (
                     "completed_with_warnings" if summary["failedCategories"] or summary["warnings"] else "completed"
                 )
+                self._restored = None
+            self._save_discovery(job, conn)
         except DiscoveryError as exc:
             self._fail(job, redact(str(exc)))
         except Exception as exc:  # noqa: BLE001 - never leak a traceback to the UI
@@ -1051,6 +1088,9 @@ class Session:
                 # rather than a fabricated one.
                 "progress": None,
                 "summary": job.summary,
+                # Loaded at start from the last session: the source it came from is not signed in yet.
+                "restored": self._restored is not None,
+                "restoredFrom": dict(self._restored) if self._restored is not None else None,
             }
 
     def results(self, query: Dict[str, str]) -> dict:
@@ -1163,7 +1203,10 @@ class Session:
         out is safe while a new discovery starts."""
         job = self._completed_job()
         with self._lock:
-            pool = self._connection.sql_pool if self._connection else None
+            if self._connection is not None:
+                pool = self._connection.sql_pool
+            else:  # a discovery restored at start, before the source is signed in again
+                pool = (self._restored or {}).get("pool")
         return job, pool
 
     def dependency_graph(self) -> dict:

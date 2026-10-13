@@ -47,6 +47,9 @@ import {
   type ResultsQuery,
 } from "../types";
 import { generateObjects } from "./mockData";
+import { RUN_KIND, applyDemoRuntime } from "./mockRuntime";
+import { DEMO_PROJECT, KIND_OF_TYPE, demoNeedsWork, demoPrompt, demoSource, demoTransformSettings } from "./mockTransform";
+import type { TransformObject } from "../types";
 import { mockComponents } from "./mockMapping";
 
 const STEP_MS = 700;
@@ -363,7 +366,9 @@ function runNow(): ExecutionRun {
   const logs: string[] = [line(0, "RUN", "run", `${sim.items.length} objects, workspace ${fabric.workspaceName ?? "Fabric_demo"}, warehouse ${WAREHOUSE} (demo)`)];
   let slot = 0;
   const items: ExecItem[] = sim.items.map((si) => {
-    const base: ExecItem = { id: si.id, name: si.name, type: si.type, wave: si.wave, step: "Waiting", status: "PENDING", startedAt: null, completedAt: null, error: null };
+    const accepted = transforms.get(si.id)?.accepted;
+    const base: ExecItem = { id: si.id, name: si.name, type: si.type, wave: si.wave, step: "Waiting", status: "PENDING", startedAt: null, completedAt: null, error: null,
+      llm: accepted ? { acceptedAt: accepted.acceptedAt, edited: accepted.edited } : null };
     // Like the real backend: what this build does not create is listed, with the reason.
     if (!MIGRATABLE_TYPES.includes(si.type) && si.type !== "Table data") {
       return { ...base, step: "Not migrated in this session", status: "DEFERRED", error: deferredReason[si.type] ?? `${si.type} objects are migrated by hand (demo).` };
@@ -413,6 +418,8 @@ export function resetDemo(): void {
   execSim = null;
   plannerHistory = [];
   demoPartnerSignedIn = false;
+  transforms.clear();
+  projectText = DEMO_PROJECT;
 }
 
 /** A small stand-in for the backend planner so the demo page is fully populated. */
@@ -460,7 +467,13 @@ function demoAnalysis(items: PlanItem[], record: boolean, options?: RunOptions):
   if (record) {
     plannerHistory = [{ id: `P${String(plannerHistory.length + 1).padStart(3, "0")}`, plannerVersion: "1.0.0", fingerprint, objects: rows.length, effortDays, waves: waves.length, readiness, blocking: riskCounts.BLOCKING, createdAt: new Date().toISOString(), status: "COMPLETED" }, ...plannerHistory].slice(0, 20);
   }
+  // Demo: notebooks and Spark jobs read one storage container directly; a key-based connection to it already exists.
+  const storage = rows.some(({ o }) => o.type === "Notebook" || o.type === "Spark Job Definition")
+    ? [{ account: "demorawstorage", container: "raw", uses: 7, connectionId: "11111111-2222-3333-4444-555555555555",
+      connectionName: "LS_ADLS_demorawstorage", linkedService: null }]
+    : [];
   return {
+    storage,
     plannerVersion: "1.0.0", fingerprint, readiness, objects: rows.length, strategyCounts: counts, effortDays,
     needsReview: { count: counts.manual + counts.assess, effortDays: +(reviewHours / 8).toFixed(2) }, blocking: riskCounts.BLOCKING,
     waves, typeStrategies, risks, riskCounts,
@@ -895,7 +908,8 @@ export const mockApi: MigrationApi = {
     return runNow();
   },
 
-  async runValidation(): Promise<ValidationRow[]> {
+  async runValidation(_items, _options, runtime, onProgress): Promise<ValidationRow[]> {
+    onProgress?.("Comparing Synapse with Fabric (demo)");
     await sleep(500);
     const run = runNow();
     const done = run.items.filter((i) => i.status === "COMPLETED");
@@ -932,6 +946,18 @@ export const mockApi: MigrationApi = {
     for (const i of run.items.filter((x) => x.status === "DEFERRED" && x.type === "Integration Runtime")) {
       rows.push({ category: "Manual", object: i.name, source: "present", target: "set up by hand", status: "REVIEW", detail: i.error ?? "Set up by hand." });
     }
+    if (runtime) {
+      const byName = new Map(done.map((i) => [i.name, i]));
+      const running = rows.filter((r) => { const k = RUN_KIND[byName.get(r.object)?.type ?? ""]; return k && runtime.run.includes(k); }).length;
+      if (running) {
+        onProgress?.(`Running in Fabric: 0 of ${running} finished (demo)`);
+        await sleep(1200);
+      }
+      for (const r of rows) {
+        const item = byName.get(r.object);
+        if (item) applyDemoRuntime(r, item.type, hash(item.id), runtime);
+      }
+    }
     return rows;
   },
 
@@ -941,5 +967,104 @@ export const mockApi: MigrationApi = {
     if (!found) throw new ApiRequestError("object_not_found", "That object is not in the current discovery results.", 404);
     return found;
   },
+
+  // -- LLM-assisted transformation (demo: canned drafts, no model is called) --
+  async getTransformSettings() {
+    await sleep(60);
+    return demoTransformSettings;
+  },
+  async listTransforms() {
+    return [...transforms.values()].map((t) => ({ ...t }));
+  },
+  async getTransform(id) {
+    await sleep(80);
+    const o = transformable(id);
+    return { ...current(o), source: demoSource(o) };
+  },
+  async getTransformPrompt(id) {
+    await sleep(80);
+    const prompt = demoPrompt(transformable(id));
+    return { objectId: id, prompt, characters: prompt.length, promptsDir: demoTransformSettings.promptsDir };
+  },
+  async generateTransforms(ids) {
+    await sleep(120);
+    return ids.map((id) => {
+      const o = completedObjects().find((x) => x.id === id);
+      if (!o || !KIND_OF_TYPE[o.type]) return { objectId: id, state: "rejected" as const, error: "Drafts are not available for this type of object yet." };
+      const t = current(o);
+      transforms.set(id, { ...t, state: "running", error: null, startedAt: new Date().toISOString() });
+      setTimeout(() => {
+        const src = demoSource(o);
+        const now = transforms.get(id) ?? t;
+        transforms.set(id, {
+          ...now, state: "draft", error: null,
+          draft: {
+            code: src.draft, notes: src.notes, unconverted: src.unconverted, confidence: src.unconverted.length ? "medium" : "high",
+            checks: [{ level: "ok", message: "Passed the automatic checks. They are not a substitute for reading it." },
+              ...(src.unconverted.length ? [{ level: "warning" as const, message: `The model left ${src.unconverted.length} item for a person; see below.` }] : [])],
+            sourceHash: src.hash, generatedAt: new Date().toISOString(), model: "demo", costUsd: null, durationMs: 1800, stale: false,
+          },
+        });
+      }, 1800);
+      return { objectId: id, state: "queued" as const, error: null };
+    });
+  },
+  async acceptTransform(id, code) {
+    await sleep(150);
+    const o = transformable(id);
+    const t = current(o);
+    if (!t.draft) throw new ApiRequestError("no_draft", "There is no draft to accept. Generate one first.", 409);
+    const text = (code ?? t.draft.code).trim();
+    if (!text) throw new ApiRequestError("invalid_request", "The code to accept is empty.", 400);
+    const { costUsd: _c, durationMs: _d, ...rest } = t.draft;
+    transforms.set(id, { ...t, state: "accepted", draft: null, accepted: { ...rest, code: text, acceptedAt: new Date().toISOString(), edited: text !== t.draft.code.trim() } });
+    return { ...current(o), source: demoSource(o) };
+  },
+  async listTransformCandidates() {
+    await sleep(200);
+    const items = completedObjects().filter((o) => KIND_OF_TYPE[o.type]).map((o) => {
+      const t = current(o);
+      const problems = demoNeedsWork(o) ? demoSource(o).problems : [];
+      const latest = t.draft ?? t.accepted;
+      return { objectId: o.id, name: o.name, type: o.type, kind: KIND_OF_TYPE[o.type], problems, rulesChange: !problems.length,
+        state: t.state, error: t.error, confidence: latest?.confidence ?? null, stale: latest ? false : null, unavailable: null };
+    }).sort((a, b) => Number(!a.problems.length) - Number(!b.problems.length) || a.name.localeCompare(b.name));
+    const n = (f: (i: (typeof items)[number]) => boolean) => items.filter(f).length;
+    return { items, summary: { total: items.length, needsWork: n((i) => i.problems.length > 0), drafts: n((i) => i.state === "draft"),
+      accepted: n((i) => i.state === "accepted"), working: n((i) => i.state === "queued" || i.state === "running"), failed: n((i) => i.state === "failed") } };
+  },
+  async getProjectRequirements() {
+    await sleep(60);
+    return { text: projectText, path: "prompts/transform/project.md", placeholders: ["object.name", "object.type", "object.kind", "object.schema", "target.warehouse", "target.workspace", "target.component", "notebook.language"] };
+  },
+  async saveProjectRequirements(text) {
+    await sleep(150);
+    if ((text.match(/\{\{#if/g) ?? []).length !== (text.match(/\{\{\/if\}\}/g) ?? []).length)
+      throw new ApiRequestError("invalid_template", "An {{#if}} block is not closed, or an {{/if}} has no {{#if}}.", 400);
+    projectText = text.split("\r\n").join("\n");
+    return this.getProjectRequirements();
+  },
+  async discardTransform(id, scope) {
+    await sleep(100);
+    const o = transformable(id);
+    const t = current(o);
+    if (scope === "all" || !t.accepted) transforms.delete(id);
+    else transforms.set(id, { ...t, state: "accepted", draft: null });
+    return { ...current(o), source: demoSource(o) };
+  },
 };
+
+const transforms = new Map<string, TransformObject>();
+let projectText = DEMO_PROJECT;
+
+function transformable(id: string) {
+  const o = completedObjects().find((x) => x.id === id);
+  if (!o) throw new ApiRequestError("object_not_found", "That object is not in the current discovery results.", 404);
+  if (!KIND_OF_TYPE[o.type]) throw new ApiRequestError("not_transformable", `Drafts are not available for ${o.type} objects yet.`, 400);
+  return o;
+}
+
+function current(o: { id: string; name: string; type: string }): TransformObject {
+  return transforms.get(o.id) ?? { objectId: o.id, name: o.name, type: o.type, kind: KIND_OF_TYPE[o.type] ?? null, state: "none", error: null, startedAt: null, draft: null, accepted: null };
+}
 

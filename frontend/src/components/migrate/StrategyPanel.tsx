@@ -4,6 +4,7 @@ import { ClassificationBadge } from "../shared/Metrics";
 import { Button, Collapsible, StatusBadge, type Tone } from "../shared/Shared";
 import { useMigration } from "../../state/MigrationState";
 import type { Strategy } from "../../types";
+import { LlmBadge, useAcceptedTransforms } from "../discovery/LlmBadge";
 
 export const STRATEGY_TONE: Record<Strategy, Tone> = { automated: "success", manual: "warning", assess: "info", later: "neutral", deselected: "neutral" };
 const STRATEGY_TEXT: Record<Strategy, string> = {
@@ -45,6 +46,7 @@ export function PlanEditor() {
   const { graph, plan, analysis, addAllToPlan, addToPlan, removeFromPlan, setPlanWave, movePlanItem, clearPlan } = useMigration();
   const [pick, setPick] = useState("");
   const [pickWave, setPickWave] = useState(0);
+  const accepted = useAcceptedTransforms();
 
   const nodes = useMemo(() => new Map((graph?.nodes ?? []).map((n) => [n.id, n])), [graph]);
   const byName = useMemo(() => new Map((graph?.nodes ?? []).map((n) => [n.name.toLowerCase(), n])), [graph]);
@@ -93,7 +95,7 @@ export function PlanEditor() {
                           const st = analysis?.objectStrategies[p.id];
                           return (
                             <tr key={p.id}>
-                              <td className="name" title={n.name}>{n.name}</td>
+                              <td className="name" title={n.name}>{n.name}{accepted.has(p.id) && <> <LlmBadge {...accepted.get(p.id)} /></>}</td>
                               <td>{n.type}</td>
                               <td className="ws" title={n.fabricTarget}>{n.fabricTarget}</td>
                               <td><ClassificationBadge value={n.classification} /></td>

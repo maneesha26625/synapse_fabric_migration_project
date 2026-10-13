@@ -7,6 +7,7 @@ import { useAppState } from "../../state/AppState";
 import { useMigration } from "../../state/MigrationState";
 import type { ExecItem } from "../../types";
 import { STRATEGY_TONE } from "./StrategyPanel";
+import { LlmBadge, useAcceptedTransforms } from "../discovery/LlmBadge";
 
 const TONE: Record<ExecItem["status"], Tone> = { PENDING: "neutral", "IN PROGRESS": "info", COMPLETED: "success", FAILED: "error", SKIPPED: "neutral", DEFERRED: "warning" };
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleTimeString() : "—");
@@ -82,6 +83,7 @@ export function RunPanel() {
   const { execution: run, executionError, startExecution, controlExecution, plan, fabric, analysis, analysisError, options, capabilities } = useMigration();
   const [logs, setLogs] = useState(false);
   const [view, setView] = useState<View>("all");
+  const accepted = useAcceptedTransforms();
   const table = useRef<HTMLDivElement>(null);
   // A card shows the objects it counts, and brings the table into view.
   const showCard = (v: View) => { setView(v); table.current?.scrollIntoView?.({ behavior: "smooth", block: "start" }); };
@@ -158,6 +160,15 @@ export function RunPanel() {
         </div>
       </Card>
 
+      {(() => {
+        const fromLlm = started ? run.items.filter((i) => i.llm).length : plan.filter((p) => accepted.has(p.id)).length;
+        return fromLlm > 0 ? (
+          <Banner tone="info" title={`${fromLlm} object${fromLlm === 1 ? "" : "s"} ${started ? "were" : "will be"} created from accepted LLM transforms`}>
+            Marked <LlmBadge /> below. Everything else uses the rule-based conversion. Review or withdraw them in Assess → LLM transforms.
+          </Banner>
+        ) : null;
+      })()}
+
       {!started ? (
         <Card><EmptyState icon={<Play size={22} />} title="Nothing is running.">Start the migration to see each wave's progress and every object's result.</EmptyState></Card>
       ) : (
@@ -213,7 +224,7 @@ export function RunPanel() {
                     const st = analysis?.objectStrategies[i.id];
                     return (
                       <tr key={i.id}>
-                        <td className="name" title={i.name}>{i.name}</td>
+                        <td className="name" title={i.name}>{i.name}{i.llm && <> <LlmBadge edited={i.llm.edited} acceptedAt={i.llm.acceptedAt} /></>}</td>
                         <td>{i.type}</td>
                         <td className="num">{i.wave ?? "—"}</td>
                         <td>{st ? <StatusBadge tone={STRATEGY_TONE[st.strategy]}>{st.label}</StatusBadge> : "—"}</td>

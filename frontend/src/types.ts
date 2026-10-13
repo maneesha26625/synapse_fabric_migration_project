@@ -189,6 +189,9 @@ export interface DiscoveryStatus {
   workspace: string | null;
   progress: ProgressStep[] | null;
   summary: DiscoverySummary | null;
+  /** Loaded when the API started, from the last session: the source it came from is not signed in yet. */
+  restored?: boolean;
+  restoredFrom?: { workspace: string | null; pool: string | null } | null;
 }
 
 /** Discovery status: factual, never evaluative. */
@@ -445,7 +448,30 @@ export interface PlannerRun {
   id: string; plannerVersion: string; fingerprint: string; objects: number; effortDays: number;
   waves: number; readiness: number; blocking: number; createdAt: string; status: string;
 }
+/** A storage location the plan's code reads directly, and the connection a OneLake shortcut to it can use. */
+export interface StorageSuggestion {
+  account: string;
+  container: string;
+  /** How many times the code names it literally (0: only built from variables). */
+  uses: number;
+  /** A Fabric connection already there that reaches it, or null. */
+  connectionId: string | null;
+  connectionName: string | null;
+  /** Otherwise the Synapse linked service whose connection the Connections stage creates in the same run. */
+  linkedService: string | null;
+}
+
+/** One storage location the run sends through a OneLake shortcut (run option). */
+export interface StorageRoute {
+  account: string;
+  container: string;
+  connectionId?: string;
+  linkedService?: string;
+}
+
 export interface PlanAnalysis {
+  /** Storage the plan's code reads directly; route each through a OneLake shortcut in Stages & credentials. */
+  storage?: StorageSuggestion[];
   plannerVersion: string;
   /** Same plan over the same estate always gives the same fingerprint. */
   fingerprint: string;
@@ -475,6 +501,11 @@ export interface RunOptions {
   dataRun: "run" | "create";
   /** Warehouse: the collation it is created with (it cannot change afterwards). */
   collation: "match_synapse" | "case_insensitive" | "case_sensitive";
+  /** An object already in Fabric: left as it is, or updated in place (views/procedures by CREATE OR ALTER,
+   *  notebooks, pipelines, scripts and Spark jobs by replacing their definition). Tables are never replaced. */
+  existing?: "skip" | "update";
+  /** Storage read directly by code, routed through OneLake shortcuts (paths rewritten). Undefined: not chosen yet. */
+  storageRoutes?: StorageRoute[];
   /** Table data: how far back each sync of a table with key columns re-reads. */
   syncOverlap?: "1h" | "1d" | "none";
   /** Table data: which rows each table loads, by "schema.table" (lowercase). A table not listed loads every row. */
@@ -569,6 +600,8 @@ export interface ExecItem {
   notes?: string[];
   /** Where it landed in Fabric. */
   target?: string | null;
+  /** Created from an accepted LLM-assisted transform (reviewed in Assess → LLM transforms). */
+  llm?: { acceptedAt: string | null; edited: boolean } | null;
 }
 export interface ExecutionRun {
   runId: string;
@@ -598,10 +631,140 @@ export interface ValidationRow {
   status: ValidationStatus;
   /** Why it matched, differs or could not be checked. */
   detail?: string;
+  /** Whether it runs in Fabric: present when a run check applies to the object. A FAIL makes the row a MISMATCH. */
+  runtime?: RuntimeCheck;
+}
+
+export type RuntimeStatus = "PASS" | "FAIL" | "NOT RUN" | "NOT CHECKED";
+export interface RuntimeCheck {
+  status: RuntimeStatus;
+  /** What was done: "Queried the view", "Compiled", "Last run in Fabric", "Ran now in Fabric"… */
+  check: string;
+  detail: string;
+  runAt?: string | null;
+}
+
+/** Object kinds Validate may run for real in Fabric, when the operator asks. */
+export type RunnableKind = "pipeline" | "notebook" | "script" | "sparkjob" | "procedure";
+export interface ValidationRuntimeOptions {
+  /** Read-only checks in the Warehouse: query tables and views, compile procedures. */
+  probe: boolean;
+  /** Run these now in Fabric (real runs) instead of reading their last run. */
+  run: RunnableKind[];
+  timeoutMinutes: number;
 }
 
 /** The single seam between the UI and whatever supplies data. */
 export type RunControl = "pause" | "resume" | "retry" | "reset";
+
+/* ---- LLM-assisted transformation ------------------------------------------- */
+
+/** The Synapse object kinds a draft can be generated for. */
+export type TransformKind = "procedure" | "view" | "table" | "script" | "pipeline" | "notebook";
+export type TransformState = "none" | "queued" | "running" | "failed" | "draft" | "accepted";
+
+export interface TransformSettings {
+  /** Generation is allowed on this server (MIGRATION_LLM is not off). */
+  enabled: boolean;
+  /** The Claude Code CLI was found on the machine running the API. */
+  available: boolean;
+  model: string;
+  timeoutSeconds: number;
+  message: string | null;
+  disabledReason: string | null;
+  kinds: TransformKind[];
+  promptsDir: string;
+  storeDir: string;
+}
+
+export interface TransformCheck {
+  level: "ok" | "warning" | "error";
+  message: string;
+}
+
+export interface TransformDraft {
+  code: string;
+  notes: string[];
+  unconverted: string[];
+  confidence: "high" | "medium" | "low";
+  checks: TransformCheck[];
+  sourceHash: string;
+  generatedAt: string;
+  model: string;
+  costUsd: number | null;
+  durationMs: number;
+  /** The source changed since this was generated; null when unknown. */
+  stale: boolean | null;
+}
+
+export interface TransformAccepted extends Omit<TransformDraft, "costUsd" | "durationMs"> {
+  acceptedAt: string;
+  /** The reviewer changed the draft before accepting it. */
+  edited: boolean;
+}
+
+export interface TransformObject {
+  objectId: string;
+  name: string | null;
+  type: string | null;
+  kind: TransformKind | null;
+  state: TransformState;
+  error: string | null;
+  startedAt: string | null;
+  draft: TransformDraft | null;
+  accepted: TransformAccepted | null;
+  /** Present on a single object, not in the list. */
+  source?: {
+    code: string;
+    language: "sql" | "json";
+    hash: string;
+    ruleOutput: string;
+    ruleNotes: string[];
+    problems: string[];
+  };
+}
+
+export interface TransformPrompt {
+  objectId: string;
+  prompt: string;
+  characters: number;
+  promptsDir: string;
+}
+
+export interface TransformQueued {
+  objectId: string;
+  state: "queued" | "rejected";
+  error: string | null;
+}
+
+/** One row of the transformation work queue. */
+export interface TransformCandidate {
+  objectId: string;
+  name: string;
+  type: string;
+  kind: TransformKind;
+  /** What the rules cannot convert. Empty when the rules handle it alone. */
+  problems: string[];
+  /** The rules change the object on the way (they can convert it, with changes). */
+  rulesChange: boolean;
+  state: TransformState;
+  error: string | null;
+  confidence: "high" | "medium" | "low" | null;
+  stale: boolean | null;
+  /** Why no draft can be made (for example the definition was not kept), or null. */
+  unavailable: string | null;
+}
+
+export interface TransformCandidates {
+  items: TransformCandidate[];
+  summary: { total: number; needsWork: number; drafts: number; accepted: number; working: number; failed: number };
+}
+
+export interface ProjectRequirements {
+  text: string;
+  path: string;
+  placeholders: string[];
+}
 
 export interface MigrationApi {
   readonly mode: ApiMode;
@@ -643,7 +806,23 @@ export interface MigrationApi {
   /** `reset` forgets the run's record so the next run starts fresh; refused while the run is working. */
   controlExecution(action: RunControl): Promise<ExecutionRun>;
   /** Compares Synapse with Fabric. With no items, every discovered object is checked. */
-  runValidation(items?: PlanItem[], options?: Pick<RunOptions, "dataFilters">): Promise<ValidationRow[]>;
+  runValidation(items?: PlanItem[], options?: Pick<RunOptions, "dataFilters">, runtime?: ValidationRuntimeOptions,
+    onProgress?: (text: string) => void): Promise<ValidationRow[]>;
+  // LLM-assisted transformation, through Claude Code on the machine running the API.
+  getTransformSettings(): Promise<TransformSettings>;
+  listTransforms(): Promise<TransformObject[]>;
+  getTransform(id: string): Promise<TransformObject>;
+  getTransformPrompt(id: string): Promise<TransformPrompt>;
+  generateTransforms(ids: string[]): Promise<TransformQueued[]>;
+  /** Accept the draft; with `code`, an edited version of it. */
+  acceptTransform(id: string, code?: string): Promise<TransformObject>;
+  /** `draft` drops the draft only; `all` goes back to the rule-based conversion. */
+  discardTransform(id: string, scope: "draft" | "all"): Promise<TransformObject>;
+  /** Every object a draft can be made for, those the rules cannot convert first. */
+  listTransformCandidates(): Promise<TransformCandidates>;
+  /** The project requirements every prompt carries (prompts/transform/project.md on the server). */
+  getProjectRequirements(): Promise<ProjectRequirements>;
+  saveProjectRequirements(text: string): Promise<ProjectRequirements>;
 }
 
 export class ApiRequestError extends Error {

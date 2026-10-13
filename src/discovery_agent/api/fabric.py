@@ -10,8 +10,10 @@ operator already uses:
 * **Fabric CLI** -- ``fab auth logout`` then ``fab auth login`` (interactive browser); workspaces are
   read through ``fab api``. The CLI holds the token, not this process.
 
-No token is ever returned, logged or placed in an error message. Nothing is
-written to disk by this module.
+No token is ever returned, logged or placed in an error message. Only the
+*selection* is kept between starts (method, account, workspace; through
+``persist``): at start it is checked again silently with the CLI session the
+machine already has, never a new sign-in window.
 """
 
 from __future__ import annotations
@@ -36,6 +38,8 @@ FABRIC_API = FABRIC_RESOURCE + "/v1"
 LOGIN_TIMEOUT = 180  # seconds the operator has to finish a browser sign-in
 CALL_TIMEOUT = 60
 METHODS = ("azure_cli", "fabric_cli")
+#: The saved target selection's name in the state store (``persist``).
+TARGET_STATE = "fabric_target"
 
 _GUID = re.compile(r"^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$")
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\\u001b\[[0-9;]*m")
@@ -113,11 +117,45 @@ def _clean_workspaces(items: List[dict]) -> List[dict]:
 class FabricTarget:
     """One Fabric target connection, in memory, guarded by a lock."""
 
-    def __init__(self) -> None:
+    def __init__(self, store: Any = None) -> None:
         self._lock = threading.RLock()
         self._gen = 0  # bumps on every authenticate/disconnect so a stale sign-in is ignored
         self._login_proc: Optional[subprocess.Popen] = None
+        self._store = store
         self._reset()
+        saved = store.load(TARGET_STATE) if store is not None else None
+        if isinstance(saved, dict) and saved.get("method") in METHODS and _GUID.match(str(saved.get("workspaceId") or "")):
+            self.method = saved["method"]
+            self.account = saved.get("account")
+            self.workspace_id = saved["workspaceId"]
+            self.workspace_name = saved.get("workspaceName")
+            self.status = "signing_in"
+            self.message = "Reconnecting to the Fabric workspace from the last session…"
+            self._gen += 1
+            threading.Thread(target=self._restore, args=(saved["method"], saved["workspaceId"], self._gen), daemon=True).start()
+
+    def _restore(self, method: str, wid: str, gen: int) -> None:
+        """Check the saved selection again with the CLI session already on this machine. No sign-in window."""
+        checks: List[dict] = []
+        try:
+            _require("az" if method == "azure_cli" else "fab", "Azure CLI" if method == "azure_cli" else "Fabric CLI")
+            with self._lock:
+                if gen != self._gen:
+                    return
+                self._verify(method, wid, checks)
+                self.checks, self.status, self.message = checks, "connected", None
+        except FabricError as exc:
+            with self._lock:
+                if gen != self._gen:
+                    return
+                name = self.workspace_name or wid
+                self._reset()
+                self.message = f"Could not reconnect to {name} from the last session ({exc.message}) Log in again."
+        except Exception as exc:  # noqa: BLE001 - a restore never takes the API down
+            with self._lock:
+                if gen == self._gen:
+                    self._reset()
+                    self.message = f"Could not reconnect to the Fabric workspace from the last session ({type(exc).__name__}). Log in again."
 
     def _reset(self) -> None:
         self.status = "disconnected"  # disconnected | signing_in | authenticated | connected | failed
@@ -149,6 +187,8 @@ class FabricTarget:
             if self._login_proc is not None and self._login_proc.poll() is None:
                 _kill_tree(self._login_proc)
             self._reset()
+            if self._store is not None:
+                self._store.forget(TARGET_STATE)
             return self.state()
 
     def authenticate(self, body: dict) -> dict:
@@ -244,6 +284,9 @@ class FabricTarget:
                 raise FabricError(exc.status, exc.code, exc.message) from exc
             self.status = "connected"
             self.message = None
+            if self._store is not None:
+                self._store.save(TARGET_STATE, {"method": method, "account": self.account, "workspaceId": self.workspace_id,
+                                                "workspaceName": self.workspace_name})
             return self.state()
 
     # -- for the migration run ----------------------------------------
@@ -280,6 +323,17 @@ class FabricTarget:
 
         provider = credential_provider(CredentialMethod.INTERACTIVE_BROWSER, tenant_id=self.tenant)
         return provider.token_provider_for(SQL_SCOPE)
+
+    def storage_token_provider(self) -> Callable[[], str]:
+        """Tokens for OneLake files (audience storage.azure.com), in the Fabric tenant. Like the SQL tokens: from the Azure
+        CLI, or with the Fabric CLI the accelerator's own browser sign-in against the same tenant."""
+        if self.method == "azure_cli":
+            return self.token_provider("https://storage.azure.com/")
+        from discovery_agent.connections.azure import credential_provider  # noqa: PLC0415
+        from discovery_agent.connections.models import CredentialMethod  # noqa: PLC0415
+
+        provider = credential_provider(CredentialMethod.INTERACTIVE_BROWSER, tenant_id=self.tenant)
+        return provider.token_provider_for("https://storage.azure.com/.default")
 
     def _fab_send(self, method: str, url: str, headers: Any, body: Optional[bytes]) -> Tuple[int, Dict[str, str], bytes]:
         """``fab api`` as a transport: (status, lower-cased headers, body bytes)."""

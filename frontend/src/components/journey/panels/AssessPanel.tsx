@@ -3,6 +3,7 @@ import { useState } from "react";
 import { ComponentMapping } from "../../discovery/ComponentMapping";
 import { WorkstreamSummary } from "../../discovery/DiscoverySummary";
 import { Inventory } from "../../discovery/Inventory";
+import { TransformQueue } from "../../discovery/TransformQueue";
 import { Tabs } from "../../shared/Shared";
 import { useAppState } from "../../../state/AppState";
 import type { Classification } from "../../../types";
@@ -17,7 +18,7 @@ const CLASSES: { cls: Classification; label: string; meaning: string }[] = [
 
 export function AssessPanel() {
   const { discovery } = useAppState();
-  const [tab, setTab] = useState<"overview" | "objects" | "mapping">("overview");
+  const [tab, setTab] = useState<"overview" | "objects" | "mapping" | "llm">("overview");
   const [cls, setCls] = useState("");
   const [workstream, setWorkstream] = useState("");
   const summary = discovery.summary;
@@ -53,6 +54,7 @@ export function AssessPanel() {
         { id: "overview", label: "By workstream" },
         { id: "objects", label: "Objects", count: summary.total },
         { id: "mapping", label: "Component mapping" },
+        { id: "llm", label: "LLM transforms" },
       ]} />
 
       {tab === "overview" && <WorkstreamSummary summary={summary} active={workstream} onSelect={(w) => { setWorkstream(w); if (w) setTab("objects"); }} />}
@@ -68,6 +70,7 @@ export function AssessPanel() {
         </>
       )}
       {tab === "mapping" && <ComponentMapping summary={summary} />}
+      {tab === "llm" && <TransformQueue />}
     </div>
   );
 }

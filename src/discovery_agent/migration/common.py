@@ -52,3 +52,12 @@ class Source:
     uses: Tuple[Dict[str, Any], ...] = ()
     #: Table data only: the ``datafilter.DataFilter`` that limits which rows load, or None for every row.
     data_filter: Any = None
+    #: An accepted LLM-assisted transform for this object, used instead of the rule-based conversion:
+    #: ``{"code", "acceptedAt", "edited"}``. Set only while the source still matches what was accepted.
+    override: Optional[Dict[str, Any]] = None
+
+
+def override_note(source: Source) -> str:
+    """The run-log note that says an object was created from reviewed, LLM-assisted code."""
+    edited = " and edited" if (source.override or {}).get("edited") else ""
+    return f"Created from the LLM-assisted transform accepted{edited} on {(source.override or {}).get('acceptedAt') or 'an earlier date'}."

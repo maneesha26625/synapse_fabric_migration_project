@@ -1,4 +1,4 @@
-import { AlertTriangle, ArrowRight, CheckCircle2, Download, FileCode2, ListPlus, Route } from "lucide-react";
+import { AlertTriangle, ArrowRight, CheckCircle2, Download, FileCode2, ListPlus, Route, Sparkles } from "lucide-react";
 import { Fragment, useEffect, useState, type ReactNode } from "react";
 import { useAppState } from "../../state/AppState";
 import { useMigration } from "../../state/MigrationState";
@@ -6,9 +6,10 @@ import { ClassificationBadge } from "../shared/Metrics";
 import type { ObjectDetail } from "../../types";
 import { Banner, Button, Collapsible, Drawer, JsonViewer, Skeleton } from "../shared/Shared";
 import { DependencyView } from "./DependencyView";
+import { TRANSFORMABLE_TYPES, TransformPanel } from "./TransformPanel";
 import { AssessmentBadge, MappingStatusBadge, ObjectStatusBadge, PathBadge } from "./ObjectStatusBadge";
 
-type Tab = "overview" | "dependencies" | "metadata" | "activities" | "raw";
+export type Tab = "overview" | "dependencies" | "metadata" | "activities" | "transform" | "raw";
 
 const fmt = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : "—");
 const isPlain = (v: unknown) => v === null || ["string", "number", "boolean"].includes(typeof v);
@@ -56,6 +57,9 @@ function Overview({ o, onTab }: { o: ObjectDetail; onTab: (tab: Tab) => void }) 
         <Button size="small" onClick={() => onTab("metadata")}><FileCode2 size={14} aria-hidden="true" />View Source Definition</Button>
         <Button size="small" onClick={() => onTab("dependencies")}><Route size={14} aria-hidden="true" />View Mapping</Button>
         <Button size="small" onClick={exportObject}><Download size={14} aria-hidden="true" />Export</Button>
+        {TRANSFORMABLE_TYPES.has(o.type) && (
+          <Button size="small" onClick={() => onTab("transform")}><Sparkles size={14} aria-hidden="true" />Convert with LLM</Button>
+        )}
         <Button size="small" variant="primary" disabled={inPlan(o.id)} onClick={() => addToPlan([o.id])}><ListPlus size={14} aria-hidden="true" />{inPlan(o.id) ? "In Migration Plan" : "Add to Migration Plan"}</Button>
       </div>
       <Section title="Source object">
@@ -155,30 +159,31 @@ function Activities({ o }: { o: ObjectDetail }) {
   );
 }
 
-export function ObjectDetails({ id, onClose, onNavigate }: { id: string; onClose: () => void; onNavigate: (id: string) => void }) {
+export function ObjectDetails({ id, onClose, onNavigate, initialTab = "overview" }: { id: string; onClose: () => void; onNavigate: (id: string) => void; initialTab?: Tab }) {
   const { getObject } = useAppState();
   const [object, setObject] = useState<ObjectDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [tab, setTab] = useState<Tab>("overview");
+  const [tab, setTab] = useState<Tab>(initialTab);
   const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
     setObject(null);
     setError(null);
-    setTab("overview");
+    setTab(initialTab);
     getObject(id).then(
       (o) => !cancelled && setObject(o),
       (e) => !cancelled && setError(e instanceof Error ? e.message : "The object could not be loaded."),
     );
     return () => { cancelled = true; };
-  }, [id, getObject, attempt]);
+  }, [id, getObject, attempt, initialTab]);
 
   const tabs: { id: Tab; label: string }[] = [
     { id: "overview", label: "Overview" },
     { id: "dependencies", label: "Dependencies" },
     { id: "metadata", label: "Source metadata" },
     ...(object && object.activities.length ? [{ id: "activities" as Tab, label: `Activities (${object.activities.length})` }] : []),
+    ...(object && TRANSFORMABLE_TYPES.has(object.type) ? [{ id: "transform" as Tab, label: "LLM transform" }] : []),
     { id: "raw", label: "Raw metadata" },
   ];
 
@@ -191,6 +196,7 @@ export function ObjectDetails({ id, onClose, onNavigate }: { id: string; onClose
   else if (tab === "dependencies") body = <DependencyView root={object} onOpen={onNavigate} />;
   else if (tab === "metadata") body = object.configuration ? <Properties data={object.configuration} /> : <p className="muted">No source metadata was extracted for this object{object.status === "Failed" ? " because its definition is unavailable" : ""}.</p>;
   else if (tab === "activities") body = <Activities o={object} />;
+  else if (tab === "transform") body = <TransformPanel object={object} />;
   else body = <Collapsible summary="Show raw metadata (JSON)"><JsonViewer value={object.rawMetadata} /></Collapsible>;
 
   return (

@@ -16,9 +16,23 @@ import {
   type ObjectDetail,
   type ResultsPage,
   type ResultsQuery,
+  type ProjectRequirements,
+  type TransformCandidates,
+  type TransformObject,
+  type TransformPrompt,
+  type TransformQueued,
+  type TransformSettings,
   type ValidationRow,
   type ZipUpload,
 } from "../types";
+
+/** The server's background validation, as GET /api/migration/validation reports it. */
+interface ValidationState {
+  state: "idle" | "running" | "completed" | "failed";
+  progress?: string;
+  rows?: ValidationRow[];
+  error?: { code?: string; message?: string };
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
@@ -154,12 +168,37 @@ export const realApi: MigrationApi = {
   getExecution: () => request<ExecutionRun>("/api/migration/run"),
   controlExecution: (action) =>
     request<ExecutionRun>("/api/migration/control", { method: "POST", body: JSON.stringify({ action }) }),
-  runValidation: async (items, options) =>
-    (await request<{ rows: ValidationRow[] }>("/api/migration/validate", { method: "POST", body: JSON.stringify({
+  runValidation: async (items, options, runtime, onProgress) => {
+    // Validation runs in the background on the server (runs in Fabric can take minutes): start it, then follow it.
+    await request<ValidationState>("/api/migration/validate", { method: "POST", body: JSON.stringify({
       ...(items?.length ? { items } : {}),
       // Date filters decide which Synapse rows a table should hold, so the counts compare like with like.
       ...(options?.dataFilters ? { options: { dataFilters: options.dataFilters } } : {}),
-    }) })).rows,
+      ...(runtime ? { runtime } : {}),
+    }) });
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 1500));
+      const state = await request<ValidationState>("/api/migration/validation");
+      if (state.state === "completed") return state.rows ?? [];
+      if (state.state === "failed") throw new ApiRequestError(state.error?.code ?? "validation_failed", state.error?.message ?? "Validation stopped.");
+      if (state.state !== "running") throw new ApiRequestError("validation_lost", "The server has no validation running (was it restarted?). Run validation again.");
+      onProgress?.(state.progress ?? "Validating");
+    }
+  },
+  getTransformSettings: () => request<TransformSettings>("/api/transform/settings"),
+  listTransforms: async () => (await request<{ items: TransformObject[] }>("/api/transform")).items,
+  getTransform: (id) => request<TransformObject>(`/api/transform/objects/${encodeURIComponent(id)}`),
+  getTransformPrompt: (id) => request<TransformPrompt>(`/api/transform/prompt/${encodeURIComponent(id)}`),
+  generateTransforms: async (ids) =>
+    (await request<{ items: TransformQueued[] }>("/api/transform/generate", { method: "POST", body: JSON.stringify({ ids }) })).items,
+  acceptTransform: (id, code) =>
+    request<TransformObject>("/api/transform/accept", { method: "POST", body: JSON.stringify(code === undefined ? { id } : { id, code }) }),
+  discardTransform: (id, scope) =>
+    request<TransformObject>("/api/transform/discard", { method: "POST", body: JSON.stringify({ id, scope }) }),
+  listTransformCandidates: () => request<TransformCandidates>("/api/transform/candidates"),
+  getProjectRequirements: () => request<ProjectRequirements>("/api/transform/project"),
+  saveProjectRequirements: (text) =>
+    request<ProjectRequirements>("/api/transform/project", { method: "POST", body: JSON.stringify({ text }) }),
   listSqlPools: async (sub, rg, ws) =>
     (await request<{ items: string[] }>(
       `/api/azure/sql-pools?subscriptionId=${encodeURIComponent(sub)}&resourceGroup=${encodeURIComponent(rg)}&workspace=${encodeURIComponent(ws)}`,

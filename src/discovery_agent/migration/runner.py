@@ -31,7 +31,7 @@ from discovery_agent.migration import environments, notebooks, tsql_rules, wareh
 from discovery_agent.migration.common import (  # noqa: F401 - re-exported: tests and the API import these from here
     COMPLETED, CONNECTION, DATA, DATASET, DEFERRED, DEFERRED_STATUS, ENVIRONMENT, FAILED, IN_PROGRESS, MISSING,
     NOTEBOOK, PENDING, PIPELINE, POOL, PROCEDURE, SCHEDULE, SCHEMA, SCRIPT, SHORTCUT, SKIPPED, SPARKJOB, TABLE,
-    VIEW, WORKSPACE_ERRORS, MigrationError, Source,
+    VIEW, WORKSPACE_ERRORS, MigrationError, Source, override_note,
 )
 from discovery_agent.migration.stages import StageMixin
 from discovery_agent.migration.stages_fabric import FabricStageMixin
@@ -110,6 +110,9 @@ class Item:
             "wave": self.source.wave, "step": self.step, "status": self.status,
             "startedAt": self.started_at, "completedAt": self.completed_at,
             "error": self.error, "notes": list(self.notes), "target": self.target,
+            # Created from an accepted LLM-assisted transform rather than the rule-based conversion.
+            "llm": ({"acceptedAt": self.source.override.get("acceptedAt"), "edited": bool(self.source.override.get("edited"))}
+                    if self.source.override else None),
         }
 
 
@@ -180,8 +183,11 @@ class Migrator(StageMixin, FabricStageMixin):
         sleep: Callable[[float], None] = lambda s: None,
         source_factory: Optional[Callable[[], Any]] = None,
         credentials: Optional[Dict[str, Dict[str, str]]] = None,
+        onelake: Any = None,
     ) -> None:
         self.run = run
+        #: Files in the Lakehouse (``onelake.OneLakeFiles``): copies of Spark job main files with rerouted storage paths.
+        self._onelake = onelake
         self._source_factory = source_factory
         self._source: Any = None
         self._item: Optional["Item"] = None
@@ -287,17 +293,38 @@ class Migrator(StageMixin, FabricStageMixin):
         if not isinstance(source.payload, dict) or not source.payload:
             raise MigrationError("The notebook's definition was not kept by discovery. Run discovery again.")
         try:
-            document, notes = notebooks.to_fabric_ipynb(source.payload, pool_name=self.run.pool_name, warehouse=self.run.warehouse)
+            payload = notebooks.with_cells(source.payload, source.override["code"]) if source.override else source.payload
+            document, notes = notebooks.to_fabric_ipynb(payload, pool_name=self.run.pool_name, warehouse=self.run.warehouse)
         except notebooks.NotebookNotMigratable as exc:
+            if source.override:
+                raise MigrationError(str(exc)) from exc
             return DEFERRED_STATUS, "Not migrated: needs a rewrite", None, [str(exc)]
+        if source.override:
+            notes.insert(0, override_note(source))
+        remapped: List[str] = []
+        for cell in document.get("cells") or []:
+            if cell.get("cell_type") != "code":
+                continue
+            text = "".join(cell.get("source") or [])
+            routed, cell_notes = self._remap(text)
+            if routed != text:
+                cell["source"] = routed.splitlines(keepends=True)
+            remapped.extend(n for n in cell_notes if n not in remapped)
+        notes.extend(remapped)
         client = self._client()
         wid = self.run.workspace_id
         if self._notebook_names is None:
             self._notebook_names = {str(n.get("displayName", "")).lower() for n in client.list(f"/workspaces/{wid}/notebooks")}
         target = f"{self.run.workspace_name} / {source.name}"
-        if source.name.lower() in self._notebook_names:
-            return SKIPPED, "Already in the Fabric workspace; left unchanged", target, []
         description = str((source.payload.get("properties") or {}).get("description") or "Migrated from Azure Synapse")
+        if source.name.lower() in self._notebook_names:
+            if not self._updating():
+                return SKIPPED, "Already in the Fabric workspace; left unchanged", target, []
+            item_id = self._find(self._ids("notebooks"), source.name)
+            if not item_id:
+                raise MigrationError("The notebook is in the workspace but its id could not be found to update it. Retry.")
+            self._update_definition(item_id, notebooks.create_body(source.name, document, description))
+            return COMPLETED, "Updated in Fabric (definition replaced)", target, notes
         try:
             self._client().create(f"/workspaces/{wid}/notebooks", notebooks.create_body(source.name, document, description))
         except FabricApiError as exc:
@@ -460,6 +487,8 @@ class Migrator(StageMixin, FabricStageMixin):
 
     @staticmethod
     def _ddl(source: Source):
+        if source.override:
+            return source.override["code"], [override_note(source)]
         try:
             return warehouse_ddl.create_table(source.payload)
         except warehouse_ddl.UnsupportedColumn as exc:
@@ -471,13 +500,25 @@ class Migrator(StageMixin, FabricStageMixin):
         if not text or not getattr(definition, "is_readable", False):
             raise MigrationError("The definition could not be read from the pool (encrypted, or VIEW DEFINITION is not granted), so it cannot be recreated.")
         cursor, schema, name, target = self._prepare(source)
-        if self._exists(cursor, schema, name):
+        exists = self._exists(cursor, schema, name)
+        if exists and not self._updating():
             return SKIPPED, "Already in the warehouse; left unchanged", target, []
-        converted = tsql_rules.rewrite(text.strip())
+        # An accepted transform still goes through the rules: they are safe to repeat and catch a slip.
+        converted = tsql_rules.rewrite(source.override["code"] if source.override else text.strip())
+        routed, remap_notes = self._remap(converted.text)
+        converted.notes.extend(remap_notes)
+        statement = routed
+        if exists:
+            statement = tsql_rules.create_or_alter(routed)
+            if statement is None:
+                return SKIPPED, "Already in the warehouse; not updated (its definition has no CREATE statement)", target, []
         self._run_sql(cursor, warehouse_ddl.ensure_schema(schema), "create schema " + schema)
-        self._run_sql(cursor, converted.text, "create " + source.type.lower())
+        self._run_sql(cursor, statement, ("update " if exists else "create ") + source.type.lower())
         what = "View" if source.kind == VIEW else "Stored procedure"
-        return COMPLETED, f"{what} created" + (" (converted for Fabric)" if converted.changed else ""), target, converted.notes
+        done = "updated in place (CREATE OR ALTER)" if exists else "created"
+        if source.override:
+            return COMPLETED, f"{what} {done} (LLM-assisted, reviewed)", target, [override_note(source), *converted.notes]
+        return COMPLETED, f"{what} {done}" + (" (converted for Fabric)" if converted.changed else ""), target, converted.notes
 
     @staticmethod
     def _run_sql(cursor: Any, statement: Optional[str], what: str) -> None:

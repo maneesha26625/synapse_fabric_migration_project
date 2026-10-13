@@ -32,7 +32,10 @@ export function buildReport({ run, validation, project, source, target }: Report
   }
   if (validation?.length) {
     rows.push("", line(["Section", "Object", "Category", "Synapse", "Fabric", "Status", "Details"]));
-    for (const v of validation) rows.push(line(["Validation", v.object, v.category, v.source, v.target, v.status, v.detail ?? ""]));
+    for (const v of validation) {
+      const runs = v.runtime ? `Runs in Fabric: ${v.runtime.status} (${v.runtime.check}: ${v.runtime.detail})` : "";
+      rows.push(line(["Validation", v.object, v.category, v.source, v.target, v.status, [v.detail ?? "", runs].filter(Boolean).join(" | ")]));
+    }
   }
   return rows.join("\r\n");
 }

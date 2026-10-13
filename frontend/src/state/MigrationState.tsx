@@ -21,6 +21,7 @@ import {
   type PlanStatus,
   type RunOptions,
   type ValidationRow,
+  type ValidationRuntimeOptions,
 } from "../types";
 import { useAppState } from "./AppState";
 
@@ -56,7 +57,7 @@ function save(key: string, value: unknown) {
 
 const DEFAULT_PROJECT: Project = { id: "default", name: "Synapse to Fabric migration", createdAt: new Date(0).toISOString() };
 
-const DEFAULT_OPTIONS: RunOptions = { scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", dataRun: "run", collation: "match_synapse", syncOverlap: "1h", dataFilters: {} };
+const DEFAULT_OPTIONS: RunOptions = { scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", dataRun: "run", collation: "match_synapse", syncOverlap: "1h", existing: "skip", dataFilters: {} };
 
 const EMPTY_RUN: ExecutionRun = { runId: "", state: "idle", total: 0, completed: 0, inProgress: 0, failed: 0, pending: 0, skipped: 0, deferred: 0, items: [], logs: [] };
 
@@ -121,6 +122,11 @@ interface MigrationStateValue {
   validation: ValidationRow[] | null;
   validationError: string | null;
   validationBusy: boolean;
+  /** What the server is doing while validation runs (runs in Fabric can take minutes). */
+  validationProgress: string | null;
+  /** Whether, and how, Validate also checks that objects run in Fabric. */
+  validationRuntime: ValidationRuntimeOptions;
+  setValidationRuntime: (next: ValidationRuntimeOptions) => void;
   runValidation: () => Promise<void>;
 
   /** Steps the operator has reviewed and confirmed with Next, per project and data mode. */
@@ -380,12 +386,18 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   const [validation, setValidation] = useState<ValidationRow[] | null>(null);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [validationBusy, setValidationBusy] = useState(false);
+  const [validationProgress, setValidationProgress] = useState<string | null>(null);
+  // Read-only run checks are on by default; real runs in Fabric only when the operator ticks them.
+  const [validationRuntime, setValidationRuntime] = useState<ValidationRuntimeOptions>({ probe: true, run: [], timeoutMinutes: 30 });
   useEffect(() => { setValidation(null); setValidationError(null); }, [api]);
   const runValidation = useCallback(async () => {
     setValidationBusy(true);
     setValidationError(null);
-    try { setValidation(await api.runValidation([...plan].sort((a, b) => a.wave - b.wave), { dataFilters: options.dataFilters })); } catch (e) { setValidationError(messageOf(e)); } finally { setValidationBusy(false); }
-  }, [api, plan, options.dataFilters]);
+    setValidationProgress(null);
+    try {
+      setValidation(await api.runValidation([...plan].sort((a, b) => a.wave - b.wave), { dataFilters: options.dataFilters }, validationRuntime, setValidationProgress));
+    } catch (e) { setValidationError(messageOf(e)); } finally { setValidationBusy(false); setValidationProgress(null); }
+  }, [api, plan, options.dataFilters, validationRuntime]);
 
   // ---- plan status
   const dependsOn = useMemo(() => {
@@ -443,7 +455,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     fabric, fabricReady, fabricBusy, fabricError, authenticateFabric, testFabric, disconnectFabric,
     analysis, analysisBusy, analysisError, analyze, options, setOptions, capabilities, credentials, setCredential, clearCredentials,
     execution, executionReady, executionError, startExecution, controlExecution,
-    validation, validationError, validationBusy, runValidation,
+    validation, validationError, validationBusy, validationProgress, validationRuntime, setValidationRuntime, runValidation,
     confirmed, confirmStep, resetJourney, resetStep, resetNonce,
   };
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

@@ -7,6 +7,10 @@ that could not be made is reported as REVIEW with the reason, never as a match.
 * REVIEW    something differs in a way the migration explains (a converted type,
             a definition reformatted, rows not loaded yet), or the check could not run.
 * MISMATCH  the object is missing from Fabric, or the two sides disagree.
+
+With ``runtime`` options, each object Fabric can run is also checked for whether it *runs*
+(``runtime_checks``), and the verdict takes that into account: a failed run or query makes the row a
+MISMATCH; an object that matches but has never run in Fabric is REVIEW, because nothing proves it works yet.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ import json
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from discovery_agent.migration import datacopy, datafilter, environments, jobs, notebooks, pipelines, warehouse_ddl
+from discovery_agent.migration import datacopy, datafilter, environments, jobs, notebooks, pipelines, runtime_checks, warehouse_ddl
 from discovery_agent.migration.common import (
     CONNECTION, DATA, DATASET, DEFERRED, ENVIRONMENT, MISSING, NOTEBOOK, PIPELINE, POOL, PROCEDURE, SCHEDULE, SCHEMA, SCRIPT,
     SHORTCUT, SPARKJOB, TABLE, VIEW, Source,
@@ -98,6 +102,10 @@ class Validator:
         sql_factory: Callable[[str, str], Any],
         source_factory: Optional[Callable[[], Any]] = None,
         artifacts: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        runtime: Optional[runtime_checks.RuntimeOptions] = None,
+        progress: Callable[[str], None] = lambda text: None,
+        sleep: Optional[Callable[[float], None]] = None,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         self.rest, self.wid, self.workspace_name = rest, workspace_id, workspace_name
         self.warehouse_name = warehouse_name
@@ -107,6 +115,11 @@ class Validator:
         self._sql: Any = None
         self._source: Any = None
         self._wh: Dict[str, Any] = {}
+        self.runtime = runtime
+        self.progress = progress
+        self._runner = runtime_checks.JobRunner(rest, workspace_id, runtime.timeout_minutes if runtime else runtime_checks.DEFAULT_TIMEOUT_MINUTES,
+                                                progress=progress, **{k: f for k, f in (("sleep", sleep), ("clock", clock)) if f is not None})
+        self._waiting: Dict[str, Dict[str, str]] = {}  # job key -> the row its run result goes on
 
     # -- lookups -----------------------------------------------------------------------
 
@@ -144,6 +157,10 @@ class Validator:
             detail = self.rest.get(f"/workspaces/{self.wid}/warehouses/{found}")
             host = str((detail.get("properties") or {}).get("connectionString") or "").replace("tcp:", "").split(",")[0].strip()
             self._sql = self._sql_factory(host, self.warehouse_name)
+            try:
+                self._sql.timeout = runtime_checks.SQL_TIMEOUT_SECONDS  # pyodbc: per-statement timeout for the run checks
+            except Exception:  # noqa: BLE001 - a driver without it simply waits
+                pass
             cur = self._sql.cursor()
 
             def fetch(sql: str) -> List[Tuple]:
@@ -196,15 +213,53 @@ class Validator:
     def run(self, sources: Sequence[Source]) -> List[Dict[str, str]]:
         out: List[Dict[str, str]] = []
         try:
-            for s in sources:
+            for n, s in enumerate(sources, 1):
+                self.progress(f"Checking {n} of {len(sources)}: {s.name}")
                 handler = getattr(self, f"_check_{s.kind}", None)
                 try:
-                    out.extend(handler(s) if handler else [row(s, REVIEW, s.type, "—", "Not checked by this build.")])
+                    rows = handler(s) if handler else [row(s, REVIEW, s.type, "—", "Not checked by this build.")]
                 except Exception as exc:  # noqa: BLE001 - one object never stops the report
-                    out.append(row(s, REVIEW, s.type, "—", f"The check could not run: {type(exc).__name__}: {str(exc)[:200]}"))
+                    rows = [row(s, REVIEW, s.type, "—", f"The check could not run: {type(exc).__name__}: {str(exc)[:200]}")]
+                if self.runtime is not None and rows:
+                    try:
+                        self._runtime(s, rows[0])
+                    except Exception as exc:  # noqa: BLE001
+                        apply_runtime(rows[0], runtime_checks.result(runtime_checks.NOT_CHECKED, "Runs in Fabric", f"{type(exc).__name__}: {str(exc)[:200]}"))
+                out.extend(rows)
+            if self._waiting:
+                for key, outcome in self._runner.run().items():
+                    apply_runtime(self._waiting[key], outcome)
         finally:
             self.close()
         return out
+
+    # -- does it run? -------------------------------------------------------------------------
+
+    def _runtime(self, s: Source, r: Dict[str, str]) -> None:
+        """Attach the run check for one object to its first row (see ``runtime_checks``)."""
+        opts = self.runtime
+        assert opts is not None
+        if s.kind in (TABLE, VIEW, PROCEDURE):
+            if not opts.probe and s.kind not in opts.run:
+                return
+            wh = self.warehouse()
+            if "error" in wh or ((s.schema or "dbo").lower(), (s.object_name or s.name).lower()) not in wh["objects"]:
+                return  # not there: the structural check already says so
+            cursor = self._sql.cursor()
+            outcome = (runtime_checks.query_check(cursor, s) if s.kind != PROCEDURE
+                       else runtime_checks.procedure_check(cursor, s, execute=PROCEDURE in opts.run))
+            apply_runtime(r, outcome)
+        elif s.kind in runtime_checks.JOBS:
+            collection, job_type = runtime_checks.JOBS[s.kind]
+            item_id = self.find(collection, s.name)
+            if not item_id:
+                return
+            if s.kind in opts.run:
+                key = f"{s.id}#{len(self._waiting)}"
+                self._waiting[key] = r
+                self._runner.add(key, item_id, job_type, s.name)
+            else:
+                apply_runtime(r, runtime_checks.last_run(self.rest, self.wid, item_id))
 
     def _sql_gate(self, s: Source) -> Optional[List[Dict[str, str]]]:
         wh = self.warehouse()
@@ -438,6 +493,15 @@ class Validator:
         return [row(s, REVIEW, s.type, "set up by hand", s.reason or "This kind of object is not migrated by the tool; check it in Fabric yourself.")]
 
     _check_missing = _check_deferred
+
+
+def apply_runtime(r: Dict[str, Any], outcome: Mapping[str, Any]) -> None:
+    """Put a run check on a row, and let it decide the verdict: a failure is a MISMATCH, never-run is not a MATCH."""
+    r["runtime"] = dict(outcome)
+    if outcome["status"] == runtime_checks.FAIL:
+        r["status"] = MISMATCH
+    elif outcome["status"] == runtime_checks.NOT_RUN and r["status"] == MATCH:
+        r["status"] = REVIEW
 
 
 def summarize(rows: Iterable[Mapping[str, str]]) -> Dict[str, int]:

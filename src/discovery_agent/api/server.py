@@ -27,9 +27,20 @@ web framework would be the first. The surface is small and fixed.
     GET    /api/migration/capabilities    the migration stages, their options and the linked services
     GET    /api/migration/run             the current migration run
     POST   /api/migration/plan            planner: strategy, risks, effort, checks (read-only)
-    POST   /api/migration/validate        compare Synapse with Fabric, object by object (read-only)
+    POST   /api/migration/validate        start validation in the background: compare Synapse with Fabric, and check what runs
+    GET    /api/migration/validation      the validation's progress, then its results
     POST   /api/migration/start           start a run from the migration plan
     POST   /api/migration/control         pause | resume | retry | reset
+    GET    /api/transform/settings        whether LLM drafts can be generated here (Claude Code CLI)
+    GET    /api/transform                 every object with a draft, an accepted transform or a job
+    GET    /api/transform/objects/{id}    one object: source, rule output, draft, accepted code
+    GET    /api/transform/prompt/{id}     the exact prompt a draft is generated from
+    GET    /api/transform/candidates      objects a draft can be made for, those the rules cannot convert first
+    GET    /api/transform/project         the project requirements every prompt carries
+    POST   /api/transform/project         replace the project requirements
+    POST   /api/transform/generate        queue drafts for objects (background)
+    POST   /api/transform/accept          accept a draft, optionally edited
+    POST   /api/transform/discard         drop a draft, or go back to the rule-based conversion
 
 Security posture, in order of importance:
 
@@ -59,14 +70,18 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 from discovery_agent.api.repository_source import MAX_PARAMETERS_BYTES, MAX_ZIP_BYTES
 
 from discovery_agent.api.fabric import FabricError, FabricTarget
+from discovery_agent.api.persist import StateStore
 from discovery_agent.api.migration import MigrationService
 from discovery_agent.api.service import ApiError, Session
+from discovery_agent.api.transform import MAX_ACCEPT_BYTES, TransformService
 
 MAX_BODY_BYTES = 64 * 1024
 #: A repository request may carry an environment's parameters file.
 MAX_REPOSITORY_BODY_BYTES = MAX_PARAMETERS_BYTES + 64 * 1024
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 RESULTS_PREFIX = "/api/discovery/results/"
+TRANSFORM_OBJECT_PREFIX = "/api/transform/objects/"
+TRANSFORM_PROMPT_PREFIX = "/api/transform/prompt/"
 
 
 def make_handler(
@@ -74,9 +89,11 @@ def make_handler(
     static_root: Optional[Path],
     fabric: Optional[FabricTarget] = None,
     migration: Optional[MigrationService] = None,
+    transforms: Optional[TransformService] = None,
 ):
     fabric = fabric or FabricTarget()
-    migration = migration or MigrationService(session, fabric)
+    transforms = transforms or TransformService(session, fabric)
+    migration = migration or MigrationService(session, fabric, transforms=transforms)
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "MigrationAcceleratorAPI"
@@ -160,6 +177,8 @@ def make_handler(
                 self._dispatch(fabric.state)
             elif path == "/api/migration/capabilities":
                 self._dispatch(migration.capabilities)
+            elif path == "/api/migration/validation":
+                self._dispatch(migration.validation_state)
             elif path == "/api/migration/run":
                 self._dispatch(migration.state)
             elif path.startswith("/api/azure/"):
@@ -174,6 +193,20 @@ def make_handler(
                 self._dispatch(session.discovery_status)
             elif path == "/api/discovery/results":
                 self._dispatch(lambda: session.results(query))
+            elif path == "/api/transform/settings":
+                self._dispatch(transforms.settings)
+            elif path == "/api/transform/candidates":
+                self._dispatch(transforms.candidates)
+            elif path == "/api/transform/project":
+                self._dispatch(transforms.project)
+            elif path == "/api/transform":
+                self._dispatch(transforms.list)
+            elif path.startswith(TRANSFORM_OBJECT_PREFIX):
+                object_id = unquote(path[len(TRANSFORM_OBJECT_PREFIX):])
+                self._dispatch(lambda: transforms.object(object_id))
+            elif path.startswith(TRANSFORM_PROMPT_PREFIX):
+                object_id = unquote(path[len(TRANSFORM_PROMPT_PREFIX):])
+                self._dispatch(lambda: transforms.prompt(object_id))
             elif path.startswith(RESULTS_PREFIX):
                 object_id = unquote(path[len(RESULTS_PREFIX):])
                 self._dispatch(lambda: session.result(object_id))
@@ -192,9 +225,13 @@ def make_handler(
                 "/api/fabric/workspaces": lambda: fabric.refresh_workspaces(self._json_body()),
                 "/api/fabric/test": lambda: fabric.test(self._json_body()),
                 "/api/migration/plan": lambda: migration.analyze(self._json_body()),
-                "/api/migration/validate": lambda: migration.validate(self._json_body()),
+                "/api/migration/validate": lambda: migration.start_validation(self._json_body()),
                 "/api/migration/start": lambda: migration.start(self._json_body()),
                 "/api/migration/control": lambda: migration.control(self._json_body()),
+                "/api/transform/generate": lambda: transforms.generate(self._json_body()),
+                "/api/transform/accept": lambda: transforms.accept(self._json_body(MAX_ACCEPT_BYTES)),
+                "/api/transform/discard": lambda: transforms.discard(self._json_body()),
+                "/api/transform/project": lambda: transforms.save_project(self._json_body()),
                 "/api/discovery/start": session.start_discovery,
             }
             handler = routes.get(path)
@@ -239,4 +276,6 @@ def make_handler(
 
 
 def create_server(host: str, port: int, static_root: Optional[Path] = None) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_handler(Session(), static_root))
+    """The API as it runs for real: the last discovery and Fabric target are restored from, and saved to, disk."""
+    store = StateStore()
+    return ThreadingHTTPServer((host, port), make_handler(Session(store), static_root, fabric=FabricTarget(store)))

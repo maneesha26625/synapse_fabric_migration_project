@@ -11,7 +11,15 @@ created in Fabric. Each rule is mechanical and safe to repeat:
   Warehouse runs every transaction under snapshot isolation;
 * workload management (``CREATE / ALTER / DROP WORKLOAD GROUP | CLASSIFIER``,
   resource-class role changes such as ``sp_addrolemember 'largerc', ...``) is
-  removed: Fabric has no such concept.
+  removed: Fabric has no such concept;
+* ``COPY INTO ... CREDENTIAL = (IDENTITY = 'Managed Identity')`` loses the credential: a Warehouse does
+  not take Synapse's managed identity, and without a credential COPY reads the storage as the
+  Microsoft Entra identity that runs it;
+* ``SET IDENTITY_INSERT <table> ON | OFF`` is removed: tables are migrated without IDENTITY (a
+  Warehouse rejects the statement), so the explicit values it allowed now insert as they are.
+
+The last two also apply inside string literals, because they are usually built as dynamic SQL
+(``SET @sql = 'COPY INTO ...'; EXEC (@sql)``).
 
 A removed statement is replaced by a block comment saying what was removed, so
 the definition still reads correctly and the change is visible in Fabric.
@@ -40,6 +48,13 @@ _RESOURCE_CLASS = re.compile(
     r"\bEXEC(?:UTE)?\s+(?:sys\.)?sp_(?:add|drop)rolemember\s+N?'(?:small|medium|large|xlarge)rc'\s*,\s*N?'[^']*'\s*;?"
     r"|\bEXEC(?:UTE)?\s+(?:sys\.)?sp_(?:add|drop)rolemember\s+N?'staticrc\d+'\s*,\s*N?'[^']*'\s*;?",
     re.IGNORECASE)
+
+
+_IDENTITY_INSERT = re.compile(rf"\bSET\s+IDENTITY_INSERT\s+(?:{_NAME_PART}\s*\.\s*){{0,2}}{_NAME_PART}\s+(?:ON|OFF)\b[ \t]*;?", re.IGNORECASE)
+#: The credential option, with the comma that joins it to the other options. Quotes may be doubled inside dynamic SQL.
+_MI_CREDENTIAL = re.compile(r"(?:,\s*CREDENTIAL\s*=\s*\(\s*IDENTITY\s*=\s*N?'{1,2}\s*Managed\s+Identity\s*'{1,2}\s*\)"
+                            r"|CREDENTIAL\s*=\s*\(\s*IDENTITY\s*=\s*N?'{1,2}\s*Managed\s+Identity\s*'{1,2}\s*\)\s*,?)", re.IGNORECASE)
+_EMPTY_WITH = re.compile(r"\bWITH\s*\(\s*\)", re.IGNORECASE)
 
 
 @dataclass
@@ -143,6 +158,55 @@ def _storage_options(sql: str, notes: List[str]) -> str:
     return _apply(sql, edits)
 
 
+def _mask_comments(sql: str) -> str:
+    """The text with only its comments blanked: rules that must also see dynamic SQL inside strings use it."""
+    out = list(sql)
+    i, n = 0, len(sql)
+    while i < n:
+        if sql.startswith("--", i):
+            end = sql.find("\n", i)
+            end = n if end < 0 else end
+        elif sql.startswith("/*", i):
+            end = sql.find("*/", i + 2)
+            end = n if end < 0 else end + 2
+        elif sql[i] == "'":  # skip a string whole, so a "--" inside it is not taken for a comment
+            j = i + 1
+            while j < n and not (sql[j] == "'" and not sql.startswith("''", j)):
+                j += 2 if sql.startswith("''", j) else 1
+            i = j + 1
+            continue
+        else:
+            i += 1
+            continue
+        for k in range(i, end):
+            if out[k] not in "\r\n":
+                out[k] = " "
+        i = end
+    return "".join(out)
+
+
+def _copy_credential(sql: str, notes: List[str]) -> str:
+    masked = _mask_comments(sql)
+    edits = [(m.start(), m.end(), "") for m in _MI_CREDENTIAL.finditer(masked)]
+    if not edits:
+        return sql
+    text = _apply(sql, edits)
+    text = _EMPTY_WITH.sub("", text)
+    notes.append(f"Removed CREDENTIAL = (IDENTITY = 'Managed Identity') from {len(edits)} COPY statement{'s' if len(edits) > 1 else ''}: "
+                 "a Fabric Warehouse reads the storage as the Microsoft Entra identity that runs the statement, so that identity "
+                 "(the user, or the identity running the pipeline) needs Storage Blob Data Reader on the storage account.")
+    return text
+
+
+def _identity_insert(sql: str, notes: List[str]) -> str:
+    masked = _mask_comments(sql)
+    edits = [(m.start(), m.end(), "/* removed for Fabric: SET IDENTITY_INSERT (the table has no IDENTITY in Fabric) */")
+             for m in _IDENTITY_INSERT.finditer(masked)]
+    if edits:
+        notes.append("Removed SET IDENTITY_INSERT: the table was migrated without IDENTITY, so the explicit key values insert as they are.")
+    return _apply(sql, edits)
+
+
 def _apply(sql: str, edits: List[Tuple[int, int, str]]) -> str:
     for start, end, replacement in sorted(edits, reverse=True):
         sql = sql[:start] + replacement + sql[end:]
@@ -200,6 +264,23 @@ def _workload(sql: str, notes: List[str]) -> str:
     return _apply(sql, edits)
 
 
+_CREATE_MODULE = re.compile(r"\bCREATE\s+(?!OR\s+ALTER\b)(PROC(?:EDURE)?|VIEW|FUNCTION)\b", re.IGNORECASE)
+_CREATE_OR_ALTER = re.compile(r"\bCREATE\s+OR\s+ALTER\b", re.IGNORECASE)
+
+
+def create_or_alter(sql: str) -> Optional[str]:
+    """The definition as ``CREATE OR ALTER``, to update a view or procedure in place. None if it has no CREATE.
+
+    Updating in place keeps the old object if the new text is rejected, unlike dropping it first."""
+    masked = _mask(sql)
+    if _CREATE_OR_ALTER.search(masked):
+        return sql
+    m = _CREATE_MODULE.search(masked)
+    if not m:
+        return None
+    return sql[:m.start()] + "CREATE OR ALTER " + sql[m.start(1):]
+
+
 def rewrite(sql: Optional[str]) -> Rewrite:
     """Apply every rule. The notes say what changed; an unchanged text has no notes."""
     if not sql:
@@ -209,4 +290,6 @@ def rewrite(sql: Optional[str]) -> Rewrite:
     text = _renames(text, notes)
     text = _isolation(text, notes)
     text = _workload(text, notes)
+    text = _copy_credential(text, notes)
+    text = _identity_insert(text, notes)
     return Rewrite(text, notes)

@@ -2,6 +2,9 @@ import { fireEvent, render, screen, waitFor, within } from "@testing-library/rea
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../App";
+import { TransformPanel } from "../components/discovery/TransformPanel";
+import { TransformQueue } from "../components/discovery/TransformQueue";
+import { AppStateProvider } from "../state/AppState";
 import { buildReport } from "../components/journey/report";
 import { buildTree } from "../components/journey/WorkspaceExplorer";
 import { mockApi, resetDemo } from "../mock/mockApi";
@@ -1020,4 +1023,174 @@ describe("report", () => {
     expect(csv).toContain('"Validation","dbo.Fact","Tables","8 columns","8 columns","MATCH","Same columns and types."');
     expect(csv.split("\r\n")[0]).toBe('"Migration report","Finance"');
   });
+});
+
+describe("LLM-assisted transformation (demo)", () => {
+  it("generates a draft, rejects types it cannot convert, and uses only what is accepted", async () => {
+    await discovered();
+    const procs = await mockApi.getResults({ ...Q, types: ["Stored Procedure"] });
+    const id = procs.items[0].id;
+    expect((await mockApi.getTransform(id)).state).toBe("none");
+    expect((await mockApi.getTransformPrompt(id)).prompt).toContain("Project requirements");
+    const links = await mockApi.getResults({ ...Q, types: ["Linked Service"] });
+    const queued = await mockApi.generateTransforms([id, links.items[0].id]);
+    expect(queued.map((q) => q.state)).toEqual(["queued", "rejected"]);
+    await waitFor(async () => expect((await mockApi.getTransform(id)).state).toBe("draft"), { timeout: 4000 });
+    const draft = (await mockApi.getTransform(id)).draft!;
+    expect(draft.code).toContain("UPDATE");
+    const accepted = await mockApi.acceptTransform(id, `${draft.code}\n-- reviewed`);
+    expect(accepted.state).toBe("accepted");
+    expect(accepted.accepted?.edited).toBe(true);
+    expect((await mockApi.discardTransform(id, "all")).state).toBe("none");
+  }, 20000);
+
+  it("shows source, rules and draft side by side and accepts from the panel", async () => {
+    await discovered();
+    const views = await mockApi.getResults({ ...Q, types: ["View"] });
+    const object = await mockApi.getObject(views.items[0].id);
+    const user = userEvent.setup();
+    render(<AppStateProvider><TransformPanel object={object} /></AppStateProvider>);
+    const generate = await screen.findByRole("button", { name: /Generate with LLM/ });
+    await user.click(screen.getByRole("tab", { name: "Synapse source" }));
+    expect(screen.getByLabelText("Synapse source").textContent).toContain("NOLOCK");
+    await user.click(screen.getByRole("tab", { name: "LLM draft" }));
+    await user.click(generate);
+    const editor = await screen.findByLabelText("LLM draft (editable)", {}, { timeout: 6000 });
+    expect((editor as HTMLTextAreaElement).value).not.toContain("NOLOCK)");
+    expect(screen.getByText(/Model confidence/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Accept draft" }));
+    expect(await screen.findByText("Accepted: used by the next run")).toBeInTheDocument();
+  }, 20000);
+});
+
+describe("LLM transformation queue (demo)", () => {
+  it("lists what the rules cannot convert first and generates drafts for a selection", async () => {
+    await discovered();
+    const before = await mockApi.listTransformCandidates();
+    expect(before.summary.needsWork).toBeGreaterThan(0);
+    const firstClean = before.items.findIndex((i) => !i.problems.length);
+    expect(before.items.slice(0, firstClean).every((i) => i.problems.length > 0)).toBe(true);
+
+    const user = userEvent.setup();
+    render(<AppStateProvider><TransformQueue /></AppStateProvider>);
+    const table = await screen.findByRole("table", { name: "Objects a draft can be made for" }, { timeout: 5000 });
+    const boxes = within(table).getAllByRole("checkbox").slice(1, 3);
+    for (const b of boxes) await user.click(b);
+    await user.click(screen.getByRole("button", { name: "Generate drafts (2)" }));
+    await user.click(await screen.findByRole("button", { name: "Generate drafts" }));
+    expect(await screen.findByText("2 drafts queued.")).toBeInTheDocument();
+    await waitFor(async () => expect((await mockApi.listTransformCandidates()).summary.drafts).toBe(2), { timeout: 5000 });
+    await user.click(screen.getByRole("tab", { name: /Drafts to review/ }));
+    await waitFor(() => expect(within(screen.getByRole("table", { name: "Objects a draft can be made for" })).getAllByText("Draft to review")).toHaveLength(2), { timeout: 6000 });
+  }, 30000);
+
+  it("edits and saves the project requirements every prompt carries", async () => {
+    await discovered();
+    const user = userEvent.setup();
+    render(<AppStateProvider><TransformQueue /></AppStateProvider>);
+    await user.click(await screen.findByText("Project requirements (sent with every prompt)", {}, { timeout: 5000 }));
+    const editor = await screen.findByLabelText("Project requirements");
+    await user.clear(editor);
+    fireEvent.change(editor, { target: { value: "- Use the fin_ schema prefix." } });
+    await user.click(screen.getByRole("button", { name: "Save requirements" }));
+    expect(await screen.findByText("Saved. The next draft uses these requirements.")).toBeInTheDocument();
+    expect((await mockApi.getProjectRequirements()).text).toBe("- Use the fin_ schema prefix.");
+  }, 20000);
+});
+
+describe("LLM transforms in a run (demo)", () => {
+  it("marks the objects created from an accepted transform", async () => {
+    await discovered();
+    const procs = await mockApi.getResults({ ...Q, types: ["Stored Procedure"] });
+    const [a, b] = procs.items;
+    await mockApi.generateTransforms([a.id]);
+    await waitFor(async () => expect((await mockApi.getTransform(a.id)).state).toBe("draft"), { timeout: 4000 });
+    await mockApi.acceptTransform(a.id);
+    await mockApi.authenticateFabric(FABRIC);
+    await mockApi.testFabric(FABRIC);
+    await mockApi.startExecution([{ id: a.id, wave: 1 }, { id: b.id, wave: 1 }]);
+    const items = (await mockApi.getExecution()).items;
+    expect(items.find((i) => i.id === a.id)?.llm?.edited).toBe(false);
+    expect(items.find((i) => i.id === b.id)?.llm).toBeNull();
+  }, 20000);
+});
+
+describe("validate step: runs in Fabric (demo)", () => {
+  it("checks that objects run, lets the operator ask for real runs, and lets a failed run decide the verdict", async () => {
+    await discovered();
+    await mockApi.authenticateFabric(FABRIC);
+    await mockApi.testFabric(FABRIC);
+    const items = await seedPlan(6);
+    await mockApi.startExecution(items);
+    await new Promise((r) => setTimeout(r, 4000));
+    unlockTo("validate");
+    const user = userEvent.setup();
+    go("/migration?step=validate");
+    expect(await stepHeading("Validate")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /Check that SQL objects work/ })).toBeChecked();
+    expect(screen.queryByText("These are real runs")).toBeNull();
+    await user.click(screen.getByRole("checkbox", { name: "Run notebooks now" }));
+    expect(screen.getByText("These are real runs")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Run validation \(with runs\)/ }));
+    const table = await screen.findByRole("table", { name: "Validation results" }, { timeout: 8000 });
+    expect(within(table).getByRole("columnheader", { name: "Runs in Fabric" })).toBeInTheDocument();
+    expect(within(table).getAllByText("Ran now in Fabric").length).toBeGreaterThan(0);
+  }, 30000);
+
+  it("turns a failed run into a mismatch and a never-run object into a review", async () => {
+    await discovered();
+    await mockApi.authenticateFabric(FABRIC);
+    await mockApi.testFabric(FABRIC);
+    const graph = await mockApi.getDependencies();
+    const nbs = graph.nodes.filter((n) => n.type === "Notebook").slice(0, 15).map((n) => ({ id: n.id, wave: n.wave }));
+    await mockApi.startExecution(nbs);
+    await waitFor(async () => expect((await mockApi.getExecution()).pending).toBe(0), { timeout: 40000 });
+    const rows = await mockApi.runValidation(nbs, undefined, { probe: true, run: [], timeoutMinutes: 30 });
+    const withRuns = rows.filter((r) => r.runtime);
+    expect(withRuns.length).toBeGreaterThan(0);
+    for (const r of withRuns) {
+      if (r.runtime!.status === "FAIL") expect(r.status).toBe("MISMATCH");
+      if (r.runtime!.status === "NOT RUN") expect(r.status).not.toBe("MATCH");
+    }
+    expect(withRuns.some((r) => r.runtime!.status === "NOT RUN")).toBe(true);
+  }, 60000);
+});
+
+describe("updating objects already in Fabric", () => {
+  it("is off by default, warns when switched on, and is kept with the project's options", async () => {
+    resetDemo();
+    await seedPlan();
+    unlockTo("plan");
+    const user = userEvent.setup();
+    const openStages = async () => user.click(await screen.findByRole("tab", { name: "Stages & credentials" }, { timeout: 5000 }));
+    const first = go("/migration?step=plan");
+    await openStages();
+    const box = await screen.findByRole("checkbox", { name: /Update objects that are already in Fabric/ });
+    expect(box).not.toBeChecked();
+    expect(screen.queryByText("Changes made in Fabric will be overwritten")).toBeNull();
+    await user.click(box);
+    expect(screen.getByText("Changes made in Fabric will be overwritten")).toBeInTheDocument();
+    first.unmount();
+    go("/migration?step=plan");
+    await openStages();
+    expect(await screen.findByRole("checkbox", { name: /Update objects that are already in Fabric/ })).toBeChecked();
+  }, 25000);
+});
+
+describe("external storage routed through OneLake", () => {
+  it("proposes the storage the code reads, routes it by default, and warns when it is not routed", async () => {
+    resetDemo();
+    await discovered();
+    await seedPlan();
+    unlockTo("plan");
+    const user = userEvent.setup();
+    go("/migration?step=plan");
+    await user.click(await screen.findByRole("tab", { name: "Stages & credentials" }, { timeout: 5000 }));
+    const box = await screen.findByRole("checkbox", { name: /Route raw on demorawstorage/ }, { timeout: 5000 });
+    await waitFor(() => expect(box).toBeChecked());
+    expect(screen.getByText("LS_ADLS_demorawstorage")).toBeInTheDocument();
+    await user.click(box);
+    expect(await screen.findByText("Not routed")).toBeInTheDocument();
+    expect(JSON.parse(localStorage.getItem("ma.options.mock.default") ?? "null")?.storageRoutes ?? []).toEqual([]);
+  }, 30000);
 });

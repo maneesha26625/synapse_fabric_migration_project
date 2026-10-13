@@ -28,6 +28,7 @@ generated sample data, with no Azure, Synapse or Fabric needed.
 [Discovery engine](#discovery-engine) ·
 [Connection architecture](#connection-architecture) ·
 [Migration](#migration) ·
+[LLM-assisted transformation](#llm-assisted-transformation) ·
 [Tests](#tests)
 
 ## What it does
@@ -42,14 +43,21 @@ before the next one opens.
 | 3 | **Waves** | Builds the dependency graph and groups objects into waves, so nothing is created before what it depends on. | Nothing |
 | 4 | **Plan** | Chooses what moves. A deterministic planner gives each object a strategy, lists risks by severity, estimates effort and scores readiness (0–100). Stages, their options and any credentials are set here. | Nothing |
 | 5 | **Migrate** | Pre-run checks, then the run, wave by wave: Warehouse and schemas, empty tables, views, procedures, data pipelines that load the rows, notebooks, connections, pipelines, Spark, jobs, scripts, schedules and shortcuts. Safe to re-run; Retry failed re-runs only the failures. | **Fabric only** |
-| 6 | **Validate** | Compares Synapse with Fabric, object by object: columns and types, row counts, definitions, notebook cells, pipeline activities. | Nothing |
+| 6 | **Validate** | Compares Synapse with Fabric, object by object: columns and types, row counts, definitions, notebook cells, pipeline activities. It also checks each object **runs in Fabric**: tables and views are queried, procedures compiled, and pipelines, notebooks and Spark jobs judged by their latest run (or run now, on request). | Nothing, unless you ask it to run items or procedures (procedures are rolled back) |
 
 ## Principles
 
 * **Synapse is never changed.** Every Azure call against the source is a GET,
   and every SQL statement is one of a fixed set of named SELECT queries.
 * **Only the Migrate step writes, and only to Fabric.** An object that already
-  exists in Fabric is skipped, never overwritten.
+  exists in Fabric is skipped, unless you tick **Update objects that are already
+  in Fabric** (Plan → Stages & credentials) to redeploy fixes. Views and
+  procedures are then updated with `CREATE OR ALTER`, so the old version stays
+  if the new one is rejected. Notebooks, pipelines, SQL scripts and Spark jobs
+  get their new definition and keep their id. Tables are never replaced. The one exception is
+  Validate: when you tick it, it runs migrated pipelines, notebooks or Spark
+  jobs in Fabric to prove they work. It runs procedures only inside a
+  transaction that is rolled back.
 * **Structure is migrated; data moves through Fabric data pipelines.** Rows go
   from the Synapse pool to the Fabric Warehouse inside Fabric, never through
   the accelerator.
@@ -58,8 +66,10 @@ before the next one opens.
   no password or token field for signing in. Credentials that Synapse will not
   give up (for linked services and the data-load connection) are typed into the
   Plan step, sent once, held in memory, and never stored, logged or returned.
-* **Deterministic.** The same workspace and the same plan give the same
-  result. Parsers and rules do the work; no language model is in the path.
+* **Deterministic by default.** The same workspace and the same plan give the same
+  result. Parsers and rules do the work. A language model is used only when a person
+  asks for a draft of one object ([LLM-assisted transformation](#llm-assisted-transformation)),
+  and a run uses the result only after that person has reviewed and accepted it.
 * **Honest about limits.** Anything that cannot be converted is reported, with
   the reason, as a risk before the run and as *left for a person* after it.
 
@@ -78,10 +88,27 @@ az login
 ```
 
 `start-ui.ps1` starts the API on port 8001 and the UI dev server on port 5173,
-and opens the browser. To start them yourself:
+and opens the browser. **Run it once; you don't restart anything by hand after that:**
+
+* The API runs with `--reload` and restarts itself within a second when code under `src/` changes.
+  The UI dev server reloads the page itself.
+* The last discovery and the Fabric target come back after every restart. They're saved in
+  `.accelerator/state`, which is git-ignored; set `MIGRATION_STATE=off` to keep nothing. Tokens,
+  passwords and credentials are never saved. The Synapse sign-in isn't kept either, so after a
+  restart sign in to Synapse again only to run discovery again, load table data, or count rows in Validate.
+* Running `start-ui.ps1` again is safe: what is already running is reused, and the API refuses to
+  start a second copy on the same port.
+
+**Keep the API running in the background (recommended).** `.\install-api-service.ps1` creates a
+Windows scheduled task, `MigrationAcceleratorAPI`, that runs the API hidden with auto-reload. It
+starts it now and every time you sign in to Windows, and no window has to stay open. It needs no
+administrator rights. The log is in `.accelerator\api.log`, and `.\install-api-service.ps1 -Remove`
+stops and removes it. With the task installed, `start-ui.ps1` only opens the UI.
+
+To start them yourself:
 
 ```
-python -m discovery_agent.api              # API on http://127.0.0.1:8001
+python -m discovery_agent.api --reload     # API on http://127.0.0.1:8001, restarts when the code changes
 cd frontend && npm install && npm run dev  # UI on http://localhost:5173, proxies /api to :8001
 ```
 
@@ -265,6 +292,8 @@ Live mode that is `realApi.ts` and the local API; in Demo mode it is
 | `src/discovery_agent/mapping/` | `synapse_fabric_mapping.py` (Fabric target, classification and workstream for each object type and pipeline activity) and `waves.py` (dependency waves). |
 | `src/discovery_agent/migration/` | The planner, the ten stages, the T-SQL rules, Fabric REST calls, data pipelines and validation. See [Migration](#migration). |
 | `src/discovery_agent/api/` | The local HTTP API: `service.py` (connections, discovery, results), `fabric.py` (Fabric sign-in), `migration.py` (plan, run, validate), `mapping.py`, `server.py`. |
+| `prompts/transform/` | The prompt templates for LLM-assisted transformation: `base.md`, one file per object type, and `project.md` for your project's own rules. |
+| `transforms/` | Drafts and accepted LLM-assisted transforms, one JSON file per object (created on first use; git-ignored, because it holds the client's code). |
 | `tests/` | The backend test suite; runs offline. |
 | `docs/` | [discovery.md](docs/discovery.md), [p0_source_strategy.md](docs/p0_source_strategy.md), [unified_discovery_record.md](docs/unified_discovery_record.md), and the *Synapse to Fabric Transformation Guide* (Word): what changes between Synapse and Fabric, what is automated and what needs a person. |
 | `input/` | Where Git repositories are cloned for discovery (gitignored). |
@@ -281,7 +310,8 @@ All under `/api`, JSON in and out. Nothing returns a token or a secret.
 | Discovery | `POST /discovery/start` · `GET /discovery/status` · `GET /discovery/results` (filter, sort, page) · `GET /discovery/results/<id>` · `GET /discovery/export` · `DELETE /discovery` (forget the results; refused while discovery runs) |
 | Mapping and waves | `GET /mapping/components` · `GET /dependencies` |
 | Fabric connection | `GET /fabric/connection` · `POST /fabric/authenticate` · `POST /fabric/workspaces` · `POST /fabric/test` · `DELETE /fabric/connection` |
-| Migration | `GET /migration/capabilities` · `POST /migration/plan` · `POST /migration/start` · `GET /migration/run` · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: forget the run's record, refused while it is working) · `POST /migration/validate` |
+| LLM transformation | `GET /transform/settings` · `GET /transform` · `GET /transform/objects/<id>` · `GET /transform/prompt/<id>` · `POST /transform/generate` (`ids`) · `POST /transform/accept` (`id`, optional edited `code`) · `POST /transform/discard` (`id`, `scope`: `draft` or `all`) · `GET /transform/candidates` · `GET`/`POST /transform/project` |
+| Migration | `GET /migration/capabilities` · `POST /migration/plan` · `POST /migration/start` · `GET /migration/run` · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: forget the run's record, refused while it is working) · `POST /migration/validate` (starts it in the background) · `GET /migration/validation` |
 
 ## What is automated, manual, or coming
 
@@ -300,8 +330,38 @@ OneLake shortcuts.
 services of other types; event and tumbling-window triggers and unusual
 recurrences; pipelines containing an activity with no Fabric equivalent (for
 example mapping data flows); .NET notebooks; Spark libraries; materialized
-views, `sys.pdw_*` system views and `COPY INTO` with Synapse's managed
-identity; security, networking and workload management.
+views and `sys.pdw_*` system views; security, networking and workload
+management; SQL scripts and pipelines written for Synapse's **serverless** pool,
+which Plan reports as `SERVERLESS_SQL` (the Lakehouse shortcut and its SQL
+endpoint replace them; leave them out of the plan).
+
+**Storage read directly by code is routed through OneLake.** Code that reads
+or writes `abfss://…@<account>.dfs.core.windows.net` or
+`https://<account>.dfs/.blob.core.windows.net` ran in Synapse as the
+workspace's managed identity. In Fabric it runs as the signed-in user. A storage
+account in another Microsoft Entra tenant than Fabric rejects that user whatever
+roles it has (401 / "Cannot find the CREDENTIAL"), but a Fabric connection with
+an account key or SAS still reaches it. So Plan → Stages & credentials →
+**External storage** lists each storage location the code uses, with the
+connection that can reach it, ticked by default. A routed location gets a
+OneLake shortcut named after its container under `Files` in the run's Lakehouse,
+and every path to it is rewritten to go through that shortcut:
+
+* notebooks, SQL scripts, views and procedures: literal paths, f-string paths
+  (`f"abfss://{container}@{account}.dfs.core.windows.net/…"`), and T-SQL that
+  builds the host (`'https://' + @Account + '.dfs.core.windows.net/'`);
+* Spark job definitions: the job runs a copy of its main file, saved in the
+  Lakehouse under `Files/_migrated_jobs/` with the paths in its code rewritten.
+  The original stays where it is, for Synapse.
+
+Plan reports each object as `STORAGE_ROUTED`, or `EXTERNAL_STORAGE` when it still
+reads storage directly. Pipelines that run such an object are reported as
+`DEPENDS_ON_STORAGE`.
+
+**Converted by the T-SQL rules**, also inside dynamic SQL: `COPY INTO ...
+CREDENTIAL = (IDENTITY = 'Managed Identity')` loses the credential, so it reads
+as the identity that runs it, and `SET IDENTITY_INSERT` is removed, because
+tables arrive without IDENTITY.
 
 **Shown in the UI, not built yet:** sources and destinations other than
 Synapse and Fabric; the migration assistant's conversation.
@@ -891,6 +951,22 @@ sides without writing to either. Each row says what it saw on each side:
 A check that could not run is a REVIEW with the reason, never a match. Row
 counts need the Synapse connection; without it they are reported as unread.
 
+**Does it run in Fabric?** Arriving is not working, so each object Fabric can run
+is also checked there (`migration/runtime_checks.py`). The result is shown in the
+**Runs in Fabric** column, and it decides the verdict: a failure is a **MISMATCH**,
+and an object that matches but has never run is a **REVIEW**, because nothing
+proves it works yet.
+
+| Object | Checked by default (read-only) | Only when ticked in Validate |
+|---|---|---|
+| Tables, views | Queried in the Warehouse (`SELECT TOP (1) *`). | — |
+| Stored procedures | Compiled without running (`sp_describe_first_result_set`). One using temporary tables can't be compiled ahead and is reported as not checked. | Executed inside a transaction that is rolled back, if it has no required parameters. |
+| Pipelines, notebooks, SQL-script notebooks, Spark job definitions | Their latest run in Fabric's run history: succeeded, failed (with Fabric's reason), or never run. | **Run now in Fabric** and followed to the end, three at a time, up to the time limit you set. These are real runs: they read their sources and write their targets. |
+
+Validation runs in the background: `POST /api/migration/validate` (with
+`runtime: {probe, run: ["pipeline", "notebook", "script", "sparkjob", "procedure"], timeoutMinutes}`)
+starts it, and `GET /api/migration/validation` reports its progress and then its rows.
+
 API: `GET /api/migration/capabilities`, `POST /api/migration/plan`,
 `POST /api/migration/validate`, `POST /api/migration/start` (`{items, options: {scope, stages, dataMode,
 dataRun, collation, stopOnFailure}, credentials}`), `GET /api/migration/run` and
@@ -899,6 +975,73 @@ dataRun, collation, stopOnFailure}, credentials}`), `GET /api/migration/run` and
 `capabilities.py`, `planner.py`, `preflight.py`, `datacopy.py`, `datapipeline.py`, `tsql_rules.py`,
 `fabric_connections.py`, `pipelines.py`, `jobs.py`, `notebooks.py`,
 `environments.py`, `warehouse_ddl.py`, `fabric_rest.py`) and `api/migration.py`.
+
+## LLM-assisted transformation
+
+Some objects can't be converted by the rules alone: a procedure using `sys.pdw_*` or `MERGE`, a table
+with a `sql_variant` column, a pipeline with a mapping data flow, a notebook using `TokenLibrary`, or a
+.NET notebook. For these, you can ask Claude for a draft and review it before anything is deployed.
+
+**How it is called.** The API runs the **Claude Code CLI** on its own machine in headless mode
+(`claude -p --output-format json --json-schema ...`). No API key is involved: it uses the account the
+CLI is already signed in with (run `claude` once in a terminal to sign in). The CLI runs with every
+tool switched off, no MCP servers and no saved session, from an empty temporary folder, so it can only
+answer. It can't read files, run commands or reach Synapse or Fabric.
+
+**Finding them.** **Assess → LLM transforms** runs the rules over every object a draft can be made for
+(Stored Procedures, Views, Tables, SQL Scripts, Pipelines, Notebooks). It lists the ones the rules can't
+convert first, each with the reason, and shows how many drafts are waiting for review or have been
+accepted. Tick several and choose **Generate drafts**. They run a few at a time in the background, and
+the list updates as they finish. Click a name to review that object. The **Project requirements** editor
+on the same tab changes `prompts/transform/project.md` for everyone.
+
+**Reviewing one object.** Open an object and choose the **LLM transform** tab (or **Convert with LLM**
+on its overview, or click it in the list above). Then:
+
+1. **Preview prompt** shows exactly what will be sent.
+2. **Generate with LLM** queues a draft. It usually takes 20–90 seconds, and you can close the panel meanwhile.
+3. Compare the **LLM draft** with the **Synapse source** and the **Rule-based output**. Read the automatic
+   checks, the model's notes, its confidence, and anything it left for a person. You can edit the draft in place.
+4. **Accept** it. Edited code is checked again first, and a draft with a failing check can't be accepted.
+   **Discard draft** throws the draft away; **Go back to the rules** deletes the accepted version too.
+
+**In a run.** The Plan and Migrate steps use an accepted transform instead of the rule-based conversion,
+but only while the object's source is unchanged since the draft was made. Each transform is pinned to a
+hash of the source; if the source changes, the run falls back to the rules and says so in the log.
+Accepted SQL still goes through the T-SQL rules, which are safe to repeat. An accepted pipeline is still a
+*Synapse-shaped* pipeline, and the usual converter embeds its datasets and resolves the Fabric ids. The
+run log marks every object created this way.
+
+**Changing the prompt for a project.** The prompt is put together on the server from Markdown files in
+`prompts/transform/`:
+
+| File | What it is for |
+|---|---|
+| `base.md` | The frame of every prompt: the object, its source, the rule output, what discovery found, its dependencies (with the column types of the tables it reads), and the answer format. |
+| `stored_procedure.md`, `view.md`, `table.md`, `sql_script.md`, `pipeline.md`, `notebook.md` | How to convert that type of object. A notebook is sent and returned as its cells (`{"language", "cells"}`), and the usual notebook conversion still runs on the result. |
+| `project.md` | **Your project's requirements**: naming, target names, coding standards, things to avoid. They take priority over the general guidance. |
+
+The files support `{{placeholders}}` (`object.name`, `object.schema`, `object.type`, `target.warehouse`,
+`target.workspace`, `target.component`, `notebook.language`), `{{#if name}} ... {{else}} ... {{/if}}` blocks, and
+`<!-- comments -->`, which are removed before sending. Edits take effect on the next draft; no restart is needed.
+
+**Settings** (environment variables for the API process):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `MIGRATION_LLM` | `on` | `off` stops new drafts from being generated. Already-accepted transforms are still used. |
+| `MIGRATION_LLM_MODEL` | Claude Code's default | Passed to `claude --model` (for example `sonnet` or `opus`). |
+| `MIGRATION_LLM_TIMEOUT` | `180` | Seconds allowed for one draft. |
+| `MIGRATION_LLM_WORKERS` | `2` | Drafts generated at the same time. |
+| `CLAUDE_CLI` | `claude` on `PATH` | Path to the CLI. |
+| `MIGRATION_PROMPTS_DIR` | `prompts/transform` | Where the templates are read from. |
+| `MIGRATION_TRANSFORMS_DIR` | `transforms` | Where drafts and accepted transforms are kept. |
+
+**What leaves the machine.** The object's definition, its rule output, the names and column types of
+what it depends on, and your `project.md` are sent to Anthropic through Claude Code. No credential,
+connection string or table data is ever sent. If this client's code must not leave the network, set `MIGRATION_LLM=off`.
+
+**Demo mode** shows the whole flow with canned drafts, and no model is called.
 
 ## Tests
 

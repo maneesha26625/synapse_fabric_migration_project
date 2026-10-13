@@ -1,8 +1,9 @@
 import { CircleAlert, KeyRound } from "lucide-react";
 import { useMemo } from "react";
-import { Button, Card, Collapsible, StatusBadge, type Tone } from "../shared/Shared";
+import { Banner, Button, Card, Collapsible, StatusBadge, type Tone } from "../shared/Shared";
 import { useMigration } from "../../state/MigrationState";
 import { DataFiltersPanel } from "./DataFiltersPanel";
+import { StorageRoutesPanel } from "./StorageRoutesPanel";
 import type { ExecItem, LinkedServiceInput, RunOptions, StageDef } from "../../types";
 
 const SECRET_FIELDS = new Set(["password", "clientSecret", "key", "token"]);
@@ -174,6 +175,7 @@ export function StagesPanel() {
       </div>
 
       {enabled.has("data") && filterable.length > 0 && <DataFiltersPanel tables={filterable} />}
+      <StorageRoutesPanel />
 
       <div className="stage-run-options">
         <div className="auth-cards" style={{ gridTemplateColumns: "repeat(2, minmax(0, 1fr))" }} role="radiogroup" aria-label="Run scope">
@@ -190,6 +192,18 @@ export function StagesPanel() {
           <input type="checkbox" checked={options.stopOnFailure} onChange={(e) => setOptions({ stopOnFailure: e.target.checked })} />
           <span><strong>Stop at the end of a wave that has failures</strong><span className="muted"> — so a failed table never lets the views that read it start. Off: every object is attempted and failures are reported.</span></span>
         </label>
+        <label className="check-row">
+          <input type="checkbox" checked={options.existing === "update"} onChange={(e) => setOptions({ existing: e.target.checked ? "update" : "skip" })} />
+          <span><strong>Update objects that are already in Fabric</strong><span className="muted"> — to redeploy fixes or accepted LLM transforms. Views and
+            procedures are updated with CREATE OR ALTER (the old one stays if the new one is rejected); notebooks, pipelines, SQL scripts and Spark
+            jobs get the new definition and keep their id, so whatever calls them still works. Tables are never replaced: they hold data.
+            Off: anything already there is left unchanged.</span></span>
+        </label>
+        {options.existing === "update" && (
+          <Banner tone="warning" title="Changes made in Fabric will be overwritten">
+            Any edit someone made in Fabric to a view, procedure, notebook, pipeline, SQL script or Spark job in this plan is replaced by the migrated version.
+          </Banner>
+        )}
       </div>
     </Card>
   );

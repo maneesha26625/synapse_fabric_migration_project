@@ -7,9 +7,12 @@ what is predicted here is what the run does. Nothing here connects anywhere.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import re
 from typing import Any, Dict, List, Optional, Sequence, Set
 
+from discovery_agent.migration import storage_remap
 from discovery_agent.migration import datacopy, datafilter, environments, fabric_connections, jobs, notebooks, pipelines, tsql_rules, warehouse_ddl
 from discovery_agent.migration.common import (
     CONNECTION, DATA, ENVIRONMENT, NOTEBOOK, PIPELINE, PROCEDURE, SCHEDULE, SCRIPT, SPARKJOB, TABLE, VIEW, Source,
@@ -170,18 +173,175 @@ _CHECKS = {TABLE: _table, VIEW: _module, PROCEDURE: _module, NOTEBOOK: _notebook
            DATA: _data, PIPELINE: _pipeline, SPARKJOB: _sparkjob, SCRIPT: _script, SCHEDULE: _schedule}
 
 
-def content_findings(sources: Sequence[Source], credential_names: Optional[Set[str]] = None, pool: str = "") -> List[Finding]:
-    """Findings for every object whose own content predicts trouble. ``pool`` is the SQL pool being migrated."""
+def content_findings(sources: Sequence[Source], credential_names: Optional[Set[str]] = None, pool: str = "",
+                     storage_routes: Optional[Sequence[Dict[str, Any]]] = None) -> List[Finding]:
+    """Findings for every object whose own content predicts trouble. ``pool`` is the SQL pool being migrated;
+    ``storage_routes`` the storage locations the run sends through OneLake shortcuts (run option ``storageRoutes``)."""
     names = credential_names or set()
+    routes = planned_routes(storage_routes)
     out: List[Finding] = []
+    direct: Set[str] = set()
     for source in sources:
         if source.kind == CONNECTION:
             out.extend(_connection(source, names, pool))
             continue
-        check = _CHECKS.get(source.kind)
-        if check is not None:
-            out.extend(check(source))
+        if source.override:
+            out.extend(_override(source))
+        else:
+            check = _CHECKS.get(source.kind)
+            if check is not None:
+                out.extend(check(source))
+        storage = _external_storage(source, routes)
+        if storage is not None:
+            out.append(storage)
+            if storage.code == "EXTERNAL_STORAGE":
+                direct.add(source.id)
+        serverless = _serverless(source)
+        if serverless is not None:
+            out.append(serverless)
+    out.extend(_depends_on_storage(sources, direct))
     return out
+
+
+#: ADLS Gen2 / Blob storage named in code: abfss://container@account.dfs..., https://account.blob..., or built from parts.
+_STORAGE_URL = re.compile(r"(?:abfss?|wasbs?)://[^@\s'\"]*@([A-Za-z0-9]+)\.(?:dfs|blob)\.core\.windows\.net"
+                          r"|https?://([A-Za-z0-9]+)\.(?:dfs|blob)\.core\.windows\.net", re.IGNORECASE)
+_STORAGE_SUFFIX = re.compile(r"\.(?:dfs|blob)\.core\.windows\.net", re.IGNORECASE)
+
+
+def code_text(source: Source) -> str:
+    """The code the run will create for an object, as text: the accepted transform, or the original."""
+    if source.override:
+        return str(source.override.get("code") or "")
+    payload = source.payload
+    if source.kind in (VIEW, PROCEDURE):
+        return str(getattr(getattr(payload, "definition", None), "text", "") or "")
+    if source.kind == SCRIPT:
+        return str(((payload or {}).get("properties") or {}).get("content", {}).get("query") or "")
+    if source.kind in (NOTEBOOK, SPARKJOB) and isinstance(payload, dict):
+        return json.dumps(payload.get("properties") or {})
+    return ""
+
+
+def planned_routes(specs: Optional[Sequence[Dict[str, Any]]]) -> storage_remap.Routes:
+    """The run option ``storageRoutes`` as routes, for predicting what the run rewrites (ids are placeholders)."""
+    return storage_remap.Routes(storage_remap.Route(str(r["account"]), str(r["container"]), "ws", "lh", str(r["container"]))
+                                for r in specs or [] if r.get("account") and r.get("container"))
+
+
+STORAGE_WHY = ("Fabric runs it as the signed-in user, not the Synapse managed identity; a storage account in another "
+               "Microsoft Entra tenant rejects that user whatever roles it has, and one in the same tenant needs a role for "
+               "it. Route the account through a OneLake shortcut (Plan > Stages & credentials > External storage), or it "
+               "fails with 401 / \"Cannot find the CREDENTIAL\".")
+
+
+def _external_storage(source: Source, routes: Optional[storage_remap.Routes] = None) -> Optional[Finding]:
+    """Code that reads or writes an Azure storage account directly, and whether the run routes it through OneLake."""
+    if source.kind not in (VIEW, PROCEDURE, SCRIPT, NOTEBOOK, SPARKJOB):
+        return None
+    text = code_text(source)
+    if not text or not _STORAGE_SUFFIX.search(text):
+        return None
+    accounts = sorted({(a or b).lower() for a, b in _STORAGE_URL.findall(text)})
+    named = ", ".join(accounts) if accounts else "a storage account built from variables"
+    main_file = source.kind == SPARKJOB and bool(re.search(r'"(?:file|executableFile)"\s*:\s*"(?:abfss?|https?)://', text))
+    if routes:
+        rewritten, notes = storage_remap.rewrite(text, routes)
+        if rewritten != text and not any(n.startswith("Not rewritten") for n in notes):
+            extra = (" Its main file is copied into the Lakehouse with the paths in its code rewritten; check that code once "
+                     "the run has copied it.") if main_file else ""
+            return Finding(source.id, "STORAGE_ROUTED", LOW,
+                           f"{source.name}: its paths on {named} will go through the OneLake shortcut.{extra}")
+    what = "Its main file is kept on" if main_file else "It reads or writes"
+    return Finding(source.id, "EXTERNAL_STORAGE", HIGH if main_file else MEDIUM,
+                   f"{source.name}: {what} {named} directly. {STORAGE_WHY}")
+
+
+def _serverless(source: Source) -> Optional[Finding]:
+    """SQL written for Synapse's serverless pool: OPENROWSET and external tables over storage have no Warehouse home."""
+    if source.kind == SCRIPT:
+        connection = (((source.payload or {}).get("properties") or {}).get("content") or {}).get("currentConnection") or {}
+        if str(connection.get("poolName") or "").lower() == "built-in":
+            return Finding(source.id, "SERVERLESS_SQL", MEDIUM,
+                           f"{source.name}: written for Synapse's serverless SQL pool. In Fabric it runs on the Warehouse; the "
+                           "Lakehouse shortcut and its SQL endpoint replace serverless queries over files. Consider leaving it out.")
+    if source.kind == PIPELINE and isinstance(source.payload, dict):
+        services = source.payload.get("linkedServices") or {}
+        on_demand = {n for n, ls in services.items()
+                     if "-ondemand." in json.dumps(((ls or {}).get("properties") or {}).get("typeProperties") or {}).lower()}
+        used = [a.get("name") for a in _activities((source.payload.get("resource") or {}).get("properties", {}).get("activities") or [])
+                if (a.get("linkedServiceName") or {}).get("referenceName") in on_demand]
+        if used:
+            return Finding(source.id, "SERVERLESS_SQL", MEDIUM,
+                           f"{source.name}: {', '.join(map(str, used[:3]))} run on Synapse's serverless SQL pool; in Fabric that SQL "
+                           "goes to the Warehouse, where OPENROWSET over storage behaves differently. Consider leaving it out.")
+    return None
+
+
+def _activities(acts: List[Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for a in acts:
+        if not isinstance(a, dict):
+            continue
+        out.append(a)
+        tp = a.get("typeProperties") or {}
+        for key in ("activities", "ifTrueActivities", "ifFalseActivities", "defaultActivities"):
+            out.extend(_activities(tp.get(key) or []))
+        for case in tp.get("cases") or []:
+            out.extend(_activities(case.get("activities") or []))
+    return out
+
+
+def _depends_on_storage(sources: Sequence[Source], direct: Set[str]) -> List[Finding]:
+    """Pipelines that run a notebook, Spark job or procedure which still reads storage directly: they fail through it."""
+    found: List[Finding] = []
+    by_kind: Dict[str, Set[str]] = {}
+    for s in sources:
+        if s.id in direct:
+            name = (s.object_name or s.name) if s.kind == PROCEDURE else s.name
+            by_kind.setdefault(s.kind, set()).add(name.lower())
+    if not by_kind:
+        return found
+    for s in sources:
+        if s.kind != PIPELINE or not isinstance(s.payload, dict):
+            continue
+        resource = s.payload.get("resource") or {}
+        names = pipelines.referenced_names(resource)
+        hits = [n for n in names["notebooks"] if n.lower() in by_kind.get(NOTEBOOK, set())]
+        hits += [n for n in names["sparkJobs"] if n.lower() in by_kind.get(SPARKJOB, set())]
+        for a in _activities((resource.get("properties") or {}).get("activities") or []):
+            proc = str((a.get("typeProperties") or {}).get("storedProcedureName") or "")
+            short = proc.replace("[", "").replace("]", "").split(".")[-1].lower()
+            if proc and short in by_kind.get(PROCEDURE, set()):
+                hits.append(proc)
+        if hits:
+            found.append(Finding(s.id, "DEPENDS_ON_STORAGE", MEDIUM,
+                                 f"{s.name} runs {', '.join(sorted(set(hits))[:4])}, which still read storage directly, so it fails "
+                                 "with them. Route their storage through a OneLake shortcut."))
+    return found
+
+def _override(source: Source) -> List[Finding]:
+    """An object with an accepted LLM-assisted transform: check the code the run will use, not the original."""
+    code = str((source.override or {}).get("code") or "")
+    found = [Finding(source.id, "LLM_TRANSFORM", LOW,
+                     f"{source.name}: uses the LLM-assisted transform accepted on {(source.override or {}).get('acceptedAt') or 'an earlier date'}, "
+                     "not the rule-based conversion.")]
+    if source.kind in (VIEW, PROCEDURE, SCRIPT):
+        found.extend(f for f in _sql_findings(source, code) if f.code != "TSQL_CONVERTED")
+    elif source.kind == PIPELINE:
+        try:
+            resource = json.loads(code)
+        except ValueError:
+            return found + [Finding(source.id, "DEFINITION_UNREADABLE", HIGH, f"{source.name}: the accepted transform is not valid JSON.")]
+        bundle = {**(source.payload if isinstance(source.payload, dict) else {}), "resource": resource}
+        found.extend(_pipeline(dataclasses.replace(source, payload=bundle, override=None)))
+    elif source.kind == NOTEBOOK:
+        try:
+            payload = notebooks.with_cells(source.payload if isinstance(source.payload, dict) else {}, code)
+        except notebooks.NotebookNotMigratable as exc:
+            return found + [Finding(source.id, "DEFINITION_UNREADABLE", HIGH, f"{source.name}: {exc}")]
+        found.extend(_notebook(dataclasses.replace(source, payload=payload, override=None)))
+    return found
 
 
 def environment_checks(fabric_state: Dict[str, Any], sql_driver: str = "", source_connected: Optional[bool] = None) -> List[Dict[str, Any]]:
