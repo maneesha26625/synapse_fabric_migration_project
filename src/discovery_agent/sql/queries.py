@@ -497,17 +497,20 @@ ROLE_MEMBERS = CatalogQuery(
 
 PERMISSIONS = CatalogQuery(
     name="permissions",
-    version=1,
+    version=2,
     description=(
         "Explicit permissions on the database (class 0), objects and columns "
         "(class 1) and schemas (class 3), with the principal they were given "
         "to and whether they were granted, granted with grant option or denied."
     ),
     # state: G granted, W granted with grant option, D denied. The securable is
-    # resolved to names here so the rows survive without object ids.
+    # resolved to names here so the rows survive without object ids. major_id is
+    # kept because a negative one is a system object (public's built-in grants on
+    # catalog views), which sys.objects does not list and no migration carries.
     sql="""
         SELECT
             pe.class AS class_code,
+            pe.major_id AS major_id,
             pe.permission_name AS permission_name,
             pe.state AS state_code,
             gp.name AS grantee_name,

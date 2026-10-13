@@ -245,16 +245,18 @@ def build_security(
                for r, m in [(_text(row.get("role_name")), _text(row.get("member_name")))] if r and m]
 
     permissions: List[SqlPermission] = []
-    unresolved = 0
+    unresolved: Dict[str, int] = {}
     for row in permission_rows:
+        if _int(row.get("class_code")) == CLASS_OBJECT and (_int(row.get("major_id")) or 0) < 0:
+            continue  # a system object (e.g. public's SELECT on catalog views): built in everywhere, Fabric included
         grantee, permission = _text(row.get("grantee_name")), _text(row.get("permission_name"))
         class_code, state = _int(row.get("class_code")), (_text(row.get("state_code")) or "").upper()
         if not grantee or not permission or class_code is None or state not in (GRANTED, GRANTED_WITH_OPTION, DENIED):
-            unresolved += 1
+            unresolved[grantee or "?"] = unresolved.get(grantee or "?", 0) + 1
             continue
         schema, obj = _text(row.get("schema_name")), _text(row.get("object_name"))
         if (class_code == CLASS_OBJECT and not (schema and obj)) or (class_code == CLASS_SCHEMA and not schema):
-            unresolved += 1  # an object or schema the principal cannot see by name
+            unresolved[grantee] = unresolved.get(grantee, 0) + 1  # an object or schema the principal cannot see by name
             continue
         permissions.append(SqlPermission(
             grantee=grantee, grantee_type=(_text(row.get("grantee_type")) or "").upper(), permission=permission.upper(),
@@ -262,9 +264,11 @@ def build_security(
             object_type=_text(row.get("object_type")), column=_text(row.get("column_name")),
         ))
     if unresolved:
+        who = ", ".join(f"{g} ({n})" for g, n in sorted(unresolved.items(), key=lambda kv: (-kv[1], kv[0]))[:5])
         own.append(ExtractionIssue(
             IssueCode.MISSING_INFORMATION,
-            f"{unresolved} permission row(s) could not be tied to a named principal and securable and were not kept",
+            f"{sum(unresolved.values())} permission row(s) name an object or schema the discovery login cannot see, so they "
+            f"were not kept; grant it VIEW DEFINITION to include them. Given to: {who}",
             f"{database}.permissions",
         ))
 

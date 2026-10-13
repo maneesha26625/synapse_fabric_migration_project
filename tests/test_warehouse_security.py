@@ -395,3 +395,19 @@ def test_a_multi_statement_function_can_be_drafted_and_an_accepted_inline_rewrit
     assert checks.blocking(still_multi) and any("multi-statement" in c["message"] for c in still_multi)
     inline = "CREATE FUNCTION sales.fnMulti () RETURNS TABLE AS RETURN SELECT 1 AS a"
     assert not checks.blocking(checks.run(FUNCTION, inline, []))
+
+
+def test_public_grants_on_system_objects_are_skipped_without_a_warning():
+    rows = [
+        {"class_code": 1, "major_id": -385, "permission_name": "SELECT", "state_code": "G", "grantee_name": "public",
+         "grantee_type": "R", "schema_name": None, "object_name": None},
+        {"class_code": 1, "major_id": 901, "permission_name": "SELECT", "state_code": "G", "grantee_name": "reporting",
+         "grantee_type": "R", "schema_name": None, "object_name": None},
+        {"class_code": 1, "major_id": 77, "permission_name": "SELECT", "state_code": "G", "grantee_name": "reporting",
+         "grantee_type": "R", "schema_name": "sales", "object_name": "Orders"},
+    ]
+    sec = build_security(DB, permission_rows=rows)
+    assert len(sec.permissions) == 1
+    (issue,) = sec.issues
+    assert issue.message.startswith("1 permission row(s)") and "Given to: reporting (1)" in issue.message
+    assert not build_security(DB, permission_rows=rows[:1]).issues

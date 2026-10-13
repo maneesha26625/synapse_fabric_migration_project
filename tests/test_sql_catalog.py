@@ -287,7 +287,7 @@ def responses(
         "functions": _response(VIEW_COLUMNS + ("type_code",), ()),
         "database_principals": _response(("principal_id", "principal_name", "type_code", "type_desc"), ()),
         "role_members": _response(("role_name", "member_name", "member_type"), ()),
-        "permissions": _response(("class_code", "permission_name", "state_code", "grantee_name", "grantee_type",
+        "permissions": _response(("class_code", "major_id", "permission_name", "state_code", "grantee_name", "grantee_type",
                                   "schema_name", "object_name", "object_type", "column_name"), ()),
         "masked_columns": _response(("schema_name", "table_name", "column_name", "masking_function"), ()),
     }
