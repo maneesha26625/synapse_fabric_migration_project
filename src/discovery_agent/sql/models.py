@@ -26,15 +26,12 @@ from discovery_agent.extractors.sql_models import DynamicSqlSite, SqlObjectRefer
 
 
 class CatalogObjectType(str, Enum):
-    """The kinds of database object discovery can enumerate.
-
-    Only TABLE is implemented. The others are declared so the enumeration
-    contract does not change shape when they land.
-    """
+    """The kinds of database object discovery can enumerate."""
 
     TABLE = "table"
     VIEW = "view"
     PROCEDURE = "procedure"
+    FUNCTION = "function"
 
 
 class DistributionPolicy(str, Enum):
@@ -659,6 +656,40 @@ class SqlProcedure(SqlModuleObject):
                 "parameters": [p.to_dict() for p in self.parameters],
             }
         )
+        return payload
+
+
+#: ``sys.objects.type`` of a user-defined T-SQL function, and what it is called.
+FUNCTION_TYPES = {
+    "FN": "scalar function",
+    "IF": "inline table-valued function",
+    "TF": "multi-statement table-valued function",
+}
+
+
+@dataclass(frozen=True)
+class SqlFunction(SqlModuleObject):
+    """One user-defined T-SQL function in a dedicated pool.
+
+    ``type_code`` is the catalog's ``type``: ``FN`` scalar, ``IF`` inline
+    table-valued, ``TF`` multi-statement table-valued. Fabric Warehouse
+    supports the first two and not the third, so the code is kept rather
+    than folded into one "function" kind.
+    """
+
+    type_code: Optional[str] = None
+
+    @property
+    def kind_label(self) -> str:
+        return FUNCTION_TYPES.get((self.type_code or "").strip().upper(), "function")
+
+    @property
+    def is_multi_statement(self) -> bool:
+        return (self.type_code or "").strip().upper() == "TF"
+
+    def to_dict(self) -> dict:
+        payload = self._base_dict()
+        payload.update({"type_code": self.type_code, "kind": self.kind_label})
         return payload
 
 

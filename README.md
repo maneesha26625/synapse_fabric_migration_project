@@ -290,7 +290,7 @@ Live mode that is `realApi.ts` and the local API; in Demo mode it is
 | `src/discovery_agent/connections/` | Authentication and every external connection. The only place that signs in. |
 | `src/discovery_agent/discovery.py`, `records.py`, `extractors/`, `sql/`, `synapse/`, `acquisition/`, `artifacts/` | The discovery engine: what the workspace, the SQL pool and the Git repository say, merged into one record per object. |
 | `src/discovery_agent/mapping/` | `synapse_fabric_mapping.py` (Fabric target, classification and workstream for each object type and pipeline activity) and `waves.py` (dependency waves). |
-| `src/discovery_agent/migration/` | The planner, the ten stages, the T-SQL rules, Fabric REST calls, data pipelines and validation. See [Migration](#migration). |
+| `src/discovery_agent/migration/` | The planner, the eleven stages, the T-SQL rules, Fabric REST calls, data pipelines and validation. See [Migration](#migration). |
 | `src/discovery_agent/api/` | The local HTTP API: `service.py` (connections, discovery, results), `fabric.py` (Fabric sign-in), `migration.py` (plan, run, validate), `mapping.py`, `server.py`. |
 | `prompts/transform/` | The prompt templates for LLM-assisted transformation: `base.md`, one file per object type, and `project.md` for your project's own rules. |
 | `transforms/` | Drafts and accepted LLM-assisted transforms, one JSON file per object (created on first use; git-ignored, because it holds the client's code). |
@@ -316,8 +316,13 @@ All under `/api`, JSON in and out. Nothing returns a token or a secret.
 ## What is automated, manual, or coming
 
 **Automated by a migration run:** Warehouse (one per SQL pool) and schemas;
-tables as empty structures with types mapped and keys recreated `NOT
-ENFORCED`; views and stored procedures after the T-SQL rules; table data
+tables as empty structures with types mapped, keys recreated `NOT
+ENFORCED`, **IDENTITY kept** (as `bigint IDENTITY`, existing key values loaded
+with `IDENTITY_INSERT`, then reseeded) and **dynamic data masks** in the
+`CREATE TABLE`; scalar and inline table-valued **functions**, views and stored
+procedures after the T-SQL rules; database **roles, role members and GRANT /
+DENY permissions** (object, column, schema and database level) for roles and
+Microsoft Entra users; table data
 through per-wave Fabric data pipelines with row counts compared; custom Spark
 pools and Environments; notebooks with `mssparkutils` and Synapse connector
 calls rewritten; linked services as Fabric connections (SQL, ADLS Gen2, Blob)
@@ -330,8 +335,11 @@ OneLake shortcuts.
 services of other types; event and tumbling-window triggers and unusual
 recurrences; pipelines containing an activity with no Fabric equivalent (for
 example mapping data flows); .NET notebooks; Spark libraries; materialized
-views and `sys.pdw_*` system views; security, networking and workload
-management; SQL scripts and pipelines written for Synapse's **serverless** pool,
+views and `sys.pdw_*` system views; multi-statement table-valued functions
+(Fabric does not support them); **SQL-authenticated users** (Fabric has no SQL
+authentication: Plan lists the Microsoft Entra principal to choose and the
+grants to give it); resource-class roles, networking and workload
+management; lake databases (not discovered yet); SQL scripts and pipelines written for Synapse's **serverless** pool,
 which Plan reports as `SERVERLESS_SQL` (the Lakehouse shortcut and its SQL
 endpoint replace them; leave them out of the plan).
 
@@ -360,8 +368,9 @@ reads storage directly. Pipelines that run such an object are reported as
 
 **Converted by the T-SQL rules**, also inside dynamic SQL: `COPY INTO ...
 CREDENTIAL = (IDENTITY = 'Managed Identity')` loses the credential, so it reads
-as the identity that runs it, and `SET IDENTITY_INSERT` is removed, because
-tables arrive without IDENTITY.
+as the identity that runs it. `SET IDENTITY_INSERT` is kept, because tables keep
+IDENTITY; it is removed only for a Warehouse table that has none (one created
+before IDENTITY was kept), where Fabric would reject it.
 
 **Shown in the UI, not built yet:** sources and destinations other than
 Synapse and Fabric; the migration assistant's conversation.
@@ -825,8 +834,9 @@ in one place, `migration/capabilities.py`, and the UI reads it from
 
 | Stage | Synapse object | Becomes in Fabric | Strategy / notes |
 |---|---|---|---|
-| Warehouse & schema | Dedicated SQL pool, schema, table, view, stored procedure | A Warehouse of the same name, its schemas, **empty** tables, views and procedures | Structure only. Tables are rebuilt from discovered columns; storage clauses are dropped and unsupported types mapped, each change noted; primary keys and unique constraints are recreated `NOT ENFORCED`. Views and procedures are created from their own text after the T-SQL rules (below). The Warehouse **collation** is chosen once, at creation: *same as Synapse* (default), case-insensitive or case-sensitive. |
-| Table data | The rows of each migrated table | **Fabric data pipelines**, one per wave, and the rows they load | Data never passes through the accelerator. Each wave gets a metadata-driven pipeline (`load_<warehouse>_wave_<n>`): a ForEach over a `tables` parameter whose Copy activity reads the pool with a typed SELECT through a Fabric SQL connection and writes the Warehouse with the COPY command. *Create and run* (default) runs it, waits, and compares row counts table by table; *create only* leaves running it to you. *Skip* (default) leaves tables that already have rows; *replace* truncates them inside the pipeline first. The connection to the pool is reused if one exists, or created from what you choose on this stage (workspace identity, Key Vault, SQL login or service principal). Per-table **date filters** load part of a table and can keep it in sync afterwards: see below. |
+| Warehouse & schema | Dedicated SQL pool, schema, table, function, view, stored procedure | A Warehouse of the same name, its schemas, **empty** tables, functions, views and procedures | Structure only. Tables are rebuilt from discovered columns; storage clauses are dropped and unsupported types mapped, each change noted; primary keys and unique constraints are recreated `NOT ENFORCED`; an IDENTITY column stays IDENTITY as `bigint IDENTITY` (Fabric supports no other type, seed or increment); a column's **dynamic data mask** is part of its `CREATE TABLE`, so no row ever lands unmasked (a masking function Fabric lacks stops the table, before any data). A table that already exists gets the masks it is missing. Functions (scalar and inline table-valued; multi-statement ones are left for a person), views and procedures are created from their own text after the T-SQL rules (below). The Warehouse **collation** is chosen once, at creation: *same as Synapse* (default), case-insensitive or case-sensitive. |
+| Table data | The rows of each migrated table | **Fabric data pipelines**, one per wave, and the rows they load | Data never passes through the accelerator. Each wave gets a metadata-driven pipeline (`load_<warehouse>_wave_<n>`): a ForEach over a `tables` parameter whose Copy activity reads the pool with a typed SELECT through a Fabric SQL connection and writes the Warehouse with the COPY command. A table with an IDENTITY column is copied into a staging table without IDENTITY (`migration_load.<schema>__<table>`), then an *After copy* Script activity moves the rows in with `SET IDENTITY_INSERT ... ON` and reseeds with `DBCC CHECKIDENT ... RESEED`, so the Synapse key values are kept (Microsoft's documented path); the staging table carries the same masks and is emptied afterwards. *Create and run* (default) runs it, waits, and compares row counts table by table; *create only* leaves running it to you. *Skip* (default) leaves tables that already have rows; *replace* truncates them inside the pipeline first. The connection to the pool is reused if one exists, or created from what you choose on this stage (workspace identity, Key Vault, SQL login or service principal). Per-table **date filters** load part of a table and can keep it in sync afterwards: see below. |
+| Roles & permissions | Database role, user (Security Object) | Warehouse roles, their members, and GRANT / DENY permissions | Custom roles get `CREATE ROLE`; built-in roles (`db_datareader` …) and `public` exist already, so only their members and permissions move. Members are added with `ALTER ROLE … ADD MEMBER`; permissions on the database, schemas, objects and columns are granted or denied as they were (`WITH GRANT OPTION` kept). Fabric has no `CREATE USER`: a Microsoft Entra user is created by its first GRANT. Not carried: the database `CONNECT` every user holds (the workspace gives access in Fabric), resource-class roles (no workload management in Fabric) and **SQL users**, which are listed for a person with the grants to give their Microsoft Entra replacement. A rejected statement fails the role with every reason; Retry Failed re-applies safely. Workspace roles and item permissions still decide who can connect. |
 | Spark pool & environment | Spark pool | A custom Spark pool and a published Environment | Node size, autoscale, runtime mapped; libraries are not copied. |
 | Notebooks | Notebook | Fabric Notebook | Cells kept; Spark pool binding and outputs dropped. Python cells: `mssparkutils` becomes `notebookutils`, and the Synapse SQL connector import and reads of the migrated pool are pointed at Fabric's connector and the Warehouse. Other Synapse-only calls (linked-service credentials, `mssparkutils.env`, connector writes, ADLS paths) are flagged. .NET notebooks are deferred. |
 | Connections | Linked service | Fabric connection | Synapse does not give up the secret, so you choose how Fabric signs in. **Workspace identity** and **Key Vault reference** (an Azure Key Vault reference's alias or ID and the secret's name) pass no secret through the accelerator and are offered first; a SQL login, key, SAS token or service principal secret can still be typed (sent once, held in memory, never stored or returned). SQL, ADLS Gen2 and Blob are converted; a parameterised linked service uses its parameters' default values. Others are created by hand, with the linked service's name so pipelines find them. |
@@ -900,7 +910,9 @@ Removed statements stay in the text as a comment. Strings, comments and
 quoted identifiers are never touched, and running the rules twice changes
 nothing more. The planner reports what the rules will fix (LOW) and what is
 left for a person (MEDIUM: `sys.pdw_*` views, materialized views, `COPY INTO`
-with Synapse's managed identity).
+with Synapse's managed identity, and what Fabric Warehouse's T-SQL surface area
+does not support: `SET ROWCOUNT`, `FOR XML`, synonyms, `PREDICT`, `CREATE USER`,
+triggers).
 
 * **Planner.** `POST /api/migration/plan` is read-only and deterministic: a
   strategy per object (Automated, Manual, Assess first, Later, Not selected),
@@ -940,9 +952,10 @@ sides without writing to either. Each row says what it saw on each side:
 | Category | What is compared |
 |---|---|
 | Warehouse, Schema | The Warehouse and each schema exist. |
-| Tables | Column names and types (a type changed by design is a REVIEW that names it). |
+| Tables | Column names and types (a type changed by design is a REVIEW that names it), and that every dynamic data mask is in place. |
 | Data Count | Rows in Synapse against rows in the Warehouse; zero loaded is a REVIEW, a difference a MISMATCH. |
-| Views, Stored Procedures | Present, and the definition text agrees (ignoring comments and whitespace). |
+| Functions, Views, Stored Procedures | Present, and the definition text agrees (ignoring comments and whitespace). |
+| Security | Each role exists with its members, and every permission given to a role or user is in the Warehouse with the same state (GRANT or DENY). |
 | Spark | The custom Spark pool and Environment exist with the same node size and scale. |
 | Notebooks, Pipelines | Present, with the same number of cells / activities (nested activities included). |
 | Connections, Spark Jobs, SQL Scripts, Schedules, Shortcuts | Present in Fabric. |

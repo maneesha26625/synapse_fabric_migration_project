@@ -265,8 +265,10 @@ RULES: Dict[str, Rule] = {
     ),
     # ---- Security / networking ------------------------------------------
     "Security Object": Rule(
-        "Fabric security model", "Security", WS_SECURITY, ASSESSMENT, AUTOMATION_MANUAL,
-        ("Synapse and Fabric security models differ; migration is a separate assessment.",),
+        "Fabric Warehouse roles and permissions", "Warehouse security", WS_SECURITY, RECONFIGURATION, AUTOMATION_PARTIAL,
+        ("Roles, role members and GRANT/DENY permissions are recreated in the Warehouse; dynamic data masks travel with their tables.",
+         "Fabric has no SQL authentication: SQL users are replaced by Microsoft Entra users or groups by hand.",
+         "Workspace roles and item permissions still decide who can connect at all."),
     ),
     "Integration Runtime": Rule(
         "Fabric connection / data gateway configuration", "Network configuration", WS_CONNECTIONS, MANUAL, AUTOMATION_MANUAL,
@@ -306,7 +308,7 @@ ACTIONS: Dict[str, str] = {
     "Linked Service": "Recreate connection",
     "Trigger": "Recreate schedule or event trigger",
     "Storage Reference": "Choose between an OneLake shortcut and a copy",
-    "Security Object": "Remap users, groups and permissions",
+    "Security Object": "Recreate roles and permissions; replace SQL users with Microsoft Entra principals",
     "Integration Runtime": "Manual / reconfiguration assessment",
     "Networking Configuration": "Manual / reconfiguration assessment",
 }

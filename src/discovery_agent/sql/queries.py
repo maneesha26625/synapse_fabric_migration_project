@@ -359,7 +359,7 @@ MODULES = CatalogQuery(
     name="modules",
     version=1,
     description=(
-        "The body of every visible module, for views and procedures alike. "
+        "The body of every visible module: views, procedures and functions alike. "
         "Keyed by object_id, which both object queries also return."
     ),
     # One query for both object kinds because sys.sql_modules is one view and
@@ -423,6 +423,138 @@ PARAMETERS = CatalogQuery(
 )
 
 
+FUNCTIONS = CatalogQuery(
+    name="functions",
+    version=1,
+    description=(
+        "Every user-defined T-SQL function visible to the connected principal: "
+        "scalar (FN), inline table-valued (IF) and multi-statement table-valued "
+        "(TF). Identity, dates and kind only; the body comes from sys.sql_modules."
+    ),
+    sql="""
+        SELECT
+            s.name AS schema_name,
+            o.name AS object_name,
+            o.object_id AS object_id,
+            o.create_date AS create_date,
+            o.modify_date AS modify_date,
+            o.type AS type_code
+        FROM sys.objects AS o
+        INNER JOIN sys.schemas AS s
+            ON s.schema_id = o.schema_id
+        WHERE o.is_ms_shipped = 0
+            AND o.type IN ('FN', 'IF', 'TF')
+        ORDER BY s.name, o.name
+    """,
+)
+
+
+# --- security: what the Warehouse needs to recreate access -------------------
+#
+# Each of these is separately grantable and degrades on its own. Together they
+# are what the Fabric Migration Assistant carries over as "security objects":
+# roles and their members, object, schema and database permissions, and
+# dynamic data masking.
+
+
+DATABASE_PRINCIPALS = CatalogQuery(
+    name="database_principals",
+    version=1,
+    description=(
+        "Every database user and role. type: S = SQL user, E = Microsoft Entra "
+        "user, X = Microsoft Entra group, R = database role."
+    ),
+    sql="""
+        SELECT
+            dp.principal_id AS principal_id,
+            dp.name AS principal_name,
+            dp.type AS type_code,
+            dp.type_desc AS type_desc
+        FROM sys.database_principals AS dp
+        ORDER BY dp.name
+    """,
+)
+
+
+ROLE_MEMBERS = CatalogQuery(
+    name="role_members",
+    version=1,
+    description="Which user or role is a member of which database role.",
+    sql="""
+        SELECT
+            r.name AS role_name,
+            m.name AS member_name,
+            m.type AS member_type
+        FROM sys.database_role_members AS rm
+        INNER JOIN sys.database_principals AS r
+            ON r.principal_id = rm.role_principal_id
+        INNER JOIN sys.database_principals AS m
+            ON m.principal_id = rm.member_principal_id
+        ORDER BY r.name, m.name
+    """,
+)
+
+
+PERMISSIONS = CatalogQuery(
+    name="permissions",
+    version=1,
+    description=(
+        "Explicit permissions on the database (class 0), objects and columns "
+        "(class 1) and schemas (class 3), with the principal they were given "
+        "to and whether they were granted, granted with grant option or denied."
+    ),
+    # state: G granted, W granted with grant option, D denied. The securable is
+    # resolved to names here so the rows survive without object ids.
+    sql="""
+        SELECT
+            pe.class AS class_code,
+            pe.permission_name AS permission_name,
+            pe.state AS state_code,
+            gp.name AS grantee_name,
+            gp.type AS grantee_type,
+            COALESCE(os.name, ss.name) AS schema_name,
+            o.name AS object_name,
+            o.type AS object_type,
+            c.name AS column_name
+        FROM sys.database_permissions AS pe
+        INNER JOIN sys.database_principals AS gp
+            ON gp.principal_id = pe.grantee_principal_id
+        LEFT JOIN sys.objects AS o
+            ON pe.class = 1 AND o.object_id = pe.major_id
+        LEFT JOIN sys.schemas AS os
+            ON os.schema_id = o.schema_id
+        LEFT JOIN sys.schemas AS ss
+            ON pe.class = 3 AND ss.schema_id = pe.major_id
+        LEFT JOIN sys.columns AS c
+            ON pe.class = 1 AND pe.minor_id > 0
+            AND c.object_id = pe.major_id AND c.column_id = pe.minor_id
+        WHERE pe.class IN (0, 1, 3)
+        ORDER BY gp.name, pe.class, pe.permission_name
+    """,
+)
+
+
+MASKED_COLUMNS = CatalogQuery(
+    name="masked_columns",
+    version=1,
+    description="Columns with a dynamic data mask, and the masking function.",
+    sql="""
+        SELECT
+            s.name AS schema_name,
+            t.name AS table_name,
+            mc.name AS column_name,
+            mc.masking_function AS masking_function
+        FROM sys.masked_columns AS mc
+        INNER JOIN sys.tables AS t
+            ON t.object_id = mc.object_id
+        INNER JOIN sys.schemas AS s
+            ON s.schema_id = t.schema_id
+        WHERE mc.is_masked = 1
+        ORDER BY s.name, t.name, mc.column_id
+    """,
+)
+
+
 #: Every query discovery may run, by name. A ``CatalogSource`` checks
 #: membership by identity, so a lookalike built elsewhere is not accepted.
 CATALOG_QUERIES: Mapping[str, CatalogQuery] = {
@@ -439,6 +571,11 @@ CATALOG_QUERIES: Mapping[str, CatalogQuery] = {
         PROCEDURES,
         MODULES,
         PARAMETERS,
+        FUNCTIONS,
+        DATABASE_PRINCIPALS,
+        ROLE_MEMBERS,
+        PERMISSIONS,
+        MASKED_COLUMNS,
     )
 }
 

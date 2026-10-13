@@ -3,11 +3,12 @@ import type { ObjectDetail, TransformKind, TransformObject, TransformSettings } 
 
 export const KIND_OF_TYPE: Record<string, TransformKind> = {
   "Stored Procedure": "procedure", View: "view", Table: "table", "SQL Script": "script", Pipeline: "pipeline", Notebook: "notebook",
+  Function: "function",
 };
 
 export const demoTransformSettings: TransformSettings = {
   enabled: true, available: true, model: "Demo (no model is called)", timeoutSeconds: 180, message: null, disabledReason: null,
-  kinds: ["notebook", "pipeline", "procedure", "script", "table", "view"],
+  kinds: ["function", "notebook", "pipeline", "procedure", "script", "table", "view"],
   promptsDir: "prompts/transform", storeDir: "transforms",
 };
 
@@ -43,6 +44,15 @@ function sources(o: ObjectDetail, kind: TransformKind) {
         draft: `CREATE TABLE [${schemaOf(o)}].[${n}] (\n    [Id] int NOT NULL,\n    [Payload] varchar(8000) NULL, -- Fabric: sql_variant is not supported; stored as text\n    [LoadedAt] datetime2(3) NOT NULL\n);`,
         notes: ["sql_variant has no Fabric type; Payload is stored as varchar(8000).", "datetime stored as datetime2(3), as the rules do."],
         unconverted: ["Check the values in Payload: anything that is not text must be converted in the load."], problems: ["Column Payload has type sql_variant, which Fabric Warehouse cannot store."],
+        language: "sql" as const,
+      };
+    case "function":
+      return {
+        code: `CREATE FUNCTION ${q} (@From date)\nRETURNS @result TABLE (Id int, Amount decimal(18,2))\nAS\nBEGIN\n    INSERT @result SELECT Id, Amount FROM ${schemaOf(o)}.Orders WHERE OrderDate >= @From;\n    DELETE FROM @result WHERE Amount = 0;\n    RETURN;\nEND`,
+        rule: "",
+        draft: `CREATE FUNCTION ${q} (@From date)\nRETURNS TABLE\nAS\nRETURN\n    -- Fabric: multi-statement function rewritten as one inline SELECT; the DELETE became a filter.\n    SELECT Id, Amount FROM ${schemaOf(o)}.Orders\n    WHERE OrderDate >= @From AND Amount <> 0;`,
+        notes: ["Rewrote the multi-statement table-valued function as an inline table-valued function: Fabric Warehouse supports only scalar and inline ones.", "The DELETE of zero amounts became a WHERE condition."],
+        unconverted: [] as string[], problems: ["Fabric Warehouse does not support multi-statement table-valued functions."],
         language: "sql" as const,
       };
     case "script":

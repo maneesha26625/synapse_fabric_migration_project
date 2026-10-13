@@ -87,7 +87,7 @@ WID = "0a1b2c3d-1111-4222-8333-444455556666"
 
 def settle(target):
     import time
-    for _ in range(200):
+    for _ in range(3000):  # up to 30 s: a busy machine can be slow to schedule the thread
         if target.state()["status"] != "signing_in":
             break
         time.sleep(0.01)
@@ -138,3 +138,26 @@ def test_reload_notices_a_changed_added_or_removed_file():
     assert _changed(before, {"a.py": 2.0, "b.py": 1.0}) == ["a.py"]
     assert _changed(before, {"a.py": 1.0}) == ["b.py"]
     assert _changed(before, {**before, "c.py": 1.0}) == ["c.py"]
+
+
+# -- what a live discovery holds ----------------------------------------------------------------------
+
+def test_read_only_mappings_from_a_live_discovery_are_saved_and_stay_read_only(store):
+    """A live workspace's artifacts keep their payload in a MappingProxyType, which pickle refuses on its own."""
+    from types import MappingProxyType
+
+    from discovery_agent.connections.validation import ConnectionValidation, ValidationStatus
+    from discovery_agent.extractors.models import SourceType
+    from discovery_agent.source_strategy import P0Artifact
+    from discovery_agent.synapse.models import SynapseArtifact
+
+    artifact = SynapseArtifact(P0Artifact.PIPELINE, "PL_Load", "pipelines", "json", {"name": "PL_Load", "properties": {"activities": []}})
+    check = ConnectionValidation(SourceType.SYNAPSE, ValidationStatus.OK, "ok", {"workspace": "ws"})
+    assert type(artifact.payload) is MappingProxyType
+    assert store.save("probe", {"artifact": artifact, "check": check}) is True
+    back = store.load("probe")
+    assert back["artifact"] == artifact and back["artifact"].payload["name"] == "PL_Load"
+    assert type(back["artifact"].payload) is MappingProxyType and type(back["check"].details) is MappingProxyType
+    with pytest.raises(TypeError):
+        back["artifact"].payload["name"] = "changed"   # still read-only after the round trip
+    assert not list(store.directory.glob("*.tmp"))

@@ -12,8 +12,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from discovery_agent.migration.common import (
-    CONNECTION, DATA, DATASET, ENVIRONMENT, NOTEBOOK, PIPELINE, POOL, PROCEDURE, SCHEDULE, SCHEMA,
-    SCRIPT, SHORTCUT, SPARKJOB, TABLE, VIEW,
+    CONNECTION, DATA, DATASET, ENVIRONMENT, FUNCTION, NOTEBOOK, PIPELINE, POOL, PROCEDURE, SCHEDULE, SCHEMA,
+    SCRIPT, SECURITY, SHORTCUT, SPARKJOB, TABLE, VIEW,
 )
 
 
@@ -46,9 +46,11 @@ class Stage:
 
 
 STAGES: Tuple[Stage, ...] = (
-    Stage("warehouse", "Warehouse & schema", "The SQL pool becomes a Fabric Warehouse; its schemas, tables (empty, with their keys), views and stored procedures are created in it. "
-          "Synapse-only T-SQL in views and procedures is converted first.",
-          ("Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure"), (POOL, SCHEMA, TABLE, VIEW, PROCEDURE), creates="Warehouse, schemas, tables, views, procedures",
+    Stage("warehouse", "Warehouse & schema", "The SQL pool becomes a Fabric Warehouse; its schemas, tables (empty, with their keys and "
+          "dynamic data masks), functions, views and stored procedures are created in it. "
+          "Synapse-only T-SQL in functions, views and procedures is converted first.",
+          ("Dedicated SQL Pool", "Schema", "Table", "Function", "View", "Stored Procedure"), (POOL, SCHEMA, TABLE, FUNCTION, VIEW, PROCEDURE),
+          creates="Warehouse, schemas, tables, functions, views, procedures",
           options=(
               Option("collation", "Warehouse collation (set once, when it is created)", (
                   ("match_synapse", "Same as Synapse", "Case-sensitive only if the Synapse pool was; Synapse's default is case-insensitive."),
@@ -74,6 +76,10 @@ STAGES: Tuple[Stage, ...] = (
                   ("none", "None", "Reads only from the last sync onwards. Tables without key columns always work this way."),
               ), "1h"),
           )),
+    Stage("security", "Roles & permissions", "Database roles are recreated in the Warehouse with their members, and GRANT / DENY "
+          "permissions are applied to roles and Microsoft Entra users (Fabric creates each user on its first grant). "
+          "SQL users are listed for a person: Fabric has no SQL authentication. Masks travel with their tables.",
+          ("Security Object",), (SECURITY,), needs=("warehouse",), creates="Roles, role members, permissions"),
     Stage("spark", "Spark pool & environment", "A Spark pool becomes a custom Fabric Spark pool plus a published Environment.",
           ("Spark Pool",), (ENVIRONMENT,), creates="Spark pool, Environment"),
     Stage("notebooks", "Notebooks", "Synapse notebooks become Fabric notebooks.",

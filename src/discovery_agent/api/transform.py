@@ -29,13 +29,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from discovery_agent.api.migration import sources_for
+from discovery_agent.api.migration import rewritable, sources_for
 from discovery_agent.api.service import ApiError
 from discovery_agent.llm import checks, context, templates
 from discovery_agent.llm.claude_cli import ClaudeCli, ModelError
 from discovery_agent.llm.store import TransformStore
 from discovery_agent.llm.templates import TemplateError
-from discovery_agent.migration.common import DEFERRED, MISSING, NOTEBOOK, Source
+from discovery_agent.migration.common import DEFERRED, FUNCTION, MISSING, NOTEBOOK, Source
 from discovery_agent.migration.runner import MIGRATABLE, warehouse_name_for
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -92,7 +92,9 @@ class TransformService:
         source = sources_for([{"id": object_id, "wave": 1}], job, pool)[0]
         if source.kind == MISSING:
             raise ApiError(404, "object_not_found", "That object is not in the current discovery results.")
-        if source.kind == DEFERRED:
+        if rewritable(source):
+            source.kind = FUNCTION  # drafted as the inline function it has to become
+        elif source.kind == DEFERRED:
             raise ApiError(400, "not_transformable", source.reason or "This object is not migrated by this build.")
         return source, job, pool
 
@@ -191,8 +193,14 @@ class TransformService:
         records = {r["objectId"]: r for r in self._store.all()}
         items = []
         for source in sources_for(plan, job, pool):
-            if source.kind not in context.TRANSFORMABLE_KINDS:
+            if rewritable(source):
+                # A multi-statement function: the rules cannot make it run in Fabric, so it heads the list.
+                source.kind = FUNCTION
+                problems = [source.reason or ""]
+            elif source.kind not in context.TRANSFORMABLE_KINDS:
                 continue
+            else:
+                problems = []
             base = {"objectId": source.id, "name": source.name, "type": source.type, "kind": source.kind}
             try:
                 subject = context.extract(source)
@@ -202,7 +210,7 @@ class TransformService:
                 continue
             view = self._view(source.id, records.get(source.id), subject.source_hash)
             latest = view["draft"] or view["accepted"] or {}
-            items.append({**base, "problems": subject.problems, "rulesChange": bool(subject.rule_output), "state": view["state"],
+            items.append({**base, "problems": problems + list(subject.problems), "rulesChange": bool(subject.rule_output), "state": view["state"],
                           "error": view["error"], "confidence": latest.get("confidence"), "stale": latest.get("stale"), "unavailable": None})
         items.sort(key=lambda i: (i["unavailable"] is not None, not i["problems"], i["name"].lower()))
         count = lambda f: sum(1 for i in items if f(i))  # noqa: E731
@@ -352,7 +360,8 @@ class TransformService:
         """Attach each accepted, current transform to its plan item. Returns run-log lines."""
         log: List[str] = []
         for source in sources:
-            if source.kind not in context.TRANSFORMABLE_KINDS:
+            deferred = rewritable(source)
+            if source.kind not in context.TRANSFORMABLE_KINDS and not deferred:
                 continue
             record = self._store.get(source.id)
             accepted = (record or {}).get("accepted")
@@ -365,5 +374,7 @@ class TransformService:
             if accepted.get("sourceHash") != current:
                 log.append(f"{source.name}: the accepted LLM-assisted transform is out of date (the source changed); the rules are used instead.")
                 continue
+            if deferred:
+                source.kind, source.reason = FUNCTION, None  # the reviewed inline rewrite replaces what Fabric cannot run
             source.override = {"code": accepted["code"], "acceptedAt": accepted.get("acceptedAt"), "edited": bool(accepted.get("edited"))}
         return log

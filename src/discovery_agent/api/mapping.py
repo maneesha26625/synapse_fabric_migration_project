@@ -82,11 +82,9 @@ CATEGORIES = ("SQL", "Spark", "Integration", "Storage", "Security", "Networking"
 #: Object types the discovery cannot list in this build, and why. The mapping
 #: rules for them exist, so adding the discovery needs no mapping work.
 NOT_DISCOVERED: Tuple[Tuple[str, str], ...] = (
-    ("Function", "the SQL catalog queries cover tables, views and stored procedures only"),
     ("External Data Source", "not yet read from the SQL catalog"),
     ("External File Format", "not yet read from the SQL catalog"),
     ("Lake Database", "lake databases are not yet listed"),
-    ("Security Object", "users, roles and permissions are not yet read"),
     ("Networking Configuration", "managed private endpoints and firewall rules are not yet read"),
 )
 
@@ -425,6 +423,10 @@ def _extra_size(extra: Extra) -> str:
         return f"{sum((m.get('objectCounts') or {}).values())} objects"
     if extra.source_type == "Storage Reference" and m.get("pathCount"):
         return f"{m['pathCount']} paths"
+    if extra.source_type == "Security Object":
+        parts = [f"{len(m.get('members') or [])} members"] if m.get("principalKind") in ("Database role", "Built-in role") else []
+        parts.append(f"{len(m.get('permissions') or [])} permissions")
+        return ", ".join(parts)
     return ""
 
 
@@ -602,6 +604,104 @@ def schema_extras(records: Iterable[UnifiedDiscoveryRecord]) -> List[Extra]:
         meta = {"database": db, "schemaName": schema, "objectCounts": counts,
                 "_from": "derived from the discovered SQL objects"}
         out.append(Extra(f"sql://{db}/{schema}", f"{db}.{schema}", "Schema", meta, tuple(deps)))
+    return out
+
+
+def _sql_object_dependencies(database: str, module: Any) -> Tuple[Dict[str, Any], ...]:
+    """A function's references as extra dependencies, joined by the SQL records' own id scheme."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for ref in getattr(module, "referenced_objects", ()) or ():
+        if not ref.is_durable or not ref.object_name:
+            continue
+        schema = ref.schema or "dbo"
+        target = f"sql://{database}/{schema}/{ref.object_name}"
+        if target.lower() == module.key.logical_id.lower():
+            continue
+        out.setdefault(target.lower(), {"name": f"{schema}.{ref.object_name}", "kind": "sql_object", "type": None,
+                                        "targetId": target, "location": ref.location})
+    return tuple(out.values())
+
+
+def function_extras(catalog: Any) -> List[Extra]:
+    """User-defined functions from the SQL catalog: scalar, inline and multi-statement table-valued."""
+    if catalog is None:
+        return []
+    db = catalog.database.name
+    out = []
+    for f in getattr(catalog, "functions", ()) or ():
+        readable = f.definition.is_readable
+        meta = {
+            "database": db, "schemaName": f.key.schema, "functionKind": f.kind_label, "typeCode": f.type_code,
+            "definitionReadable": readable, "referencedObjects": list(f.referenced_names) or None,
+            "_from": "Dedicated SQL pool catalog",
+        }
+        if f.is_multi_statement:
+            meta["fabricSupport"] = "Not supported in Fabric Warehouse: rewrite as an inline table-valued function or a view"
+        status = STATUS_WARNING if (not readable or f.is_multi_statement) else STATUS_DISCOVERED
+        out.append(Extra(f.key.logical_id, f"{db}.{f.key.schema}.{f.key.name}", "Function",
+                         {k: v for k, v in meta.items() if v is not None}, _sql_object_dependencies(db, f), status=status,
+                         raw={**f.to_dict(), "definition": {"state": f.definition.state.value}}))
+    return out
+
+
+def security_principal_id(database: str, name: str, is_role: bool) -> str:
+    return f"security://{database}/{'role' if is_role else 'user'}/{name}"
+
+
+def security_extras(catalog: Any) -> List[Extra]:
+    """Database roles and users that carry access, from the SQL catalog.
+
+    One entry per custom role, per built-in role that has members, for ``public`` when it holds explicit
+    permissions, and per user (Microsoft Entra or SQL). Resource-class roles are Synapse workload management
+    and have no Fabric equivalent; they are left out here and reported by the planner.
+    """
+    security = getattr(catalog, "security", None) if catalog is not None else None
+    if security is None:
+        return []
+    db = catalog.database.name
+    resource_classes = {p.name.lower() for p in security.principals if p.is_resource_class}
+    out: List[Extra] = []
+    for p in security.principals:
+        if p.is_built_in or p.is_resource_class:
+            continue
+        permissions = security.permissions_of(p.name)
+        members = [m for m in security.members_of(p.name)] if p.is_role else []
+        if p.is_public and not permissions:
+            continue
+        if p.is_fixed_role and not members:
+            continue
+        deps: Dict[str, Dict[str, Any]] = {}
+        for perm in permissions:
+            if perm.class_code == 1 and perm.schema and perm.object_name:
+                target = f"sql://{db}/{perm.schema}/{perm.object_name}"
+                deps.setdefault(target.lower(), {"name": f"{perm.schema}.{perm.object_name}", "kind": "sql_object", "type": None,
+                                                 "targetId": target, "location": "permissions"})
+            elif perm.class_code == 3 and perm.schema:
+                target = f"sql://{db}/{perm.schema}"
+                deps.setdefault(target.lower(), {"name": perm.schema, "kind": "sql_object", "type": "Schema",
+                                                 "targetId": target, "location": "permissions"})
+        for m in members:
+            member = security.principal(m.member)
+            if member is not None and member.is_role and not member.is_fixed_role and not member.is_public:
+                target = security_principal_id(db, member.name, True)
+                deps.setdefault(target.lower(), {"name": member.name, "kind": "artifact", "type": "Security Object",
+                                                 "targetId": target, "location": "members"})
+        kind = "Built-in role" if (p.is_fixed_role or p.is_public) else p.kind_label
+        memberships = [r for r in security.roles_of(p.name) if r.lower() not in resource_classes]
+        meta: Dict[str, Any] = {
+            "database": db, "principalKind": kind, "principalType": p.type_code,
+            "members": [m.member for m in members] or None,
+            "memberOf": memberships or None,
+            "resourceClasses": [r for r in security.roles_of(p.name) if r.lower() in resource_classes] or None,
+            "permissions": [x.to_dict() for x in permissions] or None,
+            "_from": "Dedicated SQL pool catalog",
+        }
+        if p.is_sql_user:
+            meta["fabricSupport"] = ("Fabric has no SQL authentication: replace this user with a Microsoft Entra user "
+                                     "or group, then give that principal the same roles and permissions")
+        status = STATUS_WARNING if p.is_sql_user else STATUS_DISCOVERED
+        out.append(Extra(security_principal_id(db, p.name, p.is_role), p.name, "Security Object",
+                         {k: v for k, v in meta.items() if v is not None}, tuple(deps.values()), status=status))
     return out
 
 

@@ -229,9 +229,10 @@ def test_a_type_with_no_equivalent_is_refused():
 def test_a_table_is_rebuilt_from_its_columns_without_storage_clauses():
     sql, notes = warehouse_ddl.create_table(table())
     assert sql.startswith("CREATE TABLE [sales].[Orders] (")
-    assert "[OrderId] int NOT NULL" in sql and "[Customer] varchar(400) NULL" in sql
-    assert "DISTRIBUTION" not in sql.upper() and "INDEX" not in sql.upper() and "IDENTITY" not in sql.upper()
-    assert any("IDENTITY dropped" in n for n in notes)
+    # IDENTITY stays: Fabric has it on bigint only, with no seed or increment.
+    assert "[OrderId] bigint IDENTITY NOT NULL" in sql and "[Customer] varchar(400) NULL" in sql
+    assert "DISTRIBUTION" not in sql.upper() and "INDEX" not in sql.upper()
+    assert any("IDENTITY kept" in n for n in notes) and any("int IDENTITY stored as bigint IDENTITY" in n for n in notes)
     assert any("Distribution (hash)" in n for n in notes)
 
 
@@ -430,7 +431,8 @@ def test_an_unexpected_error_on_one_object_does_not_stop_the_run():
 def test_the_migratable_types_are_the_ones_chosen_for_this_session():
     assert set(MIGRATABLE_TYPES) == {
         "Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure", "Notebook", "Spark Pool", "Linked Service",
-        "Pipeline", "Dataset", "Spark Job Definition", "SQL Script", "Trigger", "External Table"}
+        "Pipeline", "Dataset", "Spark Job Definition", "SQL Script", "Trigger", "External Table",
+        "Function", "Security Object"}
     assert "Integration Runtime" not in MIGRATABLE_TYPES  # always by hand
 
 

@@ -30,12 +30,14 @@ from discovery_agent.sql.models import (
     CatalogDatabase,
     CatalogObjectType,
     CatalogPrincipal,
+    SqlFunction,
     SqlObjectKey,
     SqlProcedure,
     SqlTable,
     SqlView,
 )
 from discovery_agent.sql.mapping import (
+    build_functions,
     build_procedures,
     build_tables,
     build_views,
@@ -47,6 +49,7 @@ from discovery_agent.sql.mapping import (
 )
 from discovery_agent.sql.queries import CatalogQuery
 from discovery_agent.sql.result import SqlCatalogDiscovery
+from discovery_agent.sql.security import SqlSecurity, build_security
 from discovery_agent.sql.source import SQL_SOURCE_FORMAT, CatalogRow, CatalogSource
 
 SOURCE_NAME = "dedicated_pool"
@@ -175,8 +178,9 @@ class DedicatedPoolSource(CatalogSource):
         query = {
             CatalogObjectType.VIEW: queries.VIEWS,
             CatalogObjectType.PROCEDURE: queries.PROCEDURES,
+            CatalogObjectType.FUNCTION: queries.FUNCTIONS,
         }.get(object_type)
-        if query is None:  # pragma: no cover - the enum has three members
+        if query is None:  # pragma: no cover - every enum member is listed
             raise SqlDiscoveryError(
                 f"enumerating {object_type.value}s is not implemented"
             )
@@ -414,8 +418,53 @@ class DedicatedPoolSource(CatalogSource):
         )
         return procedures, tuple(issues) + mapping_issues
 
+    def discover_functions(
+        self, database: Optional[str] = None
+    ) -> Tuple[Tuple[SqlFunction, ...], Tuple[ExtractionIssue, ...]]:
+        """Every visible user-defined function, with its body where it can be read.
+
+        Degrades like views: the enumeration failing raises, the body failing
+        does not.
+        """
+        name = database or self.config.database
+        issues: List[ExtractionIssue] = []
+        try:
+            function_rows: Sequence[CatalogRow] = self.rows(queries.FUNCTIONS)
+        except CatalogQueryError as exc:
+            raise SqlDiscoveryError(
+                f"could not enumerate functions in {self.config.resource_id}: {exc}"
+            ) from exc
+        module_rows, modules_readable = self._optional_rows(
+            queries.MODULES, issues, f"{name}.modules"
+        )
+        functions, mapping_issues = build_functions(
+            database=name,
+            function_rows=function_rows,
+            module_rows=module_rows,
+            modules_readable=modules_readable,
+        )
+        return functions, tuple(issues) + mapping_issues
+
+    def discover_security(self, database: Optional[str] = None) -> SqlSecurity:
+        """Roles, their members, explicit permissions and dynamic data masks.
+
+        Never raises: each of the four parts is separately grantable, and one
+        that cannot be read is recorded as unknown, with an issue.
+        """
+        name = database or self.config.database
+        issues: List[ExtractionIssue] = []
+        principals, principals_ok = self._optional_rows(queries.DATABASE_PRINCIPALS, issues, f"{name}.database_principals")
+        members, members_ok = self._optional_rows(queries.ROLE_MEMBERS, issues, f"{name}.role_members")
+        permissions, permissions_ok = self._optional_rows(queries.PERMISSIONS, issues, f"{name}.permissions")
+        masks, masks_ok = self._optional_rows(queries.MASKED_COLUMNS, issues, f"{name}.masked_columns")
+        return build_security(
+            name, principals, members, permissions, masks,
+            principals_readable=principals_ok, members_readable=members_ok,
+            permissions_readable=permissions_ok, masks_readable=masks_ok, issues=issues,
+        )
+
     def discover(self) -> SqlCatalogDiscovery:
-        """Every SQL-primary P0 object in this database: tables, views, procedures.
+        """Every SQL object in this database: tables, views, procedures, functions and security.
 
         The composed operation the discovery pipeline calls. Built on top of
         ``discover_tables`` rather than replacing it, so the table path and
@@ -459,6 +508,23 @@ class DedicatedPoolSource(CatalogSource):
                 )
             )
 
+        functions: Tuple[SqlFunction, ...] = ()
+        try:
+            functions, function_issues = self.discover_functions(discovery.database.name)
+            issues.extend(function_issues)
+        except SqlDiscoveryError as exc:
+            issues.append(
+                ExtractionIssue(
+                    IssueCode.SOURCE_UNAVAILABLE,
+                    f"functions could not be enumerated: {exc}. No claim is made "
+                    f"about how many this database has",
+                    f"{discovery.database.name}.functions",
+                )
+            )
+
+        security = self.discover_security(discovery.database.name)
+
         return replace(
-            discovery, views=views, procedures=procedures, issues=tuple(issues)
+            discovery, views=views, procedures=procedures, functions=functions,
+            security=security, issues=tuple(issues)
         )

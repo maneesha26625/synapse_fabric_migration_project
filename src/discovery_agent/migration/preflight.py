@@ -14,8 +14,10 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 
 from discovery_agent.migration import storage_remap
 from discovery_agent.migration import datacopy, datafilter, environments, fabric_connections, jobs, notebooks, pipelines, tsql_rules, warehouse_ddl
+from discovery_agent.migration import security as security_sql
 from discovery_agent.migration.common import (
-    CONNECTION, DATA, ENVIRONMENT, NOTEBOOK, PIPELINE, PROCEDURE, SCHEDULE, SCRIPT, SPARKJOB, TABLE, VIEW, Source,
+    CONNECTION, DATA, DEFERRED, ENVIRONMENT, FUNCTION, NOTEBOOK, PIPELINE, PROCEDURE, SCHEDULE, SCRIPT, SECURITY, SPARKJOB, TABLE,
+    VIEW, Source,
 )
 from discovery_agent.migration.planner import BLOCKING, HIGH, LOW, MEDIUM, Finding
 
@@ -29,6 +31,13 @@ SYNAPSE_ONLY = (
     (re.compile(r"\bsys\.(?:dm_)?pdw_", re.I), "Synapse system views (sys.pdw_*)"),
     (re.compile(r"\bCREATE\s+(?:MATERIALIZED\s+VIEW|EXTERNAL\s+TABLE)\b", re.I), "a materialized view or external table"),
     (re.compile(r"IDENTITY\s*=\s*'Managed Identity'", re.I), "COPY INTO with Synapse's managed identity"),
+    # Listed as unsupported in Fabric Warehouse's T-SQL surface area.
+    (re.compile(r"\bSET\s+ROWCOUNT\b", re.I), "SET ROWCOUNT"),
+    (re.compile(r"\bFOR\s+XML\b", re.I), "SELECT ... FOR XML"),
+    (re.compile(r"\bCREATE\s+SYNONYM\b", re.I), "a synonym"),
+    (re.compile(r"\bPREDICT\s*\(", re.I), "PREDICT"),
+    (re.compile(r"\bCREATE\s+USER\b", re.I), "CREATE USER (Fabric creates a user on its first GRANT)"),
+    (re.compile(r"\bCREATE\s+(?:OR\s+ALTER\s+)?TRIGGER\b", re.I), "a trigger"),
 )
 
 
@@ -48,15 +57,21 @@ def _sql_findings(source: Source, text: str, after_rules: bool = True) -> List[F
 
 
 def _table(source: Source) -> List[Finding]:
+    unsupported = [m for m in source.masks if security_sql.mask_clause(m) is None]
+    if unsupported:
+        names = ", ".join(f"{m.column} ({m.function})" for m in unsupported)
+        return [Finding(source.id, "MASK_UNSUPPORTED", BLOCKING,
+                        f"{source.name}: masking function(s) Fabric does not have: {names}. The table would not be created, "
+                        "so its rows are never loaded unmasked; change the mask first.")]
     try:
-        _, notes = warehouse_ddl.create_table(source.payload)
+        _, notes = warehouse_ddl.create_table(source.payload, [(m.column, security_sql.mask_clause(m)) for m in source.masks])
     except warehouse_ddl.UnsupportedColumn as exc:
         return [Finding(source.id, "UNSUPPORTED_TYPE", BLOCKING, f"{source.name}: {exc} It cannot be recreated.")]
     except Exception as exc:  # noqa: BLE001 - a malformed record is a finding, not a crash
         return [Finding(source.id, "DEFINITION_UNREADABLE", HIGH, f"{source.name}: the table definition could not be read ({type(exc).__name__}).")]
     if not notes:
         return []
-    severity = MEDIUM if any("IDENTITY" in n for n in notes) else LOW
+    severity = MEDIUM if any("IDENTITY dropped" in n for n in notes) else LOW
     shown = "; ".join(notes[:3]) + (f"; and {len(notes) - 3} more" if len(notes) > 3 else "")
     return [Finding(source.id, "TYPE_CONVERSION", severity, f"{source.name} changes on the way: {shown}.")]
 
@@ -68,6 +83,30 @@ def _module(source: Source) -> List[Finding]:
         return [Finding(source.id, "DEFINITION_UNREADABLE", BLOCKING,
                         f"{source.name}: the definition is encrypted or VIEW DEFINITION is not granted, so it cannot be recreated.")]
     return _sql_findings(source, text)
+
+
+def _security(source: Source) -> List[Finding]:
+    try:
+        plan = security_sql.plan_principal(source.payload, source.name)
+    except Exception:  # noqa: BLE001 - a principal discovery did not keep is a finding, not a crash
+        return [Finding(source.id, "DEFINITION_UNREADABLE", HIGH, f"{source.name}: the role or user was not kept by discovery. Run discovery again.")]
+    found = []
+    if plan.notes:
+        found.append(Finding(source.id, "SECURITY_REVIEW", MEDIUM if any("SQL user" in n for n in plan.notes) else LOW,
+                             f"{source.name}: " + " ".join(plan.notes)))
+    denies = [s for _, s in plan.permissions if s.startswith("DENY ")]
+    if denies:
+        found.append(Finding(source.id, "SECURITY_DENY", LOW,
+                             f"{source.name}: {len(denies)} DENY permission(s). In Fabric, workspace Admins, Members and Contributors "
+                             "hold CONTROL on the Warehouse, so a DENY does not restrict them."))
+    return found
+
+
+def _deferred(source: Source) -> List[Finding]:
+    """A function or principal the run leaves for a person (multi-statement TVF, SQL user): say why, up front."""
+    if source.type not in ("Function", "Security Object") or not source.reason:
+        return []
+    return [Finding(source.id, "NEEDS_PERSON", MEDIUM, f"{source.name}: {source.reason}")]
 
 
 def _notebook(source: Source) -> List[Finding]:
@@ -169,8 +208,9 @@ def _connection(source: Source, names: Set[str], pool: str = "") -> List[Finding
     return []
 
 
-_CHECKS = {TABLE: _table, VIEW: _module, PROCEDURE: _module, NOTEBOOK: _notebook, ENVIRONMENT: _environment,
-           DATA: _data, PIPELINE: _pipeline, SPARKJOB: _sparkjob, SCRIPT: _script, SCHEDULE: _schedule}
+_CHECKS = {TABLE: _table, VIEW: _module, PROCEDURE: _module, FUNCTION: _module, NOTEBOOK: _notebook, ENVIRONMENT: _environment,
+           DATA: _data, PIPELINE: _pipeline, SPARKJOB: _sparkjob, SCRIPT: _script, SCHEDULE: _schedule,
+           SECURITY: _security, DEFERRED: _deferred}
 
 
 def content_findings(sources: Sequence[Source], credential_names: Optional[Set[str]] = None, pool: str = "",
@@ -185,6 +225,7 @@ def content_findings(sources: Sequence[Source], credential_names: Optional[Set[s
         if source.kind == CONNECTION:
             out.extend(_connection(source, names, pool))
             continue
+        first = len(out)
         if source.override:
             out.extend(_override(source))
         else:
@@ -193,10 +234,12 @@ def content_findings(sources: Sequence[Source], credential_names: Optional[Set[s
                 out.extend(check(source))
         storage = _external_storage(source, routes)
         if storage is not None:
+            if storage.code == "STORAGE_ROUTED":
+                out[first:] = _without_storage_review(out[first:])
             out.append(storage)
             if storage.code == "EXTERNAL_STORAGE":
                 direct.add(source.id)
-        serverless = _serverless(source)
+        serverless = _serverless(source, routes)
         if serverless is not None:
             out.append(serverless)
     out.extend(_depends_on_storage(sources, direct))
@@ -214,7 +257,7 @@ def code_text(source: Source) -> str:
     if source.override:
         return str(source.override.get("code") or "")
     payload = source.payload
-    if source.kind in (VIEW, PROCEDURE):
+    if source.kind in (VIEW, PROCEDURE, FUNCTION):
         return str(getattr(getattr(payload, "definition", None), "text", "") or "")
     if source.kind == SCRIPT:
         return str(((payload or {}).get("properties") or {}).get("content", {}).get("query") or "")
@@ -237,7 +280,7 @@ STORAGE_WHY = ("Fabric runs it as the signed-in user, not the Synapse managed id
 
 def _external_storage(source: Source, routes: Optional[storage_remap.Routes] = None) -> Optional[Finding]:
     """Code that reads or writes an Azure storage account directly, and whether the run routes it through OneLake."""
-    if source.kind not in (VIEW, PROCEDURE, SCRIPT, NOTEBOOK, SPARKJOB):
+    if source.kind not in (VIEW, PROCEDURE, FUNCTION, SCRIPT, NOTEBOOK, SPARKJOB):
         return None
     text = code_text(source)
     if not text or not _STORAGE_SUFFIX.search(text):
@@ -257,26 +300,52 @@ def _external_storage(source: Source, routes: Optional[storage_remap.Routes] = N
                    f"{source.name}: {what} {named} directly. {STORAGE_WHY}")
 
 
-def _serverless(source: Source) -> Optional[Finding]:
-    """SQL written for Synapse's serverless pool: OPENROWSET and external tables over storage have no Warehouse home."""
+def _without_storage_review(found: List[Finding]) -> List[Finding]:
+    """A notebook's review note, minus its storage-path item once the run routes that storage through OneLake."""
+    out: List[Finding] = []
+    for f in found:
+        if f.code != "NOTEBOOK_REVIEW" or "direct storage paths" not in f.message:
+            out.append(f)
+            continue
+        head, _, items = f.message.partition("uses: ")
+        kept = [i for i in items.rstrip(".").split("; ") if not i.startswith("direct storage paths")]
+        if kept:
+            out.append(Finding(f.object_id, f.code, f.severity, f"{head}uses: {'; '.join(kept)}."))
+    return out
+
+
+def _serverless(source: Source, routes: Optional[storage_remap.Routes] = None) -> Optional[Finding]:
+    """SQL written for Synapse's serverless pool. It runs on the Warehouse in Fabric; its OPENROWSET over storage works
+    there once that storage goes through a OneLake shortcut (checked on a real Warehouse), and fails otherwise."""
     if source.kind == SCRIPT:
         connection = (((source.payload or {}).get("properties") or {}).get("content") or {}).get("currentConnection") or {}
-        if str(connection.get("poolName") or "").lower() == "built-in":
-            return Finding(source.id, "SERVERLESS_SQL", MEDIUM,
-                           f"{source.name}: written for Synapse's serverless SQL pool. In Fabric it runs on the Warehouse; the "
-                           "Lakehouse shortcut and its SQL endpoint replace serverless queries over files. Consider leaving it out.")
-    if source.kind == PIPELINE and isinstance(source.payload, dict):
+        if str(connection.get("poolName") or "").lower() != "built-in":
+            return None
+        text = code_text(source)
+        where = "it"
+    elif source.kind == PIPELINE and isinstance(source.payload, dict):
         services = source.payload.get("linkedServices") or {}
-        on_demand = {n for n, ls in services.items()
-                     if "-ondemand." in json.dumps(((ls or {}).get("properties") or {}).get("typeProperties") or {}).lower()}
-        used = [a.get("name") for a in _activities((source.payload.get("resource") or {}).get("properties", {}).get("activities") or [])
+        on_demand = {n for n, ls in services.items() if pipelines.is_serverless_service(ls or {})}
+        used = [a for a in _activities((source.payload.get("resource") or {}).get("properties", {}).get("activities") or [])
                 if (a.get("linkedServiceName") or {}).get("referenceName") in on_demand]
-        if used:
-            return Finding(source.id, "SERVERLESS_SQL", MEDIUM,
-                           f"{source.name}: {', '.join(map(str, used[:3]))} run on Synapse's serverless SQL pool; in Fabric that SQL "
-                           "goes to the Warehouse, where OPENROWSET over storage behaves differently. Consider leaving it out.")
-    return None
-
+        if not used:
+            return None
+        text = json.dumps([a.get("typeProperties") or {} for a in used])
+        where = ", ".join(str(a.get("name")) for a in used[:3])
+    else:
+        return None
+    if not storage_remap.uses_storage(text):
+        return Finding(source.id, "SERVERLESS_SQL", LOW,
+                       f"{source.name}: {where} ran on Synapse's serverless SQL pool; in Fabric it runs on the Warehouse.")
+    rewritten, notes = storage_remap.rewrite(text, routes) if routes else (text, ["Not rewritten"])
+    if rewritten != text and not any(n.startswith("Not rewritten") for n in notes):
+        return Finding(source.id, "SERVERLESS_SQL", LOW,
+                       f"{source.name}: {where} ran on Synapse's serverless SQL pool; in Fabric it runs on the Warehouse, and its "
+                       "queries over files go through the OneLake shortcut.")
+    return Finding(source.id, "SERVERLESS_SQL", MEDIUM,
+                   f"{source.name}: {where} ran on Synapse's serverless SQL pool and queries storage directly. In Fabric it runs "
+                   "on the Warehouse, which cannot read that storage as the signed-in user: route the storage account "
+                   "through a OneLake shortcut, or leave it out.")
 
 def _activities(acts: List[Any]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
@@ -326,7 +395,7 @@ def _override(source: Source) -> List[Finding]:
     found = [Finding(source.id, "LLM_TRANSFORM", LOW,
                      f"{source.name}: uses the LLM-assisted transform accepted on {(source.override or {}).get('acceptedAt') or 'an earlier date'}, "
                      "not the rule-based conversion.")]
-    if source.kind in (VIEW, PROCEDURE, SCRIPT):
+    if source.kind in (VIEW, PROCEDURE, FUNCTION, SCRIPT):
         found.extend(f for f in _sql_findings(source, code) if f.code != "TSQL_CONVERTED")
     elif source.kind == PIPELINE:
         try:

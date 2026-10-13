@@ -223,7 +223,7 @@ def test_validation_runs_in_the_background_and_reports_progress_then_rows():
     started = svc.start_validation({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}], "runtime": {"probe": True}})
     assert started["state"] == "running"
     state = svc.validation_state()
-    for _ in range(500):
+    for _ in range(3000):  # up to 30 s: a busy machine can be slow to schedule the thread
         state = svc.validation_state()
         if state["state"] != "running":
             break

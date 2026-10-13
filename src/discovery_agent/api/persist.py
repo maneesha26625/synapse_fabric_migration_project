@@ -24,11 +24,26 @@ import os
 import pickle
 import sys
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 #: Bump when a saved object's shape changes so an old file is ignored rather than half-loaded.
 VERSION = 1
+
+
+def _read_only(values: dict) -> MappingProxyType:
+    return MappingProxyType(values)
+
+
+class _Pickler(pickle.Pickler):
+    """Saves read-only mappings (``MappingProxyType``), which pickle refuses on its own. A live discovery holds them:
+    each Synapse artifact keeps its payload read-only, and so does each connection check."""
+
+    def reducer_override(self, obj: Any) -> Any:
+        if type(obj) is MappingProxyType:
+            return _read_only, (dict(obj),)
+        return NotImplemented
 
 
 class StateStore:
@@ -50,11 +65,15 @@ class StateStore:
             self.directory.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".tmp")
             with open(tmp, "wb") as handle:
-                pickle.dump({"version": VERSION, "value": value}, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                _Pickler(handle, protocol=pickle.HIGHEST_PROTOCOL).dump({"version": VERSION, "value": value})
             os.replace(tmp, path)
             return True
         except Exception as exc:  # noqa: BLE001 - saving is a convenience; the API works without it
             sys.stderr.write(f"Could not save {name} for the next start: {type(exc).__name__}: {str(exc)[:200]}\n")
+            try:
+                path.with_suffix(".tmp").unlink()
+            except OSError:
+                pass
             return False
 
     def load(self, name: str) -> Any:

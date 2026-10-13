@@ -10,7 +10,7 @@ const TONE: Record<ValidationStatus, Tone> = { MATCH: "success", REVIEW: "warnin
 const MARK: Record<ValidationStatus, string> = { MATCH: "✓", REVIEW: "⚠", MISMATCH: "✕" };
 const RUN_TONE: Record<RuntimeStatus, Tone> = { PASS: "success", FAIL: "error", "NOT RUN": "warning", "NOT CHECKED": "neutral" };
 const RUN_LABEL: Record<RuntimeStatus, string> = { PASS: "Runs", FAIL: "Fails", "NOT RUN": "Never run", "NOT CHECKED": "Not checked" };
-const CATEGORIES = ["Warehouse", "Schema", "Tables", "Columns", "Data Count", "Data Types", "Views", "Stored Procedures", "Spark", "Notebooks", "Connections", "Pipelines", "Spark Jobs", "SQL Scripts", "Schedules", "Shortcuts", "Security", "Dependencies", "Manual"];
+const CATEGORIES = ["Warehouse", "Schema", "Tables", "Columns", "Data Count", "Data Types", "Functions", "Views", "Stored Procedures", "Spark", "Notebooks", "Connections", "Pipelines", "Spark Jobs", "SQL Scripts", "Schedules", "Shortcuts", "Security", "Dependencies", "Manual"];
 const RUNNABLE: { kind: RunnableKind; label: string }[] = [
   { kind: "pipeline", label: "Pipelines" },
   { kind: "notebook", label: "Notebooks" },

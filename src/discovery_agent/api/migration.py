@@ -33,6 +33,7 @@ from discovery_agent.migration.runner import (
     DATASET,
     DEFERRED,
     ENVIRONMENT,
+    FUNCTION,
     MIGRATABLE,
     MISSING,
     NOTEBOOK,
@@ -41,6 +42,7 @@ from discovery_agent.migration.runner import (
     SCHEDULE,
     SCHEMA,
     SCRIPT,
+    SECURITY,
     SPARKJOB,
     TABLE,
     COLLATIONS,
@@ -65,8 +67,8 @@ MAX_CREDENTIALS = 100
 MAX_CREDENTIAL_FIELD = 2048
 MAX_HISTORY = 20
 #: How the validation report groups its rows.
-VALIDATION_ORDER = ("Warehouse", "Schema", "Tables", "Data Count", "Views", "Stored Procedures", "Spark", "Notebooks", "Connections",
-                    "Pipelines", "Spark Jobs", "SQL Scripts", "Schedules", "Shortcuts", "Manual")
+VALIDATION_ORDER = ("Warehouse", "Schema", "Tables", "Data Count", "Functions", "Views", "Stored Procedures", "Security", "Spark",
+                    "Notebooks", "Connections", "Pipelines", "Spark Jobs", "SQL Scripts", "Schedules", "Shortcuts", "Manual")
 SCOPES = ("automated", "all")
 #: An object already in Fabric: left as it is (the default), or updated in place. Tables are never replaced.
 EXISTING = ("skip", "update")
@@ -286,10 +288,60 @@ def linked_service_uses(name: str, artifacts: Dict[P0Artifact, Dict[str, dict]])
     return tuple(uses)
 
 
+#: Why a multi-statement table-valued function is left for a person.
+MULTI_STATEMENT_REASON = ("Fabric Warehouse does not support multi-statement table-valued functions. Rewrite it as an inline "
+                          "table-valued function or a view: generate an LLM-assisted draft (Discover > the function > LLM transform), "
+                          "review and accept it, and the run creates it; or create it by hand.")
+
+
+def rewritable(source: Source) -> bool:
+    """A deferred multi-statement function that an accepted inline rewrite can bring back into the run."""
+    return source.kind == DEFERRED and source.type == "Function" and source.payload is not None
+
+
+def _catalog(job: Any) -> Any:
+    """The SQL pool's catalog from the discovery, when one was read (functions, security, masks)."""
+    return getattr(getattr(job, "run", None), "catalog", None)
+
+
+def _function_source(oid: str, name: str, object_type: str, wave: int, catalog: Any, extra: Any) -> Source:
+    meta = dict(extra.metadata or {}) if extra is not None else {}
+    schema = str(meta.get("schemaName") or "dbo")
+    short = name.split(".")[-1]
+    found = catalog.function(schema, short) if catalog is not None and hasattr(catalog, "function") else None
+    if found is None:
+        return Source(oid, name, object_type, wave, DEFERRED, reason="The function's definition was not kept by discovery. Run discovery again.")
+    if found.is_multi_statement:
+        # Kept with its definition: an accepted LLM-assisted rewrite (inline table-valued) makes it a function again.
+        return Source(oid, name, object_type, wave, DEFERRED, payload=found, schema=schema, object_name=short, reason=(
+            MULTI_STATEMENT_REASON))
+    return Source(oid, name, object_type, wave, FUNCTION, payload=found, schema=schema, object_name=short)
+
+
+def _security_source(oid: str, name: str, object_type: str, wave: int, catalog: Any) -> Source:
+    from discovery_agent.migration import security as security_sql
+
+    sec = getattr(catalog, "security", None) if catalog is not None else None
+    principal = sec.principal(name) if sec is not None else None
+    if principal is None:
+        return Source(oid, name, object_type, wave, DEFERRED, reason="The role or user was not kept by discovery. Run discovery again.")
+    if principal.is_sql_user:
+        plan = security_sql.plan_principal(sec, name)
+        todo = security_sql.manual_statements(plan)
+        roles = [r for r in sec.roles_of(name) if not (sec.principal(r) and sec.principal(r).is_resource_class)]
+        steps = (["add it to role(s) " + ", ".join(roles)] if roles else []) + (["run: " + " ".join(todo[:5])] if todo else [])
+        return Source(oid, name, object_type, wave, DEFERRED, reason=(
+            "SQL user: Fabric has no SQL authentication. Choose the Microsoft Entra user or group that replaces it"
+            + ("; then " + "; ".join(steps) if steps else "") + "."))
+    return Source(oid, name, object_type, wave, SECURITY, payload=sec)
+
+
 def sources_for(plan: List[dict], job: Any, pool: Optional[str]) -> List[Source]:
     """Turn plan entries into what the runner needs, from the finished discovery."""
     rows = {item["id"]: item for item in job.items}
     artifacts = _artifacts(job)
+    catalog = _catalog(job)
+    catalog_security = getattr(catalog, "security", None) if catalog is not None else None
     by_kind = {
         NOTEBOOK: artifacts.get(P0Artifact.NOTEBOOK, {}), PIPELINE: artifacts.get(P0Artifact.PIPELINE, {}),
         CONNECTION: artifacts.get(P0Artifact.LINKED_SERVICE, {}), DATASET: artifacts.get(P0Artifact.DATASET, {}),
@@ -328,6 +380,12 @@ def sources_for(plan: List[dict], job: Any, pool: Optional[str]) -> List[Source]
         if kind == ENVIRONMENT:
             sources.append(Source(oid, name, object_type, wave, kind, payload=dict(extra.metadata) if extra is not None else {}))
             continue
+        if kind == FUNCTION:
+            sources.append(_function_source(oid, name, object_type, wave, catalog, extra))
+            continue
+        if kind == SECURITY:
+            sources.append(_security_source(oid, name, object_type, wave, catalog))
+            continue
         if kind == SCHEDULE:
             raw = dict(getattr(extra, "raw", None) or {}) if extra is not None else {}
             if not raw:
@@ -349,10 +407,11 @@ def sources_for(plan: List[dict], job: Any, pool: Optional[str]) -> List[Source]
             continue
         content = record.content
         key = getattr(content, "key", None)
+        schema = getattr(key, "schema", None) or record.identity.schema or "dbo"
+        object_name = getattr(key, "name", None) or record.identity.name
+        masks = tuple(catalog_security.masks_on(schema, object_name)) if kind == TABLE and catalog_security is not None else ()
         sources.append(Source(
-            oid, name, object_type, wave, kind, payload=content,
-            schema=getattr(key, "schema", None) or record.identity.schema or "dbo",
-            object_name=getattr(key, "name", None) or record.identity.name,
+            oid, name, object_type, wave, kind, payload=content, schema=schema, object_name=object_name, masks=masks,
         ))
     return sources
 
@@ -451,7 +510,8 @@ class MigrationService:
         needs_source = bool(stages & {"data", "shortcuts"})
         checks = environment_checks(self._fabric.state(), sql_driver(),
                                     source_connected=self._source_available() if needs_source else None)
-        names = set(credentials) | set(self._credentials)
+        # A connection already in Fabric is reused by the run (skipped), so it needs no credentials either.
+        names = set(credentials) | set(self._credentials) | self._existing_connection_names()
         result = planning.analyze(objects, content_findings(sources, names, pool or "", options["storageRoutes"]), checks)
         result["storage"] = self._storage_suggestions(sources, job)
         result["options"] = {**options, "dataFilters": {k: f.to_dict() for k, f in options["dataFilters"].items()}}
@@ -469,6 +529,18 @@ class MigrationService:
             result["history"] = list(reversed(self._history))
         return result
 
+    def _fabric_connections(self) -> List[Dict[str, Any]]:
+        """Fabric connections the signed-in user can see; empty when the target is not connected or cannot be read."""
+        try:
+            if self._fabric.state().get("status") == "connected":
+                return list(self._rest_factory().list("/connections"))
+        except Exception:  # noqa: BLE001 - planning reads this as a hint; it never fails a plan
+            pass
+        return []
+
+    def _existing_connection_names(self) -> set:
+        return {str(c.get("displayName") or "") for c in self._fabric_connections()} - {""}
+
     def _storage_suggestions(self, sources: List[Source], job: Any) -> List[dict]:
         """Storage locations the plan's code reads directly, each with the connection a OneLake shortcut can use.
 
@@ -479,15 +551,11 @@ class MigrationService:
         if not found and not any(storage_remap.uses_storage(t) for t in texts):
             return []
         candidates: List[Dict[str, Any]] = []
-        try:
-            if self._fabric.state().get("status") == "connected":
-                for c in self._rest_factory().list("/connections"):
-                    details = c.get("connectionDetails") or {}
-                    if storage_remap.connection_location(str(details.get("path") or "")):
-                        candidates.append({"id": str(c.get("id") or ""), "name": str(c.get("displayName") or ""),
-                                           "path": str(details.get("path") or "")})
-        except Exception:  # noqa: BLE001 - suggestions only; the Synapse linked services still count
-            pass
+        for c in self._fabric_connections():
+            details = c.get("connectionDetails") or {}
+            if storage_remap.connection_location(str(details.get("path") or "")):
+                candidates.append({"id": str(c.get("id") or ""), "name": str(c.get("displayName") or ""),
+                                   "path": str(details.get("path") or "")})
         known = {c["name"] for c in candidates}
         for name, ls in (_artifacts(job).get(P0Artifact.LINKED_SERVICE) or {}).items():
             props = (ls.get("properties") or {})

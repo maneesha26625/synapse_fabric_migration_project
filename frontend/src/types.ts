@@ -660,7 +660,7 @@ export type RunControl = "pause" | "resume" | "retry" | "reset";
 /* ---- LLM-assisted transformation ------------------------------------------- */
 
 /** The Synapse object kinds a draft can be generated for. */
-export type TransformKind = "procedure" | "view" | "table" | "script" | "pipeline" | "notebook";
+export type TransformKind = "procedure" | "view" | "table" | "script" | "pipeline" | "notebook" | "function";
 export type TransformState = "none" | "queued" | "running" | "failed" | "draft" | "accepted";
 
 export interface TransformSettings {

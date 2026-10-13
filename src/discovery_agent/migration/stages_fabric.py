@@ -125,6 +125,32 @@ class FabricStageMixin:
         return notes + [f"Main file copied to the Lakehouse ({copy_path}) with its storage paths rewritten; the original is unchanged.",
                         *code_notes]
 
+    #: Pipeline fields that hold SQL text: a Script activity's scripts, a Lookup or Copy source's query.
+    _SQL_FIELDS = ("text", "sqlReaderQuery", "query", "preCopyScript")
+
+    def _remap_sql_text(self, node: Any) -> List[str]:
+        """Route storage paths in a pipeline's SQL text (OPENROWSET, COPY) through the shortcuts. Edits ``node`` in place."""
+        notes: List[str] = []
+
+        def walk(n: Any) -> None:
+            if isinstance(n, dict):
+                for k, v in n.items():
+                    if k in self._SQL_FIELDS and isinstance(v, str) and storage_remap.uses_storage(v):
+                        n[k], found = self._remap(v)
+                        notes.extend(x for x in found if x not in notes)
+                    elif k in self._SQL_FIELDS and isinstance(v, dict) and isinstance(v.get("value"), str) \
+                            and storage_remap.uses_storage(v["value"]):
+                        v["value"], found = self._remap(v["value"])
+                        notes.extend(x for x in found if x not in notes)
+                    else:
+                        walk(v)
+            elif isinstance(n, list):
+                for v in n:
+                    walk(v)
+
+        walk(node)
+        return notes
+
     def _remap(self, text: str) -> Tuple[str, List[str]]:
         """Storage paths in code rewritten to go through the run's OneLake shortcuts (unchanged when there are none)."""
         if not storage_remap.uses_storage(text):
@@ -230,6 +256,7 @@ class FabricStageMixin:
         converted = pipelines.convert(resource, context)
         if source.override:
             converted.notes.insert(0, override_note(source))
+        converted.notes.extend(self._remap_sql_text(converted.definition))
         if converted.unsupported:
             return DEFERRED_STATUS, "Needs a rewrite", None, [
                 "These activities have no Fabric equivalent, so the pipeline was not created: " + "; ".join(converted.unsupported) + "."]
@@ -262,6 +289,12 @@ class FabricStageMixin:
         except jobs.NotConvertible as exc:
             return DEFERRED_STATUS, "Needs a rewrite", None, [str(exc)]
         notes.extend(self._remap_job(source, content))
+        if not content.get("defaultLakehouseArtifactId"):
+            # Fabric refuses to run a Spark job definition without one ("'DefaultLakehouseArtifactId' property is
+            # required for job execution"). The run's Lakehouse also holds its shortcuts and rewritten main files.
+            lakehouse_name, lakehouse = self._lakehouse()
+            content["defaultLakehouseArtifactId"] = lakehouse
+            notes.append(f"Default Lakehouse: {lakehouse_name} (Fabric needs one to run a Spark job definition).")
         body = jobs.spark_job_body(source.name, content, "Migrated from Azure Synapse")
         if existing_id:
             self._update_definition(existing_id, body)

@@ -26,6 +26,7 @@ BASE_WAVE: Mapping[str, int] = {
     "Spark Pool": 1,
     "Spark Library": 1,
     "Schema": 1,
+    # Roles and users land after the objects they are granted on: their dependencies push them later.
     "Security Object": 1,
     "Networking Configuration": 1,
     "Table": 2,

@@ -225,3 +225,39 @@ def test_onelake_files_create_append_and_flush():
     assert [c[:2] for c in calls[1:]] == [("PUT", "resource=file"), ("PATCH", "action=append&position=0"), ("PATCH", "action=flush&position=3")]
     assert onelake.lakehouse_path("abfss://w@onelake.dfs.fabric.microsoft.com/l/Files/a/b.py") == ("w", "l", "Files/a/b.py")
     assert onelake.lakehouse_path("abfss://c@acct.dfs.core.windows.net/x") is None
+
+
+def test_a_routed_notebook_is_not_also_told_to_review_its_storage_paths():
+    src = nb([f"df = spark.read.csv('abfss://{CONT}@{ACCT}.dfs.core.windows.net/x')\nTokenLibrary.getSecret('kv', 's')"])
+    unrouted = [f.message for f in content_findings([src]) if f.code == "NOTEBOOK_REVIEW"][0]
+    assert "direct storage paths" in unrouted and "TokenLibrary" in unrouted
+    routed = [f.message for f in content_findings([src], storage_routes=SPEC) if f.code == "NOTEBOOK_REVIEW"]
+    assert len(routed) == 1 and "direct storage paths" not in routed[0] and "TokenLibrary" in routed[0]
+    only_storage = nb([f"df = spark.read.csv('abfss://{CONT}@{ACCT}.dfs.core.windows.net/x')"])
+    assert "NOTEBOOK_REVIEW" not in codes(content_findings([only_storage], storage_routes=SPEC))
+
+
+def test_a_serverless_script_activity_runs_on_the_warehouse_with_its_storage_routed():
+    """A real pipeline's Script activity still ran in Synapse's serverless pool, reading storage directly:
+    'Cannot find the CREDENTIAL https://acct.dfs.core.windows.net/...'."""
+    from discovery_agent.migration import pipelines
+    serverless = {"properties": {"type": "AzureSqlDatabase", "typeProperties": {
+        "connectionString": "Data Source=ws-ondemand.sql.azuresynapse.net;Initial Catalog=master"}}}
+    query = f"SELECT COUNT(*) FROM OPENROWSET(BULK 'https://{ACCT}.dfs.core.windows.net/{CONT}/csv/*.csv', FORMAT='CSV') r"
+    resource = {"name": "PL_Serverless_Test", "properties": {"activities": [
+        {"name": "Serverless_Assessment", "type": "Script", "linkedServiceName": {"referenceName": "LS_Serverless_SQL"},
+         "typeProperties": {"scripts": [{"type": "Query", "text": query}]}}]}}
+    rest = ShortcutRest(warehouses=[{"id": "wh-1", "displayName": "pool01"}])
+    src = Source("p", "PL_Serverless_Test", "Pipeline", 1, PIPELINE,
+                 payload={"resource": resource, "datasets": {}, "linkedServices": {"LS_Serverless_SQL": serverless}})
+    run, rest = run_routed([src], rest=rest)
+    assert one(run).status == COMPLETED, one(run).error
+    import base64
+    body = [b for p, b in rest.created if p.endswith("/dataPipelines")][0]
+    act = json.loads(base64.b64decode(body["definition"]["parts"][0]["payload"]))["properties"]["activities"][0]
+    assert act["linkedService"]["properties"]["type"] == "DataWarehouse" and "externalReferences" not in act
+    text = act["typeProperties"]["scripts"][0]["text"]
+    from test_migration import WS
+    assert f"onelake.dfs.fabric.microsoft.com/{WS}/lh-1/Files/migrationcontainer/csv" in text and "core.windows.net" not in text
+    assert pipelines.is_serverless_service(serverless) and not pipelines.is_serverless_service({"properties": {"typeProperties": {
+        "connectionString": "Data Source=ws.sql.azuresynapse.net;Initial Catalog=pool01"}}})

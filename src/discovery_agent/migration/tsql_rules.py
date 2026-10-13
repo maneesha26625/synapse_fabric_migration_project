@@ -15,8 +15,9 @@ created in Fabric. Each rule is mechanical and safe to repeat:
 * ``COPY INTO ... CREDENTIAL = (IDENTITY = 'Managed Identity')`` loses the credential: a Warehouse does
   not take Synapse's managed identity, and without a credential COPY reads the storage as the
   Microsoft Entra identity that runs it;
-* ``SET IDENTITY_INSERT <table> ON | OFF`` is removed: tables are migrated without IDENTITY (a
-  Warehouse rejects the statement), so the explicit values it allowed now insert as they are.
+* ``SET IDENTITY_INSERT <table> ON | OFF`` is kept: tables keep IDENTITY in Fabric, which supports
+  the statement. It is removed only for tables the caller names as having no IDENTITY in the
+  Warehouse (``without_identity``: tables created before IDENTITY was kept), where Fabric rejects it.
 
 The last two also apply inside string literals, because they are usually built as dynamic SQL
 (``SET @sql = 'COPY INTO ...'; EXEC (@sql)``).
@@ -31,7 +32,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 _STORAGE_OPTION = re.compile(
     r"^\s*(DISTRIBUTION\s*=.*|CLUSTERED\s+COLUMNSTORE\s+INDEX(\s+ORDER\s*\(.*\))?|HEAP|CLUSTERED\s+INDEX\s*\(.*\)|PARTITION\s*\(.*\))\s*$",
@@ -198,12 +199,26 @@ def _copy_credential(sql: str, notes: List[str]) -> str:
     return text
 
 
-def _identity_insert(sql: str, notes: List[str]) -> str:
+def _identity_target(statement: str) -> str:
+    """The table a SET IDENTITY_INSERT statement names, as ``schema.table`` (or ``table``), unbracketed and lowercased."""
+    body = re.sub(r"^\s*SET\s+IDENTITY_INSERT\s+", "", statement, flags=re.IGNORECASE)
+    body = re.sub(r"\s+(?:ON|OFF)\b.*$", "", body, flags=re.IGNORECASE | re.S)
+    parts = [_unbracket(p) for p in re.split(r"\s*\.\s*", body.strip()) if p.strip()]
+    return ".".join(parts[-2:]).lower()
+
+
+def _identity_insert(sql: str, notes: List[str], without_identity: Optional[Set[str]]) -> str:
+    if not without_identity:
+        return sql
     masked = _mask_comments(sql)
-    edits = [(m.start(), m.end(), "/* removed for Fabric: SET IDENTITY_INSERT (the table has no IDENTITY in Fabric) */")
-             for m in _IDENTITY_INSERT.finditer(masked)]
+    edits = []
+    for m in _IDENTITY_INSERT.finditer(masked):
+        name = _identity_target(sql[m.start():m.end()])
+        short = name.split(".")[-1]
+        if name in without_identity or (("." not in name) and f"dbo.{short}" in without_identity):
+            edits.append((m.start(), m.end(), "/* removed for Fabric: SET IDENTITY_INSERT (the table has no IDENTITY in Fabric) */"))
     if edits:
-        notes.append("Removed SET IDENTITY_INSERT: the table was migrated without IDENTITY, so the explicit key values insert as they are.")
+        notes.append("Removed SET IDENTITY_INSERT for table(s) that have no IDENTITY in the Warehouse, so the explicit key values insert as they are.")
     return _apply(sql, edits)
 
 
@@ -281,15 +296,19 @@ def create_or_alter(sql: str) -> Optional[str]:
     return sql[:m.start()] + "CREATE OR ALTER " + sql[m.start(1):]
 
 
-def rewrite(sql: Optional[str]) -> Rewrite:
-    """Apply every rule. The notes say what changed; an unchanged text has no notes."""
+def rewrite(sql: Optional[str], without_identity: Optional[Iterable[str]] = None) -> Rewrite:
+    """Apply every rule. The notes say what changed; an unchanged text has no notes.
+
+    ``without_identity``: ``schema.table`` names of Warehouse tables that have no IDENTITY column; a
+    ``SET IDENTITY_INSERT`` on one of them is removed, because Fabric rejects it there."""
     if not sql:
         return Rewrite(sql or "")
+    lacking = {str(n).lower() for n in without_identity} if without_identity else None
     notes: List[str] = []
     text = _storage_options(sql, notes)
     text = _renames(text, notes)
     text = _isolation(text, notes)
     text = _workload(text, notes)
     text = _copy_credential(text, notes)
-    text = _identity_insert(text, notes)
+    text = _identity_insert(text, notes, lacking)
     return Rewrite(text, notes)

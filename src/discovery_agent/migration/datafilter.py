@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-from discovery_agent.migration import datacopy
+from discovery_agent.migration import datacopy, warehouse_ddl
 from discovery_agent.migration.warehouse_ddl import qualified, quote
 from discovery_agent.sql.models import SqlColumn, SqlTable
 
@@ -345,10 +345,16 @@ def apply_sql(table: SqlTable, r: Resolved, target_schema: str, target_name: str
     if r.keys:
         match = " AND ".join(f"s.{quote(k)} = {target}.{quote(k)}" for k in r.keys)
         steps.append(f"DELETE FROM {target} WHERE EXISTS (SELECT 1 FROM {stage} AS s WHERE {match});")
-    steps.append(f"INSERT INTO {target} ({cols}) SELECT {cols} FROM {stage};")
+    identity = bool(warehouse_ddl.identity_columns(table))
+    insert = f"INSERT INTO {target} ({cols}) SELECT {cols} FROM {stage};"
+    if identity:  # the rows keep their Synapse key values; IDENTITY_INSERT is per session, so it wraps the insert here
+        insert = f"SET IDENTITY_INSERT {target} ON; {insert} SET IDENTITY_INSERT {target} OFF;"
+    steps.append(insert)
     steps.append(f"UPDATE {CONTROL} SET watermark = {_literal(TO_MARK)}, synced_at = SYSUTCDATETIME(), "
                  f"rows_copied = (SELECT COUNT_BIG(*) FROM {stage}) WHERE table_name = {_literal(table_key(target_schema, target_name))};")
     steps.append("COMMIT TRANSACTION;")
+    if identity:
+        steps.append(f"DBCC CHECKIDENT({_literal(target)}, RESEED);")
     return " ".join(steps)
 
 
@@ -369,10 +375,19 @@ REGISTER_SQL = (f"INSERT INTO {CONTROL} (table_name, target_schema, target_table
                 "watermark_query, copy_query, apply_script, filter, registered_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME())")
 
 
-def staging_ddl(target_schema: str, target_name: str) -> str:
-    """An empty copy of the Warehouse table, with its exact column types, to stage changed rows in."""
+def staging_ddl(target_schema: str, target_name: str, table: Optional[SqlTable] = None) -> str:
+    """An empty copy of the Warehouse table, with its exact column types, to stage changed rows in.
+
+    CTAS would carry an IDENTITY over, and staged rows keep their own key values, so an IDENTITY column is
+    selected through CAST, which leaves the property behind."""
     stage = qualified(SYNC_SCHEMA, staging_table(target_schema, target_name))
-    return f"CREATE TABLE {stage} AS SELECT * FROM {qualified(target_schema, target_name)} WHERE 1 = 0"
+    source = qualified(target_schema, target_name)
+    identity = {c.column_id for c in warehouse_ddl.identity_columns(table)} if table is not None else set()
+    if not identity:
+        return f"CREATE TABLE {stage} AS SELECT * FROM {source} WHERE 1 = 0"
+    cols = ", ".join(f"CAST({quote(c.name)} AS bigint) AS {quote(c.name)}" if c.column_id in identity else quote(c.name)
+                     for c in datacopy.columns_of(table))
+    return f"CREATE TABLE {stage} AS SELECT {cols} FROM {source} WHERE 1 = 0"
 
 
 def registration(table: SqlTable, r: Resolved, target_schema: str, target_name: str, watermark: str,

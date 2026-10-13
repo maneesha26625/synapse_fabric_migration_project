@@ -1,6 +1,6 @@
 import {
   ChevronDown, ChevronRight, Clock, Cpu, Database, Eye, File, FileCode2, FileJson, Folder, FolderOpen, FolderTree, HardDrive,
-  Layers, Link2, NotebookPen, Package, Sparkles, SquareFunction, Table2, TableProperties, Workflow, Zap, type LucideIcon,
+  Layers, Link2, NotebookPen, Package, ShieldCheck, Sparkles, SquareFunction, Table2, TableProperties, Workflow, Zap, type LucideIcon,
 } from "lucide-react";
 import { useMemo, useState } from "react";
 import { ObjectDetails } from "../discovery/ObjectDetails";
@@ -33,6 +33,7 @@ const REPO_FOLDERS: { folder: string; types: string[]; icon: LucideIcon }[] = [
   { folder: "bigDataPool", types: ["Spark Pool"], icon: Sparkles },
   { folder: "library", types: ["Spark Library"], icon: Package },
   { folder: "storage", types: ["Storage Reference"], icon: HardDrive },
+  { folder: "security", types: ["Security Object"], icon: ShieldCheck },
 ];
 
 /** What a dedicated SQL pool holds, per schema, in the order Synapse Studio lists it. */

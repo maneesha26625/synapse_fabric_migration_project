@@ -1194,3 +1194,20 @@ describe("external storage routed through OneLake", () => {
     expect(JSON.parse(localStorage.getItem("ma.options.mock.default") ?? "null")?.storageRoutes ?? []).toEqual([]);
   }, 30000);
 });
+
+describe("functions, roles and permissions (demo)", () => {
+  it("discovers functions and principals, and offers the Roles & permissions stage", async () => {
+    await discovered();
+    const functions = await mockApi.getResults({ ...Q, types: ["Function"] });
+    expect(functions.total).toBeGreaterThan(0);
+    const multi = functions.items.find((f) => f.name.includes("Multi"))!;
+    expect(multi.status).toBe("Warning");
+    const principals = await mockApi.getResults({ ...Q, types: ["Security Object"] });
+    expect(principals.items.map((p) => p.name)).toEqual(expect.arrayContaining(["reporting_reader", "legacy_etl_login", "analyst@contoso.com"]));
+    const sqlUser = await mockApi.getObject(principals.items.find((p) => p.name === "legacy_etl_login")!.id);
+    expect(String((sqlUser.configuration as Record<string, unknown>).fabricSupport)).toContain("no SQL authentication");
+    const caps = await mockApi.getCapabilities();
+    expect(caps.stages.find((s) => s.key === "security")?.types).toEqual(["Security Object"]);
+    expect(caps.stages.find((s) => s.key === "warehouse")?.types).toContain("Function");
+  });
+});

@@ -10,6 +10,9 @@ What this build migrates:
   procedures from their own text after the T-SQL rules (``tsql_rules``) have
   removed what a Warehouse rejects.
 * **Table data** -> Fabric data pipelines, one per wave (``stages``).
+* **Functions** -> the Warehouse, like views (scalar and inline table-valued only).
+* **Roles and users** -> Warehouse roles, members and GRANT/DENY permissions (``security``);
+  dynamic data masks are written into each table's CREATE TABLE.
 
 Everything else in the plan is marked DEFERRED with the reason, so a run never
 pretends to have moved what it cannot move yet. An object that already exists
@@ -27,10 +30,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
-from discovery_agent.migration import environments, notebooks, tsql_rules, warehouse_ddl
+from discovery_agent.migration import environments, notebooks, security, tsql_rules, warehouse_ddl
 from discovery_agent.migration.common import (  # noqa: F401 - re-exported: tests and the API import these from here
-    COMPLETED, CONNECTION, DATA, DATASET, DEFERRED, DEFERRED_STATUS, ENVIRONMENT, FAILED, IN_PROGRESS, MISSING,
-    NOTEBOOK, PENDING, PIPELINE, POOL, PROCEDURE, SCHEDULE, SCHEMA, SCRIPT, SHORTCUT, SKIPPED, SPARKJOB, TABLE,
+    COMPLETED, CONNECTION, DATA, DATASET, DEFERRED, DEFERRED_STATUS, ENVIRONMENT, FAILED, FUNCTION, IN_PROGRESS, MISSING,
+    NOTEBOOK, PENDING, PIPELINE, POOL, PROCEDURE, SCHEDULE, SCHEMA, SCRIPT, SECURITY, SHORTCUT, SKIPPED, SPARKJOB, TABLE,
     VIEW, WORKSPACE_ERRORS, MigrationError, Source, override_note,
 )
 from discovery_agent.migration.stages import StageMixin
@@ -43,17 +46,19 @@ MIGRATABLE = {
     "Stored Procedure": PROCEDURE, "Notebook": NOTEBOOK, "Spark Pool": ENVIRONMENT,
     "Linked Service": CONNECTION, "Pipeline": PIPELINE, "Dataset": DATASET,
     "Spark Job Definition": SPARKJOB, "SQL Script": SCRIPT, "Trigger": SCHEDULE, "External Table": SHORTCUT,
+    "Function": FUNCTION, "Security Object": SECURITY,
 }
 MIGRATABLE_TYPES = tuple(MIGRATABLE)
 #: Within one wave, in the order things must exist: the warehouse, schemas and connections, tables,
 #: the views and procedures that read them, their rows, then notebooks, jobs, pipelines and schedules.
 _KIND_ORDER = {
-    POOL: -2, SCHEMA: -1, CONNECTION: -0.5, TABLE: 0, VIEW: 1, PROCEDURE: 2, DATA: 2.2, DATASET: 2.3,
+    # Functions before the views and procedures that call them; roles and grants once the objects exist.
+    POOL: -2, SCHEMA: -1, CONNECTION: -0.5, TABLE: 0, FUNCTION: 0.5, VIEW: 1, PROCEDURE: 2, SECURITY: 2.1, DATA: 2.2, DATASET: 2.3,
     ENVIRONMENT: 2.5, NOTEBOOK: 3, SCRIPT: 3.2, SPARKJOB: 3.5, PIPELINE: 4, SHORTCUT: 4.5, SCHEDULE: 5,
     MISSING: 6, DEFERRED: 7,
 }
 _FABRIC_KINDS = {NOTEBOOK, ENVIRONMENT, POOL, SCHEMA, TABLE, VIEW, PROCEDURE, DATA, CONNECTION, PIPELINE,
-                 SPARKJOB, SCRIPT, SCHEDULE, SHORTCUT}
+                 SPARKJOB, SCRIPT, SCHEDULE, SHORTCUT, FUNCTION, SECURITY}
 
 _DEFERRED_REASONS = {
     "Pipeline": "Pipelines move in a later session: their datasets and linked services need Fabric connections first.",
@@ -65,6 +70,9 @@ _DEFERRED_REASONS = {
 }
 
 SCHEMA_EXISTS_QUERY = "SELECT SCHEMA_ID(?)"
+#: Warehouse tables without an IDENTITY column.
+WITHOUT_IDENTITY_QUERY = ("SELECT s.name, t.name FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id "
+                          "WHERE NOT EXISTS (SELECT 1 FROM sys.identity_columns ic WHERE ic.object_id = t.object_id)")
 
 #: Warehouse collations: Fabric's default is case-sensitive; Synapse's default is case-insensitive.
 CASE_SENSITIVE = "Latin1_General_100_BIN2_UTF8"
@@ -254,7 +262,8 @@ class Migrator(StageMixin, FabricStageMixin):
                 raise MigrationError(self._fatal)
             handler = {
                 NOTEBOOK: self._notebook, POOL: self._pool, SCHEMA: self._schema,
-                TABLE: self._table, VIEW: self._module, PROCEDURE: self._module, ENVIRONMENT: self._environment,
+                TABLE: self._table, VIEW: self._module, PROCEDURE: self._module, FUNCTION: self._module,
+                SECURITY: self._security, ENVIRONMENT: self._environment,
                 DATA: self._data, CONNECTION: self._connection, DATASET: self._dataset, PIPELINE: self._pipeline,
                 SPARKJOB: self._sparkjob, SCRIPT: self._script, SCHEDULE: self._schedule, SHORTCUT: self._shortcut,
             }.get(source.kind)
@@ -473,6 +482,9 @@ class Migrator(StageMixin, FabricStageMixin):
     def _table(self, source: Source):
         cursor, schema, name, target = self._prepare(source)
         if self._exists(cursor, schema, name):
+            added = self._add_missing_masks(cursor, source)
+            if added:
+                return COMPLETED, "Already in the warehouse; dynamic data masks added", target, added
             return SKIPPED, "Already in the warehouse; left unchanged", target, []
         sql, notes = self._ddl(source)
         self._run_sql(cursor, warehouse_ddl.ensure_schema(schema), "create schema " + schema)
@@ -488,11 +500,85 @@ class Migrator(StageMixin, FabricStageMixin):
     @staticmethod
     def _ddl(source: Source):
         if source.override:
-            return source.override["code"], [override_note(source)]
+            notes = [override_note(source)]
+            if source.masks:
+                notes.append("Dynamic data masks are not added to a reviewed CREATE TABLE: check they are in it.")
+            return source.override["code"], notes
+        clauses, unsupported = [], []
+        for mask in source.masks:
+            clause = security.mask_clause(mask)
+            if clause:
+                clauses.append((mask.column, clause))
+            else:
+                unsupported.append(mask)
+        if unsupported:
+            names = ", ".join(f"{m.column} ({m.function})" for m in unsupported)
+            raise MigrationError(f"Masking function(s) Fabric does not have: {names}. The table is not created, so its rows "
+                                 "are never loaded unmasked. Change the mask in Synapse or create the table by hand.")
         try:
-            return warehouse_ddl.create_table(source.payload)
+            return warehouse_ddl.create_table(source.payload, clauses)
         except warehouse_ddl.UnsupportedColumn as exc:
             raise MigrationError(str(exc)) from exc
+
+    def _add_missing_masks(self, cursor: Any, source: Source) -> List[str]:
+        """An existing table gets the dynamic data masks it lacks (a mask only hides; adding one never exposes)."""
+        if not source.masks:
+            return []
+        try:
+            cursor.execute(security.MASKS_SQL)
+            present = {(str(r[0]).lower(), str(r[1]).lower(), str(r[2]).lower()) for r in cursor.fetchall()}
+        except Exception as exc:  # noqa: BLE001 - masks cannot be compared; say so rather than guess
+            raise MigrationError(f"The table exists, but its dynamic data masks could not be read to check them: {str(exc)[:200]}") from exc
+        notes = []
+        for mask in source.masks:
+            if (mask.schema.lower(), mask.table.lower(), mask.column.lower()) in present:
+                continue
+            statement = security.add_mask_statement(mask)
+            if statement is None:
+                raise MigrationError(f"Column {mask.column} has masking function {mask.function}, which Fabric does not have. Mask it by hand.")
+            self._run_sql(cursor, statement, f"dynamic data mask on {mask.column}")
+            notes.append(f"{mask.column}: dynamic data mask added ({mask.function})")
+        return notes
+
+    # -- roles, members and permissions ---------------------------------------
+
+    def _security(self, source: Source):
+        plan = security.plan_principal(source.payload, source.name)
+        principal = plan.principal
+        target = f"{self.run.warehouse} / {principal.kind_label.lower()} {principal.name}"
+        if principal.is_sql_user:
+            # A plan never sends one (sources_for defers SQL users), but a hand-built run must not grant to it.
+            raise MigrationError("A SQL user cannot be recreated in Fabric. Replace it with a Microsoft Entra principal.")
+        cursor = self._warehouse().cursor()
+        notes = list(plan.notes)
+        created = False
+        if plan.create_role:
+            cursor.execute(security.ROLE_EXISTS_QUERY, principal.name)
+            found = cursor.fetchone()
+            if not (found and found[0] is not None):
+                self._run_sql(cursor, plan.create_role, f"role {principal.name}")
+                created = True
+        rejected: List[str] = []
+        for _, statement in plan.members + plan.permissions:
+            try:
+                cursor.execute(statement)
+            except Exception as exc:  # noqa: BLE001 - collect every rejection, like the Migration Assistant's "Fix problems" list
+                rejected.append(f"{statement} -> {str(exc)[:160]}")
+        total = len(plan.members) + len(plan.permissions)
+        if rejected:
+            raise MigrationError(f"Fabric rejected {len(rejected)} of {total} statement(s); the others are applied and Retry Failed "
+                                 "re-applies them all safely: " + " | ".join(rejected[:5]))
+        if principal.is_role:
+            step = ("Role created" if created else "Role already in the warehouse") + \
+                f"; {len(plan.members)} member(s) and {len(plan.permissions)} permission(s) applied"
+        elif plan.permissions:
+            step = f"{len(plan.permissions)} permission(s) applied (Fabric creates the user on its first GRANT or DENY)"
+        else:
+            step = "Nothing granted directly: this principal's access comes from its role memberships"
+        if total:
+            notes.append("Workspace roles and item permissions still decide who can connect: give these principals "
+                         "Read on the Warehouse in Fabric.")
+        return COMPLETED, step, target, notes
 
     def _module(self, source: Source):
         definition = getattr(source.payload, "definition", None)
@@ -504,7 +590,7 @@ class Migrator(StageMixin, FabricStageMixin):
         if exists and not self._updating():
             return SKIPPED, "Already in the warehouse; left unchanged", target, []
         # An accepted transform still goes through the rules: they are safe to repeat and catch a slip.
-        converted = tsql_rules.rewrite(source.override["code"] if source.override else text.strip())
+        converted = tsql_rules.rewrite(source.override["code"] if source.override else text.strip(), self._tables_without_identity(cursor))
         routed, remap_notes = self._remap(converted.text)
         converted.notes.extend(remap_notes)
         statement = routed
@@ -514,11 +600,22 @@ class Migrator(StageMixin, FabricStageMixin):
                 return SKIPPED, "Already in the warehouse; not updated (its definition has no CREATE statement)", target, []
         self._run_sql(cursor, warehouse_ddl.ensure_schema(schema), "create schema " + schema)
         self._run_sql(cursor, statement, ("update " if exists else "create ") + source.type.lower())
-        what = "View" if source.kind == VIEW else "Stored procedure"
+        what = {VIEW: "View", FUNCTION: "Function"}.get(source.kind, "Stored procedure")
         done = "updated in place (CREATE OR ALTER)" if exists else "created"
         if source.override:
             return COMPLETED, f"{what} {done} (LLM-assisted, reviewed)", target, [override_note(source), *converted.notes]
         return COMPLETED, f"{what} {done}" + (" (converted for Fabric)" if converted.changed else ""), target, converted.notes
+
+    def _tables_without_identity(self, cursor: Any) -> set:
+        """``schema.table`` of every Warehouse table with no IDENTITY column (e.g. created before IDENTITY was kept),
+        where ``SET IDENTITY_INSERT`` is rejected. Read when first needed; an unreadable catalog removes nothing."""
+        if "_no_identity" not in self.__dict__:
+            try:
+                cursor.execute(WITHOUT_IDENTITY_QUERY)
+                self.__dict__["_no_identity"] = {f"{r[0]}.{r[1]}".lower() for r in cursor.fetchall()}
+            except Exception:  # noqa: BLE001 - keep the statement; Fabric reports it if it is wrong
+                self.__dict__["_no_identity"] = set()
+        return self.__dict__["_no_identity"]
 
     @staticmethod
     def _run_sql(cursor: Any, statement: Optional[str], what: str) -> None:

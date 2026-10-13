@@ -9,7 +9,7 @@ import { DependencyView } from "./DependencyView";
 import { TRANSFORMABLE_TYPES, TransformPanel } from "./TransformPanel";
 import { AssessmentBadge, MappingStatusBadge, ObjectStatusBadge, PathBadge } from "./ObjectStatusBadge";
 
-export type Tab = "overview" | "dependencies" | "metadata" | "activities" | "transform" | "raw";
+export type Tab = "overview" | "dependencies" | "metadata" | "activities" | "access" | "transform" | "raw";
 
 const fmt = (iso: string | null) => (iso ? new Date(iso).toLocaleString() : "—");
 const isPlain = (v: unknown) => v === null || ["string", "number", "boolean"].includes(typeof v);
@@ -27,6 +27,49 @@ function Properties({ data }: { data: Record<string, unknown> }) {
         </Fragment>
       ))}
     </dl>
+  );
+}
+
+interface Permission { grantee?: string; permission: string; state: string; on: string }
+
+/** A database role or user: who is in it, what it is in, and what it may do, as the pool's catalog says. */
+function Access({ o }: { o: ObjectDetail }) {
+  const c = (o.configuration ?? {}) as Record<string, unknown>;
+  const list = (k: string) => (Array.isArray(c[k]) ? (c[k] as unknown[]).map(String) : []);
+  const members = list("members"), memberOf = list("memberOf"), resource = list("resourceClasses");
+  const permissions = (Array.isArray(c.permissions) ? c.permissions : []) as Permission[];
+  const isRole = c.principalKind === "Database role" || c.principalKind === "Built-in role";
+  return (
+    <div className="stack" style={{ gap: 20 }}>
+      <dl className="kv">
+        <dt>Kind</dt><dd>{String(c.principalKind ?? "Database principal")}</dd>
+        {isRole && <><dt>Members</dt><dd>{members.length ? members.join(", ") : "None"}</dd></>}
+        {!isRole && <><dt>Member of</dt><dd>{memberOf.length ? memberOf.join(", ") : "No roles"}</dd></>}
+        {resource.length > 0 && <><dt>Resource classes</dt><dd>{resource.join(", ")} <span className="faint">(dropped: Fabric sizes each query itself)</span></dd></>}
+      </dl>
+      <Section title={`Permissions (${permissions.length})`}>
+        {permissions.length === 0 ? <p className="muted">No permissions were given to it directly{isRole ? "" : "; its access comes from its roles"}.</p> : (
+          <div className="table-wrap">
+            <table className="data">
+              <thead><tr><th>State</th><th>Permission</th><th>On</th></tr></thead>
+              <tbody>
+                {permissions.map((p, i) => (
+                  <tr key={i}>
+                    <td><span className={`badge ${p.state === "DENY" ? "error" : "success"}`}>{p.state}</span></td>
+                    <td>{p.permission}</td>
+                    <td>{p.on}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Section>
+      <p className="faint">
+        In Fabric, custom roles are created with CREATE ROLE, members added with ALTER ROLE … ADD MEMBER, and these permissions granted or denied as they are.
+        Fabric creates a Microsoft Entra user on its first GRANT. Workspace roles and item permissions still decide who can connect.
+      </p>
+    </div>
   );
 }
 
@@ -51,8 +94,10 @@ function Overview({ o, onTab }: { o: ObjectDetail; onTab: (tab: Tab) => void }) 
     a.click();
     URL.revokeObjectURL(url);
   };
+  const support = (o.configuration as Record<string, unknown> | null)?.fabricSupport;
   return (
     <div className="stack" style={{ gap: 24 }}>
+      {typeof support === "string" && <Banner tone="warning" title="Needs a person in Fabric">{support}.</Banner>}
       <div className="row">
         <Button size="small" onClick={() => onTab("metadata")}><FileCode2 size={14} aria-hidden="true" />View Source Definition</Button>
         <Button size="small" onClick={() => onTab("dependencies")}><Route size={14} aria-hidden="true" />View Mapping</Button>
@@ -183,6 +228,7 @@ export function ObjectDetails({ id, onClose, onNavigate, initialTab = "overview"
     { id: "dependencies", label: "Dependencies" },
     { id: "metadata", label: "Source metadata" },
     ...(object && object.activities.length ? [{ id: "activities" as Tab, label: `Activities (${object.activities.length})` }] : []),
+    ...(object && object.type === "Security Object" ? [{ id: "access" as Tab, label: "Access" }] : []),
     ...(object && TRANSFORMABLE_TYPES.has(object.type) ? [{ id: "transform" as Tab, label: "LLM transform" }] : []),
     { id: "raw", label: "Raw metadata" },
   ];
@@ -196,6 +242,7 @@ export function ObjectDetails({ id, onClose, onNavigate, initialTab = "overview"
   else if (tab === "dependencies") body = <DependencyView root={object} onOpen={onNavigate} />;
   else if (tab === "metadata") body = object.configuration ? <Properties data={object.configuration} /> : <p className="muted">No source metadata was extracted for this object{object.status === "Failed" ? " because its definition is unavailable" : ""}.</p>;
   else if (tab === "activities") body = <Activities o={object} />;
+  else if (tab === "access") body = <Access o={object} />;
   else if (tab === "transform") body = <TransformPanel object={object} />;
   else body = <Collapsible summary="Show raw metadata (JSON)"><JsonViewer value={object.rawMetadata} /></Collapsible>;
 

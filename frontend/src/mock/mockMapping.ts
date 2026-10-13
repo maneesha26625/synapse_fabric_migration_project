@@ -14,6 +14,7 @@ const RULES: Record<string, Rule> = {
   Table: ["Fabric Warehouse Table", "Warehouse Table", "Data Warehouse", "Target With Transformation", "Partial", "Recreate the table definition and load its data"],
   View: ["Fabric Warehouse View", "Warehouse View", "Data Warehouse", "Direct Target", "Candidate", "Recreate the view after its tables exist"],
   "Stored Procedure": ["Fabric Warehouse Stored Procedure", "Warehouse Stored Procedure", "Data Warehouse", "Target With Refactoring", "Partial", "Recreate the procedure, adjusting T-SQL where Fabric differs"],
+  Function: ["Fabric Warehouse Function", "Warehouse Function", "Data Warehouse", "Target With Refactoring", "Partial", "Recreate the function where Fabric supports it"],
   "SQL Script": ["Fabric Data Warehouse (SQL query)", "Warehouse SQL Query", "Data Warehouse", "Requires Assessment", "Not determined", "Review the script and decide where it runs in Fabric"],
   "External Table": ["Requires Assessment (Fabric Warehouse or Fabric Lakehouse)", "Undetermined", "OneLake / Storage", "Requires Assessment", "Not determined", "Assess storage and access pattern"],
   "Spark Pool": ["Fabric Spark pool / Environment configuration", "Environment", "Data Engineering", "Target With Transformation", "Partial", "Reconfigure compute/runtime"],
@@ -25,7 +26,7 @@ const RULES: Record<string, Rule> = {
   "Linked Service": ["Fabric Connection", "Connection", "Connections", "Requires Reconfiguration", "Partial", "Recreate connection"],
   Trigger: ["Fabric Data Factory pipeline schedule / trigger", "Schedule or trigger", "Data Factory", "Requires Assessment", "Partial", "Recreate schedule or event trigger"],
   "Storage Reference": ["OneLake (shortcut or copy)", "OneLake", "OneLake / Storage", "Requires Assessment", "Partial", "Choose between an OneLake shortcut and a copy"],
-  "Security Object": ["Fabric security model", "Security", "Security & Governance", "Requires Assessment", "Manual", "Remap users, groups and permissions"],
+  "Security Object": ["Fabric Warehouse roles and permissions", "Warehouse security", "Security & Governance", "Requires Reconfiguration", "Partial", "Recreate roles and permissions; replace SQL users with Microsoft Entra principals"],
   "Integration Runtime": ["Fabric connection / data gateway configuration", "Network configuration", "Connections", "Manual / Special Handling", "Manual", "Manual / reconfiguration assessment"],
   "Networking Configuration": ["Fabric network configuration", "Network configuration", "Security & Governance", "Manual / Special Handling", "Manual", "Manual / reconfiguration assessment"],
 };
@@ -53,7 +54,7 @@ const CATEGORY: Record<string, string> = {
   "Stored Procedure": "SQL", "SQL Script": "SQL", "Spark Pool": "Spark", "Spark Library": "Spark",
   Notebook: "Spark", "Spark Job Definition": "Spark", Pipeline: "Integration", Dataset: "Integration",
   "Linked Service": "Integration", Trigger: "Integration", "Storage Reference": "Storage",
-  "Integration Runtime": "Networking",
+  "Integration Runtime": "Networking", Function: "SQL", "Security Object": "Security",
 };
 
 const COMPONENT: Record<string, string> = {
@@ -63,6 +64,7 @@ const COMPONENT: Record<string, string> = {
   Notebook: "Apache Spark", "Spark Job Definition": "Apache Spark", Pipeline: "Synapse Pipelines",
   Dataset: "Synapse Pipelines", "Linked Service": "Synapse Pipelines", Trigger: "Synapse Pipelines",
   "Storage Reference": "Storage (ADLS Gen2)", "Integration Runtime": "Integration Runtime",
+  Function: "Dedicated SQL Pool", "Security Object": "Security",
 };
 
 const STEPS: Record<string, string[]> = {
@@ -75,7 +77,7 @@ const GENERIC_STEPS = ["Review the discovered definition", "Recreate or reconfig
 const BASE_WAVE: Record<string, number> = {
   "Linked Service": 1, "Integration Runtime": 1, "Storage Reference": 1, "Dedicated SQL Pool": 1, "Spark Pool": 1,
   "Spark Library": 1, Schema: 1, Table: 2, "External Table": 2, Dataset: 2, View: 3, "Stored Procedure": 3,
-  "SQL Script": 3, Notebook: 4, "Spark Job Definition": 4, Pipeline: 4, Trigger: 5,
+  "SQL Script": 3, Function: 3, "Security Object": 1, Notebook: 4, "Spark Job Definition": 4, Pipeline: 4, Trigger: 5,
 };
 
 export const categoryOf = (type: string) => CATEGORY[type] ?? "Other";

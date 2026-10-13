@@ -54,7 +54,7 @@ EFFORT_HOURS = {
     "Pipeline": 4.0, "Dataset": 1.0, "Linked Service": 1.0, "Trigger": 0.5, "SQL Script": 1.0,
     "External Table": 1.0, "Spark Job Definition": 3.0, "Integration Runtime": 2.0,
     "Notebook": 2.0, "Table": 1.0, "View": 1.0, "Stored Procedure": 2.0, "Schema": 0.25,
-    "Dedicated SQL Pool": 1.0, "Spark Pool": 1.0,
+    "Dedicated SQL Pool": 1.0, "Spark Pool": 1.0, "Function": 1.0, "Security Object": 0.5,
 }
 DEFAULT_EFFORT_HOURS = 2.0
 #: Share of that effort left for an automated object: reading the result.

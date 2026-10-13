@@ -15,9 +15,11 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from discovery_agent.extractors.models import ExtractionIssue, ExtractionProvenance
+from discovery_agent.sql.security import SqlSecurity
 from discovery_agent.sql.models import (
     CatalogDatabase,
     CatalogPrincipal,
+    SqlFunction,
     SqlObjectKey,
     SqlProcedure,
     SqlTable,
@@ -46,6 +48,10 @@ class SqlCatalogDiscovery:
     views: Tuple[SqlView, ...] = ()
     procedures: Tuple[SqlProcedure, ...] = ()
     issues: Tuple[ExtractionIssue, ...] = ()
+    #: User-defined functions and the database's security. Not P0 artifacts: they become
+    #: inventory entries of their own ("Function", "Security Object") rather than records.
+    functions: Tuple[SqlFunction, ...] = ()
+    security: Optional[SqlSecurity] = None
 
     @property
     def table_count(self) -> int:
@@ -60,9 +66,13 @@ class SqlCatalogDiscovery:
         return len(self.procedures)
 
     @property
+    def function_count(self) -> int:
+        return len(self.functions)
+
+    @property
     def object_count(self) -> int:
         """Every discovered catalog object, of any kind."""
-        return self.table_count + self.view_count + self.procedure_count
+        return self.table_count + self.view_count + self.procedure_count + self.function_count
 
     @property
     def opaque_modules(self) -> Tuple[str, ...]:
@@ -73,7 +83,7 @@ class SqlCatalogDiscovery:
         """
         return tuple(
             module.key.qualified_name
-            for module in self.views + self.procedures
+            for module in self.views + self.procedures + self.functions
             if module.is_opaque
         )
 
@@ -89,6 +99,12 @@ class SqlCatalogDiscovery:
             None,
         )
 
+    def function(self, schema: str, name: str) -> Optional[SqlFunction]:
+        return next(
+            (f for f in self.functions if f.key.schema == schema and f.key.name == name),
+            None,
+        )
+
     @property
     def column_count(self) -> int:
         return sum(table.column_count for table in self.tables)
@@ -101,6 +117,7 @@ class SqlCatalogDiscovery:
                 {table.key.schema for table in self.tables}
                 | {view.key.schema for view in self.views}
                 | {procedure.key.schema for procedure in self.procedures}
+                | {function.key.schema for function in self.functions}
             )
         )
 
@@ -112,6 +129,8 @@ class SqlCatalogDiscovery:
             + tuple(issue for table in self.tables for issue in table.issues)
             + tuple(issue for view in self.views for issue in view.issues)
             + tuple(issue for p in self.procedures for issue in p.issues)
+            + tuple(issue for f in self.functions for issue in f.issues)
+            + (self.security.issues if self.security is not None else ())
         )
 
     @property
@@ -155,6 +174,8 @@ class SqlCatalogDiscovery:
             "table_count": self.table_count,
             "view_count": self.view_count,
             "procedure_count": self.procedure_count,
+            "function_count": self.function_count,
+            "security": self.security.summary() if self.security is not None else None,
             "column_count": self.column_count,
             "opaque_modules": list(self.opaque_modules),
             "schemas": list(self.schemas),
@@ -171,5 +192,6 @@ class SqlCatalogDiscovery:
             "tables": [table.to_dict() for table in self.tables],
             "views": [view.to_dict() for view in self.views],
             "procedures": [p.to_dict() for p in self.procedures],
+            "functions": [f.to_dict() for f in self.functions],
             "issues": [issue.to_dict() for issue in self.issues],
         }

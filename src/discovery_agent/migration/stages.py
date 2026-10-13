@@ -18,7 +18,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from discovery_agent.migration import datacopy, datafilter, datapipeline, fabric_connections
+from discovery_agent.migration import datacopy, datafilter, datapipeline, fabric_connections, security, warehouse_ddl
 from discovery_agent.migration.common import (
     COMPLETED, DATA, DEFERRED_STATUS, FAILED, IN_PROGRESS, PENDING, SKIPPED, MigrationError, Source,
 )
@@ -211,7 +211,15 @@ class StageMixin:
                 if resolved is not None and resolved.sync and s.id not in results:
                     extra[s.id].append(sync_note)
 
-        entries = [datapipeline.entry(s.payload, replace, datafilter.select_sql(s.payload, predicates[s.id]) if predicates[s.id] else "")
+        # IDENTITY tables load through a staging copy without IDENTITY, then move in with IDENTITY_INSERT.
+        identity = {s.id for s in ready if warehouse_ddl.identity_columns(s.payload)}
+        for s in ready:
+            if s.id in identity:
+                self._load_staging(cursor, s)
+                extra[s.id].append(f"Loaded through {datapipeline.LOAD_SCHEMA}.{datapipeline.load_staging(s.schema or 'dbo', s.object_name or s.name)} "
+                                   "with IDENTITY_INSERT, keeping the Synapse key values; the identity was then reseeded.")
+        entries = [datapipeline.entry(s.payload, replace, datafilter.select_sql(s.payload, predicates[s.id]) if predicates[s.id] else "",
+                                      identity=s.id in identity)
                    for s in ready]
         name = datapipeline.pipeline_name(run.warehouse, wave)
         pipeline_id, created = self._data_pipeline(name, entries, str(connection["id"]), warehouse)
@@ -237,6 +245,12 @@ class StageMixin:
         for s in ready:
             schema, table_name = s.schema or "dbo", s.object_name or s.name
             target = f"{run.warehouse}.{schema}.{table_name}"
+            if s.id in identity:
+                try:
+                    self._finish_identity(cursor, s)
+                except MigrationError as exc:
+                    results[s.id] = (FAILED, "Rows staged but not moved into the table", target, [made + ".", str(exc)])
+                    continue
             landed = self._scalar(cursor, datacopy.count_sql(schema, table_name))
             notes = [made + "."] + extra[s.id]
             if reader is None:
@@ -252,6 +266,29 @@ class StageMixin:
                     f"{datacopy.describe_count(expected)} in Synapse{within}, {datacopy.describe_count(landed)} in the Warehouse. "
                     "Check the pipeline run in Fabric, then Retry Failed with 'Replace' to load it again."])
         return results
+
+    # -- IDENTITY tables ------------------------------------------------------------------------
+
+    def _load_staging(self, cursor: Any, source: Source) -> None:
+        """The staging copy an IDENTITY table is loaded through: its columns and masks, without IDENTITY."""
+        schema, name = source.schema or "dbo", source.object_name or source.name
+        stage = datapipeline.load_staging(schema, name)
+        if self._exists(cursor, datapipeline.LOAD_SCHEMA, stage):  # type: ignore[attr-defined]
+            return
+        self._run_sql(cursor, warehouse_ddl.ensure_schema(datapipeline.LOAD_SCHEMA), "create schema " + datapipeline.LOAD_SCHEMA)  # type: ignore[attr-defined]
+        masks = [(m.column, clause) for m in source.masks for clause in [security.mask_clause(m)] if clause]
+        sql, _ = warehouse_ddl.create_table(source.payload, masks, identity=False, schema=datapipeline.LOAD_SCHEMA, name=stage)
+        self._run_sql(cursor, sql, f"staging table for {schema}.{name}")  # type: ignore[attr-defined]
+
+    def _finish_identity(self, cursor: Any, source: Source) -> None:
+        """After the pipeline: if staged rows are still waiting (a pipeline made before the post-copy step existed),
+        move them in here, inside the Warehouse, exactly as the pipeline's step would have."""
+        schema, name = source.schema or "dbo", source.object_name or source.name
+        stage = datapipeline.load_staging(schema, name)
+        if not self._scalar(cursor, datacopy.count_sql(datapipeline.LOAD_SCHEMA, stage)):
+            return
+        self._run_sql(cursor, datapipeline.identity_finish(source.payload, schema, name), "IDENTITY_INSERT load")  # type: ignore[attr-defined]
+        self._run_sql(cursor, datapipeline.identity_cleanup(schema, name), "staging cleanup and identity reseed")  # type: ignore[attr-defined]
 
     # -- keeping tables in sync ---------------------------------------------------------------
 
@@ -269,7 +306,7 @@ class StageMixin:
         for statement in datafilter.CONTROL_DDL:
             cursor.execute(statement)
         if not self._exists(cursor, datafilter.SYNC_SCHEMA, datafilter.staging_table(schema, name)):  # type: ignore[attr-defined]
-            cursor.execute(datafilter.staging_ddl(schema, name))
+            cursor.execute(datafilter.staging_ddl(schema, name, source.payload))
         cursor.execute(datafilter.UNREGISTER_SQL, datafilter.table_key(schema, name))
         cursor.execute(datafilter.REGISTER_SQL, *datafilter.registration(source.payload, resolved, schema, name, watermark, overlap))
         self.run.log("SYNC", source.name, f"Registered for sync with watermark {watermark}")

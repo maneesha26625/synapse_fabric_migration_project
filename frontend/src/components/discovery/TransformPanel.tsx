@@ -5,7 +5,7 @@ import { ApiRequestError, type ObjectDetail, type TransformCheck, type Transform
 import { Banner, Button, Collapsible, ConfirmDialog, Skeleton, StatusBadge, Tabs, type Tone } from "../shared/Shared";
 
 /** Synapse types a draft can be generated for; the server's settings have the final say. */
-export const TRANSFORMABLE_TYPES = new Set(["Stored Procedure", "View", "Table", "SQL Script", "Pipeline", "Notebook"]);
+export const TRANSFORMABLE_TYPES = new Set(["Stored Procedure", "View", "Table", "SQL Script", "Pipeline", "Notebook", "Function"]);
 
 const POLL_MS = 2000;
 type Pane = "draft" | "source" | "rules";

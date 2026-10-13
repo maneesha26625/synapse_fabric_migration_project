@@ -21,6 +21,8 @@ SPARKJOB = "sparkjob"
 SCRIPT = "script"           # a SQL script -> a notebook
 SCHEDULE = "schedule"       # a trigger -> a pipeline schedule
 SHORTCUT = "shortcut"       # an external table -> a OneLake shortcut
+FUNCTION = "function"       # a user-defined T-SQL function
+SECURITY = "security"       # a database role or user -> Warehouse roles, members and permissions
 
 # -- statuses an item can have ----------------------------------------------------
 PENDING, IN_PROGRESS, COMPLETED, FAILED, SKIPPED, DEFERRED_STATUS = (
@@ -55,6 +57,8 @@ class Source:
     #: An accepted LLM-assisted transform for this object, used instead of the rule-based conversion:
     #: ``{"code", "acceptedAt", "edited"}``. Set only while the source still matches what was accepted.
     override: Optional[Dict[str, Any]] = None
+    #: Tables only: ``sql.security.SqlMaskedColumn`` entries, recreated as dynamic data masks with the table.
+    masks: Tuple[Any, ...] = ()
 
 
 def override_note(source: Source) -> str:

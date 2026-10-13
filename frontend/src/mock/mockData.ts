@@ -41,6 +41,8 @@ const DEFS: Record<string, Def> = {
   trigger: { key: "trigger", type: "Trigger" },
   storage: { key: "storage", type: "Storage Reference" },
   ir: { key: "integration_runtime", type: "Integration Runtime" },
+  fn: { key: "function", type: "Function" },
+  sec: { key: "security", type: "Security Object" },
 };
 
 export interface MockOptions {
@@ -73,13 +75,14 @@ export function generateObjects({ workspace, omitCategories = [] }: MockOptions)
   ) {
     const def = DEFS[kind];
     if (omitCategories.includes(categoryOf(def.type))) return;
-    const isSql = def.type === "Table" || def.type === "External Table" || def.type === "View" || def.type === "Stored Procedure";
+    const isSql = def.type === "Table" || def.type === "External Table" || def.type === "View" || def.type === "Stored Procedure" || def.type === "Function";
     let uniq = name;
     for (let n = 2; used.has(`${kind}:${uniq}`); n++) uniq = `${name}_${n}`;
     used.add(`${kind}:${uniq}`);
-    const id = isSql ? `sql://mockpool/${uniq.replace(".", "/")}` : `synapse://${def.key}/${uniq}`;
+    const id = isSql ? `sql://mockpool/${uniq.replace(".", "/")}` : def.type === "Security Object" ? `security://mockpool/${uniq}` : `synapse://${def.key}/${uniq}`;
     const roll = rand();
-    const status: ObjectStatus = roll < 0.04 ? "Warning" : roll < 0.06 ? "Partial" : roll < 0.07 ? "Failed" : "Discovered";
+    let status: ObjectStatus = roll < 0.04 ? "Warning" : roll < 0.06 ? "Partial" : roll < 0.07 ? "Failed" : "Discovered";
+    if (def.type === "Security Object" || def.type === "Function") status = "Discovered";
     const self: ObjectDetail = {
       id, name: uniq, type: def.type, category: categoryOf(def.type), workspace, status,
       dependencyCount: 0, sources: isSql ? ["sql"] : ["synapse"],
@@ -102,6 +105,10 @@ export function generateObjects({ workspace, omitCategories = [] }: MockOptions)
       rawMetadata: null,
     };
     const { deps, config, specific, activities } = build(self);
+    if (typeof config.fabricSupport === "string") {
+      self.status = "Warning";
+      self.issues = [{ code: "unsupported_construct", message: `${config.fabricSupport} (demo).`, source: "sql", facet: "definition" }];
+    }
     Object.assign(self, mockMap(def.type, !!specific));
     self.dependencies = deps;
     self.dependencyCount = deps.length;
@@ -167,6 +174,52 @@ export function generateObjects({ workspace, omitCategories = [] }: MockOptions)
       }
       return { deps: dedupe(deps), config: { parameters: Math.floor(rand() * 5), language: "T-SQL" } };
     });
+  }
+  for (let i = 0; i < 24; i++) {
+    const kind = i % 8 === 7 ? "TF" : i % 2 ? "IF" : "FN";
+    const label = kind === "FN" ? "scalar function" : kind === "IF" ? "inline table-valued function" : "multi-statement table-valued function";
+    add("fn", `dbo.${kind === "FN" ? "fn_" : "tvf_"}${ENTITIES[i % ENTITIES.length]}${kind === "TF" ? "Multi" : ""}${i}`, () => ({
+      deps: kind !== "FN" && tables.length ? [dep(pick(tables), "sql_object", "definition")] : [],
+      config: { functionKind: label, typeCode: kind, definitionReadable: true,
+        ...(kind === "TF" ? { fabricSupport: "Not supported in Fabric Warehouse: rewrite as an inline table-valued function or a view" } : {}) },
+    }));
+  }
+  const roles = ["reporting_reader", "etl_writer", "finance_analyst", "data_steward", "app_service"];
+  const users = ["analyst@contoso.com", "etl-sp@contoso.com", "Finance Team", "Data Engineers", "legacy_etl_login", "report_svc_login"];
+  const sqlUsers = new Set(["legacy_etl_login", "report_svc_login"]);
+  const securables = (byKind.view ?? []).slice(0, 6).concat(tables.slice(0, 6));
+  for (const [i, role] of roles.entries()) {
+    add("sec", role, () => {
+      const on = securables.length ? [securables[(i * 3) % securables.length], securables[(i * 3 + 1) % securables.length]] : [];
+      return {
+        deps: dedupe([...on.map((o) => dep(o, "sql_object", "permissions"))]),
+        config: {
+          principalKind: "Database role", principalType: "R",
+          members: users.filter((_, k) => (k + i) % 3 === 0),
+          permissions: [
+            ...on.map((o) => ({ grantee: role, permission: "SELECT", state: "GRANT", on: o.name })),
+            { grantee: role, permission: i % 2 ? "EXECUTE" : "SELECT", state: "GRANT", on: `schema ${pick(["dbo", "dw", "stg"])}` },
+            ...(i === 2 ? [{ grantee: role, permission: "SELECT", state: "DENY", on: `${on[0]?.name ?? "dw.FactPayment"} (CardNumber)` }] : []),
+          ],
+        },
+      };
+    });
+  }
+  add("sec", "db_datareader", () => ({ deps: [], config: { principalKind: "Built-in role", principalType: "R", members: ["Data Engineers"], permissions: [] } }));
+  const secByName = new Map((byKind.sec ?? []).map((o) => [o.name, o]));
+  for (const [i, user] of users.entries()) {
+    const sql = sqlUsers.has(user);
+    const memberOf = roles.filter((_, k) => (i + k) % 3 === 0);
+    add("sec", user, () => ({
+      deps: memberOf.flatMap((r) => (secByName.get(r) ? [dep(secByName.get(r)!, "artifact", "members")] : [])),
+      config: {
+        principalKind: sql ? "SQL user" : user.includes("@") ? "Microsoft Entra user" : "Microsoft Entra group",
+        principalType: sql ? "S" : user.includes("@") ? "E" : "X",
+        memberOf, permissions: i % 2 === 0 ? [{ grantee: user, permission: "VIEW DEFINITION", state: "GRANT", on: "the database" }] : [],
+        ...(i === 4 ? { resourceClasses: ["largerc"] } : {}),
+        ...(sql ? { fabricSupport: "Fabric has no SQL authentication: replace this user with a Microsoft Entra user or group, then give that principal the same roles and permissions" } : {}),
+      },
+    }));
   }
   for (let i = 0; i < 40; i++) {
     add("script", `SQL_Script_${ENTITIES[i % ENTITIES.length]}_${i}`, () => ({

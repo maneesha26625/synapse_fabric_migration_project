@@ -12,14 +12,17 @@ from typing import Any, Dict, List, Optional
 
 from discovery_agent.llm.context import synapse_only, unsupported_activities
 from discovery_agent.migration import notebooks, tsql_rules
-from discovery_agent.migration.common import NOTEBOOK, PIPELINE, PROCEDURE, SCRIPT, TABLE, VIEW
+from discovery_agent.migration.common import FUNCTION, NOTEBOOK, PIPELINE, PROCEDURE, SCRIPT, TABLE, VIEW
 
 _CREATE = {
     VIEW: re.compile(r"^\s*(?:--[^\n]*\n|/\*.*?\*/|\s)*CREATE\s+(?:OR\s+ALTER\s+)?VIEW\b", re.I | re.S),
     PROCEDURE: re.compile(r"^\s*(?:--[^\n]*\n|/\*.*?\*/|\s)*CREATE\s+(?:OR\s+ALTER\s+)?PROC(?:EDURE)?\b", re.I | re.S),
     TABLE: re.compile(r"^\s*(?:--[^\n]*\n|/\*.*?\*/|\s)*CREATE\s+TABLE\b", re.I | re.S),
+    FUNCTION: re.compile(r"^\s*(?:--[^\n]*\n|/\*.*?\*/|\s)*CREATE\s+(?:OR\s+ALTER\s+)?FUNCTION\b", re.I | re.S),
 }
-_WHAT = {VIEW: "CREATE VIEW", PROCEDURE: "CREATE PROCEDURE", TABLE: "CREATE TABLE"}
+_WHAT = {VIEW: "CREATE VIEW", PROCEDURE: "CREATE PROCEDURE", TABLE: "CREATE TABLE", FUNCTION: "CREATE FUNCTION"}
+#: ``RETURNS @t TABLE``: a multi-statement table-valued function, which a Fabric Warehouse does not support.
+_MULTI_STATEMENT = re.compile(r"\bRETURNS\s+@\w+\s+TABLE\b", re.I)
 
 
 def _check(level: str, message: str) -> Dict[str, str]:
@@ -40,6 +43,9 @@ def _sql(kind: str, code: str) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
     if kind in _CREATE and not _CREATE[kind].match(code):
         out.append(_check("error", f"It does not start with {_WHAT[kind]}, so the run could not create it."))
+    if kind == FUNCTION and _MULTI_STATEMENT.search(code):
+        out.append(_check("error", "It is still a multi-statement table-valued function (RETURNS @... TABLE), which a Fabric "
+                                   "Warehouse rejects. Rewrite it as an inline table-valued function (RETURNS TABLE AS RETURN SELECT ...)."))
     if kind == TABLE and re.search(r"\b(?:PRIMARY\s+KEY|UNIQUE|FOREIGN\s+KEY)\b", code, re.I):
         out.append(_check("warning", "It declares keys. The run adds the table's keys itself, NOT ENFORCED; remove them here to avoid a duplicate."))
     if not _balanced(code):
@@ -88,7 +94,7 @@ def run(kind: str, code: str, unconverted: List[Any], original: Optional[Dict[st
     elif kind == NOTEBOOK:
         found = _notebook(code, original)
     else:
-        found = _sql(kind, code) if kind in (VIEW, PROCEDURE, TABLE, SCRIPT) else []
+        found = _sql(kind, code) if kind in (VIEW, PROCEDURE, TABLE, SCRIPT, FUNCTION) else []
     if unconverted:
         found.append(_check("warning", f"The model left {len(unconverted)} item{'s' if len(unconverted) != 1 else ''} for a person; see below."))
     if not any(c["level"] == "error" for c in found):

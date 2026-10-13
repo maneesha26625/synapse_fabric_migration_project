@@ -213,8 +213,15 @@ class PipelineRest(StageRest):
         if self.outcome == "Completed":
             for e in body["executionData"]["parameters"]["tables"]:
                 key = f"[{e['schema']}].[{e['table']}]"
-                if e["preCopyScript"]:
-                    self.db.tables[key] = []
+                for statement in (e["preCopyScript"] or "").split("; "):
+                    if statement.startswith("TRUNCATE TABLE "):
+                        self.db.tables[statement[len("TRUNCATE TABLE "):]] = []
+                finish = e.get("postCopyScript") or ""
+                if finish:
+                    # An IDENTITY table: the copy fills its staging table, the post-copy step moves the rows in.
+                    target = finish.split("INSERT INTO ")[1].split(" (")[0]
+                    self.db.tables[target].extend(self.source_rows.get(target, []))
+                    continue
                 self.db.tables[key].extend(self.source_rows.get(key, []))
         return f"/workspaces/{WS}/items/{path.split('/')[4]}/jobs/instances/job-{len(self.runs)}"
 
@@ -310,7 +317,9 @@ def test_tables_with_rows_are_skipped_unless_replace_which_truncates_inside_the_
     assert one(run).status == SKIPPED and "Already has 1 row" in one(run).step and not rest.runs
     run = load([data_item()], db, rest, SourceCounts({ORDERS: 4}), settings={"dataMode": "replace"})
     assert one(run).status == COMPLETED and len(db.tables[ORDERS]) == 4
-    assert rest.runs[-1][1]["executionData"]["parameters"]["tables"][0]["preCopyScript"] == "TRUNCATE TABLE [sales].[Orders]"
+    # Orders has an IDENTITY column: the pipeline empties its staging table and the table itself.
+    entry = rest.runs[-1][1]["executionData"]["parameters"]["tables"][0]
+    assert entry["preCopyScript"] == "TRUNCATE TABLE [migration_load].[sales__Orders]; TRUNCATE TABLE [sales].[Orders]"
 
 
 def test_without_credentials_or_an_existing_connection_the_tables_wait_for_one():
@@ -730,9 +739,13 @@ def test_the_spark_job_stage_creates_it_with_the_matching_environment():
     rest = StageRest(environments=[{"id": "env-7", "displayName": "transportation"}])
     run, rest, _ = migrate([Source("j", "job1", "Spark Job Definition", 4, SPARKJOB, payload=SJD)], rest=rest)
     assert one(run).status == COMPLETED
-    path, body = rest.created[0]
-    assert path.endswith("/sparkJobDefinitions") and body["definition"]["format"] == "SparkJobDefinitionV1"
-    assert json.loads(base64.b64decode(body["definition"]["parts"][0]["payload"]))["environmentArtifactId"] == "env-7"
+    path, body = [c for c in rest.created if c[0].endswith("/sparkJobDefinitions")][0]
+    assert body["definition"]["format"] == "SparkJobDefinitionV1"
+    content = json.loads(base64.b64decode(body["definition"]["parts"][0]["payload"]))
+    assert content["environmentArtifactId"] == "env-7"
+    # Fabric will not run a Spark job definition without a default Lakehouse: the run's own is created and set
+    lakehouse = [c for c in rest.created if c[0].endswith("/lakehouses")][0]
+    assert lakehouse[1]["displayName"] == "pool01_lakehouse" and content["defaultLakehouseArtifactId"] == "lakehouses-1"
 
 
 SCRIPT_RES = {"name": "q1", "properties": {"content": {"query": "SELECT 1;\nSELECT 2;", "metadata": {"language": "sql"}, "currentConnection": {"poolName": "pool01"}}}}
@@ -743,6 +756,9 @@ def test_a_sql_script_becomes_a_t_sql_notebook_bound_to_the_warehouse():
     cell = document["cells"][0]
     assert "".join(cell["source"]) == "SELECT 1;\nSELECT 2;" and cell["metadata"]["microsoft"]["language_group"] == "sqldatawarehouse"
     assert document["metadata"]["dependencies"]["warehouse"]["default_warehouse"] == "wh-1"
+    # the T-SQL kernel: without it Fabric runs the notebook on Spark and the T-SQL fails as Spark SQL
+    assert document["metadata"]["kernel_info"] == {"name": "sqldatawarehouse"}
+    assert document["metadata"]["kernelspec"]["name"] == "sqldatawarehouse"
     assert any("Review before running" in n for n in notes)
     with pytest.raises(jobs.NotConvertible):
         jobs.sql_script_notebook({"properties": {"content": {"query": "  "}}}, None, "w")

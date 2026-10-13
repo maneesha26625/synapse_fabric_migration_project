@@ -16,15 +16,16 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from discovery_agent.llm import templates
 from discovery_agent.migration import notebooks, pipelines, tsql_rules, warehouse_ddl
-from discovery_agent.migration.common import NOTEBOOK, PIPELINE, PROCEDURE, SCRIPT, TABLE, VIEW, Source
+from discovery_agent.migration.common import FUNCTION, NOTEBOOK, PIPELINE, PROCEDURE, SCRIPT, TABLE, VIEW, Source
 from discovery_agent.migration.preflight import SYNAPSE_ONLY
 
 #: The kinds a draft can be generated for, and the template that describes each.
 TEMPLATES = {PROCEDURE: "stored_procedure.md", VIEW: "view.md", TABLE: "table.md", SCRIPT: "sql_script.md", PIPELINE: "pipeline.md",
-             NOTEBOOK: "notebook.md"}
+             NOTEBOOK: "notebook.md", FUNCTION: "function.md"}
 TRANSFORMABLE_KINDS = tuple(TEMPLATES)
 _OUTPUT = {
     PROCEDURE: "`CREATE PROCEDURE` statement", VIEW: "`CREATE VIEW` statement", TABLE: "`CREATE TABLE` statement",
+    FUNCTION: "`CREATE FUNCTION` statement (scalar or inline table-valued)",
     SCRIPT: "T-SQL script text", PIPELINE: "Synapse pipeline resource JSON (it is converted to Fabric afterwards)",
     NOTEBOOK: 'notebook as JSON, `{"language": ..., "cells": [...]}`, in the same shape as the source',
 }
@@ -117,7 +118,7 @@ def extract(source: Source) -> Subject:
     if payload is None:
         raise NotTransformable("Discovery did not keep this object's definition. Run discovery again.")
 
-    if kind in (VIEW, PROCEDURE):
+    if kind in (VIEW, PROCEDURE, FUNCTION):
         definition = getattr(payload, "definition", None)
         text = getattr(definition, "text", None)
         if not text or not getattr(definition, "is_readable", False):
@@ -223,7 +224,7 @@ def build(subject: Subject, source: Source, detail: Mapping[str, Any], target: M
     """The full prompt for one object, from the templates in ``prompts_dir``."""
     context: Dict[str, Any] = {
         "object": {"id": source.id, "name": source.object_name or source.name, "type": source.type, "kind": subject.kind,
-                   "schema": source.schema if subject.kind in (TABLE, VIEW, PROCEDURE) else ""},
+                   "schema": source.schema if subject.kind in (TABLE, VIEW, PROCEDURE, FUNCTION) else ""},
         "notebook": {"language": json.loads(subject.code).get("language", "") if subject.kind == NOTEBOOK else ""},
         "source": {"platform": _PLATFORM.get(subject.kind, "Azure Synapse dedicated SQL pool"), "language": subject.language,
                    "code": subject.code, "fence": _fence(subject.code)},

@@ -16,6 +16,11 @@ type the Warehouse column was created with. Because the table list is a
 parameter, a re-run passes only the tables that still need data, and the same
 pipeline serves every run.
 
+A table with an IDENTITY column is copied into a staging table of the same
+shape without IDENTITY (schema ``migration_load``), and a Script activity then
+moves the rows into the real table with ``SET IDENTITY_INSERT`` and reseeds it,
+so the original key values are kept, all inside the Warehouse.
+
 A table with a date filter gets a SELECT with a WHERE clause instead
 (``datafilter``). Tables kept in sync share one more pipeline per Warehouse, the
 sync pipeline, which reads its table list from the control table in the
@@ -58,14 +63,58 @@ def pipeline_name(warehouse: str, wave: int) -> str:
     return f"load_{base}_wave_{wave}"[:120]
 
 
-def entry(table: SqlTable, replace: bool, query: str = "") -> Dict[str, str]:
-    """One element of the pipeline's ``tables`` parameter. ``query`` overrides the full-table SELECT (a date filter)."""
+#: Where IDENTITY tables are staged on their way in: rows copied as they are, then moved with IDENTITY_INSERT.
+LOAD_SCHEMA = "migration_load"
+#: What the Script activity runs for a table that needs no step after the copy.
+NOTHING = "DECLARE @nothing int"
+
+
+def load_staging(schema: str, name: str) -> str:
+    """The staging table an IDENTITY table is loaded through (in ``LOAD_SCHEMA``)."""
+    return datafilter.staging_table(schema, name)
+
+
+def identity_finish(table: SqlTable, schema: str, name: str) -> str:
+    """Staged rows into the IDENTITY table with their own key values. One batch: IDENTITY_INSERT is per session."""
+    target = warehouse_ddl.qualified(schema, name)
+    stage = warehouse_ddl.qualified(LOAD_SCHEMA, load_staging(schema, name))
+    cols = ", ".join(warehouse_ddl.quote(c.name) for c in datacopy.columns_of(table))
+    return (f"SET IDENTITY_INSERT {target} ON; INSERT INTO {target} ({cols}) SELECT {cols} FROM {stage}; "
+            f"SET IDENTITY_INSERT {target} OFF;")
+
+
+def identity_cleanup(schema: str, name: str) -> str:
+    """After the rows are in: empty the staging table and realign the identity past the loaded keys."""
+    target = warehouse_ddl.qualified(schema, name)
+    stage = warehouse_ddl.qualified(LOAD_SCHEMA, load_staging(schema, name))
+    return f"TRUNCATE TABLE {stage}; DBCC CHECKIDENT('{target.replace(chr(39), chr(39) * 2)}', RESEED);"
+
+
+def entry(table: SqlTable, replace: bool, query: str = "", identity: bool = False) -> Dict[str, str]:
+    """One element of the pipeline's ``tables`` parameter. ``query`` overrides the full-table SELECT (a date filter).
+
+    ``identity``: the table keeps an IDENTITY column, so the copy writes its staging table and the
+    post-copy scripts move the rows in with IDENTITY_INSERT, then reseed."""
     schema, name = table.key.schema, table.key.name
+    target = warehouse_ddl.qualified(schema, name)
+    if not identity:
+        return {
+            "schema": schema,
+            "table": name,
+            "query": query or datacopy.select_sql(table),
+            "preCopyScript": f"TRUNCATE TABLE {target}" if replace else "",
+            "postCopyScript": "",
+            "postCopyCleanup": "",
+        }
+    stage = load_staging(schema, name)
+    pre = f"TRUNCATE TABLE {warehouse_ddl.qualified(LOAD_SCHEMA, stage)}" + (f"; TRUNCATE TABLE {target}" if replace else "")
     return {
-        "schema": schema,
-        "table": name,
+        "schema": LOAD_SCHEMA,
+        "table": stage,
         "query": query or datacopy.select_sql(table),
-        "preCopyScript": f"TRUNCATE TABLE {warehouse_ddl.qualified(schema, name)}" if replace else "",
+        "preCopyScript": pre,
+        "postCopyScript": identity_finish(table, schema, name),
+        "postCopyCleanup": identity_cleanup(schema, name),
     }
 
 
@@ -142,10 +191,28 @@ def _copy(name: str, query: Any, schema: Any, table: Any, pre_copy: Any, connect
     }
 
 
+def _script_or_nothing(field: str) -> Dict[str, Any]:
+    return _expression(f"@if(empty(item()?.{field}), '{NOTHING}', item()?.{field})")
+
+
 def definition(entries: List[Mapping[str, str]], connection_id: str, warehouse: WarehouseTarget) -> Dict[str, Any]:
     """The ``pipeline-content.json`` of one wave's data pipeline."""
     copy = _copy("Copy table", _expression("@item().query"), _expression("@item().schema"), _expression("@item().table"),
                  _expression("@item().preCopyScript"), connection_id, warehouse)
+    # IDENTITY tables only: staged rows into the table with IDENTITY_INSERT, then the staging table emptied and the
+    # identity reseeded. Two scripts, so the cleanup runs only if the rows went in. Other tables run a no-op.
+    after = {
+        "name": "After copy",
+        "type": "Script",
+        "dependsOn": _after("Copy table"),
+        "policy": dict(_POLICY),
+        "linkedService": _warehouse_link(warehouse),
+        "typeProperties": {
+            "scripts": [{"type": "NonQuery", "text": _script_or_nothing("postCopyScript")},
+                        {"type": "NonQuery", "text": _script_or_nothing("postCopyCleanup")}],
+            "scriptBlockExecutionTimeout": "02:00:00",
+        },
+    }
     return {"properties": {
         "parameters": {"tables": {"type": "array", "defaultValue": [dict(e) for e in entries]}},
         "activities": [{
@@ -156,7 +223,7 @@ def definition(entries: List[Mapping[str, str]], connection_id: str, warehouse: 
                 "items": _expression("@pipeline().parameters.tables"),
                 "isSequential": False,
                 "batchCount": PARALLEL_COPIES,
-                "activities": [copy],
+                "activities": [copy, after],
             },
         }],
         "annotations": [],

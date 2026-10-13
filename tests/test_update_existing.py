@@ -87,6 +87,8 @@ def test_an_existing_fabric_item_keeps_its_id_and_gets_the_new_definition(kind, 
             "notebooks" if collection != "notebooks" else "environments": [{"id": "nb-1", "displayName": "LoadSales"}]}
     if kind == PIPELINE:
         seed[collection].append({"id": "pl-9", "displayName": "pl_child"})  # the sample pipeline calls it
+    if kind == SPARKJOB:
+        seed["lakehouses"] = [{"id": "lh-1", "displayName": "pool01_lakehouse"}]  # a Spark job needs a default Lakehouse
     src = Source("x", name, type_, 1, kind, payload=payload)
     skipped, rest, _ = migrate([src], rest=UpdRest(**seed))
     assert one(skipped).status == SKIPPED and not rest.updated

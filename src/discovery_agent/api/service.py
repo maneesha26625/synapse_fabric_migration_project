@@ -301,7 +301,7 @@ class Session:
                 "discoveryScope": [
                     f"{t}s" if not t.endswith("s") else t
                     for t, _ in mapping.ARTIFACT_INFO.values()
-                ],
+                ] + ["Functions", "Roles, users and permissions", "Dynamic data masks"],
                 # What a migration run moves into Fabric today; the rest of
                 # a plan is reported as deferred to a later session.
                 "migratableTypes": list(MIGRATABLE_TYPES),
@@ -863,7 +863,7 @@ class Session:
                 config = DiscoveryConfig(source=Path("."), out=Path(DEFAULT_OUTPUT_DIR))
                 run = discovery.run(config, connections=conn.manager, scan_repository=False)
             records = list(run.records.records)
-            extras, extra_failures = self._collect_extras(conn, records)
+            extras, extra_failures = self._collect_extras(conn, records, getattr(run, "catalog", None))
 
             # Every id a dependency can join onto, in one place.
             known: Dict[str, str] = {}
@@ -917,7 +917,8 @@ class Session:
                     "completed_with_warnings" if summary["failedCategories"] or summary["warnings"] else "completed"
                 )
                 self._restored = None
-            self._save_discovery(job, conn)
+                # Saved before anyone can see "completed", so a restart right after never misses it.
+                self._save_discovery(job, conn)
         except DiscoveryError as exc:
             self._fail(job, redact(str(exc)))
         except Exception as exc:  # noqa: BLE001 - never leak a traceback to the UI
@@ -963,7 +964,7 @@ class Session:
         }
 
     @staticmethod
-    def _collect_extras(conn: _Connection, records: list) -> Tuple[List["mapping.Extra"], List[dict]]:
+    def _collect_extras(conn: _Connection, records: list, catalog: Any = None) -> Tuple[List["mapping.Extra"], List[dict]]:
         """Inventory entries beyond the nine P0 artifacts.
 
         Each source is read independently and a failure is reported by name,
@@ -983,6 +984,8 @@ class Session:
             if conn.manager is None:
                 extras.extend(mapping.schema_extras(records))
                 extras.extend(mapping.storage_extras(records))
+                extras.extend(mapping.function_extras(catalog))
+                extras.extend(mapping.security_extras(catalog))
                 return extras, failures
         workspace_id = conn.manager.settings.synapse.workspace_resource_id(conn.subscription_id)
 
@@ -1003,6 +1006,9 @@ class Session:
             attempt("Triggers", lambda: conn.manager.synapse_artifacts().list_triggers(), mapping.trigger_extras)
         extras.extend(mapping.schema_extras(records))
         extras.extend(mapping.storage_extras(records))
+        # From the SQL pool's catalog, when one was read: functions, and the roles and users that carry access.
+        extras.extend(mapping.function_extras(catalog))
+        extras.extend(mapping.security_extras(catalog))
         return extras, failures
 
     def _fail(self, job: _Job, message: str) -> None:

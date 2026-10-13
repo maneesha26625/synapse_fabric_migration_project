@@ -29,6 +29,7 @@ from discovery_agent.sql.models import (
     IndexKind,
     SqlColumn,
     SqlDistributionColumn,
+    SqlFunction,
     SqlIndex,
     SqlIndexColumn,
     SqlModuleDefinition,
@@ -1062,6 +1063,65 @@ def build_procedures(
             )
         )
     return tuple(procedures), tuple(issues)
+
+
+def build_functions(
+    database: str,
+    function_rows: Sequence[Mapping[str, Any]],
+    module_rows: Sequence[Mapping[str, Any]] = (),
+    modules_readable: bool = True,
+) -> Tuple[Tuple[SqlFunction, ...], Tuple[ExtractionIssue, ...]]:
+    """Assemble every visible user-defined function from its catalog rows. Pure.
+
+    Built the way views are: the body comes from ``sys.sql_modules`` and is
+    observed by the same scanner, so a function's references read like a
+    view's. The catalog ``type`` is kept, because Fabric Warehouse accepts
+    scalar and inline table-valued functions but not multi-statement ones.
+    """
+    modules = modules_by_object_id(module_rows)
+    functions: List[SqlFunction] = []
+    issues: List[ExtractionIssue] = []
+    unidentified = 0
+
+    for row in function_rows:
+        try:
+            key = module_key_from_row(database, row, CatalogObjectType.FUNCTION)
+        except ValueError:
+            unidentified += 1
+            continue
+
+        definition = definition_from_row(
+            modules.get(key.object_id) if key.object_id is not None else None,
+            modules_readable,
+        )
+        referenced, dynamic = observe_definition(
+            definition, f"{key.qualified_name}.definition"
+        )
+        own_issues = [i for i in (definition_issue(definition, key),) if i is not None]
+
+        functions.append(
+            SqlFunction(
+                key=key,
+                create_date=_timestamp(row.get("create_date")),
+                modify_date=_timestamp(row.get("modify_date")),
+                definition=definition,
+                referenced_objects=referenced,
+                dynamic_sql=dynamic,
+                type_code=_text(row.get("type_code")),
+                issues=tuple(own_issues),
+            )
+        )
+
+    if unidentified:
+        issues.append(
+            ExtractionIssue(
+                IssueCode.MISSING_INFORMATION,
+                f"{unidentified} function row(s) could not be identified and "
+                f"were not reported",
+                f"{database}.functions",
+            )
+        )
+    return tuple(functions), tuple(issues)
 
 
 def _dynamic_sql_issue(

@@ -98,6 +98,14 @@ def _substitute(node: Any, params: Mapping[str, Any]) -> Any:
     if isinstance(node, list):
         return [_substitute(n, params) for n in node]
     if isinstance(node, dict):
+        if node.get("type") == "Expression" and isinstance(node.get("value"), str):
+            # {"value": "@dataset().x", "type": "Expression"} is replaced whole by what the activity passed for x (an
+            # Expression object or a literal). Substituting only its text would nest one Expression inside another,
+            # which Fabric rejects for the whole pipeline ("Operation returned an invalid status code 'BadRequest'").
+            whole = re.fullmatch(r"@dataset\(\)\.([A-Za-z_][A-Za-z0-9_]*)", node["value"].strip())
+            if whole and whole.group(1) in params:
+                return copy.deepcopy(params[whole.group(1)])
+            return {**node, "value": _substitute(node["value"], params)}
         return {k: _substitute(v, params) for k, v in node.items()}
     return node
 
@@ -125,6 +133,13 @@ def _bind_ls_parameters(text: str, ls: Mapping[str, Any], passed: Optional[Mappi
 
     bound = _LS_PARAM.sub(repl, text)
     return "" if unresolved else bound
+
+
+def is_serverless_service(ls: Mapping[str, Any]) -> bool:
+    """Whether a linked service points at a Synapse workspace's serverless (on-demand) SQL endpoint."""
+    tp = (ls.get("properties") or {}).get("typeProperties") or {}
+    text = " ".join(str(tp.get(k) or "") for k in ("connectionString", "server", "fullyQualifiedDomainName") if isinstance(tp.get(k), str))
+    return "-ondemand.sql.azuresynapse.net" in text.lower()
 
 
 def _is_pool_service(ls: Mapping[str, Any], ctx: Context, passed: Optional[Mapping[str, Any]] = None) -> bool:
@@ -224,6 +239,15 @@ def _copy(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, Any
     if tp.pop("enableStaging", False):
         out.notes.append(f"Copy '{act.get('name')}': staging was switched off; Fabric Copy stages through the workspace itself.")
     tp.pop("stagingSettings", None)
+    translator = tp.get("translator")
+    if (tp.get("sink") or {}).get("type") == "DataWarehouseSink" and isinstance(translator, dict) and "typeConversion" in translator:
+        # A Warehouse sink loads with the Warehouse's COPY command, which maps types itself and rejects the setting:
+        # "The copy feature: TypeConversion is not supported by the external command MSSQLImportCommand".
+        translator.pop("typeConversion", None)
+        translator.pop("typeConversionSettings", None)
+        if set(translator) <= {"type"}:
+            tp.pop("translator")
+        out.notes.append(f"Copy '{act.get('name')}': type conversion settings dropped; the Warehouse's COPY converts types itself.")
     result["typeProperties"] = tp
     return result
 
@@ -336,6 +360,12 @@ def _script(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, A
     ls = ctx.linked_services.get(ls_name)
     if ls is not None and ctx.warehouse is not None and _is_pool_service(ls, ctx, ref.get("parameters")):
         result["linkedService"] = _warehouse_ref(ctx)
+    elif ls is not None and ctx.warehouse is not None and is_serverless_service(ls):
+        # Synapse's serverless pool is not migrated: kept, the script would still run in Synapse (whose identity the
+        # Fabric connection does not have). Its SQL runs on the Warehouse, which reads files with OPENROWSET too.
+        result["linkedService"] = _warehouse_ref(ctx)
+        out.notes.append(f"Script '{act.get('name')}' ran on Synapse's serverless SQL pool; it now runs on the Warehouse "
+                         f"'{ctx.warehouse.name}'. Check its OPENROWSET queries once.")
     elif ctx.connections.get(ls_name):
         result["externalReferences"] = {"connection": ctx.connections[ls_name]}
     else:

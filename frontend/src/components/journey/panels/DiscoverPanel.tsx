@@ -14,6 +14,7 @@ const PLURAL: Record<string, string> = {
   Trigger: "Triggers", Notebook: "Notebooks", "Spark Pool": "Spark pools", "Spark Job Definition": "Spark job definitions",
   Dataset: "Datasets", "Linked Service": "Linked services", "Integration Runtime": "Integration runtimes",
   "Storage Reference": "Storage connections", "Spark Library": "Spark libraries", Function: "Functions",
+  "Security Object": "Roles & users",
 };
 
 // The migration paths behind the two summary counts, exactly as the API counts them.

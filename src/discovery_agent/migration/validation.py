@@ -21,9 +21,10 @@ import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from discovery_agent.migration import datacopy, datafilter, environments, jobs, notebooks, pipelines, runtime_checks, warehouse_ddl
+from discovery_agent.migration import security as security_sql
 from discovery_agent.migration.common import (
-    CONNECTION, DATA, DATASET, DEFERRED, ENVIRONMENT, MISSING, NOTEBOOK, PIPELINE, POOL, PROCEDURE, SCHEDULE, SCHEMA, SCRIPT,
-    SHORTCUT, SPARKJOB, TABLE, VIEW, Source,
+    CONNECTION, DATA, DATASET, DEFERRED, ENVIRONMENT, FUNCTION, MISSING, NOTEBOOK, PIPELINE, POOL, PROCEDURE, SCHEDULE, SCHEMA,
+    SCRIPT, SECURITY, SHORTCUT, SPARKJOB, TABLE, VIEW, Source,
 )
 from discovery_agent.migration.fabric_rest import FabricApiError, FabricRestClient
 
@@ -32,17 +33,18 @@ CATEGORY = {
     POOL: "Warehouse", SCHEMA: "Schema", TABLE: "Tables", DATA: "Data Count", VIEW: "Views", PROCEDURE: "Stored Procedures",
     NOTEBOOK: "Notebooks", ENVIRONMENT: "Spark", CONNECTION: "Connections", PIPELINE: "Pipelines", DATASET: "Pipelines",
     SPARKJOB: "Spark Jobs", SCRIPT: "SQL Scripts", SCHEDULE: "Schedules", SHORTCUT: "Shortcuts", DEFERRED: "Manual", MISSING: "Manual",
+    FUNCTION: "Functions", SECURITY: "Security",
 }
 _SIZED = {"varchar", "char", "varbinary", "binary"}
 
 SCHEMAS_SQL = "SELECT name FROM sys.schemas"
 OBJECTS_SQL = ("SELECT s.name, o.name, o.type FROM sys.objects o JOIN sys.schemas s ON s.schema_id = o.schema_id "
-               "WHERE o.type IN ('U', 'V', 'P')")
+               "WHERE o.type IN ('U', 'V', 'P', 'FN', 'IF', 'TF')")
 COLUMNS_SQL = ("SELECT s.name, o.name, c.column_id, c.name, t.name, c.max_length, c.precision, c.scale, c.is_nullable "
                "FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id "
                "JOIN sys.types t ON t.user_type_id = c.user_type_id WHERE o.type = 'U'")
 MODULES_SQL = ("SELECT s.name, o.name, m.definition FROM sys.sql_modules m JOIN sys.objects o ON o.object_id = m.object_id "
-               "JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.type IN ('V', 'P')")
+               "JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.type IN ('V', 'P', 'FN', 'IF', 'TF')")
 
 
 def row(source: Source, status: str, synapse: str, fabric: str, detail: str = "", category: Optional[str] = None) -> Dict[str, str]:
@@ -180,6 +182,11 @@ class Validator:
                     self._wh["modules"][(str(r[0]).lower(), str(r[1]).lower())] = str(r[2] or "")
             except Exception:  # noqa: BLE001 - definitions are an extra; their absence is reported per object
                 self._wh["modules"] = None
+            try:
+                self._wh["masks"] = {(str(r[0]).lower(), str(r[1]).lower(), str(r[2]).lower()): str(r[3] or "")
+                                     for r in fetch(security_sql.MASKS_SQL)}
+            except Exception:  # noqa: BLE001 - reported on the tables that have masks
+                self._wh["masks"] = None
         except Exception as exc:  # noqa: BLE001 - driver, token or network failure
             self._wh = {"error": f"Could not read the Warehouse: {type(exc).__name__}: {str(exc)[:200]}"}
         return self._wh
@@ -300,6 +307,14 @@ class Validator:
                 + ([f"unexpected: {', '.join(shown[c] for c in extra[:5])}"] if extra else []) \
                 + ([f"type differs: {', '.join(f'{shown[c]} ({expected[c]} expected, {actual[c]} found)' for c in wrong[:3])}"] if wrong else [])
             return [row(s, MISMATCH, label_s, label_t, "; ".join(parts))]
+        if s.masks:
+            masks = wh.get("masks")
+            if masks is None:
+                return [row(s, REVIEW, label_s, label_t, "Columns agree; the dynamic data masks could not be read to compare.")]
+            unmasked = [m.column for m in s.masks if (schema.lower(), name.lower(), m.column.lower()) not in masks]
+            if unmasked:
+                return [row(s, MISMATCH, label_s, label_t, f"Dynamic data mask missing in Fabric on: {', '.join(unmasked[:5])}. "
+                            "Those columns are visible unmasked to users without UNMASK.")]
         converted = [c for c in s.payload.columns if warehouse_ddl.map_type(c)[1]]
         if converted:
             return [row(s, REVIEW, label_s, label_t, f"{len(converted)} column type(s) converted by design (e.g. {warehouse_ddl.map_type(converted[0])[1]}).")]
@@ -386,6 +401,55 @@ class Validator:
 
     def _check_procedure(self, s: Source) -> List[Dict[str, str]]:
         return self._module(s, "procedure")
+
+    def _check_function(self, s: Source) -> List[Dict[str, str]]:
+        return self._module(s, "function")
+
+    def _security_state(self) -> Dict[str, Any]:
+        """Fabric's roles, members and explicit permissions, read once, or {'error': why}."""
+        wh = self.warehouse()
+        if "error" in wh:
+            return wh
+        if "security" not in wh:
+            try:
+                cur = self._sql.cursor()
+                cur.execute(security_sql.PRINCIPALS_SQL)
+                principals = {str(r[0]).lower() for r in cur.fetchall()}
+                cur.execute(security_sql.MEMBERS_SQL)
+                members = {(str(r[0]).lower(), str(r[1]).lower()) for r in cur.fetchall()}
+                cur.execute(security_sql.PERMISSIONS_SQL)
+                permissions = {security_sql.permission_key(r[0], int(r[1]), r[2], str(r[3]), r[4], r[5], r[6]) for r in cur.fetchall()}
+                wh["security"] = {"principals": principals, "members": members, "permissions": permissions}
+            except Exception as exc:  # noqa: BLE001 - reported on each security row
+                wh["security"] = {"error": f"Roles and permissions could not be read: {type(exc).__name__}: {str(exc)[:200]}"}
+        return wh["security"]
+
+    def _check_security(self, s: Source) -> List[Dict[str, str]]:
+        if (gate := self._sql_gate(s)):
+            return gate
+        plan = security_sql.plan_principal(s.payload, s.name)
+        state = self._security_state()
+        wanted_p = security_sql.expected_keys(plan, s.payload)
+        label_s = f"{len(plan.members)} members, {len(wanted_p)} permissions" if plan.principal.is_role else f"{len(wanted_p)} permissions"
+        if "error" in state:
+            return [row(s, REVIEW, label_s, "not read", state["error"])]
+        problems = []
+        if plan.create_role and plan.principal.name.lower() not in state["principals"]:
+            return [row(s, MISMATCH, label_s, "missing", "The role is not in the Warehouse.")]
+        if not plan.principal.is_role and wanted_p and plan.principal.name.lower() not in state["principals"]:
+            return [row(s, MISMATCH, label_s, "missing", "The user is not in the Warehouse: none of its permissions were applied.")]
+        missing_m = [m for m, _ in plan.members if (plan.principal.name.lower(), m.lower()) not in state["members"]]
+        missing_p = [k for k in wanted_p if k not in state["permissions"]]
+        if missing_m:
+            problems.append(f"member(s) missing: {', '.join(missing_m[:5])}")
+        if missing_p:
+            shown = [f"{k[3] == 'd' and 'DENY' or 'GRANT'} {k[2].upper()} on {'.'.join(x for x in k[4:6] if x) or 'the database'}" for k in missing_p[:3]]
+            problems.append(f"{len(missing_p)} permission(s) missing, e.g. {'; '.join(shown)}")
+        got = f"{len(plan.members) - len(missing_m)} members, {len(wanted_p) - len(missing_p)} permissions" if plan.principal.is_role \
+            else f"{len(wanted_p) - len(missing_p)} permissions"
+        if problems:
+            return [row(s, MISMATCH, label_s, got, "; ".join(problems) + ".")]
+        return [row(s, MATCH, label_s, got, "Role, members and permissions agree." if plan.principal.is_role else "Permissions agree.")]
 
     def _check_notebook(self, s: Source) -> List[Dict[str, str]]:
         found = self.find("notebooks", s.name)

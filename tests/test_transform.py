@@ -321,7 +321,7 @@ def test_the_plan_checks_the_accepted_code_not_the_original():
 def test_every_transformable_kind_has_a_template_and_the_templates_render(service):
     for kind, name in context.TEMPLATES.items():
         assert (PROMPTS / name).is_file(), name
-    assert set(context.TRANSFORMABLE_KINDS) == {PROCEDURE, VIEW, TABLE, SCRIPT, PIPELINE, NOTEBOOK}
+    assert set(context.TRANSFORMABLE_KINDS) == {PROCEDURE, VIEW, TABLE, SCRIPT, PIPELINE, NOTEBOOK, "function"}
 
 
 def test_the_http_routes_reach_the_service(service):

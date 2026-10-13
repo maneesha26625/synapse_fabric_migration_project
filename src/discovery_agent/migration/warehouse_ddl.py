@@ -9,6 +9,12 @@ Fabric Warehouse supports a smaller set of types. Each unsupported type is
 mapped to its closest supported one and the change is reported, so nobody is
 surprised by a ``datetime`` that came back as ``datetime2(6)``.
 
+IDENTITY columns stay IDENTITY. Fabric supports it on ``bigint`` only, with no
+seed or increment, so an ``int`` identity becomes ``bigint IDENTITY``. Existing
+key values are kept: the data stage loads them through a staging table with
+``SET IDENTITY_INSERT`` and then reseeds (``DBCC CHECKIDENT ... RESEED``), the
+migration path Microsoft documents for Fabric Data Warehouse.
+
 Views and procedures are created from their own definition text, unchanged:
 that text is the most faithful thing there is, and where Fabric's T-SQL
 differs the statement fails with the server's own message, which is reported.
@@ -16,12 +22,14 @@ differs the statement fails with the server's own message, which is reported.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 from discovery_agent.sql.models import SqlColumn, SqlTable
 
 #: Types Fabric Warehouse accepts as they are (precision handled below).
 _SAME = {"bit", "smallint", "int", "bigint", "float", "real", "date", "uniqueidentifier"}
+#: Source types an IDENTITY column can have; in Fabric every one becomes bigint IDENTITY.
+_IDENTITY_TYPES = {"tinyint", "smallint", "int", "bigint", "decimal", "numeric"}
 MAX_TIME_PRECISION = 6
 
 
@@ -56,6 +64,10 @@ def map_type(column: SqlColumn) -> Tuple[str, Optional[str]]:
     name = column.name
     precision, scale = column.precision, column.scale
 
+    if column.is_identity and source in _IDENTITY_TYPES:
+        if source == "bigint":
+            return "bigint", None
+        return "bigint", f"{name}: {source} IDENTITY stored as bigint IDENTITY (Fabric supports IDENTITY on bigint only)"
     if source in _SAME:
         return source, None
     if source in ("decimal", "numeric"):
@@ -99,23 +111,46 @@ def map_type(column: SqlColumn) -> Tuple[str, Optional[str]]:
     raise UnsupportedColumn(f"Column {name} has type {source or 'unknown'}, which Fabric Warehouse cannot store.")
 
 
-def create_table(table: SqlTable) -> Tuple[str, List[str]]:
-    """``CREATE TABLE`` for a Fabric Warehouse, and notes on what changed."""
+def identity_columns(table: SqlTable) -> List[SqlColumn]:
+    """The table's IDENTITY columns that stay IDENTITY in Fabric (in practice, at most one)."""
+    return [c for c in sorted(table.columns, key=lambda c: c.column_id)
+            if c.is_identity and (c.data_type or "").strip().lower() in _IDENTITY_TYPES]
+
+
+def create_table(table: SqlTable, masks: Iterable[Tuple[str, str]] = (), *, identity: bool = True,
+                 schema: Optional[str] = None, name: Optional[str] = None) -> Tuple[str, List[str]]:
+    """``CREATE TABLE`` for a Fabric Warehouse, and notes on what changed.
+
+    ``masks`` are ``(column, MASKED WITH (...) clause)`` pairs: a column's dynamic data mask is part of
+    its definition, so the table never exists, even empty, without it. ``identity=False`` with another
+    ``schema``/``name`` makes the staging copy an IDENTITY table is loaded through: same columns and
+    masks, no IDENTITY, so the original key values can be copied into it as they are."""
     if not table.columns:
         raise UnsupportedColumn("No columns were discovered for this table, so it cannot be recreated.")
+    masked = {str(c).lower(): clause for c, clause in masks}
+    keep = {c.column_id for c in identity_columns(table)} if identity else set()
     notes: List[str] = []
     lines: List[str] = []
     for column in sorted(table.columns, key=lambda c: c.column_id):
         sql_type, note = map_type(column)
         if note:
             notes.append(note)
-        if column.is_identity:
-            notes.append(f"{column.name}: IDENTITY dropped; values are loaded as they are")
-        nullability = "NULL" if column.is_nullable is not False else "NOT NULL"
-        lines.append(f"    {quote(column.name)} {sql_type} {nullability}")
+        marker = ""
+        if column.column_id in keep:
+            marker = " IDENTITY"
+            notes.append(f"{column.name}: IDENTITY kept; Fabric chooses the seed and increment, existing values are loaded "
+                         "with IDENTITY_INSERT and the identity is reseeded")
+        elif column.is_identity and identity:
+            notes.append(f"{column.name}: IDENTITY dropped ({column.data_type} cannot be IDENTITY in Fabric); values are loaded as they are")
+        nullability = "NULL" if column.is_nullable is not False and column.column_id not in keep else "NOT NULL"
+        mask = masked.get(column.name.lower())
+        if mask:
+            notes.append(f"{column.name}: dynamic data mask kept ({mask})")
+        lines.append(f"    {quote(column.name)} {sql_type}{marker} {mask + ' ' if mask else ''}{nullability}")
     if table.distribution.value not in ("unknown", "not_applicable"):
         notes.append(f"Distribution ({table.distribution.value}) and index settings dropped: Fabric manages storage itself.")
-    sql = f"CREATE TABLE {qualified(table.key.schema, table.key.name)} (\n" + ",\n".join(lines) + "\n);"
+    target = qualified(schema or table.key.schema, name or table.key.name)
+    sql = f"CREATE TABLE {target} (\n" + ",\n".join(lines) + "\n);"
     return sql, notes
 
 

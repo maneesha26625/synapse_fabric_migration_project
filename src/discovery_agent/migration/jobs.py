@@ -85,7 +85,11 @@ def sql_script_notebook(payload: Mapping[str, Any], warehouse_id: Optional[str],
     pool = (content.get("currentConnection") or {}).get("poolName") or (content.get("currentConnection") or {}).get("databaseName")
     if pool:
         notes.append(f"It was written against '{pool}'; it is bound to the Warehouse '{warehouse_name}'.")
-    metadata: Dict[str, Any] = {"language_info": {"name": "sql"}}
+    # The T-SQL kernel. Without it Fabric runs the notebook on Spark, which reads the cell as Spark SQL and fails on
+    # T-SQL ("System cancelled the Spark session due to statement execution failures"), although the SQL is fine.
+    metadata: Dict[str, Any] = {"kernel_info": {"name": "sqldatawarehouse"},
+                                "kernelspec": {"name": "sqldatawarehouse", "display_name": "sqldatawarehouse"},
+                                "language_info": {"name": "sql"}}
     if warehouse_id:
         metadata["dependencies"] = {"warehouse": {"default_warehouse": warehouse_id,
                                                   "known_warehouses": [{"id": warehouse_id, "type": "Datawarehouse"}]}}

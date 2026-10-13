@@ -54,7 +54,10 @@ import { mockComponents } from "./mockMapping";
 
 const STEP_MS = 700;
 /** What a migration run moves in this build; mirrors the backend's list. */
-const MIGRATABLE_TYPES = ["Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure", "Notebook", "Spark Pool", "Linked Service", "Pipeline", "Dataset", "Spark Job Definition", "SQL Script", "Trigger", "External Table"];
+const MIGRATABLE_TYPES = ["Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure", "Notebook", "Spark Pool", "Linked Service", "Pipeline", "Dataset", "Spark Job Definition", "SQL Script", "Trigger", "External Table", "Function", "Security Object"];
+/** Demo: what a run leaves for a person among the types it otherwise migrates (as the backend does). */
+const isMultiStatement = (type: string, name: string) => type === "Function" && /Multi\d*$/.test(name);
+const SQL_USERS = new Set(["legacy_etl_login", "report_svc_login"]);
 const STEPS = [
   "Discovering SQL objects",
   "Discovering pipelines",
@@ -275,9 +278,8 @@ function buildResult() {
     coverage: {
       discoveredTypes: Object.keys(tally((o) => o.type)).sort(),
       notDiscovered: [
-        { type: "Function", reason: "the SQL catalog queries cover tables, views and stored procedures only" },
+        { type: "External Data Source", reason: "not yet read from the SQL catalog" },
         { type: "Lake Database", reason: "lake databases are not yet listed" },
-        { type: "Security Object", reason: "users, roles and permissions are not yet read" },
       ],
     },
   };
@@ -325,11 +327,11 @@ function outcome(i: SimItem, h: number): { step: string; target: string | null; 
   switch (i.type) {
     case "Dedicated SQL Pool": return { step: "Fabric Warehouse created", target: `${ws} / ${WAREHOUSE}`, notes: ["Collation Latin1_General_100_CI_AS_KS_WS_SC_UTF8 (case-insensitive, like the Synapse pool)."] };
     case "Schema": return { step: "Schema created", target: `${WAREHOUSE}.${i.name.split(".").pop()}`, notes: [] };
-    case "Table": return { step: "Table created (empty: the Table data stage loads it with a pipeline)", target: `${WAREHOUSE}.${i.name}`, notes: h % 3 === 0 ? ["Key kept as NOT ENFORCED: primary key (demo)."] : [] };
     case "Table data": {
       const f = i.filter;
       const rows = Math.round((1000 + (h % 900000)) * (f?.column ? 0.4 : 1)).toLocaleString();
-      if (!f) return { step: `Loaded ${rows} rows by pipeline; counts match`, target: `${WAREHOUSE}.${i.table}`, notes: [`Pipeline '${wave}' created and run (demo).`] };
+      if (!f) return { step: `Loaded ${rows} rows by pipeline; counts match`, target: `${WAREHOUSE}.${i.table}`, notes: [`Pipeline '${wave}' created and run (demo).`,
+        ...(h % 5 === 0 ? [`Loaded through migration_load.${(i.table ?? "").replace(".", "__")} with IDENTITY_INSERT, keeping the Synapse key values; the identity was then reseeded.`] : [])] };
       const notes = [`Pipeline '${wave}' created and run (demo).`, `Loads ${describeFilter(f)}.`];
       if (f.sync) {
         const change = f.changeColumn || f.column;
@@ -338,6 +340,14 @@ function outcome(i: SimItem, h: number): { step: string; target: string | null; 
       }
       return { step: `Loaded ${rows} rows by pipeline; counts match${f.column ? " within the filter" : ""}`, target: `${WAREHOUSE}.${i.table}`, notes };
     }
+    case "Function": return { step: "Function created", target: `${WAREHOUSE}.${i.name}`, notes: [] };
+    case "Security Object":
+      return /@|Team|Engineers/.test(i.name)
+        ? { step: h % 2 ? "1 permission(s) applied (Fabric creates the user on its first GRANT or DENY)" : "Nothing granted directly: this principal's access comes from its role memberships", target: `${WAREHOUSE} / ${i.name}`, notes: [] }
+        : { step: `${i.name.startsWith("db_") ? "Role already in the warehouse" : "Role created"}; ${1 + (h % 3)} member(s) and ${2 + (h % 3)} permission(s) applied`, target: `${WAREHOUSE} / database role ${i.name}`,
+          notes: ["Workspace roles and item permissions still decide who can connect: give these principals Read on the Warehouse in Fabric."] };
+    case "Table": return { step: "Table created (empty: the Table data stage loads it with a pipeline)", target: `${WAREHOUSE}.${i.name}`,
+      notes: [...(h % 3 === 0 ? ["Key kept as NOT ENFORCED: primary key (demo)."] : []), ...(h % 5 === 0 ? [`${i.name.split(".").pop()}Key: IDENTITY kept; Fabric chooses the seed and increment, existing values are loaded with IDENTITY_INSERT and the identity is reseeded`] : []), ...(h % 11 === 0 ? ["Email: dynamic data mask kept (MASKED WITH (FUNCTION = 'email()'))"] : [])] };
     case "View": case "Stored Procedure": {
       const converted = h % 4 === 0;
       return { step: `${i.type === "View" ? "View" : "Stored procedure"} created${converted ? " (converted for Fabric)" : ""}`, target: `${WAREHOUSE}.${i.name}`,
@@ -372,6 +382,12 @@ function runNow(): ExecutionRun {
     // Like the real backend: what this build does not create is listed, with the reason.
     if (!MIGRATABLE_TYPES.includes(si.type) && si.type !== "Table data") {
       return { ...base, step: "Not migrated in this session", status: "DEFERRED", error: deferredReason[si.type] ?? `${si.type} objects are migrated by hand (demo).` };
+    }
+    if (isMultiStatement(si.type, si.name) && !accepted) {
+      return { ...base, step: "Not migrated in this session", status: "DEFERRED", error: "Fabric Warehouse does not support multi-statement table-valued functions. Rewrite it as an inline table-valued function or a view: generate an LLM-assisted draft, review and accept it, and the run creates it (demo)." };
+    }
+    if (si.type === "Security Object" && SQL_USERS.has(si.name)) {
+      return { ...base, step: "Not migrated in this session", status: "DEFERRED", error: `SQL user: Fabric has no SQL authentication. Choose the Microsoft Entra user or group that replaces it; then add it to its roles and run: GRANT VIEW DEFINITION TO [<Microsoft Entra user or group>]; (demo).` };
     }
     if (si.type === "Linked Service" && !sim.credentials.includes(si.name)) {
       return { ...base, step: "Needs credentials", status: "DEFERRED", target: si.name,
@@ -488,8 +504,9 @@ function demoAnalysis(items: PlanItem[], record: boolean, options?: RunOptions):
 }
 
 const DEMO_STAGES: Capabilities["stages"] = [
-  { key: "warehouse", label: "Warehouse & schema", summary: "The SQL pool becomes a Fabric Warehouse; its schemas, tables (empty, with their keys), views and stored procedures are created in it. Synapse-only T-SQL in views and procedures is converted first.", types: ["Dedicated SQL Pool", "Schema", "Table", "View", "Stored Procedure"], needs: [], needsInput: null, creates: "Warehouse, schemas, tables, views, procedures", options: [{ key: "collation", label: "Warehouse collation (set once, when it is created)", default: "match_synapse", choices: [{ value: "match_synapse", label: "Same as Synapse", description: "Case-sensitive only if the Synapse pool was; Synapse's default is case-insensitive." }, { value: "case_insensitive", label: "Case-insensitive", description: "'ABC' equals 'abc' in comparisons and object names, as in most Synapse pools." }, { value: "case_sensitive", label: "Case-sensitive", description: "Fabric's own default: 'ABC' and 'abc' are different." }] }] },
+  { key: "warehouse", label: "Warehouse & schema", summary: "The SQL pool becomes a Fabric Warehouse; its schemas, tables (empty, with their keys and dynamic data masks), functions, views and stored procedures are created in it. Synapse-only T-SQL in functions, views and procedures is converted first.", types: ["Dedicated SQL Pool", "Schema", "Table", "Function", "View", "Stored Procedure"], needs: [], needsInput: null, creates: "Warehouse, schemas, tables, functions, views, procedures", options: [{ key: "collation", label: "Warehouse collation (set once, when it is created)", default: "match_synapse", choices: [{ value: "match_synapse", label: "Same as Synapse", description: "Case-sensitive only if the Synapse pool was; Synapse's default is case-insensitive." }, { value: "case_insensitive", label: "Case-insensitive", description: "'ABC' equals 'abc' in comparisons and object names, as in most Synapse pools." }, { value: "case_sensitive", label: "Case-sensitive", description: "Fabric's own default: 'ABC' and 'abc' are different." }] }] },
   { key: "data", label: "Table data", summary: "Loads the rows of each migrated table with Fabric data pipelines: one pipeline per wave, reading the Synapse pool through a Fabric connection and writing the Warehouse. The run then compares row counts.", types: ["Table"], needs: ["warehouse"], needsInput: "credentials", creates: "Data pipelines; rows in the Warehouse tables", options: [{ key: "dataRun", label: "What the stage does", default: "run", choices: [{ value: "run", label: "Create and run", description: "Creates each wave's pipeline, runs it, waits for it, and compares row counts." }, { value: "create", label: "Create only", description: "Creates the pipelines; you run them from Fabric (or a schedule) when you choose." }] }, { key: "dataMode", label: "If a table already has rows", default: "if_empty", choices: [{ value: "if_empty", label: "Skip it (safe)", description: "Never touches data that is already there, so re-runs are safe." }, { value: "replace", label: "Replace it", description: "The pipeline empties the table (TRUNCATE) before loading it again." }] }, { key: "syncOverlap", label: "Re-read window for tables kept in sync", default: "1h", choices: [{ value: "1h", label: "One hour", description: "Each sync also re-reads the hour before the last one, catching rows committed late. Re-read rows replace themselves, so nothing doubles." }, { value: "1d", label: "One day", description: "Re-reads the day before the last sync: for sources that write rows with older timestamps, or a date-only change column." }, { value: "none", label: "None", description: "Reads only from the last sync onwards. Tables without key columns always work this way." }] }] },
+  { key: "security", label: "Roles & permissions", summary: "Database roles are recreated in the Warehouse with their members, and GRANT / DENY permissions are applied to roles and Microsoft Entra users (Fabric creates each user on its first grant). SQL users are listed for a person: Fabric has no SQL authentication. Masks travel with their tables.", types: ["Security Object"], needs: ["warehouse"], needsInput: null, creates: "Roles, role members, permissions", options: [] },
   { key: "spark", label: "Spark pool & environment", summary: "A Spark pool becomes a custom Fabric Spark pool plus a published Environment.", types: ["Spark Pool"], needs: [], needsInput: null, creates: "Spark pool, Environment", options: [] },
   { key: "notebooks", label: "Notebooks", summary: "Synapse notebooks become Fabric notebooks.", types: ["Notebook"], needs: [], needsInput: null, creates: "Notebooks", options: [] },
   { key: "connections", label: "Connections", summary: "Linked services become Fabric connections. Fabric needs their credentials, which Synapse does not give up.", types: ["Linked Service"], needs: [], needsInput: "credentials", creates: "Fabric connections", options: [] },
@@ -520,7 +537,7 @@ export const mockApi: MigrationApi = {
             caveat: "The window opens on the machine running this server.",
           },
         ],
-        discoveryScope: ["Tables", "Views", "Stored Procedures", "SQL Scripts", "Pipelines", "Datasets", "Linked Services", "Notebooks", "Spark Job Definitions"],
+        discoveryScope: ["Tables", "Views", "Stored Procedures", "SQL Scripts", "Pipelines", "Datasets", "Linked Services", "Notebooks", "Spark Job Definitions", "Functions", "Roles, users and permissions", "Dynamic data masks"],
         migratableTypes: [...MIGRATABLE_TYPES],
       },
     };
@@ -920,6 +937,7 @@ export const mockApi: MigrationApi = {
       "Dedicated SQL Pool": "Warehouse", Schema: "Schema", Table: "Tables", View: "Views", "Stored Procedure": "Stored Procedures",
       "Spark Pool": "Spark", Notebook: "Notebooks", "Linked Service": "Connections", Pipeline: "Pipelines", Dataset: "Pipelines",
       "Spark Job Definition": "Spark Jobs", "SQL Script": "SQL Scripts", Trigger: "Schedules", "External Table": "Shortcuts",
+      Function: "Functions", "Security Object": "Security",
     };
     for (const i of done) {
       const h = hash(i.id);
@@ -935,7 +953,12 @@ export const mockApi: MigrationApi = {
       } else if (i.type === "Pipeline" || i.type === "Notebook") {
         const n = 2 + (h % 6);
         rows.push({ category: category[i.type], object: i.name, source: `${n} ${i.type === "Pipeline" ? "activities" : "cells"}`, target: `${n} ${i.type === "Pipeline" ? "activities" : "cells"}`, status: "MATCH", detail: "Present in Fabric with the same structure." });
-      } else if (i.type === "View" || i.type === "Stored Procedure") {
+      } else if (i.type === "Security Object") {
+        const role = !/@|Team|Engineers/.test(i.name);
+        const missing = role && h % 9 === 0;
+        rows.push({ category: "Security", object: i.name, source: role ? "3 members, 3 permissions" : "1 permissions", target: missing ? "3 members, 2 permissions" : role ? "3 members, 3 permissions" : "1 permissions",
+          status: missing ? "MISMATCH" : "MATCH", detail: missing ? "1 permission(s) missing, e.g. GRANT SELECT on dw.FactTrip (demo)." : role ? "Role, members and permissions agree." : "Permissions agree." });
+      } else if (i.type === "View" || i.type === "Stored Procedure" || i.type === "Function") {
         const review = h % 10 === 0;
         rows.push({ category: category[i.type], object: i.name, source: "definition", target: "definition", status: review ? "REVIEW" : "MATCH",
           detail: review ? "The definition was converted for Fabric (storage options removed); compare its results once." : "The definition text agrees." });
