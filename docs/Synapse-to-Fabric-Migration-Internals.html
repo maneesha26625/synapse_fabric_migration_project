@@ -1,0 +1,741 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Synapse to Fabric Migration Internals</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&display=swap">
+<style>
+/* Layout: technical reference. Sticky contents rail on wide screens, one reading column; each component is a spec card + steps. */
+:root {
+  --bg: #f6f7f8;
+  --surface: #ffffff;
+  --ink: #17202a;
+  --muted: #56636f;
+  --line: #d9dee3;
+  --accent: #0b6e75;
+  --accent-soft: #e2f1f1;
+  --code-bg: #eef1f3;
+  --sql: #6a3fb5;  --sql-soft: #efe8fa;
+  --rest: #1d5fae; --rest-soft: #e4eefa;
+  --data: #a3570a; --data-soft: #fbeedd;
+  --manual: #8a2d3b; --manual-soft: #f8e6e9;
+  --font-display: "IBM Plex Sans Condensed", "Arial Narrow", system-ui, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #11161b; --surface: #182027; --ink: #e5eaee; --muted: #9aa7b2; --line: #2b3640;
+  --accent: #5cc4c9; --accent-soft: #173336; --code-bg: #1f2931;
+  --sql: #b79af0; --sql-soft: #2a2140; --rest: #7fb0ec; --rest-soft: #19283b;
+  --data: #e9a75c; --data-soft: #33261a; --manual: #ec8f9d; --manual-soft: #3a1f25; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #11161b; --surface: #182027; --ink: #e5eaee; --muted: #9aa7b2; --line: #2b3640;
+  --accent: #5cc4c9; --accent-soft: #173336; --code-bg: #1f2931;
+  --sql: #b79af0; --sql-soft: #2a2140; --rest: #7fb0ec; --rest-soft: #19283b;
+  --data: #e9a75c; --data-soft: #33261a; --manual: #ec8f9d; --manual-soft: #3a1f25; color-scheme: dark; }
+
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--ink); font: 15px/1.6 var(--font-body); }
+.wrap { max-width: 1180px; margin: 0 auto; padding-inline: 20px; padding-block: 32px 80px;
+  display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 40px; }
+@media (max-width: 900px) { .wrap { grid-template-columns: minmax(0, 1fr); padding-inline: 16px; } nav.toc { display: none; } }
+
+nav.toc { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 20px); align-self: start; max-height: calc(100vh - 40px);
+  overflow-y: auto; font-size: 13px; padding-right: 8px; }
+nav.toc h2 { font: 600 11px/1 var(--font-body); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin: 18px 0 8px; }
+nav.toc a { display: block; color: var(--muted); text-decoration: none; padding: 3px 0 3px 10px; border-left: 2px solid var(--line); }
+nav.toc a:hover, nav.toc a:focus-visible { color: var(--accent); border-left-color: var(--accent); outline: none; }
+
+main { min-width: 0; }
+header.doc { border-bottom: 1px solid var(--line); padding-bottom: 24px; margin-bottom: 8px; }
+.eyebrow { font: 600 12px/1 var(--font-body); letter-spacing: .1em; text-transform: uppercase; color: var(--accent); }
+h1 { font: 700 clamp(30px, 4.6vw, 44px)/1.08 var(--font-display); margin: 10px 0 14px; text-wrap: balance; letter-spacing: -.01em; }
+h2 { font: 700 27px/1.2 var(--font-display); margin: 56px 0 12px; text-wrap: balance; scroll-margin-top: 20px; }
+h3 { font: 600 20px/1.25 var(--font-display); margin: 0; text-wrap: balance; }
+h4 { font: 600 13px/1.3 var(--font-body); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); margin: 20px 0 6px; }
+p, li { max-width: 72ch; }
+p { margin: 0 0 12px; }
+.lede { font-size: 17px; color: var(--muted); max-width: 70ch; }
+code, .mono { font-family: var(--font-mono); font-size: .88em; background: var(--code-bg); padding: 1px 5px; border-radius: 4px; overflow-wrap: anywhere; }
+pre { font: 13px/1.5 var(--font-mono); background: var(--code-bg); padding: 14px 16px; border-radius: 6px; overflow-x: auto; margin: 8px 0 14px; }
+pre code { background: none; padding: 0; }
+ul, ol { padding-left: 22px; margin: 0 0 12px; }
+li { margin-bottom: 4px; }
+a { color: var(--accent); }
+
+.legend { display: flex; flex-wrap: wrap; gap: 10px 22px; margin-top: 18px; font-size: 13px; color: var(--muted); }
+.tag { display: inline-flex; align-items: center; gap: 6px; font: 600 11px/1 var(--font-body); letter-spacing: .05em; text-transform: uppercase;
+  padding: 5px 8px; border-radius: 4px; white-space: nowrap; }
+.tag.sql { color: var(--sql); background: var(--sql-soft); }
+.tag.rest { color: var(--rest); background: var(--rest-soft); }
+.tag.data { color: var(--data); background: var(--data-soft); }
+.tag.manual { color: var(--manual); background: var(--manual-soft); }
+
+/* end-to-end flow */
+.flow { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; margin: 18px 0 8px; counter-reset: step; }
+@media (max-width: 760px) { .flow { grid-template-columns: minmax(0, 1fr); } }
+.flow > div { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 14px; position: relative; min-width: 0; }
+.flow > div::before { counter-increment: step; content: counter(step); font: 700 12px/1 var(--font-mono); color: var(--accent);
+  display: block; margin-bottom: 8px; }
+.flow b { display: block; font: 600 16px/1.2 var(--font-display); margin-bottom: 6px; }
+.flow p { font-size: 13px; color: var(--muted); margin: 0; }
+
+.mech { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin: 16px 0; }
+@media (max-width: 760px) { .mech { grid-template-columns: minmax(0, 1fr); } }
+.mech > div { background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 16px; min-width: 0; }
+.mech p { font-size: 14px; margin: 10px 0 0; }
+
+.tablewrap { overflow-x: auto; margin: 10px 0 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font: 600 12px/1.3 var(--font-body); letter-spacing: .04em; text-transform: uppercase; color: var(--muted); background: var(--bg); }
+tr:last-child td { border-bottom: none; }
+td.num { font-variant-numeric: tabular-nums; font-family: var(--font-mono); font-size: 12.5px; white-space: nowrap; }
+
+/* component cards */
+section.comp { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 22px 24px 14px; margin: 18px 0 26px;
+  scroll-margin-top: 20px; min-width: 0; }
+@media (max-width: 560px) { section.comp { padding: 18px 16px 10px; } }
+.comp-head { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px 16px; margin-bottom: 14px; }
+.spec { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line);
+  border-radius: 6px; overflow: hidden; margin-bottom: 16px; }
+@media (max-width: 760px) { .spec { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.spec > div { background: var(--bg); padding: 10px 12px; min-width: 0; }
+.spec dt { font: 600 10.5px/1.2 var(--font-body); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
+.spec dd { margin: 0; font-size: 13.5px; overflow-wrap: anywhere; }
+ol.steps { counter-reset: s; list-style: none; padding-left: 0; }
+ol.steps > li { counter-increment: s; position: relative; padding-left: 34px; margin-bottom: 9px; }
+ol.steps > li::before { content: counter(s); position: absolute; left: 0; top: 1px; width: 22px; height: 22px; border-radius: 50%;
+  background: var(--accent-soft); color: var(--accent); font: 600 12px/22px var(--font-mono); text-align: center; }
+.note { border-left: 3px solid var(--accent); background: var(--accent-soft); padding: 10px 14px; border-radius: 0 6px 6px 0; margin: 12px 0; font-size: 14px; }
+.note.warn { border-left-color: var(--manual); background: var(--manual-soft); }
+.cols2 { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 28px; }
+@media (max-width: 760px) { .cols2 { grid-template-columns: minmax(0, 1fr); } }
+.cols2 > div { min-width: 0; }
+.src { font-size: 12.5px; color: var(--muted); margin-top: 6px; }
+.src code { font-size: 11.5px; }
+pre.mermaid { background: var(--surface); border: 1px solid var(--line); text-align: center; }
+footer { margin-top: 48px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+<nav class="toc" aria-label="Contents">
+  <h2>Overview</h2>
+  <a href="#flow">End-to-end flow</a>
+  <a href="#mechanisms">Three ways things move</a>
+  <a href="#order">Run order</a>
+  <h2>SQL pool</h2>
+  <a href="#pool">Dedicated SQL pool</a>
+  <a href="#schema">Schemas</a>
+  <a href="#table">Tables (structure)</a>
+  <a href="#data">Table data (rows)</a>
+  <a href="#sync">Date filters and sync</a>
+  <a href="#modules">Views, procedures, functions</a>
+  <a href="#security">Roles, permissions, masks</a>
+  <h2>Spark</h2>
+  <a href="#spark">Spark pools</a>
+  <a href="#notebooks">Notebooks</a>
+  <a href="#sjd">Spark job definitions</a>
+  <h2>Integration</h2>
+  <a href="#connections">Linked services</a>
+  <a href="#pipelines">Pipelines and datasets</a>
+  <a href="#schedules">Triggers</a>
+  <a href="#scripts">SQL scripts</a>
+  <h2>Storage</h2>
+  <a href="#shortcuts">External tables</a>
+  <a href="#routing">Storage path routing</a>
+  <h2>Around the run</h2>
+  <a href="#manual">Not migrated</a>
+  <a href="#llm">LLM-assisted transforms</a>
+  <a href="#validation">Validation</a>
+  <a href="#safety">Safety rules</a>
+</nav>
+
+<main>
+<header class="doc">
+  <div class="eyebrow">Migration Accelerator · Technical reference</div>
+  <h1>How each Synapse component is migrated to Microsoft Fabric</h1>
+  <p class="lede">This document covers every component the accelerator moves. For each one it says what is read from Synapse, what the backend does with it, which Fabric API or SQL statement creates the result, what changes on the way, and what is left for a person. It was written from the accelerator's source code (<code>src/discovery_agent/migration</code> and <code>api</code>) as of 15 October 2026.</p>
+  <div class="legend" aria-label="Legend">
+    <span><span class="tag sql">T-SQL</span>&nbsp; created by running SQL on the Warehouse</span>
+    <span><span class="tag rest">REST</span>&nbsp; created as a Fabric item through the REST API</span>
+    <span><span class="tag data">Data</span>&nbsp; rows moved by a Fabric data pipeline</span>
+    <span><span class="tag manual">Manual</span>&nbsp; left for a person, with the reason</span>
+  </div>
+</header>
+
+<h2 id="flow">End-to-end backend flow</h2>
+<p>The UI calls the local API (port 8001). The API runs every step below. Discovery only reads. The migration run is the only part that writes, and it writes only to Fabric.</p>
+<div class="flow">
+  <div><b>Discover</b><p>Reads the Synapse workspace through the Artifacts API, the dedicated pool's catalog over ODBC, and optionally a Git repo. Everything is read-only, and catalog queries are SELECT-only by construction.</p></div>
+  <div><b>Plan</b><p>Puts objects in dependency-ordered waves, picks a strategy for each, runs preflight checks on every object's content, and scores readiness.</p></div>
+  <div><b>Configure</b><p>You switch stages on or off, choose options (collation, data mode, filters), and enter credentials. Credentials are kept in memory only.</p></div>
+  <div><b>Run</b><p>A background thread processes objects one at a time, in wave order and then kind order. Each object ends Completed, Skipped, Failed or Deferred.</p></div>
+  <div><b>Validate</b><p>Compares Synapse with Fabric object by object, including row counts. It can also check that items run in Fabric.</p></div>
+</div>
+
+<h4>Who signs in where</h4>
+<div class="tablewrap"><table>
+<thead><tr><th>Connection</th><th>How</th><th>Used for</th></tr></thead>
+<tbody>
+<tr><td>Synapse workspace (source)</td><td>Azure CLI sign-in. Token for the Synapse Artifacts API.</td><td>Listing and reading notebooks, pipelines, datasets, linked services, SQL scripts, Spark job definitions, triggers, Spark pools.</td></tr>
+<tr><td>Dedicated SQL pool (source)</td><td>ODBC (pyodbc) with a Microsoft Entra access token. No SQL logins.</td><td>Catalog reads during discovery. During the run: row counts, watermarks and external-table locations.</td></tr>
+<tr><td>Fabric REST API (target)</td><td>Azure CLI or Fabric CLI. Token for <code>api.fabric.microsoft.com</code>.</td><td>Creating the warehouse, notebooks, pipelines, environments, connections, schedules, Lakehouse and shortcuts. Running pipelines.</td></tr>
+<tr><td>Fabric Warehouse SQL endpoint (target)</td><td>ODBC with an Entra token (<code>database.windows.net</code> audience) in the Fabric tenant. Writable session.</td><td>All T-SQL: schemas, tables, views, procedures, functions, roles, grants, masks, and post-load scripts.</td></tr>
+<tr><td>OneLake files (target)</td><td>Entra token (<code>storage.azure.com</code> audience) in the Fabric tenant.</td><td>Copying a Spark job's main file into the Lakehouse with its storage paths rewritten.</td></tr>
+</tbody></table></div>
+<p>Before a run starts, the API checks that the workspace has a Fabric capacity (<code>capacityId</code>). If it doesn't, the run is refused with the fix. Only one run can happen at a time. The UI polls <code>GET /api/migration/run</code> for progress and the log.</p>
+
+<h2 id="mechanisms">The three ways things move</h2>
+<p>Every component uses one of three mechanisms. This is the main distinction between scripts and actual data.</p>
+<div class="mech">
+  <div><span class="tag sql">T-SQL on the Warehouse</span><p>Database objects are rebuilt as SQL statements and executed on the Warehouse SQL endpoint. Table structure is generated from catalog metadata. Views, procedures and functions use their own definition text after conversion rules have run.</p></div>
+  <div><span class="tag rest">Fabric item via REST</span><p>Workspace artifacts are converted from Synapse JSON to Fabric's definition format. The result is base64-encoded and posted to the Fabric REST API. Long-running creates are polled until they finish.</p></div>
+  <div><span class="tag data">Fabric data pipeline</span><p>Table rows never pass through the accelerator. It generates a Fabric data pipeline whose Copy activity reads the Synapse pool and writes the Warehouse, then it runs the pipeline and compares row counts.</p></div>
+</div>
+
+<h2 id="order">Run order</h2>
+<p>Discovery assigns each object a wave. The base wave comes from the object's type, and an object is pushed to a later wave if something it depends on sits in the same or a later one. Within a wave, the runner sorts objects by kind so each one exists before anything that uses it:</p>
+<div class="tablewrap"><table>
+<thead><tr><th>Order</th><th>Kind</th><th>Base wave</th><th>Stage that owns it</th><th>Needs stage</th></tr></thead>
+<tbody>
+<tr><td class="num">1</td><td>Dedicated SQL pool → Warehouse</td><td class="num">1</td><td>Warehouse &amp; schema</td><td>–</td></tr>
+<tr><td class="num">2</td><td>Schema</td><td class="num">1</td><td>Warehouse &amp; schema</td><td>–</td></tr>
+<tr><td class="num">3</td><td>Linked service → connection</td><td class="num">1</td><td>Connections</td><td>–</td></tr>
+<tr><td class="num">4</td><td>Table (structure)</td><td class="num">2</td><td>Warehouse &amp; schema</td><td>–</td></tr>
+<tr><td class="num">5</td><td>Function</td><td class="num">3</td><td>Warehouse &amp; schema</td><td>–</td></tr>
+<tr><td class="num">6</td><td>View</td><td class="num">3</td><td>Warehouse &amp; schema</td><td>–</td></tr>
+<tr><td class="num">7</td><td>Stored procedure</td><td class="num">3</td><td>Warehouse &amp; schema</td><td>–</td></tr>
+<tr><td class="num">8</td><td>Roles &amp; permissions</td><td class="num">1+</td><td>Roles &amp; permissions</td><td>Warehouse</td></tr>
+<tr><td class="num">9</td><td>Table data (rows)</td><td class="num">table's</td><td>Table data</td><td>Warehouse</td></tr>
+<tr><td class="num">10</td><td>Dataset (folded into pipelines)</td><td class="num">2</td><td>Pipelines &amp; datasets</td><td>–</td></tr>
+<tr><td class="num">11</td><td>Spark pool → pool + Environment</td><td class="num">1</td><td>Spark pool &amp; environment</td><td>–</td></tr>
+<tr><td class="num">12</td><td>Notebook</td><td class="num">4</td><td>Notebooks</td><td>–</td></tr>
+<tr><td class="num">13</td><td>SQL script → T-SQL notebook</td><td class="num">3</td><td>SQL scripts</td><td>Warehouse</td></tr>
+<tr><td class="num">14</td><td>Spark job definition</td><td class="num">4</td><td>Spark job definitions</td><td>–</td></tr>
+<tr><td class="num">15</td><td>Pipeline</td><td class="num">4</td><td>Pipelines &amp; datasets</td><td>Connections, Notebooks, Warehouse</td></tr>
+<tr><td class="num">16</td><td>External table → OneLake shortcut</td><td class="num">2</td><td>External tables</td><td>Connections</td></tr>
+<tr><td class="num">17</td><td>Trigger → schedule</td><td class="num">5</td><td>Schedules</td><td>Pipelines</td></tr>
+</tbody></table></div>
+<p>Run controls: <b>Pause</b> stops before the next object. <b>Retry failed</b> starts a new pass over failed items. <b>Stop on failure</b> won't start a wave while an earlier wave has failures. If an error is about the whole workspace (no capacity, capacity paused, workspace missing), every remaining Fabric object fails at once with the same message instead of retrying.</p>
+
+<!-- ============================ SQL POOL ============================ -->
+<h2 id="sql-pool">Dedicated SQL pool</h2>
+
+<section class="comp" id="pool">
+  <div class="comp-head"><h3>Dedicated SQL pool → Fabric Warehouse</h3><span class="tag rest">REST</span></div>
+  <dl class="spec">
+    <div><dt>Synapse</dt><dd>The dedicated pool you connected</dd></div>
+    <div><dt>Fabric</dt><dd>Warehouse with the pool's name</dd></div>
+    <div><dt>API</dt><dd><code>POST /workspaces/{id}/warehouses</code></dd></div>
+    <div><dt>Stage</dt><dd>Warehouse &amp; schema</dd></div>
+  </dl>
+  <ol class="steps">
+    <li>The Warehouse name is the pool name with any character other than letters, digits and <code>_</code> replaced by <code>_</code>. If the name doesn't start with a letter, it gets a <code>wh_</code> prefix.</li>
+    <li>The runner looks for a Warehouse with that name in the workspace. If one exists, it's reused.</li>
+    <li>If not, it creates one with <code>creationPayload.defaultCollation</code>. The collation can't be changed later, so you pick it before the run:
+      <ul>
+        <li><b>Same as Synapse</b> (default): case-sensitive <code>Latin1_General_100_BIN2_UTF8</code> if the pool's collation contains <code>_CS</code> or <code>_BIN</code>. Otherwise case-insensitive <code>Latin1_General_100_CI_AS_KS_WS_SC_UTF8</code>.</li>
+        <li><b>Case-insensitive</b> or <b>Case-sensitive</b>: forced.</li>
+      </ul></li>
+    <li>It polls the Warehouse every 3 seconds, up to 20 times, until Fabric publishes the SQL endpoint (<code>properties.connectionString</code>).</li>
+    <li>It opens one writable ODBC session on that endpoint. Every later T-SQL step in the run reuses this session.</li>
+  </ol>
+  <h4>Not carried</h4>
+  <p>Performance level (DWU), distribution and workload management have no equivalent: Fabric sizes compute itself. Only the pool you connected becomes the Warehouse. Any other pool in the plan is deferred.</p>
+  <p class="src">Source: <code>runner.py</code> <code>_pool</code>, <code>_open_warehouse</code>, <code>warehouse_collation</code></p>
+</section>
+
+<section class="comp" id="schema">
+  <div class="comp-head"><h3>Schemas</h3><span class="tag sql">T-SQL</span></div>
+  <dl class="spec">
+    <div><dt>Synapse</dt><dd>User schemas in the pool</dd></div>
+    <div><dt>Fabric</dt><dd>Schemas in the Warehouse</dd></div>
+    <div><dt>SQL</dt><dd><code>CREATE SCHEMA</code></dd></div>
+    <div><dt>Stage</dt><dd>Warehouse &amp; schema</dd></div>
+  </dl>
+  <ol class="steps">
+    <li>The runner checks <code>SELECT SCHEMA_ID(?)</code>. If the schema exists, it's skipped.</li>
+    <li>Otherwise it runs <code>IF SCHEMA_ID(N'x') IS NULL EXEC(N'CREATE SCHEMA [x]')</code>. <code>dbo</code> already exists and is never created.</li>
+  </ol>
+  <p>Every table, view, procedure and function step also runs the same idempotent statement first, so an object never fails because its schema is missing.</p>
+</section>
+
+<section class="comp" id="table">
+  <div class="comp-head"><h3>Tables (structure only)</h3><span class="tag sql">T-SQL</span></div>
+  <dl class="spec">
+    <div><dt>Synapse</dt><dd>User tables (<code>sys.tables</code>, <code>sys.columns</code>, indexes)</dd></div>
+    <div><dt>Fabric</dt><dd>Empty Warehouse table</dd></div>
+    <div><dt>SQL</dt><dd><code>CREATE TABLE</code> + <code>ALTER TABLE … ADD CONSTRAINT</code></dd></div>
+    <div><dt>Stage</dt><dd>Warehouse &amp; schema</dd></div>
+  </dl>
+  <p>A dedicated pool doesn't store <code>CREATE TABLE</code> text. The table is rebuilt from the column metadata discovery read from the catalog: name, type, length, precision, scale, nullability, identity and column order.</p>
+  <ol class="steps">
+    <li>The runner checks <code>SELECT OBJECT_ID(?)</code>. If the table exists, it's left alone except that any missing dynamic data masks are added (see <a href="#security">masks</a>).</li>
+    <li>It maps each column to a type the Warehouse supports (table below) and records a note for every change.</li>
+    <li>It writes the column's dynamic data mask into the column definition (<code>MASKED WITH (FUNCTION = '…')</code>). The table therefore never exists unmasked, even while empty. If a mask uses a function Fabric doesn't have, the table <b>is not created at all</b>, so its rows can never be loaded unmasked.</li>
+    <li>IDENTITY columns stay IDENTITY. Fabric supports IDENTITY only on <code>bigint</code>, with no seed or increment, so an <code>int IDENTITY</code> becomes <code>bigint IDENTITY NOT NULL</code>.</li>
+    <li>It drops <code>DISTRIBUTION</code>, clustered columnstore, heap and partition settings, because the Warehouse manages storage itself. A note records the original distribution.</li>
+    <li>It runs the <code>CREATE TABLE</code>. Then, for each primary key and unique constraint, it runs <code>ALTER TABLE … ADD CONSTRAINT … NONCLUSTERED (…) NOT ENFORCED</code>. Synapse already holds these as NOT ENFORCED. If Fabric refuses one, the table still counts as created and the refusal goes into the notes.</li>
+    <li>The table is left empty. The Table data stage loads its rows.</li>
+  </ol>
+  <h4>Type mapping</h4>
+  <div class="tablewrap"><table>
+  <thead><tr><th>Synapse type</th><th>Fabric Warehouse type</th><th>What changes</th></tr></thead>
+  <tbody>
+  <tr><td>bit, smallint, int, bigint, float, real, date, uniqueidentifier</td><td>same</td><td>nothing</td></tr>
+  <tr><td>decimal / numeric (p,s)</td><td>decimal(p,s)</td><td>nothing</td></tr>
+  <tr><td>char(n), varchar(n)</td><td>same; MAX above 8000</td><td>nothing</td></tr>
+  <tr><td>tinyint</td><td>smallint</td><td>wider type</td></tr>
+  <tr><td>money / smallmoney</td><td>decimal(19,4) / decimal(10,4)</td><td>same precision, different type</td></tr>
+  <tr><td>datetime</td><td>datetime2(3)</td><td>more precise type</td></tr>
+  <tr><td>smalldatetime</td><td>datetime2(0)</td><td>–</td></tr>
+  <tr><td>datetime2(7), time(7)</td><td>datetime2(6), time(6)</td><td>max 6 fractional digits</td></tr>
+  <tr><td>datetimeoffset</td><td>datetime2(≤6)</td><td><b>time-zone offset is lost</b></td></tr>
+  <tr><td>nchar, nvarchar, sysname</td><td>varchar(n × 4) UTF-8</td><td>stored as UTF-8 text</td></tr>
+  <tr><td>text, ntext, xml</td><td>varchar(MAX)</td><td>XML becomes plain text</td></tr>
+  <tr><td>binary(n)</td><td>varbinary(n)</td><td>–</td></tr>
+  <tr><td>image</td><td>varbinary(MAX)</td><td>–</td></tr>
+  <tr><td>timestamp / rowversion</td><td>varbinary(8)</td><td>no longer changes on update</td></tr>
+  <tr><td>geography, geometry</td><td>varbinary(MAX)</td><td>stored as well-known binary</td></tr>
+  <tr><td>int / smallint / tinyint / decimal IDENTITY</td><td>bigint IDENTITY</td><td>Fabric picks seed and increment</td></tr>
+  <tr><td>anything else</td><td>–</td><td>object fails: “Fabric Warehouse cannot store”</td></tr>
+  </tbody></table></div>
+  <p class="src">Source: <code>warehouse_ddl.py</code> <code>map_type</code>, <code>create_table</code>, <code>key_constraints</code>; <code>runner.py</code> <code>_table</code></p>
+</section>
+
+<section class="comp" id="data">
+  <div class="comp-head"><h3>Table data (the rows)</h3><span class="tag data">Data</span></div>
+  <dl class="spec">
+    <div><dt>Synapse</dt><dd>Rows of each migrated table</dd></div>
+    <div><dt>Fabric</dt><dd>Rows in the Warehouse table</dd></div>
+    <div><dt>Carried by</dt><dd>Generated Fabric data pipeline, one per wave</dd></div>
+    <div><dt>Stage</dt><dd>Table data (needs Warehouse)</dd></div>
+  </dl>
+  <p>The accelerator doesn't copy any data itself. It generates and runs a Fabric data pipeline, the bulk-copy tool built into Fabric. Each table in the plan gets its own “(data)” item in the run, so results are reported table by table. The first data item of a wave to start picks up every pending table in that wave and loads them together with one pipeline.</p>
+
+  <h4>1 · Decide which tables need rows</h4>
+  <ul>
+    <li>External tables are skipped because they hold no rows in the pool and become shortcuts instead. Tables with no discovered columns, or more than 1,024 columns, fail.</li>
+    <li>The table must already exist in the Warehouse (Warehouse stage). If it doesn't, that item fails and tells you to run that stage first.</li>
+    <li>The runner counts the rows already in the Warehouse table. What happens next depends on the <b>If a table already has rows</b> option:
+      <ul><li><b>Skip it</b> (default): a table with rows is left alone, so re-runs are safe.</li>
+      <li><b>Replace it</b>: the pipeline runs <code>TRUNCATE TABLE</code> before copying.</li></ul></li>
+  </ul>
+
+  <h4>2 · The connection to Synapse</h4>
+  <p>The pipeline reads the pool through a Fabric SQL connection named <code>synapse-{workspace}-{pool}</code>. If a connection with that name exists, or any connection whose path contains the pool's server and database, it's reused. Otherwise one is created from the credentials you entered in the Table data stage. The options are a SQL login, a service principal, a Key Vault reference, or the workspace identity. Synapse never gives out its secrets, so without credentials these items are marked <b>Deferred: needs the Synapse pool connection</b>.</p>
+
+  <h4>3 · The pipeline the accelerator generates</h4>
+  <p>Name: <code>load_{warehouse}_wave_{n}</code>. The same wave always maps to the same pipeline, so it's reused on later runs. It is metadata-driven. A <code>tables</code> array parameter holds one entry per table, and each entry carries everything the copy needs:</p>
+<pre><code>{ "schema": "dbo", "table": "Trips",
+  "query": "SELECT [TripId], [Pickup], [Geo].STAsBinary() AS [Geo], ... FROM [dbo].[Trips]",
+  "preCopyScript": "TRUNCATE TABLE [dbo].[Trips]",   // only with "Replace it"
+  "postCopyScript": "", "postCopyCleanup": "" }      // filled for IDENTITY tables</code></pre>
+<pre class="mermaid">
+flowchart LR
+  P["Parameter: tables[]"] --> F["ForEach table<br/>4 in parallel"]
+  F --> C["Copy activity<br/>source: Synapse pool (SqlDWSource + SELECT)<br/>sink: Warehouse table (COPY command)<br/>staging: on"]
+  C --> S["Script activity 'After copy'<br/>IDENTITY_INSERT move + reseed<br/>or a no-op"]
+</pre>
+  <ul>
+    <li><b>Source</b>: <code>SqlDWSource</code> with the table's SELECT, through the Fabric connection, with a 2-hour query timeout. Columns a Copy activity can't carry are converted in the SELECT: <code>geography</code>/<code>geometry</code> → <code>.STAsBinary()</code>, <code>xml</code> → <code>nvarchar(max)</code>.</li>
+    <li><b>Sink</b>: <code>DataWarehouseSink</code> with <code>allowCopyCommand: true</code>. The Warehouse's COPY command loads the rows. Staging is switched on because COPY can't read a Synapse source directly, so the Copy activity stages the rows in the workspace first.</li>
+    <li><b>Types</b>: the tabular translator converts every other type into the type the Warehouse column was created with.</li>
+    <li><b>Policy</b>: 12-hour timeout per activity, 2 retries 60 seconds apart.</li>
+  </ul>
+
+  <h4>4 · Tables with an IDENTITY column</h4>
+  <p>The original key values are kept. The table is loaded through a staging copy, which is the path Microsoft documents for Fabric Data Warehouse:</p>
+  <ol class="steps">
+    <li>A staging table with the same columns and masks but <b>no IDENTITY</b> is created in schema <code>migration_load</code>.</li>
+    <li>The Copy activity writes the rows into the staging table unchanged.</li>
+    <li>The “After copy” Script activity runs <code>SET IDENTITY_INSERT … ON; INSERT INTO target (cols) SELECT cols FROM staging; SET IDENTITY_INSERT … OFF;</code></li>
+    <li>A second script empties the staging table and runs <code>DBCC CHECKIDENT('target', RESEED)</code> so new rows continue after the loaded keys. It runs only if the move succeeded.</li>
+  </ol>
+
+  <h4>5 · Run, wait, verify</h4>
+  <ol class="steps">
+    <li>What happens next depends on the <b>What the stage does</b> option. With <b>Create only</b>, the pipeline is created and the items say “Pipeline ready; run it in Fabric”. With <b>Create and run</b> (default), the runner starts it with <code>POST …/items/{id}/jobs/instances?jobType=Pipeline</code> and passes <b>only this run's</b> table list as the <code>tables</code> parameter.</li>
+    <li>It polls the job every 20 seconds for up to 6 hours, and the item shows how many minutes it has been running.</li>
+    <li>When the job completes, it runs <code>SELECT COUNT_BIG(*)</code> on both sides. Synapse is counted with the same filter that was used to load. Equal counts make the item <b>Completed</b> with “counts match”. Different counts make it <b>Failed: Row counts do not match</b>, showing both numbers.</li>
+    <li>If the pipeline fails, each table gets Fabric's failure reason and a suggestion to retry with “Replace”.</li>
+  </ol>
+  <p class="src">Source: <code>stages.py</code> <code>_load_wave</code>; <code>datapipeline.py</code> <code>definition</code>, <code>entry</code>, <code>identity_finish</code>; <code>datacopy.py</code></p>
+</section>
+
+<section class="comp" id="sync">
+  <div class="comp-head"><h3>Date filters and keeping tables in sync</h3><span class="tag data">Data</span></div>
+  <p>By default a whole table is copied. In Plan, you can give a table a filter instead:</p>
+  <div class="cols2">
+    <div>
+      <h4>Scope: which rows</h4>
+      <p>A date column with a fixed <b>from</b> date (inclusive) and/or <b>to</b> date (exclusive). Dates are fixed when the plan is made, not relative to today, so every run copies and validates the same rows. The pipeline entry's query gets a <code>WHERE</code> clause.</p>
+    </div>
+    <div>
+      <h4>Sync: keep loading new changes</h4>
+      <p>A <b>change column</b> (such as <code>modified_at</code>) that moves when a row is added or changed, plus <b>key columns</b>. By default these are the table's own primary key or unique constraint. A synced table can't have an end date.</p>
+    </div>
+  </div>
+  <h4>What happens for a synced table</h4>
+  <ol class="steps">
+    <li>The runner reads the newest change value from Synapse. This is the <b>watermark</b>.</li>
+    <li>It creates the control table <code>migration_sync.sync_tables</code> in the Warehouse if it's missing, plus a staging table for this table. It then registers one row: the table, its watermark, and the SQL each sync runs.</li>
+    <li>The first load copies the rows in scope up to the watermark, through the normal wave pipeline.</li>
+    <li>It creates one <b>sync pipeline</b> per Warehouse, <code>sync_{warehouse}</code>, with a daily 02:00 UTC schedule that is <b>switched off</b>. When you switch it on, each run works one table at a time:
+      <ul>
+        <li>Lookup: read the table list from the control table.</li>
+        <li>Lookup: the newest change in Synapse.</li>
+        <li>Copy: rows changed since the watermark go into the staging table. The window also re-reads the last hour or day, so rows committed late are caught.</li>
+        <li>Script: in one Warehouse transaction, replace rows that match on the key, insert the rest, and move the watermark forward.</li>
+      </ul></li>
+  </ol>
+  <p>A failed step leaves the watermark where it was, so the next run copies the same window again. Adding a table to sync only adds a row to the control table. The pipeline itself never changes.</p>
+  <div class="note warn"><b>Limits stated by the code:</b> rows hard-deleted in Synapse leave nothing to copy, so they stay in the Warehouse. A soft delete that also moves the change column does carry over. Without key columns, a changed row can't be matched, so it arrives as an extra row. The runner refuses to load a synced table while the sync schedule is on, because the two would lose or duplicate rows.</div>
+  <p class="src">Source: <code>datafilter.py</code>; <code>datapipeline.py</code> <code>sync_definition</code>; <code>stages.py</code> <code>_register</code>, <code>_sync_pipeline</code></p>
+</section>
+
+<section class="comp" id="modules">
+  <div class="comp-head"><h3>Views, stored procedures and functions</h3><span class="tag sql">T-SQL</span></div>
+  <dl class="spec">
+    <div><dt>Synapse</dt><dd>Definition text from <code>sys.sql_modules</code></dd></div>
+    <div><dt>Fabric</dt><dd>Same object in the Warehouse</dd></div>
+    <div><dt>SQL</dt><dd>The converted <code>CREATE …</code> statement</dd></div>
+    <div><dt>Stage</dt><dd>Warehouse &amp; schema</dd></div>
+  </dl>
+  <p>These are scripts, and they're migrated from their own text, which is the most faithful source available. The text goes through deterministic rewrite rules, and the result runs on the Warehouse.</p>
+  <ol class="steps">
+    <li>If the definition couldn't be read (encrypted, or VIEW DEFINITION not granted), the object fails with that reason.</li>
+    <li>If the object already exists, it's skipped. With the <b>update existing</b> option it's rewritten as <code>CREATE OR ALTER</code> instead, which updates it in place and keeps the old version if Fabric rejects the new text.</li>
+    <li>The <b>T-SQL rules</b> run (list below). They work on a masked copy of the text, so strings, quoted identifiers and comments are never changed by accident. Every removed statement is replaced by a <code>/* removed for Fabric: … */</code> comment, so the change stays visible in Fabric.</li>
+    <li>Direct storage paths are rewritten to OneLake if storage routing is set up (see <a href="#routing">routing</a>).</li>
+    <li>The statement runs on the Warehouse. If Fabric rejects it, the object fails with the server's own error message so you can fix it.</li>
+  </ol>
+  <h4>Rewrite rules</h4>
+  <div class="tablewrap"><table>
+  <thead><tr><th>In Synapse code</th><th>What the rule does</th></tr></thead>
+  <tbody>
+  <tr><td><code>WITH (DISTRIBUTION = …, CLUSTERED COLUMNSTORE INDEX, HEAP, PARTITION (…))</code> on CREATE TABLE / CTAS</td><td>Removed. Fabric manages storage.</td></tr>
+  <tr><td><code>RENAME OBJECT a TO b</code></td><td>Rewritten as <code>EXEC sp_rename N'a', N'b'</code></td></tr>
+  <tr><td><code>SET TRANSACTION ISOLATION LEVEL …</code> (not SNAPSHOT)</td><td>Removed. The Warehouse always uses snapshot isolation.</td></tr>
+  <tr><td><code>CREATE/ALTER/DROP WORKLOAD GROUP | CLASSIFIER</code>, <code>sp_addrolemember 'largerc', …</code></td><td>Removed. Fabric has no workload management.</td></tr>
+  <tr><td><code>COPY INTO … CREDENTIAL = (IDENTITY = 'Managed Identity')</code>, including inside dynamic SQL strings</td><td>Credential removed. COPY then reads storage as the Entra identity running it, which needs Storage Blob Data Reader.</td></tr>
+  <tr><td><code>SET IDENTITY_INSERT t ON|OFF</code></td><td>Kept. Removed only for tables that have no IDENTITY in the Warehouse.</td></tr>
+  </tbody></table></div>
+  <p>Before the run, preflight flags whatever is left that a Warehouse is known to reject, so you see it as a plan risk instead of a mid-run failure: <code>sys.pdw_*</code> views, materialized views, <code>SET ROWCOUNT</code>, <code>FOR XML</code>, synonyms, <code>PREDICT</code>, <code>CREATE USER</code> and triggers.</p>
+  <h4>Functions</h4>
+  <p>Scalar functions and inline table-valued functions are created like views, before the views and procedures that call them. <b>Multi-statement table-valued functions</b> aren't supported by Fabric Warehouse, so they're deferred. You can bring one back by accepting an LLM-assisted rewrite as an inline function or a view (see <a href="#llm">LLM transforms</a>), or by rewriting it by hand.</p>
+  <p class="src">Source: <code>tsql_rules.py</code>; <code>runner.py</code> <code>_module</code>; <code>preflight.py</code> <code>SYNAPSE_ONLY</code></p>
+</section>
+
+<section class="comp" id="security">
+  <div class="comp-head"><h3>Roles, permissions and dynamic data masks</h3><span class="tag sql">T-SQL</span></div>
+  <dl class="spec">
+    <div><dt>Synapse</dt><dd>Database principals, role members, permissions, masked columns</dd></div>
+    <div><dt>Fabric</dt><dd>Warehouse roles, members, GRANT/DENY, masks</dd></div>
+    <div><dt>SQL</dt><dd><code>CREATE ROLE</code>, <code>ALTER ROLE</code>, <code>GRANT</code>, <code>DENY</code></dd></div>
+    <div><dt>Stage</dt><dd>Roles &amp; permissions (needs Warehouse)</dd></div>
+  </dl>
+  <p>Each role or user is one plan item. It's rebuilt from the catalog that discovery read. The run handles it after the objects it's granted on, in the same wave.</p>
+  <ol class="steps">
+    <li><b>Custom roles</b>: <code>CREATE ROLE</code>, unless <code>DATABASE_PRINCIPAL_ID</code> says it already exists. Built-in roles such as <code>db_datareader</code> and <code>public</code> already exist, so only their members and permissions are applied.</li>
+    <li><b>Members</b>: <code>ALTER ROLE [r] ADD MEMBER [m]</code> for Entra users, Entra groups and nested roles. Built-in and resource-class members are skipped.</li>
+    <li><b>Permissions</b>: <code>GRANT</code> or <code>DENY</code> on the database, a schema (<code>ON SCHEMA::</code>), an object (<code>ON OBJECT::</code>) or individual columns, with <code>WITH GRANT OPTION</code> when it was set. Fabric creates an Entra user automatically on that user's first GRANT or DENY, so <code>CREATE USER</code> is never run.</li>
+    <li>Every statement is attempted. If Fabric rejects some, the item fails and lists them, but the rest stay applied, and Retry re-applies everything safely.</li>
+  </ol>
+  <h4>Dynamic data masks</h4>
+  <p>Masks travel with their tables rather than as a separate item. A new table gets <code>MASKED WITH (FUNCTION = 'default()' | 'email()' | 'random(a,b)' | 'partial(…)')</code> in its <code>CREATE TABLE</code>. An existing table gets <code>ALTER TABLE … ALTER COLUMN … ADD MASKED</code> for each mask it lacks. Adding a mask only hides data, so it never exposes anything.</p>
+  <h4>Left for a person</h4>
+  <ul>
+    <li><b>SQL-authenticated users</b>: Fabric has no SQL authentication. The item is deferred, and its reason contains the exact GRANT statements to run once you choose the Entra user or group that replaces it.</li>
+    <li><b>Resource-class roles</b> (<code>largerc</code>, <code>staticrc20</code> …) are dropped, because Fabric sizes queries itself.</li>
+    <li><b>CONNECT</b> isn't carried, because workspace roles and item permissions decide who can connect in Fabric. Give these principals Read on the Warehouse in Fabric.</li>
+  </ul>
+  <p class="src">Source: <code>migration/security.py</code>; <code>runner.py</code> <code>_security</code>, <code>_add_missing_masks</code></p>
+</section>
+
+<!-- ============================ SPARK ============================ -->
+<h2 id="spark-h">Spark</h2>
+
+<section class="comp" id="spark">
+  <div class="comp-head"><h3>Apache Spark pool → custom Spark pool + Environment</h3><span class="tag rest">REST</span></div>
+  <dl class="spec">
+    <div><dt>Synapse</dt><dd>Spark pool settings</dd></div>
+    <div><dt>Fabric</dt><dd>Workspace custom pool and a published Environment</dd></div>
+    <div><dt>API</dt><dd><code>/spark/pools</code>, <code>/environments</code>, <code>…/staging/sparkcompute</code>, <code>…/staging/publish</code></dd></div>
+    <div><dt>Stage</dt><dd>Spark pool &amp; environment</dd></div>
+  </dl>
+  <p>A Synapse Spark pool is compute only. Fabric splits it into two items, and the runner creates both.</p>
+  <ol class="steps">
+    <li>If an Environment with that name exists, the item is skipped.</li>
+    <li>It creates a <b>custom Spark pool</b> with the same name: node size (Small to XXLarge; unknown sizes become Medium), node family MemoryOptimized, autoscale min–max nodes (a fixed node count becomes min = max), and dynamic executor allocation.</li>
+    <li>If Fabric refuses the custom pool, the Environment uses the <b>Starter Pool</b> with Medium nodes instead, and a note says so.</li>
+    <li>It creates the <b>Environment</b>, patches its staging Spark compute (driver and executor cores and memory, runtime version), and <b>publishes</b> it.</li>
+  </ol>
+  <div class="tablewrap"><table>
+  <thead><tr><th>Synapse Spark version</th><th>Fabric runtime</th></tr></thead>
+  <tbody><tr><td>3.5</td><td>Runtime 1.3 (Spark 3.5)</td></tr><tr><td>3.4, 3.3, 3.2, 3.1</td><td>Runtime 1.2 (Spark 3.4)</td></tr><tr><td>unknown</td><td>Runtime 1.3</td></tr></tbody></table></div>
+  <h4>Not carried</h4>
+  <p><b>Libraries aren't copied</b>, because the pool records only package names, not the files. Add them in the Environment's Libraries section. Auto-pause is dropped, because Fabric ends idle sessions on its own timeout.</p>
+  <p class="src">Source: <code>environments.py</code>; <code>runner.py</code> <code>_environment</code></p>
+</section>
+
+<section class="comp" id="notebooks">
+  <div class="comp-head"><h3>Notebooks</h3><span class="tag rest">REST</span></div>
+  <dl class="spec">
+    <div><dt>Synapse</dt><dd>Notebook resource (ipynb inside Synapse JSON)</dd></div>
+    <div><dt>Fabric</dt><dd>Notebook item</dd></div>
+    <div><dt>API</dt><dd><code>POST /workspaces/{id}/notebooks</code> (ipynb, base64)</dd></div>
+    <div><dt>Stage</dt><dd>Notebooks</dd></div>
+  </dl>
+  <p>Notebooks are code, so they're converted as a document and their cells keep their content. A few lines get mechanical rewrites.</p>
+  <ol class="steps">
+    <li>The notebook's language is mapped to Fabric's: PySpark → python, Spark → scala, SparkSQL → sql, SparkR → r. <b>.NET (C#) notebooks can't be migrated</b> and are deferred with “needs a rewrite”.</li>
+    <li>It builds a plain ipynb document from the cells, keeping each cell's language override. Saved outputs are cleared.</li>
+    <li>It drops Synapse-only settings and notes each one: the attached Spark pool (Fabric uses the workspace or Environment settings), session size settings, and the folder (the notebook goes to the workspace root).</li>
+    <li>In <b>Python cells</b> it applies these rewrites:
+      <ul>
+        <li><code>mssparkutils.*</code> → <code>notebookutils.*</code>. The <code>from notebookutils import mssparkutils</code> import is commented out because the module is built in.</li>
+        <li>The Synapse SQL connector <code>com.microsoft.spark.sqlanalytics</code> → Fabric's <code>com.microsoft.spark.fabric</code>.</li>
+        <li><code>spark.read.synapsesql("pool.schema.table")</code> → reads <code>"warehouse.schema.table"</code> when the pool name differs from the Warehouse name.</li>
+      </ul></li>
+    <li>It doesn't rewrite the following. It flags them in the notes for review: <code>TokenLibrary</code>, <code>synapsesql</code> writes, linked-service credential calls, <code>mssparkutils.env</code>, and direct <code>*.dfs.core.windows.net</code> paths unless routing is on.</li>
+    <li>It routes storage paths through OneLake shortcuts in every code cell when storage routing is set up.</li>
+    <li>If a notebook with that name exists, it's skipped. With <b>update existing</b>, its definition is replaced through <code>updateDefinition</code>, which keeps its id so pipelines that call it still work.</li>
+  </ol>
+  <p class="src">Source: <code>notebooks.py</code> <code>to_fabric_ipynb</code>, <code>rewrite_python</code>; <code>runner.py</code> <code>_notebook</code></p>
+</section>
+
+<section class="comp" id="sjd">
+  <div class="comp-head"><h3>Spark job definitions</h3><span class="tag rest">REST</span></div>
+  <dl class="spec">
+    <div><dt>Synapse</dt><dd>Spark job definition (main file, class, args, jars)</dd></div>
+    <div><dt>Fabric</dt><dd>Spark job definition item</dd></div>
+    <div><dt>API</dt><dd><code>POST /sparkJobDefinitions</code> (<code>SparkJobDefinitionV1</code>)</dd></div>
+    <div><dt>Stage</dt><dd>Spark job definitions</dd></div>
+  </dl>
+  <ol class="steps">
+    <li>The language is mapped (Python, Scala/Java, R). Other languages and jobs with no main file are deferred.</li>
+    <li>It carries over the main file, main class, command-line arguments, and jars and files as additional library URIs.</li>
+    <li>The target Spark pool becomes the Environment with the same name, if the Spark stage created one. Executor and driver sizing and <code>conf</code> are dropped and belong in the Environment.</li>
+    <li><b>Main file with storage paths</b>: if storage routing applies and the main file is a .py, .r, .scala or .sql script, it's read through the OneLake shortcut, its storage paths are rewritten, and a copy is saved at <code>Files/_migrated_jobs/{job}/</code> in the Lakehouse. The job runs that copy, and the original stays unchanged for Synapse.</li>
+    <li>It sets a default Lakehouse (<code>{warehouse}_lakehouse</code>, created if needed), because Fabric won't run a Spark job definition without one.</li>
+  </ol>
+  <p class="src">Source: <code>jobs.py</code> <code>spark_job</code>; <code>stages_fabric.py</code> <code>_sparkjob</code>, <code>_remap_job</code></p>
+</section>
+
+<!-- ============================ INTEGRATION ============================ -->
+<h2 id="integration">Integration</h2>
+
+<section class="comp" id="connections">
+  <div class="comp-head"><h3>Linked services → Fabric connections</h3><span class="tag rest">REST</span></div>
+  <dl class="spec">
+    <div><dt>Synapse</dt><dd>Linked service JSON (no secrets)</dd></div>
+    <div><dt>Fabric</dt><dd>Shareable cloud connection, same name</dd></div>
+    <div><dt>API</dt><dd><code>POST /v1/connections</code></dd></div>
+    <div><dt>Stage</dt><dd>Connections (needs credentials)</dd></div>
+  </dl>
+  <p>A linked service says <em>where</em> to connect, and Synapse strips its secret. A Fabric connection needs the location plus a credential. The location comes from discovery and the credential comes from you.</p>
+  <div class="tablewrap"><table>
+  <thead><tr><th>Linked service type</th><th>Fabric connection</th><th>Taken from the linked service</th></tr></thead>
+  <tbody>
+  <tr><td>AzureSqlDatabase, AzureSqlDW, AzureSynapseAnalytics, SqlServer</td><td>SQL</td><td>server, database (properties or connection string)</td></tr>
+  <tr><td>AzureBlobFS (ADLS Gen2)</td><td>AzureDataLakeStorage</td><td>URL. You enter the container or folder path.</td></tr>
+  <tr><td>AzureBlobStorage</td><td>AzureBlobs</td><td>account name</td></tr>
+  <tr><td>anything else</td><td>–</td><td>Deferred. Create it by hand <b>with the same name</b>, because pipelines find connections by name.</td></tr>
+  </tbody></table></div>
+  <ol class="steps">
+    <li>Parameterised linked services use their parameters' default values. If a parameter has no default, the item is deferred, because there's no single address to connect to.</li>
+    <li>If every pipeline uses the linked service only to reach the pool being migrated, no connection is made. The item completes as “Replaced by the migrated Warehouse”, because those pipelines now point at the Warehouse.</li>
+    <li>If a connection with that name exists, the item is skipped. If you haven't entered credentials, it's deferred with “Needs credentials”.</li>
+    <li>Credential choices are listed with the options that pass no secret through the tool first: <b>workspace identity</b>; a <b>Key Vault reference</b> (SQL login, service principal, account key or SAS, with the secret read from Azure Key Vault by Fabric); or a SQL login, service principal, account key or SAS token entered directly.</li>
+    <li>The credential goes straight into the create call. It's held in memory for the run's life and never stored, logged or returned.</li>
+  </ol>
+  <p><b>Not carried:</b> integration runtimes (<code>connectVia</code>). Fabric connections use the cloud or an on-premises gateway you set up separately.</p>
+  <p class="src">Source: <code>fabric_connections.py</code>; <code>stages_fabric.py</code> <code>_connection</code></p>
+</section>
+
+<section class="comp" id="pipelines">
+  <div class="comp-head"><h3>Pipelines and datasets</h3><span class="tag rest">REST</span></div>
+  <dl class="spec">
+    <div><dt>Synapse</dt><dd>Pipeline + the datasets and linked services it uses</dd></div>
+    <div><dt>Fabric</dt><dd>Data pipeline item</dd></div>
+    <div><dt>API</dt><dd><code>POST /dataPipelines</code> (<code>pipeline-content.json</code>, base64)</dd></div>
+    <div><dt>Stage</dt><dd>Pipelines &amp; datasets (needs Connections, Notebooks, Warehouse)</dd></div>
+  </dl>
+  <p>Fabric pipelines use the same JSON family as Synapse, with three real differences the converter handles:</p>
+  <ul>
+    <li><b>Datasets are inline.</b> Fabric has no dataset item. Each Copy, Lookup, GetMetadata, Delete and Validation activity gets the dataset's settings embedded as <code>datasetSettings</code>, with <code>@dataset().x</code> parameters filled from what the activity passed. The connection is referenced by Fabric id. Dataset plan items complete as “Embedded in the pipelines that use it”.</li>
+    <li><b>Fabric items are referenced by id</b>, so the notebooks, Spark jobs and child pipelines a pipeline calls must exist first.</li>
+    <li><b>The SQL pool is gone.</b> Anything that read or wrote the migrated pool is pointed at the Warehouse.</li>
+  </ul>
+  <h4>Activity conversion</h4>
+  <div class="tablewrap"><table>
+  <thead><tr><th>Synapse activity</th><th>Fabric activity and change</th></tr></thead>
+  <tbody>
+  <tr><td>Copy</td><td>Copy. Datasets are embedded. Pool sources and sinks become <code>DataWarehouseSource</code>/<code>DataWarehouseSink</code> on the Warehouse. <code>enableStaging</code> is removed, and type-conversion settings are removed for Warehouse sinks.</td></tr>
+  <tr><td>Lookup, GetMetadata, Delete, Validation</td><td>Same type. <code>dataset</code> becomes <code>datasetSettings</code>.</td></tr>
+  <tr><td>SynapseNotebook</td><td>TridentNotebook with the Fabric notebook id. Spark pool and size settings are dropped.</td></tr>
+  <tr><td>SparkJob</td><td>SparkJobDefinition with the Fabric item id.</td></tr>
+  <tr><td>ExecutePipeline</td><td>ExecutePipeline with the child pipeline's Fabric id. No connection is needed.</td></tr>
+  <tr><td>SqlPoolStoredProcedure</td><td>SqlServerStoredProcedure that runs in the Warehouse.</td></tr>
+  <tr><td>SqlServerStoredProcedure</td><td>Runs in the Warehouse if its linked service is the migrated pool. Otherwise it runs through the Fabric connection.</td></tr>
+  <tr><td>Script</td><td>The Warehouse if it targeted the pool or the <b>serverless</b> endpoint (OPENROWSET is supported in the Warehouse). Otherwise the connection.</td></tr>
+  <tr><td>ForEach, Until, IfCondition, Switch</td><td>Same. Their inner activities are converted recursively.</td></tr>
+  <tr><td>Wait, SetVariable, AppendVariable, Fail, Web, WebHook, Filter</td><td>Passed through unchanged.</td></tr>
+  <tr><td>Azure Function, Databricks, HDInsight, Custom (Batch), Azure ML</td><td>Same type, through the Fabric connection with the linked service's name.</td></tr>
+  <tr><td>anything else</td><td>The <b>whole pipeline</b> is deferred with “Needs a rewrite”, listing the activities. It's never guessed.</td></tr>
+  </tbody></table></div>
+  <ol class="steps">
+    <li>Parameters, variables, concurrency and annotations are kept. The folder is dropped.</li>
+    <li>Storage paths inside SQL text (<code>text</code>, <code>sqlReaderQuery</code>, <code>query</code>, <code>preCopyScript</code>) are rerouted if routing is on.</li>
+    <li>If anything it references is missing in Fabric (a connection, notebook or child pipeline), the pipeline fails and lists what to create first.</li>
+    <li>If a pipeline with that name exists, it's skipped. With <b>update existing</b>, its definition is replaced in place, so callers and schedules keep pointing at it.</li>
+  </ol>
+  <p class="src">Source: <code>pipelines.py</code> <code>convert</code>; <code>stages_fabric.py</code> <code>_pipeline</code>, <code>_dataset</code></p>
+</section>
+
+<section class="comp" id="schedules">
+  <div class="comp-head"><h3>Triggers → pipeline schedules</h3><span class="tag rest">REST</span></div>
+  <dl class="spec">
+    <div><dt>Synapse</dt><dd>Schedule trigger</dd></div>
+    <div><dt>Fabric</dt><dd>Schedule on each pipeline it runs, <b>switched off</b></dd></div>
+    <div><dt>API</dt><dd><code>POST …/items/{pipeline}/jobs/Pipeline/schedules</code></dd></div>
+    <div><dt>Stage</dt><dd>Schedules (needs Pipelines)</dd></div>
+  </dl>
+  <div class="tablewrap"><table>
+  <thead><tr><th>Synapse recurrence</th><th>Fabric schedule</th></tr></thead>
+  <tbody>
+  <tr><td>Every n minutes</td><td>Cron, interval n minutes</td></tr>
+  <tr><td>Every n hours</td><td>Cron, interval n × 60 minutes (the minute offset within the hour is lost)</td></tr>
+  <tr><td>Daily (interval 1) at hours/minutes</td><td>Daily at the same times</td></tr>
+  <tr><td>Weekly (interval 1) on weekdays at times</td><td>Weekly on the same days and times</td></tr>
+  <tr><td>Every 2+ days or weeks, monthly</td><td>Manual: Fabric has no equivalent form</td></tr>
+  <tr><td>Event, tumbling-window, custom-event triggers</td><td>Manual: event triggers use Fabric Activator</td></tr>
+  </tbody></table></div>
+  <p>The start time, end time (10 years ahead if none was set) and time zone are kept. Every schedule is created <b>switched off</b>, so nothing runs before its data and pipelines are ready. If a pipeline already has a schedule, it's left unchanged. Parameter values passed by the trigger aren't carried, so set them as the pipeline's defaults.</p>
+  <p class="src">Source: <code>jobs.py</code> <code>schedule_bodies</code>; <code>stages_fabric.py</code> <code>_schedule</code></p>
+</section>
+
+<section class="comp" id="scripts">
+  <div class="comp-head"><h3>SQL scripts → T-SQL notebooks</h3><span class="tag rest">REST</span></div>
+  <dl class="spec">
+    <div><dt>Synapse</dt><dd>SQL script (workspace artifact)</dd></div>
+    <div><dt>Fabric</dt><dd>Notebook with one T-SQL cell, bound to the Warehouse</dd></div>
+    <div><dt>API</dt><dd><code>POST /notebooks</code></dd></div>
+    <div><dt>Stage</dt><dd>SQL scripts (needs Warehouse)</dd></div>
+  </dl>
+  <p>Fabric has no standalone SQL script item, so each script becomes a notebook. The script is <b>not executed</b> during migration.</p>
+  <ol class="steps">
+    <li>The same <a href="#modules">T-SQL rules</a> run on the query text, then storage routing if it's on.</li>
+    <li>The text goes into one cell with the <code>sqldatawarehouse</code> kernel and the migrated Warehouse as its default. Without that kernel, Fabric would run the cell as Spark SQL and fail on T-SQL.</li>
+    <li>Scripts with no text, or in a language other than SQL, are deferred.</li>
+  </ol>
+  <p class="src">Source: <code>jobs.py</code> <code>sql_script_notebook</code>; <code>stages_fabric.py</code> <code>_script</code></p>
+</section>
+
+<!-- ============================ STORAGE ============================ -->
+<h2 id="storage">Storage</h2>
+
+<section class="comp" id="shortcuts">
+  <div class="comp-head"><h3>External tables → OneLake shortcuts</h3><span class="tag rest">REST</span></div>
+  <dl class="spec">
+    <div><dt>Synapse</dt><dd>External table over ADLS or Blob</dd></div>
+    <div><dt>Fabric</dt><dd>Shortcut in <code>{warehouse}_lakehouse</code></dd></div>
+    <div><dt>API</dt><dd><code>POST …/items/{lakehouse}/shortcuts</code></dd></div>
+    <div><dt>Stage</dt><dd>External tables (needs Connections)</dd></div>
+  </dl>
+  <p>The data isn't copied. It stays in the storage account, and Fabric reads it in place.</p>
+  <ol class="steps">
+    <li>The runner reads the table's data source location and file path from <code>sys.external_tables</code> joined to <code>sys.external_data_sources</code> on the Synapse pool.</li>
+    <li>The location must be <code>abfss://</code>, <code>abfs://</code>, <code>wasbs://</code> or <code>wasb://</code> on Azure storage. Anything else is deferred.</li>
+    <li>It needs a Fabric connection whose path starts with that storage endpoint, created by the Connections stage. If there isn't one, the item fails and tells you to create it.</li>
+    <li>It creates the Lakehouse if needed, then a shortcut at <code>Files/{schema}/{table}</code> pointing at the container and folder.</li>
+  </ol>
+  <p>The shortcut appears under <b>Files</b>. Promote it to a table in the Lakehouse to query it with SQL. File format and column definitions of the external table aren't recreated.</p>
+  <p class="src">Source: <code>jobs.py</code> <code>shortcut_target</code>; <code>stages_fabric.py</code> <code>_shortcut</code></p>
+</section>
+
+<section class="comp" id="routing">
+  <div class="comp-head"><h3>Storage path routing (applies across components)</h3><span class="tag rest">REST</span></div>
+  <p>In Synapse, code reads <code>abfss://container@account.dfs.core.windows.net/…</code> as the workspace's managed identity. In Fabric it runs as the user. That often fails, for example when the storage account is in a different Entra tenant from Fabric. A Fabric connection with an account key or SAS still works across tenants, and a OneLake shortcut uses that connection.</p>
+  <p>If you map a storage account and container in Plan, the run:</p>
+  <ol class="steps">
+    <li>Creates one shortcut per container, named after the container, under <code>Files</code> in <code>{warehouse}_lakehouse</code>.</li>
+    <li>Rewrites paths in notebooks, views, procedures, SQL scripts, pipeline SQL and Spark job files:
+<pre><code>abfss://raw@acct.dfs.core.windows.net/x  →  abfss://&lt;ws&gt;@onelake.dfs.fabric.microsoft.com/&lt;lh&gt;/Files/raw/x
+https://acct.dfs.core.windows.net/raw/x  →  https://onelake.dfs.fabric.microsoft.com/&lt;ws&gt;/&lt;lh&gt;/Files/raw/x</code></pre>
+      Paths built from variables, such as f-strings or T-SQL string concatenation, are rewritten too when only one account is mapped.</li>
+  </ol>
+  <p class="src">Source: <code>storage_remap.py</code>; <code>stages_fabric.py</code> <code>_routes</code>, <code>_remap</code></p>
+</section>
+
+<!-- ============================ AROUND ============================ -->
+<h2 id="manual">What is not migrated automatically</h2>
+<p>These objects are discovered and listed in the plan, but the run marks them <b>Deferred</b> and gives the reason. A run never claims to have moved something it didn't.</p>
+<div class="tablewrap"><table>
+<thead><tr><th>Component</th><th>Why, and what to do</th></tr></thead>
+<tbody>
+<tr><td>Integration runtimes</td><td>No Fabric equivalent. Use cloud connections or an on-premises data gateway.</td></tr>
+<tr><td>Lake databases</td><td>Not built yet. Recreate as a Lakehouse.</td></tr>
+<tr><td>Serverless SQL pool objects</td><td>Not built yet. Pipeline Script activities that used serverless are redirected to the Warehouse.</td></tr>
+<tr><td>Spark libraries (workspace and pool packages)</td><td>Only names are known, not files. Add them to the Environment.</td></tr>
+<tr><td>Networking (managed VNet, private endpoints, firewall)</td><td>Set up in Fabric workspace networking by hand.</td></tr>
+<tr><td>Multi-statement table-valued functions</td><td>Not supported by the Warehouse. Use an accepted LLM rewrite or rewrite it by hand.</td></tr>
+<tr><td>SQL-authenticated users</td><td>Fabric has no SQL auth. Map each one to an Entra principal; the GRANT statements are provided.</td></tr>
+<tr><td>Event and tumbling-window triggers, irregular schedules</td><td>Recreate them with Fabric Activator or by hand.</td></tr>
+<tr><td>.NET (C#) notebooks, other-language Spark jobs</td><td>Rewrite in PySpark or Scala.</td></tr>
+<tr><td>Pipelines with an unknown activity type</td><td>The whole pipeline is deferred, and the activities are listed.</td></tr>
+<tr><td>Unsupported linked-service types</td><td>Create the connection by hand with the same name.</td></tr>
+</tbody></table></div>
+
+<h2 id="llm">LLM-assisted transforms (optional)</h2>
+<p>Some objects can't be converted by the rules, such as multi-statement functions, unusual T-SQL and notebooks with Synapse-only APIs. For these, you can ask for a draft from Claude through the local Claude Code CLI. No API key is used.</p>
+<ol class="steps">
+  <li>On request, the object's source, the rule-based output and the project requirements (<code>prompts/transform/project.md</code>) are sent to the model. It runs with every tool switched off, in an empty folder, so it can only answer.</li>
+  <li>The draft is checked and shown next to the source and the rule output. Nothing is deployed until a person <b>accepts</b> it, optionally after editing it.</li>
+  <li>A run uses the accepted code instead of the rule-based conversion, but only while the source still matches what was accepted. T-SQL still goes through the rules afterwards to catch slips. The run log marks the object “LLM-assisted, reviewed”.</li>
+</ol>
+<p>Setting <code>MIGRATION_LLM=off</code> turns generation off entirely.</p>
+
+<h2 id="validation">Validation: how the result is checked</h2>
+<p>Validate reads both sides and writes nothing, unless you ask it to run items now. Each row is <b>MATCH</b>, <b>REVIEW</b> (an explained difference, or a check that couldn't run) or <b>MISMATCH</b>.</p>
+<div class="tablewrap"><table>
+<thead><tr><th>Component</th><th>What is compared</th></tr></thead>
+<tbody>
+<tr><td>Warehouse, schemas</td><td>That they exist and can be read.</td></tr>
+<tr><td>Tables</td><td>Column names and types against the expected mapping; masks present. Converted types give REVIEW.</td></tr>
+<tr><td>Table data</td><td><code>COUNT_BIG(*)</code> in Synapse and in Fabric, with the same filter. A synced table counts as in step anywhere between “up to the last watermark” and “everything now”.</td></tr>
+<tr><td>Views, procedures, functions</td><td>Definition text with whitespace and comments normalised. Differences give REVIEW (reformatted or converted).</td></tr>
+<tr><td>Roles &amp; permissions</td><td>The role exists; members and every expected GRANT/DENY are present in <code>sys.database_permissions</code>.</td></tr>
+<tr><td>Notebooks</td><td>Cell count.</td></tr>
+<tr><td>Pipelines</td><td>Activity count, including nested activities. Datasets: embedded in every pipeline that uses them.</td></tr>
+<tr><td>Spark pool</td><td>Pool and Environment exist with the same node size and scale.</td></tr>
+<tr><td>Connections, Spark jobs, SQL scripts, shortcuts</td><td>That they exist in Fabric.</td></tr>
+<tr><td>Schedules</td><td>Each target pipeline has a schedule.</td></tr>
+</tbody></table></div>
+<p><b>Runtime checks</b>, which you choose to run, go further. Tables and views are queried with <code>SELECT TOP (1)</code>. Procedures are compiled with <code>sp_describe_first_result_set</code>, and on request executed inside a transaction that's rolled back. Pipelines, notebooks and Spark jobs report their last Fabric run, or are run now on request; that is a real run. An object that matches but has never run in Fabric is REVIEW, because nothing proves it works yet.</p>
+
+<h2 id="safety">Safety rules the run follows</h2>
+<ul>
+  <li><b>Never overwrites.</b> An object that exists in Fabric is skipped. The only exceptions are the explicit “update existing” option for notebooks, pipelines, Spark jobs, SQL scripts, views, procedures and functions, and masks being added to an existing table.</li>
+  <li><b>Re-runs are safe.</b> Data loads skip tables that have rows unless you choose “Replace”. Shortcuts, connections, schedules and pipelines are reused by name.</li>
+  <li><b>Never runs anything early.</b> Schedules and the sync schedule are created switched off.</li>
+  <li><b>Secrets aren't kept.</b> Credentials live in memory for the run, go only into the Fabric create call, and are never logged or returned. Tokens stay inside the process.</li>
+  <li><b>Masked data is never exposed.</b> A table whose mask can't be recreated isn't created, so its rows are never loaded.</li>
+  <li><b>Discovery is read-only.</b> Catalog queries come from a fixed registry that's checked to be SELECT-only. The only writes go to the Fabric API and the Warehouse.</li>
+  <li><b>Every change is reported.</b> Each converted type, removed clause, dropped setting and rewritten call appears as a note on the object and in the run log.</li>
+</ul>
+
+<footer>Generated from the Migration Accelerator source (<code>src/discovery_agent</code>) on 15 October 2026. If the code changes, regenerate this page so it stays accurate.</footer>
+</main>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+<script>mermaid.initialize({ startOnLoad: true, theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "default" });</script>
+</body>
+</html>
