@@ -24,6 +24,7 @@ instead, and reads the dedicated pool only when the operator added one.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import threading
 import urllib.parse
@@ -38,6 +39,7 @@ from discovery_agent.api.repository_source import RepositoryError, RepositorySpe
 from discovery_agent.api.persist import StateStore
 from discovery_agent.config import DEFAULT_OUTPUT_DIR, DiscoveryConfig
 from discovery_agent.diagnostics import record_unexpected, unexpected_message
+from discovery_agent.state import context
 from discovery_agent.connections.azure import (
     ARM_SCOPE,
     AzureConnection,
@@ -232,6 +234,10 @@ class _Connection:
     repository: Optional[RepositorySpec] = None
 
 
+#: Who a URL signs in as (https://user:token@host/...): never recorded, whatever its form.
+_USERINFO = re.compile(r"(?<=://)[^/@\s]+@")
+
+
 @dataclass
 class _Job:
     state: str = "idle"  # idle | running | completed | completed_with_warnings | failed
@@ -249,6 +255,8 @@ class _Job:
     workspace: Optional[str] = None
     #: A repository source's definitions by kind and name, as migration reads them.
     repository_artifacts: Dict[Any, Dict[str, dict]] = field(default_factory=dict)
+    #: The snapshot this discovery was recorded as (``_snapshot``): its id, fingerprint and completeness.
+    snapshot: Optional[Dict[str, Any]] = None
 
 
 #: The saved discovery's name in the state store.
@@ -258,8 +266,11 @@ DISCOVERY_STATE = "discovery"
 class Session:
     """The connection and the last discovery, guarded by one lock."""
 
-    def __init__(self, store: Optional[StateStore] = None) -> None:
+    def __init__(self, store: Optional[StateStore] = None, records: Any = None,
+                 audit: Optional[Callable[..., Any]] = None) -> None:
         self._lock = threading.RLock()
+        #: Records what people do here, and what discovery found (``state.audit``); never raises.
+        self._audit = audit or (lambda *args, **kwargs: None)
         self._connection: Optional[_Connection] = None
         self._signin: Optional[_SignIn] = None
         self._signing_in = False
@@ -267,12 +278,76 @@ class Session:
         self._detail_cache: Dict[str, dict] = {}
         #: Where the last discovery is kept between starts (``persist``). None: nothing is kept.
         self._store = store
+        #: The project's durable record (``state.store.Store``): where each discovery is recorded as a snapshot.
+        self._records = records
         #: The source a discovery loaded at start was read from ({"workspace", "pool"}), until a live one replaces it.
         self._restored: Optional[Dict[str, Optional[str]]] = None
-        saved = store.load(DISCOVERY_STATE) if store is not None else None
+        self._load_saved()
+
+    def _load_saved(self) -> None:
+        """The discovery saved for this project, back as it is after a restart (its source not signed in yet)."""
+        saved = self._store.load(DISCOVERY_STATE) if self._store is not None else None
         if isinstance(saved, dict) and isinstance(saved.get("job"), _Job) and saved["job"].state in ("completed", "completed_with_warnings"):
             self._job = saved["job"]
             self._restored = {"workspace": saved.get("workspace"), "pool": saved.get("pool")}
+
+    def busy(self) -> Optional[str]:
+        """Why this session cannot change project now, or None."""
+        with self._lock:
+            if self._job.state == "running":
+                return "Discovery is running; wait for it to finish."
+            if self._signing_in:
+                return "A sign-in is waiting for you in a browser window; finish it first."
+        return None
+
+    def switch(self, store: Optional[StateStore], records: Any) -> None:
+        """Hold another project's discovery instead, as a restart into that project would. The Synapse sign-in is
+        kept; the connection to a workspace is not, since it was made for the project left."""
+        with self._lock:
+            reason = self.busy()
+            if reason:
+                raise ApiError(409, "session_busy", reason)
+            self._replace_connection(None)
+            self._job = _Job()
+            self._detail_cache.clear()
+            self._restored = None
+            self._store, self._records = store, records
+            self._load_saved()
+
+    def _snapshot(self, job: "_Job", conn: "_Connection") -> Optional[Dict[str, Any]]:
+        """Record what this discovery saw, as the project's next snapshot: the source, every object by id and type,
+        a fingerprint over them and their definitions, and whether a part of the source could not be read."""
+        digest = hashlib.sha256()
+        for item in sorted(job.items, key=lambda i: str(i.get("id"))):
+            digest.update(f"{item.get('id')}|{item.get('type')}|{item.get('name')}\n".encode("utf-8"))
+            record = job.records_by_id.get(item.get("id"))
+            if record is not None:
+                try:
+                    digest.update(hashlib.sha256(repr(getattr(getattr(record, "definition", None), "content", None)).encode("utf-8")).digest())
+                except Exception:  # noqa: BLE001 - a definition that cannot be described still counts by its id
+                    pass
+        summary = job.summary or {}
+        types: Dict[str, int] = {}
+        for item in job.items:
+            types[str(item.get("type"))] = types.get(str(item.get("type")), 0) + 1
+        repo = conn.repository
+        snapshot = {
+            "at": job.finished_at, "by": context.actor().to_dict(), "workspace": conn.workspace, "pool": conn.sql_pool,
+            "sourceKind": conn.source_kind,
+            "repository": ({"label": repo.label, "ref": repo.ref, "commit": repo.commit, "environment": repo.environment}
+                           if repo is not None else None),
+            "complete": not summary.get("failedCategories"),
+            "failedCategories": [str(f.get("name") if isinstance(f, dict) else f) for f in summary.get("failedCategories") or []],
+            "warnings": len(summary.get("warnings") or []), "objects": len(job.items), "types": types,
+            "fingerprint": digest.hexdigest()[:16],
+        }
+        if self._records is None:
+            return {**snapshot, "id": None}
+        try:
+            recorded = self._records.append("snapshots", snapshot)
+        except OSError:
+            return {**snapshot, "id": None}  # the discovery stands; it is only not recorded
+        return {**recorded, "id": f"S{recorded['seq']:03d}"}
 
     # -- what survives a restart -----------------------------------------------
 
@@ -324,6 +399,7 @@ class Session:
         with self._lock:
             if self._job.state == "running":
                 raise ApiError(409, "discovery_running", "Discovery is running; wait for it to finish.")
+            workspace = self._connection.workspace if self._connection is not None else None
             self._replace_connection(None)
             self._signin = None
             self._drop_discovery()
@@ -331,6 +407,7 @@ class Session:
             forget_auth_record()
             payload = self._connection_payload(None)
         payload["note"] = "Signed out of this accelerator. Your Azure CLI session is untouched."
+        self._audit("source.disconnected", target={"type": "source", "id": workspace}, details={"workspace": workspace})
         return payload
 
     def authenticate(self, body: dict) -> dict:
@@ -401,6 +478,12 @@ class Session:
         payload["ok"] = error is None
         if error is not None:
             payload["error"] = error
+        self._audit("source.signed_in", target={"type": "account", "id": signin.account if signin else None},
+                    outcome="done" if error is None else "failed", code=error["code"] if error else None,
+                    reason=error["message"] if error else None,
+                    details={"method": method, "tenant": signin.tenant_id if signin else None,
+                             "account": signin.account if signin else None,
+                             "subscriptions": len(signin.subscriptions) if signin else 0})
         return payload
 
     @staticmethod
@@ -643,6 +726,10 @@ class Session:
                     self._restored = None  # the restored discovery now belongs to a live connection
                 else:
                     self._drop_discovery()
+        self._audit("source.connected", target={"type": "source", "id": workspace}, outcome="done" if conn.connected else "failed",
+                    code=None if conn.connected else "connection_test_failed",
+                    details={"workspace": workspace, "pool": sql_pool, "sourceKind": conn.source_kind,
+                             "checks": [{"name": c.get("name"), "status": c.get("status")} for c in conn.checks]})
         return self._with_error(self._connection_payload(conn), failures)
 
     # -- repository sources: Git, or a ZIP of the repository ---------------------
@@ -668,6 +755,7 @@ class Session:
             found, root_folder, note = repository_source.counts(root), relative, None
         except RepositoryError as exc:
             found, root_folder, note = {}, None, str(exc)
+        self._audit("source.uploaded", target={"type": "upload", "id": upload_id}, details={"name": name, "bytes": len(data)})
         return {"uploadId": upload_id, "fileName": name, "rootFolder": root_folder, "counts": found, "note": note}
 
     def connect_repository(self, body: dict) -> dict:
@@ -789,9 +877,15 @@ class Session:
         if not conn.connected:
             payload["error"] = {"code": "configuration", "title": "No Synapse definitions found",
                                 "hint": "The folder holds no definition files.", "message": checks[-1]["message"]}
+        self._audit("source.repository", target={"type": "source", "id": conn.workspace}, outcome="done" if conn.connected else "failed",
+                    code=None if conn.connected else "configuration",
+                    details={"label": _USERINFO.sub("", label), "ref": ref, "commit": commit, "environment": environment,
+                             "parameters": len(spec.applied), "unmatched": len(spec.unmatched), "secrets": len(spec.secrets)})
         return payload
 
     def _repository_failure(self, checks: List[dict], title: str, message: Optional[str], hint: str) -> dict:
+        self._audit("source.repository", target={"type": "source", "id": None}, outcome="failed", code="configuration",
+                    reason=f"{title}: {message}" if message else title)
         with self._lock:
             payload = self._connection_payload(None)
         payload.update({"checks": checks, "ok": False,
@@ -888,8 +982,9 @@ class Session:
             self._job = _Job(state="running", started_at=_now(), workspace=conn.workspace)
             self._detail_cache.clear()
             job = self._job
-        thread = threading.Thread(target=self._discover, args=(conn, job), daemon=True)
-        thread.start()
+        self._audit("discovery.started", target={"type": "source", "id": conn.workspace},
+                    details={"workspace": conn.workspace, "pool": conn.sql_pool, "sourceKind": conn.source_kind})
+        context.spawn(self._discover, conn, job, name="discovery")
         return self.discovery_status()
 
     def reset_discovery(self) -> dict:
@@ -898,7 +993,9 @@ class Session:
         with self._lock:
             if self._job.state == "running":
                 raise ApiError(409, "discovery_running", "Discovery is running; wait for it to finish.")
+            snapshot = (self._job.snapshot or {}).get("id")
             self._drop_discovery()
+        self._audit("discovery.reset", target={"type": "snapshot", "id": snapshot}, details={"snapshot": snapshot})
         return self.discovery_status()
 
     def _discover(self, conn: _Connection, job: _Job) -> None:
@@ -961,12 +1058,18 @@ class Session:
                     job.repository_artifacts = repository_source.artifacts(conn.repository.path)
                 job.summary = summary
                 job.finished_at = _now()
+                job.snapshot = self._snapshot(job, conn)
                 job.state = (
                     "completed_with_warnings" if summary["failedCategories"] or summary["warnings"] else "completed"
                 )
                 self._restored = None
                 # Saved before anyone can see "completed", so a restart right after never misses it.
                 self._save_discovery(job, conn)
+            snap = job.snapshot or {}
+            self._audit("discovery.completed", target={"type": "snapshot", "id": snap.get("id")}, actor=context.system(),
+                        details={"snapshot": snap.get("id"), "fingerprint": snap.get("fingerprint"), "objects": len(job.items),
+                                 "complete": snap.get("complete"), "failedCategories": snap.get("failedCategories"),
+                                 "warnings": snap.get("warnings"), "state": job.state})
         except DiscoveryError as exc:
             self._fail(job, redact(str(exc)))
         except Exception as exc:  # noqa: BLE001 - never leak a traceback to the UI; the API's log gets it
@@ -1065,6 +1168,8 @@ class Session:
             job.error = message
             job.finished_at = _now()
             job.state = "failed"
+        self._audit("discovery.completed", target={"type": "snapshot", "id": None}, actor=context.system(), outcome="failed",
+                    code="discovery_failed", details={"state": "failed", "message": message})
 
     @staticmethod
     def _summarise(run: discovery.DiscoveryRun, items: List[dict], extra_failures: List[dict]) -> dict:
@@ -1146,6 +1251,9 @@ class Session:
                 # Loaded at start from the last session: the source it came from is not signed in yet.
                 "restored": self._restored is not None,
                 "restoredFrom": dict(self._restored) if self._restored is not None else None,
+                # The snapshot it was recorded as: what it saw, and whether all of the source could be read.
+                "snapshot": ({k: v for k, v in snap.items() if k in ("id", "at", "fingerprint", "complete", "failedCategories", "objects")}
+                             if (snap := getattr(job, "snapshot", None)) else None),
             }
 
     def results(self, query: Dict[str, str]) -> dict:

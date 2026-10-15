@@ -13,6 +13,8 @@ export interface StepStatus extends StepMeta {
   running: boolean;
   /** The run is paused part-way (Migrate only). */
   paused: boolean;
+  /** How the Next bar says it is held, when that is not a plain pause (a run waiting for sign-off). */
+  pausedTitle?: string;
   /** Finished, but with something worth a look first (failures, warnings, blocking risks). */
   attention: string | null;
   /** The one number shown on the step's box. */
@@ -87,10 +89,14 @@ export function useJourney(): { steps: StepStatus[]; current: StepKey; finished:
       complete: run.state === "completed",
       running: run.state === "running",
       paused: run.state === "paused",
-      attention: run.failed ? plural(run.failed, "object") + " failed" : null,
-      metric: run.state === "idle" ? "Not started" : run.state === "running" ? `${run.total ? Math.round(((run.completed + run.failed + (run.skipped ?? 0) + (run.deferred ?? 0)) / run.total) * 100) : 0}%` : run.state === "paused" ? "Paused" : `${n(run.completed)} migrated`,
+      pausedTitle: run.status === "awaiting_approval" ? "waits for sign-off" : undefined,
+      attention: run.failed || run.blocked ? [run.failed ? plural(run.failed, "object") + " failed" : "", run.blocked ? `${n(run.blocked)} blocked` : ""].filter(Boolean).join(", ") : null,
+      metric: run.state === "idle" ? "Not started" : run.state === "running" ? `${run.total ? Math.round(((run.completed + run.failed + (run.skipped ?? 0) + (run.deferred ?? 0)) / run.total) * 100) : 0}%` : run.status === "awaiting_approval" ? "Sign-off" : run.state === "paused" ? "Paused" : `${n(run.completed)} migrated`,
       outcome: run.state === "completed" ? `${n(run.completed)} migrated, ${n(run.skipped ?? 0)} already there, ${n(run.deferred ?? 0)} left for a person${run.failed ? `, ${n(run.failed)} failed` : ""}.` : "",
-      waiting: run.state === "running" ? "The migration is running…" : run.state === "paused" ? "The run is paused. Resume it to finish." : "Start the migration run.",
+      waiting: run.state === "running" ? "The migration is running…"
+        : run.status === "awaiting_approval" ? "The run waits for a person to sign it off; nothing has been written to Fabric yet."
+        : run.pausedReason === "interrupted" ? "The accelerator stopped under the run. Resume it to carry on from where it stopped."
+        : run.state === "paused" ? "The run is paused. Resume it to finish." : "Start the migration run.",
     },
     validate: {
       complete: validation !== null,

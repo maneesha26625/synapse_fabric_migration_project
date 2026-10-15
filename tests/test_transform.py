@@ -237,6 +237,29 @@ def test_a_draft_is_generated_checked_and_stored_but_not_used_until_accepted(ser
     assert sources[0].override["code"] == GOOD_PROC
 
 
+def test_a_draft_made_on_the_worker_pool_carries_the_request_correlation(tmp_path):
+    """The real (threaded) path: the worker runs in the context of the request that queued it."""
+    import time
+
+    from discovery_agent.state import context as work_context
+
+    seen = []
+
+    class Watching(FakeModel):
+        def complete(self, prompt):
+            seen.append(work_context.correlation_id())
+            return super().complete(prompt)
+
+    svc = TransformService(FakeSession(), model=Watching(), store=TransformStore(tmp_path / "t"), prompts=PROMPTS, workers=1)
+    with work_context.bound(correlation="request-1234", actor=work_context.operator()):
+        svc.generate({"ids": [OID]})
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and svc.object(OID)["state"] != "draft":
+        time.sleep(0.01)
+    assert svc.object(OID)["state"] == "draft"
+    assert seen == ["request-1234"]
+
+
 def test_an_edited_draft_is_checked_again_before_it_is_accepted(service):
     svc = service()
     svc.generate({"ids": [OID]})

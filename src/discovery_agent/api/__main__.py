@@ -1,9 +1,11 @@
 """Run the API: ``python -m discovery_agent.api``.
 
 ``--reload`` is for working on the accelerator: the server runs as a child process that is restarted within
-a second whenever a ``.py`` file under ``src/`` changes. The last discovery and the Fabric target come back
-on their own after each restart (``persist``); only the Synapse sign-in has to be repeated, and only to read
-Synapse again.
+a second whenever a ``.py`` file under ``src/`` changes. The active project's discovery, Fabric target, runs
+and audit trail come back on their own after each restart (``state.projects``); a run the restart cut short is
+paused as interrupted, for Resume. Only the Synapse sign-in has to be repeated, and only to read Synapse again.
+
+The server process claims its state folder: a second API pointed at the same folder refuses to start.
 """
 
 from __future__ import annotations
@@ -19,6 +21,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from discovery_agent.api.server import create_server
+from discovery_agent.state import context, logs
+from discovery_agent.state.projects import ProjectError, Projects
 
 DEFAULT_PORT = 8001
 DEFAULT_STATIC = Path(__file__).resolve().parents[3] / "frontend" / "dist"
@@ -106,15 +110,31 @@ def main() -> int:
         print(f"Migration Accelerator API on http://{args.host}:{args.port} (restarts when the code changes; Ctrl+C to stop)")
         return _supervise(["--host", args.host, "--port", str(args.port), "--static", str(args.static)])
 
-    server = create_server(args.host, args.port, args.static)
-    print(f"Migration Accelerator API on http://{args.host}:{args.port}")
-    print("Sign in first with `az login`. Press Ctrl+C to stop.")
+    # The server process (never the --reload supervisor) logs to its console and to .accelerator/logs/api.jsonl.
+    log_file = logs.configure()
+    # One API process per state folder: a second one writing the same projects would corrupt their records.
+    projects = Projects()
+    owner = f"API on {args.host}:{args.port}"
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        projects.claim_process(owner)
+    except ProjectError as exc:
+        print(exc.message)
+        return 1
+    try:
+        server = create_server(args.host, args.port, args.static, projects=projects)
+        print(f"Migration Accelerator API on http://{args.host}:{args.port}" + (f" (log: {log_file})" if log_file else ""))
+        print(f"State: {projects.root}" + ("" if projects.persistent else " (MIGRATION_STATE=off: kept for this run only)"))
+        print("Sign in first with `az login`. Press Ctrl+C to stop.")
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
+            with context.bound(actor=context.system()):
+                server.projects.audit("system.stopped", details={"pid": os.getpid()})
     finally:
-        server.server_close()
+        projects.release_process(owner)
     return 0
 
 

@@ -1402,6 +1402,10 @@ def test_a_configuration_model_never_prints_a_secret_because_it_holds_none():
         "connect failed: access_token=abc123def456",
         "https://user:ghp_secret@github.com/contoso/repo is unreachable",
         "login failed, PWD=hunter2",
+        "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=hunter2==;EndpointSuffix=core.windows.net",
+        "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=root;SharedAccessKey=hunter2",
+        'the body was {"password": "hunter2", "username": "loader"}',
+        "api_key: hunter2",
     ],
 )
 def test_anything_credential_shaped_is_redacted_out_of_a_result(leak):

@@ -418,7 +418,7 @@ def test_disconnect_returns_to_disconnected(server):
     assert status == 200 and body["status"] == "disconnected"
 
 
-def test_an_unexpected_error_is_logged_under_a_reference_and_the_browser_gets_only_the_reference(capsys):
+def test_an_unexpected_error_is_logged_under_a_reference_and_the_browser_gets_only_the_reference(caplog):
     class Broken(Session):
         def connection_state(self):
             raise RuntimeError("Password=hunter2 while reading the connection")
@@ -434,18 +434,18 @@ def test_an_unexpected_error_is_logged_under_a_reference_and_the_browser_gets_on
     reference = body["error"]["reference"]
     assert re.fullmatch(r"[0-9a-f]{8}", reference) and f"reference {reference}" in body["error"]["message"]
     assert "Traceback" not in json.dumps(body) and "hunter2" not in json.dumps(body)
-    log = capsys.readouterr().err
-    assert f"ERROR [{reference}] GET /api/connections: unexpected RuntimeError" in log
+    log = caplog.text
+    assert f"[{reference}] GET /api/connections: unexpected RuntimeError" in log
     assert "Traceback" in log and "hunter2" not in log
 
 
-def test_recording_an_unexpected_error_redacts_it_and_returns_its_reference(capsys):
+def test_recording_an_unexpected_error_redacts_it_and_returns_its_reference(caplog):
     try:
         raise ValueError("Server=tcp:x;Password=hunter2;")
     except ValueError as exc:
         reference = record_unexpected("a test", exc)
-    log = capsys.readouterr().err
-    assert re.fullmatch(r"[0-9a-f]{8}", reference) and f"ERROR [{reference}] a test: unexpected ValueError" in log
+    log = caplog.text
+    assert re.fullmatch(r"[0-9a-f]{8}", reference) and f"[{reference}] a test: unexpected ValueError" in log
     assert "Traceback" in log and "hunter2" not in log
 
 

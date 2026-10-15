@@ -1,5 +1,9 @@
 import {
   ApiRequestError,
+  type AuditPage,
+  type AuditVerification,
+  type ProjectListing,
+  type RunHistory,
   type AzureSubscription,
   type ComponentRow,
   type DependencyGraph,
@@ -33,6 +37,7 @@ interface ValidationState {
   state: "idle" | "running" | "completed" | "failed";
   progress?: string;
   rows?: ValidationRow[];
+  finishedAt?: string;
   error?: { code?: string; message?: string };
 }
 
@@ -171,8 +176,43 @@ export const realApi: MigrationApi = {
       body: JSON.stringify({ items, ...(options ? { options } : {}), ...(credentials ? { credentials } : {}) }),
     }),
   getExecution: () => request<ExecutionRun>("/api/migration/run"),
-  controlExecution: (action) =>
-    request<ExecutionRun>("/api/migration/control", { method: "POST", body: JSON.stringify({ action }) }),
+  controlExecution: (action, extra) =>
+    request<ExecutionRun>("/api/migration/control", {
+      method: "POST",
+      // Credentials a restart lost travel once more, the same way: into the backend's memory, never stored here.
+      body: JSON.stringify({ action, ...(extra?.version !== undefined ? { version: extra.version } : {}),
+        ...(extra?.credentials && Object.keys(extra.credentials).length ? { credentials: extra.credentials } : {}) }),
+    }),
+  approveExecution: (decision, comment, extra) =>
+    request<ExecutionRun>("/api/migration/approve", {
+      method: "POST",
+      body: JSON.stringify({ decision, ...(comment ? { comment } : {}), ...(extra?.subjectHash ? { subjectHash: extra.subjectHash } : {}),
+        ...(extra?.credentials && Object.keys(extra.credentials).length ? { credentials: extra.credentials } : {}) }),
+    }),
+  listRuns: () => request<RunHistory>("/api/migration/runs"),
+  getRun: (runId) => request<ExecutionRun>(`/api/migration/runs/${encodeURIComponent(runId)}`),
+  getValidation: () => request<ValidationState>("/api/migration/validation"),
+  listProjects: () => request<ProjectListing>("/api/projects"),
+  createProject: (name, options) =>
+    request<ProjectListing>("/api/projects", { method: "POST", body: JSON.stringify({ name, ...(options ?? {}) }) }),
+  renameProject: (id, name, version) =>
+    request<ProjectListing>(`/api/projects/${encodeURIComponent(id)}/rename`, {
+      method: "POST", body: JSON.stringify({ name, ...(version !== undefined ? { version } : {}) }) }),
+  activateProject: (id, version) =>
+    request<ProjectListing>(`/api/projects/${encodeURIComponent(id)}/activate`, {
+      method: "POST", body: JSON.stringify(version !== undefined ? { version } : {}) }),
+  deleteProject: (id, version) =>
+    request<ProjectListing>(`/api/projects/${encodeURIComponent(id)}${version !== undefined ? `?version=${version}` : ""}`, { method: "DELETE" }),
+  getAudit: (q) => {
+    const p = new URLSearchParams();
+    for (const [k, v] of Object.entries(q ?? {})) if (v !== undefined && v !== "") p.set(k, String(v));
+    return request<AuditPage>(`/api/audit${p.toString() ? `?${p}` : ""}`);
+  },
+  verifyAudit: () => request<AuditVerification>("/api/audit/verify"),
+  exportAudit: async (format) => ({ url: `/api/audit/export?format=${format}`, fileName: `audit.${format}` }),
+  confirmStep: async (step, note) => {
+    await request<unknown>("/api/journey/confirm", { method: "POST", body: JSON.stringify({ step, ...(note ? { note } : {}) }) });
+  },
   runValidation: async (items, options, runtime, onProgress) => {
     // Validation runs in the background on the server (runs in Fabric can take minutes): start it, then follow it.
     await request<ValidationState>("/api/migration/validate", { method: "POST", body: JSON.stringify({

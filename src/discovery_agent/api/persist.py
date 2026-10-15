@@ -21,14 +21,15 @@ pickles: only this process writes them, and only from this folder are they read.
 
 from __future__ import annotations
 
+import logging
 import os
 import pickle
-import sys
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Optional
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+_log = logging.getLogger("discovery_agent.state")
 #: Bump when a saved object's shape changes so an old file is ignored rather than half-loaded.
 VERSION = 1
 
@@ -70,7 +71,7 @@ class StateStore:
             os.replace(tmp, path)
             return True
         except Exception as exc:  # noqa: BLE001 - saving is a convenience; the API works without it
-            sys.stderr.write(f"Could not save {name} for the next start: {type(exc).__name__}: {str(exc)[:200]}\n")
+            _log.warning("Could not save %s for the next start: %s: %s", name, type(exc).__name__, str(exc)[:200])
             try:
                 path.with_suffix(".tmp").unlink()
             except OSError:
@@ -89,7 +90,7 @@ class StateStore:
             if isinstance(saved, dict) and saved.get("version") == VERSION:
                 return saved.get("value")
         except Exception as exc:  # noqa: BLE001 - an unreadable file (code changed shape) is ignored, not fatal
-            sys.stderr.write(f"Ignored the saved {name} ({type(exc).__name__}); it will be saved again.\n")
+            _log.warning("Ignored the saved %s (%s); it will be saved again.", name, type(exc).__name__)
         return None
 
     def forget(self, name: str) -> None:

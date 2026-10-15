@@ -18,7 +18,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-from discovery_agent.migration import datacopy, datafilter, datapipeline, fabric_connections, security, warehouse_ddl
+from discovery_agent.diagnostics import redacted
+from discovery_agent.migration import datacopy, datafilter, datapipeline, fabric_connections, failures, security, warehouse_ddl
 from discovery_agent.migration.common import (
     COMPLETED, DATA, DEFERRED_STATUS, FAILED, IN_PROGRESS, PENDING, SKIPPED, MigrationError, Source,
 )
@@ -73,16 +74,24 @@ class StageMixin:
         """Load this table's wave with a data pipeline, and report every table in it."""
         run = self.run
         current = self._item
+        # The wave's other tables load with it; one whose table did not complete is left for its own turn, to be blocked.
         batch = [current] + [i for i in run.items
-                             if i is not current and i.status == PENDING and i.source.kind == DATA and i.source.wave == source.wave]
-        with run.lock:
-            for item in batch[1:]:
-                item.status, item.started_at, item.error, item.notes = IN_PROGRESS, _now(), None, []
-                item.step = "Waiting for this wave's data pipeline"
+                             if i is not current and i.status == PENDING and i.source.kind == DATA and i.source.wave == source.wave
+                             and not self._blocker(i)]  # type: ignore[attr-defined]
+        for item in batch[1:]:
+            run.update(item, status=IN_PROGRESS, started_at=_now(), completed_at=None, error=None, notes=[], category=None,
+                       step="Waiting for this wave's data pipeline", attempts=item.attempts + 1)
         try:
             results = self._load_wave(source.wave, [i.source for i in batch])
-        except (MigrationError, FabricApiError) as exc:
-            message = exc.message if isinstance(exc, FabricApiError) else str(exc)
+        except Exception as exc:
+            # Whatever stopped the wave stops every table in it, so none is left "in progress" for good.
+            if isinstance(exc, FabricApiError):
+                message = exc.message
+            elif isinstance(exc, MigrationError):
+                message = str(exc)
+            else:
+                message = (f"Unexpected {type(exc).__name__}: {redacted(str(exc)[:300])} "
+                           f"(reference {self._reference(source, exc)})")  # type: ignore[attr-defined]
             for item in batch[1:]:
                 self._finish(item, FAILED, "Failed", None, [], message)
             raise
@@ -96,17 +105,87 @@ class StageMixin:
 
     def _finish(self, item: Any, status: str, step: str, target: Optional[str], notes: List[str], error: Optional[str] = None) -> None:
         run = self.run
-        with run.lock:
-            item.status, item.step, item.target, item.notes, item.error, item.completed_at = status, step, target, list(notes), error, _now()
+        category = failures.classify(error or step) if status == FAILED else None
+        if status == SKIPPED and item.maybe_created:
+            status, notes = COMPLETED, ["Found loaded on this try: an earlier attempt in this run most likely loaded it (the "
+                                        "accelerator stopped under it).", *notes]
+        run.update(item, status=status, step=step, target=target, notes=list(notes), error=error, completed_at=_now(),
+                   category=category, maybe_created=False if status != FAILED else item.maybe_created)
         run.log(status, item.source.name, error or (step + (f" -> {target}" if target else "")))
         for note in notes:
             run.log("NOTE", item.source.name, note)
+
+    def _earlier_load(self, wave: int, sources: List[Source], results: Dict[str, Result]) -> Tuple[List[Source], set]:
+        """A load of this wave that this run started before the accelerator stopped (its record says so) is followed
+        to its end before anything else: a second load must never run beside it, nor empty a table under it.
+
+        Returns the sources still to load, and the tables that load filled: those are kept as it left them, even
+        with Replace. A table whose earlier load did not complete is failed, for a person to look at."""
+        run = self.run
+        running = [e for e in run.executions if e.get("kind") == "pipelineRun" and e.get("wave") == wave and e.get("status") == "running"]
+        if not running:
+            return sources, set()
+        execution = running[-1]
+        name = str(execution.get("pipeline") or datapipeline.pipeline_name(run.warehouse, wave))
+        tables = set(execution.get("tables") or [])
+        mine = [s for s in sources if s.id in tables]
+        self._progress(f"Following pipeline '{name}', which this run started before the accelerator stopped")
+        try:
+            state = self._wait_for_run(str(execution.get("instance") or ""), name, len(mine))
+        except FabricApiError as exc:
+            if exc.status != 404:
+                # Fabric did not answer this time: the run stays one to follow, and the next pass asks again. Never
+                # treated as ended, or a second load could start beside one still going.
+                raise
+            # Fabric no longer knows the run: never start another blind. A person checks it.
+            run.finish_execution(str(execution["id"]), "unknown", exc.message)
+            for s in mine:
+                results[s.id] = (FAILED, "The earlier pipeline run could not be followed", f"{run.workspace_name} / {name}", [
+                    f"This run started pipeline '{name}' before the accelerator stopped, and Fabric cannot say how it ended "
+                    f"({exc.message}). Check it in Fabric's Monitoring hub, then Retry Failed; choose 'Replace' if some rows "
+                    "already arrived."])
+            return [s for s in sources if s.id not in tables], set()
+        status = str(state.get("status") or "unknown")
+        run.finish_execution(str(execution["id"]), status)
+        if status == "Completed":
+            return sources, tables
+        reason = datapipeline.failure_reason(state)
+        for s in mine:
+            results[s.id] = (FAILED, "Pipeline run did not complete", f"{run.workspace_name} / {name}", [
+                f"The pipeline run this run started before the accelerator stopped ended as {status}. {reason}",
+                "Fix the cause, then Retry Failed; choose 'Replace' if some rows already arrived."])
+        return [s for s in sources if s.id not in tables], set()
+
+    def _running_elsewhere(self, wave: int) -> Optional[Dict[str, Any]]:
+        """The run of this wave's pipeline going in Fabric now, if one is (Fabric's own job list); else None. When
+        Fabric cannot say, None: this is a safety net, and the loads it guards are recorded and followed anyway."""
+        run = self.run
+        pipeline_id = self._find(self._ids("dataPipelines"), datapipeline.pipeline_name(run.warehouse, wave))  # type: ignore[attr-defined]
+        if not pipeline_id:
+            return None
+        try:
+            jobs = self._client().list(f"/workspaces/{run.workspace_id}/items/{pipeline_id}/jobs/instances")  # type: ignore[attr-defined]
+        except FabricApiError:
+            return None
+        return next((j for j in jobs if str(j.get("status") or "") in ("NotStarted", "InProgress")), None)
 
     def _load_wave(self, wave: int, sources: List[Source]) -> Dict[str, Result]:
         run = self.run
         results: Dict[str, Result] = {}
         replace = run.settings.get("dataMode", "if_empty") == "replace"
         cursor = self._warehouse().cursor()  # type: ignore[attr-defined]
+        # 0. A load of this wave this run had started before a restart: followed to its end first. And none starts
+        #    while the wave's pipeline is running in Fabric for anything else (a run since closed, a person).
+        sources, filled = self._earlier_load(wave, sources, results)
+        going = self._running_elsewhere(wave) if sources else None
+        if going is not None:
+            name = datapipeline.pipeline_name(run.warehouse, wave)
+            note = (f"Pipeline '{name}' is already running in Fabric (started {going.get('startTimeUtc') or 'moments ago'}), "
+                    "and not by this pass. A second load beside it could copy rows twice, or empty a table under it. "
+                    "Wait for it to finish (Fabric's Monitoring hub shows it), then Retry Failed.")
+            for s in sources:
+                results[s.id] = (FAILED, "Its wave's pipeline is already running", f"{run.workspace_name} / {name}", [note])
+            return results
 
         # 1. Which tables still need rows, and which rows: a date filter must fit its table.
         load: List[Tuple[Source, Optional[datafilter.Resolved]]] = []
@@ -133,6 +212,12 @@ class StageMixin:
                     "The table is not in the Warehouse yet. Run the Warehouse & schema stage first (it creates the table; this stage loads it)."])
                 continue
             existing = self._scalar(cursor, datacopy.count_sql(schema, name))
+            if existing and s.id in filled:
+                results[s.id] = (COMPLETED, f"Loaded {datacopy.describe_count(existing)} by the pipeline run started before "
+                                 "the accelerator stopped", target, [
+                                     "Its row counts were not compared here, since the accelerator stopped while it ran. "
+                                     "Validate compares them."])
+                continue
             if existing and not replace:
                 notes: List[str] = []
                 if resolved is not None and resolved.sync:
@@ -234,7 +319,11 @@ class StageMixin:
         # 4. Run it, wait, and compare row counts: Synapse's are counted with the same filter.
         instance = self._client().run_job(  # type: ignore[attr-defined]
             f"/workspaces/{run.workspace_id}/items/{pipeline_id}/jobs/instances?jobType=Pipeline", datapipeline.run_body(entries))
-        state = self._wait_for_run(instance, name, len(ready))
+        # Recorded before it is followed: a restart while it runs follows this run, never starts a second one beside it.
+        execution = run.record_execution({"kind": "pipelineRun", "wave": wave, "pipeline": name, "pipelineId": pipeline_id,
+                                          "instance": instance, "tables": [s.id for s in ready]})
+        state = self._wait_for_run(instance, name, len(ready))  # still running after the timeout: the record stays "running"
+        run.finish_execution(execution, str(state.get("status") or "unknown"))
         if state.get("status") != "Completed":
             reason = datapipeline.failure_reason(state)
             for s in ready:

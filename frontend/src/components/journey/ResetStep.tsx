@@ -11,7 +11,7 @@ const n = (v: number) => v.toLocaleString();
 /** What resetting ``step`` would clear, and why it cannot be done right now. */
 export function useResetPlan(step: StepKey) {
   const { discovery, isConnected } = useAppState();
-  const { plan, credentials, execution: run, validation, validationBusy, confirmed, projects } = useMigration();
+  const { plan, credentials, execution: run, validation, validationBusy, confirmed, projects, backendProjects } = useMigration();
   const from = STEP_KEYS.indexOf(step);
   const covers = (k: StepKey) => from <= STEP_KEYS.indexOf(k);
   const discovered = discovery.state === "completed" || discovery.state === "completed_with_warnings";
@@ -25,7 +25,13 @@ export function useResetPlan(step: StepKey) {
     const typed = Object.keys(credentials).length;
     clears.push(`The plan: ${n(plan.length)} objects, the stage options${typed ? ` and the credentials typed for ${typed} connection${typed === 1 ? "" : "s"}` : ""}.`);
   }
-  if (covers("migrate") && run.state !== "idle") clears.push(`The record of migration run #${run.runId}: ${n(run.completed)} migrated, ${n(run.failed)} failed, ${n(run.deferred ?? 0)} left for a person.`);
+  if (covers("migrate") && run.state !== "idle") {
+    const counts = `${n(run.completed)} migrated, ${n(run.failed)} failed, ${n(run.deferred ?? 0)} left for a person`;
+    // A backend that keeps a record of each run closes the run and keeps its record, as the run history.
+    clears.push(backendProjects && run.status
+      ? `Migration run #${run.runId} (${counts}) as the current run: it is closed, and its record stays in the run history.`
+      : `The record of migration run #${run.runId}: ${counts}.`);
+  }
   if (validation) clears.push(`The validation results: ${n(validation.length)} checks.`);
   const unconfirm = STEP_KEYS.filter((k) => covers(k) && confirmed.includes(k));
   if (unconfirm.length) clears.push(`Your confirmation of ${unconfirm.map((k) => stepMeta(k).title).join(", ")}.`);
@@ -38,7 +44,7 @@ export function useResetPlan(step: StepKey) {
 
   const notes = ["Not affected: your connections, everything in Synapse, and anything already created in Fabric (a new run skips what already exists; nothing is deleted)."];
   if (step === "discover" && !isConnected) notes.push("The source is not connected, so discovery can run again only after you reconnect it.");
-  if (projects.length > 1 && ((step === "discover" && discovery.state !== "idle") || (covers("migrate") && run.state !== "idle")))
+  if (!backendProjects && projects.length > 1 && ((step === "discover" && discovery.state !== "idle") || (covers("migrate") && run.state !== "idle")))
     notes.push("The backend keeps one discovery and one run record for all your projects, so the other projects see this reset too.");
   return { clears, blocked, notes };
 }

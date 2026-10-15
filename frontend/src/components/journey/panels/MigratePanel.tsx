@@ -1,4 +1,5 @@
 import { Preflight, RunPanel } from "../../migrate/RunPanel";
+import { RunHistory } from "../../migrate/RunHistory";
 import { useMigration } from "../../../state/MigrationState";
 
 /** The run: what must be true first, then the controls and every object's result. */
@@ -9,6 +10,7 @@ export function MigratePanel() {
       {/* Before the first run the checks matter most; afterwards the results do. */}
       {execution.state === "idle" && <Preflight />}
       <RunPanel />
+      <RunHistory />
     </div>
   );
 }

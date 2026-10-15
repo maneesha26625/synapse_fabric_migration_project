@@ -17,6 +17,9 @@ import {
   type FabricTarget,
   type Capabilities,
   type ConnectionCredentials,
+  type MigrationApi,
+  type Project,
+  type ProjectListing,
   type PlanAnalysis,
   type PlanItem,
   type PlanStatus,
@@ -26,14 +29,18 @@ import {
 } from "../types";
 import { useAppState } from "./AppState";
 
-// ---- projects (local labels) ----------------------------------------------------
+// ---- projects ---------------------------------------------------------------------
 //
-// A project is a label the operator organises work under. The backend holds one
-// connection and one discovery at a time, so projects do not separate data;
-// they name it. Only names and ids are stored, in this browser.
+// A project is one migration engagement. The backend owns them: each keeps its own
+// discovery, Fabric target, runs, plan versions and audit trail, and one is active at
+// a time. This browser keeps, per project id, only what it always kept: the plan being
+// edited, the stage options and the steps confirmed. Against an older backend, which
+// has no projects, they are labels kept in this browser, as before.
 
-export interface Project { id: string; name: string; createdAt: string }
+export type { Project };
 const PROJECTS_KEY = "ma.projects";
+/** Set once this browser's own projects have been handed to the backend. */
+const ADOPTED_KEY = "ma.projects.adopted";
 const PLAN_KEY = "ma.plan";
 const OPTIONS_KEY = "ma.options";
 const JOURNEY_KEY = "ma.journey";
@@ -65,11 +72,16 @@ const EMPTY_RUN: ExecutionRun = { runId: "", state: "idle", total: 0, completed:
 interface MigrationStateValue {
   projects: Project[];
   project: Project;
-  addProject: (name: string) => void;
-  selectProject: (id: string) => void;
-  renameProject: (id: string, name: string) => void;
-  /** Removes the project and what this browser keeps for it (plan, options, confirmations). Never the last one. */
-  deleteProject: (id: string) => void;
+  /** Whether the backend owns the projects (else they are this browser's labels, against an older backend). */
+  backendProjects: boolean;
+  /** Changes whenever the backend switches project, so what is read from it is read again. */
+  projectEpoch: number;
+  /** Each refuses (throws with the backend's message) when it cannot be done now, such as a switch while a run works. */
+  addProject: (name: string) => Promise<void>;
+  selectProject: (id: string) => Promise<void>;
+  renameProject: (id: string, name: string) => Promise<void>;
+  /** Removes the project (the backend archives its folder) and what this browser keeps for it. Never the last one. */
+  deleteProject: (id: string) => Promise<void>;
 
   /** The dependency graph and suggested waves, for the current discovery. */
   graph: DependencyGraph | null;
@@ -126,6 +138,8 @@ interface MigrationStateValue {
   /** Starts a run. `only` runs a single stage, leaving the others off for that run. */
   startExecution: (only?: string) => Promise<boolean>;
   controlExecution: (action: "pause" | "resume" | "retry") => Promise<void>;
+  /** A person signs the waiting run off, and it starts; or declines it. */
+  approveExecution: (decision: "approve" | "reject", comment?: string) => Promise<boolean>;
 
   validation: ValidationRow[] | null;
   validationError: string | null;
@@ -162,33 +176,130 @@ export function useMigration(): MigrationStateValue {
 
 const messageOf = (e: unknown) => (e instanceof ApiRequestError || e instanceof Error ? e.message : "Something went wrong.");
 
-export function MigrationStateProvider({ children }: { children: ReactNode }) {
-  const { api, mode, discovery, isConnected, connection, resetDiscovery, refreshDiscovery } = useAppState();
+/**
+ * Hand this browser's projects to the backend, once: each keeps its id, so the plan and options kept here under
+ * it carry on. The project this browser was on carries on the discovery the backend saved before it had projects
+ * (that one went to its default project), and becomes the active one.
+ */
+async function adoptBrowserProjects(api: MigrationApi, listing: ProjectListing): Promise<ProjectListing> {
+  const local = load<Project[]>(PROJECTS_KEY, []);
+  const current = load<string>(`${PROJECTS_KEY}.current`, DEFAULT_PROJECT.id);
+  const known = new Set(listing.projects.map((p) => p.id));
+  for (const p of local) {
+    if (known.has(p.id) || !p.name?.trim()) continue;
+    try {
+      const carry = p.id === current && known.has(DEFAULT_PROJECT.id) ? { copyFrom: DEFAULT_PROJECT.id } : {};
+      listing = await api.createProject(p.name, { id: p.id, ...carry });
+      known.add(p.id);
+    } catch { /* one that cannot be made (an id the backend refuses) stays this browser's label only */ }
+  }
+  if (known.has(current) && listing.active !== current) {
+    try { listing = await api.activateProject(current); } catch { /* the backend's active project stands */ }
+  }
+  save(ADOPTED_KEY, true);
+  return listing;
+}
 
-  // ---- projects
+export function MigrationStateProvider({ children }: { children: ReactNode }) {
+  const { api, mode, discovery, isConnected, connection, resetDiscovery, refreshDiscovery, reload } = useAppState();
+
+  // ---- projects: the backend's; against an older backend, this browser's labels as before
   const [projects, setProjects] = useState<Project[]>(() => load<Project[]>(PROJECTS_KEY, [DEFAULT_PROJECT]));
   const [projectId, setProjectId] = useState<string>(() => load<string>(`${PROJECTS_KEY}.current`, DEFAULT_PROJECT.id));
+  const [backendProjects, setBackendProjects] = useState(false);
+  const [projectsVersion, setProjectsVersion] = useState<number | undefined>(undefined);
+  const [projectEpoch, setProjectEpoch] = useState(0);
   const project = projects.find((p) => p.id === projectId) ?? projects[0] ?? DEFAULT_PROJECT;
-  useEffect(() => save(PROJECTS_KEY, projects), [projects]);
-  useEffect(() => save(`${PROJECTS_KEY}.current`, projectId), [projectId]);
-  const addProject = useCallback((name: string) => {
-    const created: Project = { id: `p${Date.now().toString(36)}`, name: name.trim(), createdAt: new Date().toISOString() };
-    setProjects((ps) => [...ps, created]);
-    setProjectId(created.id);
+  // This browser's own list is kept only while it is the list: never overwritten with the backend's, or the demo's.
+  useEffect(() => { if (!backendProjects) save(PROJECTS_KEY, projects); }, [projects, backendProjects]);
+  useEffect(() => { if (!backendProjects) save(`${PROJECTS_KEY}.current`, projectId); }, [projectId, backendProjects]);
+  const applyListing = useCallback((listing: ProjectListing) => {
+    setProjects(listing.projects.length ? listing.projects : [DEFAULT_PROJECT]);
+    setProjectId(listing.active);
+    setProjectsVersion(listing.version);
   }, []);
-  const renameProject = useCallback((id: string, name: string) => {
+  // The latest reload, for the effect below without making it run again on every render.
+  const reloadRef = useRef(reload);
+  reloadRef.current = reload;
+  useEffect(() => {
+    let live = true;
+    (async () => {
+      try {
+        let listing = await api.listProjects();
+        const before = listing.active;
+        if (api.mode === "real" && !load<boolean>(ADOPTED_KEY, false)) listing = await adoptBrowserProjects(api, listing);
+        if (!live) return;
+        setBackendProjects(true);
+        applyListing(listing);
+        if (listing.active !== before) {
+          // Handing this browser's projects over switched the backend to the one it was on: read it all again.
+          reloadRef.current();
+          setProjectEpoch((n) => n + 1);
+        }
+      } catch {
+        // An older backend (no /api/projects), or none answering yet: projects stay this browser's labels.
+        if (live) {
+          setBackendProjects(false);
+          setProjects(load<Project[]>(PROJECTS_KEY, [DEFAULT_PROJECT]));
+          setProjectId(load<string>(`${PROJECTS_KEY}.current`, DEFAULT_PROJECT.id));
+        }
+      }
+    })();
+    return () => { live = false; };
+  }, [api, applyListing]);
+  // The backend now holds another project: read everything it holds again.
+  const switched = useCallback((listing: ProjectListing) => {
+    applyListing(listing);
+    reload();
+    setProjectEpoch((n) => n + 1);
+  }, [applyListing, reload]);
+  // A change refused because the list moved on: read the list again, so the next try uses it.
+  const refused = useCallback(async (e: unknown) => {
+    if (e instanceof ApiRequestError && e.code === "stale") {
+      try { applyListing(await api.listProjects()); } catch { /* the error below says enough */ }
+    }
+    throw e instanceof Error ? e : new Error(messageOf(e));
+  }, [api, applyListing]);
+  const addProject = useCallback(async (name: string) => {
+    if (!backendProjects) {
+      const created: Project = { id: `p${Date.now().toString(36)}`, name: name.trim(), createdAt: new Date().toISOString() };
+      setProjects((ps) => [...ps, created]);
+      setProjectId(created.id);
+      return;
+    }
+    try { switched(await api.createProject(name.trim(), { version: projectsVersion, activate: true })); } catch (e) { await refused(e); }
+  }, [api, backendProjects, projectsVersion, switched, refused]);
+  const selectProject = useCallback(async (id: string) => {
+    if (!backendProjects) { setProjectId(id); return; }
+    if (id === projectId) return;
+    try { switched(await api.activateProject(id, projectsVersion)); } catch (e) { await refused(e); }
+  }, [api, backendProjects, projectId, projectsVersion, switched, refused]);
+  const renameProject = useCallback(async (id: string, name: string) => {
     if (!name.trim()) return;
-    setProjects((ps) => ps.map((p) => (p.id === id ? { ...p, name: name.trim() } : p)));
-  }, []);
-  const deleteProject = useCallback((id: string) => {
+    if (!backendProjects) {
+      setProjects((ps) => ps.map((p) => (p.id === id ? { ...p, name: name.trim() } : p)));
+      return;
+    }
+    try { applyListing(await api.renameProject(id, name.trim(), projectsVersion)); } catch (e) { await refused(e); }
+  }, [api, backendProjects, projectsVersion, applyListing, refused]);
+  const deleteProject = useCallback(async (id: string) => {
     const rest = projects.filter((p) => p.id !== id);
     if (!rest.length) return;
+    if (backendProjects) {
+      // The backend refuses to delete the active project: switch away first, as the menu does.
+      try {
+        if (id === projectId) switched(await api.activateProject(rest[0].id, projectsVersion));
+        applyListing(await api.deleteProject(id));
+      } catch (e) { await refused(e); }
+    }
     for (const m of ["real", "mock"]) for (const k of PROJECT_KEYS) {
       try { localStorage.removeItem(`${k}.${m}.${id}`); } catch { /* storage unavailable */ }
     }
-    setProjects(rest);
-    if (project.id === id) setProjectId(rest[0].id);
-  }, [projects, project.id]);
+    if (!backendProjects) {
+      setProjects(rest);
+      if (project.id === id) setProjectId(rest[0].id);
+    }
+  }, [api, projects, project.id, projectId, projectsVersion, backendProjects, switched, applyListing, refused]);
 
   // ---- graph (loaded once per completed discovery)
   const done = discovery.state === "completed" || discovery.state === "completed_with_warnings";
@@ -213,7 +324,11 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   const [confirmed, setConfirmed] = useState<StepKey[]>(() => load<StepKey[]>(journeyKey, []));
   useEffect(() => { setConfirmed(load<StepKey[]>(journeyKey, [])); }, [journeyKey]);
   useEffect(() => save(journeyKey, confirmed), [journeyKey, confirmed]);
-  const confirmStep = useCallback((step: StepKey) => setConfirmed((c) => (c.includes(step) ? c : [...c, step])), []);
+  const confirmStep = useCallback((step: StepKey) => {
+    setConfirmed((c) => (c.includes(step) ? c : [...c, step]));
+    // The audit trail records who confirmed which step; a backend without one is simply not told.
+    api.confirmStep(step).catch(() => undefined);
+  }, [api]);
   const resetJourney = useCallback((from?: StepKey) => {
     setConfirmed((c) => (from ? c.filter((k) => STEP_KEYS.indexOf(k) < STEP_KEYS.indexOf(from)) : []));
   }, []);
@@ -266,7 +381,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
       () => { if (live) setFabric({ status: "disconnected" }); },
     ).finally(() => { if (live) setFabricReady(true); });
     return () => { live = false; };
-  }, [api]);
+  }, [api, projectEpoch]);
   const fabricCall = useCallback(async (kind: "authenticate" | "test", call: () => Promise<FabricTarget>) => {
     setFabricBusy(kind);
     setFabricError(null);
@@ -351,7 +466,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
       setOptionsState((o) => ({ ...o, stages: stagesChosen.current ? o.stages.filter((k) => known.has(k)) : c.stages.map((s) => s.key) }));
     }, () => { if (live) setCapabilities(null); });
     return () => { live = false; };
-  }, [api, discovery.state]);
+  }, [api, discovery.state, projectEpoch]);
   const setOptions = useCallback((patch: Partial<RunOptions>) => {
     if (patch.stages) stagesChosen.current = true;
     setOptionsState((o) => ({ ...o, ...patch }));
@@ -391,7 +506,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     api.getExecution().then((r) => { if (live) setExecution(r); }, () => { if (live) setExecution(EMPTY_RUN); })
       .finally(() => { if (live) setExecutionReady(true); });
     return () => { live = false; };
-  }, [api]);
+  }, [api, projectEpoch]);
   // Signing out, reconnecting or a new discovery can change what the backend holds: read the run again.
   useEffect(() => {
     if (!executionReady) return;
@@ -429,10 +544,30 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
       return false;
     }
   }, [api, plan, options, credentials]);
+  // The credentials a run asks for again (a restart lost them: they are never kept), from what was typed on this page.
+  const neededCredentials = useCallback((): ConnectionCredentials => Object.fromEntries(
+    (execution.needsInput ?? []).filter((name) => credentials[name]).map((name) => [name, credentials[name]])), [execution.needsInput, credentials]);
   const controlExecution = useCallback(async (action: "pause" | "resume" | "retry") => {
     setExecutionError(null);
-    try { setExecution(await api.controlExecution(action)); } catch (e) { setExecutionError(messageOf(e)); }
-  }, [api]);
+    try {
+      setExecution(await api.controlExecution(action, { version: execution.version, credentials: neededCredentials() }));
+    } catch (e) {
+      setExecutionError(messageOf(e));
+      // Refused because the run moved on since it was read, or for input it needs: show it as it is now.
+      api.getExecution().then(setExecution, () => undefined);
+    }
+  }, [api, execution.version, neededCredentials]);
+  const approveExecution = useCallback(async (decision: "approve" | "reject", comment?: string) => {
+    setExecutionError(null);
+    try {
+      setExecution(await api.approveExecution(decision, comment, { subjectHash: execution.approval?.subjectHash, credentials: neededCredentials() }));
+      return true;
+    } catch (e) {
+      setExecutionError(messageOf(e));
+      api.getExecution().then(setExecution, () => undefined);
+      return false;
+    }
+  }, [api, execution.approval?.subjectHash, neededCredentials]);
 
   // ---- validation
   const [validation, setValidation] = useState<ValidationRow[] | null>(null);
@@ -441,7 +576,29 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   const [validationProgress, setValidationProgress] = useState<string | null>(null);
   // Read-only run checks are on by default; real runs in Fabric only when the operator ticks them.
   const [validationRuntime, setValidationRuntime] = useState<ValidationRuntimeOptions>({ probe: true, run: [], timeoutMinutes: 30 });
-  useEffect(() => { setValidation(null); setValidationError(null); }, [api]);
+  // The project's last validation comes back after a reload; one still running on the server is followed to its end.
+  useEffect(() => {
+    let live = true;
+    setValidation(null);
+    setValidationError(null);
+    (async () => {
+      try {
+        let state = await api.getValidation();
+        if (state.state === "running") {
+          setValidationBusy(true);
+          while (live && state.state === "running") {
+            await new Promise((r) => setTimeout(r, 1500));
+            state = await api.getValidation();
+          }
+          if (live) setValidationBusy(false);
+        }
+        if (!live) return;
+        if (state.state === "completed" && state.rows) setValidation(state.rows);
+        else if (state.state === "failed" && state.error?.code !== "interrupted") setValidationError(state.error?.message ?? null);
+      } catch { if (live) setValidationBusy(false); /* an older backend, or none: nothing to show */ }
+    })();
+    return () => { live = false; };
+  }, [api, projectEpoch]);
   const runValidation = useCallback(async () => {
     setValidationBusy(true);
     setValidationError(null);
@@ -463,6 +620,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     const run = runStatus.get(id);
     if (run === "COMPLETED" || run === "SKIPPED") return "COMPLETED"; // skipped = already in Fabric
     if (run === "FAILED") return "FAILED";
+    if (run === "BLOCKED") return "BLOCKED"; // something it needs failed in the run
     if (run === "IN PROGRESS") return "IN PROGRESS";
     // Blocked: it needs something that is not in the plan, or that is planned later.
     const mine = planWave.get(id) ?? 1;
@@ -501,13 +659,13 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   }, [api, execution.state, discovery.state, resetDiscovery, refreshDiscovery, capabilities, resetJourney]);
 
   const value: MigrationStateValue = {
-    projects, project, addProject, selectProject: setProjectId, renameProject, deleteProject,
+    projects, project, backendProjects, projectEpoch, addProject, selectProject, renameProject, deleteProject,
     graph, graphError, graphLoading, reloadGraph: () => setGraphEpoch((n) => n + 1),
     plan, addToPlan, addAllToPlan, removeFromPlan, setPlanWave, movePlanItem, clearPlan, inPlan, planStatus,
     fabric, fabricReady, fabricBusy, fabricError, authenticateFabric, testFabric, disconnectFabric,
     fabricGit, fabricGitError, refreshFabricGit, commitFabricGit,
     analysis, analysisBusy, analysisError, analyze, options, setOptions, capabilities, credentials, setCredential, clearCredentials,
-    execution, executionReady, executionError, startExecution, controlExecution,
+    execution, executionReady, executionError, startExecution, controlExecution, approveExecution,
     validation, validationError, validationBusy, validationProgress, validationRuntime, setValidationRuntime, runValidation,
     confirmed, confirmStep, resetJourney, resetStep, resetNonce,
   };

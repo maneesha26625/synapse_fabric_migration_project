@@ -646,6 +646,47 @@ export interface Capabilities {
 export type ConnectionCredentials = Record<string, Record<string, string>>;
 
 export type ExecState = "idle" | "running" | "paused" | "completed";
+/** A run's own status, finer than `state`: how it was left, and so what may be done with it. */
+export type RunStatus = "queued" | "awaiting_approval" | "running" | "paused" | "completed" | "completed_with_failures"
+  | "failed" | "cancelled" | "rejected";
+/** Why a run is paused: each has its own way on. */
+export type PausedReason = "by_person" | "halted_on_failures" | "needs_input" | "interrupted";
+/** What kind of failure an object's error is (the backend classifies every one). */
+export type FailureCategory = "TRANSIENT" | "AUTH" | "CAPACITY" | "CONFIG" | "UNSUPPORTED" | "DEPENDENCY" | "CONFLICT"
+  | "INTERRUPTED" | "UNKNOWN";
+/** Who did something: a person (the operator at the machine), the agent (an LLM draft) or the accelerator itself. */
+export interface Actor { kind: "person" | "agent" | "system"; id: string }
+/** The sign-off before a run writes to Fabric: asked of a person, or given by the accelerator itself. */
+export interface RunApproval {
+  policy: "never" | "overwrite" | "always";
+  required: boolean;
+  reason: string | null;
+  subjectHash: string;
+  requestedAt: string;
+  requestedBy: Actor;
+  decision: "approved" | "rejected" | null;
+  by: Actor | null;
+  at: string | null;
+  comment: string | null;
+  automatic: boolean;
+}
+/** One pass over a run's pending objects: Start, then each Resume and Retry. */
+export interface RunPass { n: number; trigger: "start" | "resume" | "retry"; status: string; startedAt: string; finishedAt: string | null; by: Actor }
+/** A job the run started in Fabric (a data pipeline's run), followed again after a restart rather than started twice. */
+export interface RunExecution {
+  id: string;
+  kind: string;
+  wave?: number;
+  pipeline?: string;
+  instance?: string;
+  tables?: string[];
+  status: string;
+  startedAt: string;
+  finishedAt: string | null;
+  note?: string;
+}
+/** What the run sent to Fabric for an object, kept by its hash: a definition, or a SQL statement. */
+export interface ArtifactPart { kind: "fabric" | "sql"; what: string; hash: string; bytes: number }
 export interface ExecItem {
   id: string;
   name: string;
@@ -653,8 +694,9 @@ export interface ExecItem {
   /** The wave it was planned in. */
   wave?: number;
   step: string;
-  /** SKIPPED: already in Fabric, left unchanged. DEFERRED: not migrated in this session; error says why. */
-  status: "PENDING" | "IN PROGRESS" | "COMPLETED" | "FAILED" | "SKIPPED" | "DEFERRED";
+  /** SKIPPED: already in Fabric, left unchanged. DEFERRED: not migrated in this session; error says why.
+   *  BLOCKED: not started, because something in the run it needs failed. */
+  status: "PENDING" | "IN PROGRESS" | "COMPLETED" | "FAILED" | "SKIPPED" | "DEFERRED" | "BLOCKED";
   startedAt: string | null;
   completedAt: string | null;
   error: string | null;
@@ -664,6 +706,14 @@ export interface ExecItem {
   target?: string | null;
   /** Created from an accepted LLM-assisted transform (reviewed in Assess → LLM transforms). */
   llm?: { acceptedAt: string | null; edited: boolean } | null;
+  /** What kind of failure `error` is, and so what may be done about it. */
+  category?: FailureCategory | null;
+  /** How many passes have started on it. */
+  attempts?: number;
+  /** An earlier attempt may have made it in Fabric (the accelerator stopped under it): checked there first. */
+  maybeCreated?: boolean;
+  /** What was sent to Fabric for it. */
+  artifact?: { parts: ArtifactPart[] } | null;
 }
 export interface ExecutionRun {
   runId: string;
@@ -684,7 +734,83 @@ export interface ExecutionRun {
   git?: GitCommitResult | null;
   items: ExecItem[];
   logs: string[];
+  // What a backend that keeps a record of each run adds. Older backends (and an idle run) leave them out.
+  status?: RunStatus;
+  pausedReason?: PausedReason | null;
+  /** Connections whose credentials it needs again (lost with a restart: they are never kept), by name. */
+  needsInput?: string[];
+  blocked?: number;
+  passes?: RunPass[];
+  /** Changes with every change to the run: sent back with a control, so a stale page is refused. */
+  version?: number;
+  createdAt?: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  closedAt?: string | null;
+  requestedBy?: Actor;
+  approval?: RunApproval | null;
+  resumable?: boolean;
+  unresumableReason?: string | null;
+  executions?: RunExecution[];
 }
+
+/** One run in the project's run history. */
+export interface RunSummary {
+  runId: string;
+  status: RunStatus;
+  pausedReason?: PausedReason | null;
+  createdAt: string;
+  startedAt?: string | null;
+  finishedAt?: string | null;
+  closedAt?: string | null;
+  workspace?: string | null;
+  warehouse?: string | null;
+  requestedBy?: Actor;
+  counts?: Record<string, number>;
+  approval?: RunApproval | null;
+  passes: number;
+}
+export interface RunHistory { runs: RunSummary[]; current: string | null }
+
+/** A project: one migration engagement. The backend keeps its discovery, runs, plan versions and audit trail. */
+export interface Project { id: string; name: string; createdAt: string; updatedAt?: string }
+export interface ProjectListing {
+  active: string;
+  projects: Project[];
+  /** Sent back with a change, so one made from an older list is refused. */
+  version: number;
+  /** False with MIGRATION_STATE=off: nothing outlives the backend process. */
+  persistent?: boolean;
+  created?: string;
+}
+
+/** One record of the audit trail: who did what, to what, when, and how it ended. */
+export interface AuditRecord {
+  seq: number;
+  at: string;
+  action: string;
+  actor: Actor;
+  target: { type: string; id: string | null } | null;
+  outcome: "done" | "failed" | "refused";
+  code: string | null;
+  reason: string | null;
+  details: Record<string, unknown>;
+  correlationId: string | null;
+  project: string | null;
+  run: string | null;
+  prev: string;
+  hash: string;
+}
+export interface AuditQuery { before?: number; limit?: number; action?: string; actor?: string; outcome?: string; run?: string }
+export interface AuditPage {
+  records: AuditRecord[];
+  /** Pass as `before` to read further back; null at the start of the trail. */
+  next: number | null;
+  matched: number;
+  /** What each action means, for the page. */
+  catalog: Record<string, string>;
+}
+export interface AuditVerification { ok: boolean; records: number; brokenAt: number | null; problem: string | null; head: string }
 
 export type ValidationStatus = "MATCH" | "REVIEW" | "MISMATCH";
 export interface ValidationRow {
@@ -720,6 +846,8 @@ export interface ValidationRuntimeOptions {
 
 /** The single seam between the UI and whatever supplies data. */
 export type RunControl = "pause" | "resume" | "retry" | "reset";
+/** What a control may carry: the run's version (a stale page is refused), and credentials a restart lost. */
+export interface RunControlExtra { version?: number; credentials?: ConnectionCredentials }
 
 /* ---- LLM-assisted transformation ------------------------------------------- */
 
@@ -874,8 +1002,28 @@ export interface MigrationApi {
   analyzePlan(items: PlanItem[], record?: boolean, options?: RunOptions, credentialNames?: string[]): Promise<PlanAnalysis>;
   startExecution(items: PlanItem[], options?: RunOptions, credentials?: ConnectionCredentials): Promise<ExecutionRun>;
   getExecution(): Promise<ExecutionRun>;
-  /** `reset` forgets the run's record so the next run starts fresh; refused while the run is working. */
-  controlExecution(action: RunControl): Promise<ExecutionRun>;
+  /** `reset` closes the run (its record stays in the history) so the next run starts fresh; refused while it works. */
+  controlExecution(action: RunControl, extra?: RunControlExtra): Promise<ExecutionRun>;
+  /** A person signs a waiting run off, and it starts; or declines it. Credentials a restart lost travel with it. */
+  approveExecution(decision: "approve" | "reject", comment?: string, extra?: { subjectHash?: string; credentials?: ConnectionCredentials }): Promise<ExecutionRun>;
+  /** Every run of the project, newest first. */
+  listRuns(): Promise<RunHistory>;
+  /** One run as its record has it. */
+  getRun(runId: string): Promise<ExecutionRun>;
+  /** The last validation's results, if one finished (or failed) in this project. */
+  getValidation(): Promise<{ state: string; rows?: ValidationRow[]; finishedAt?: string; error?: { code?: string; message?: string } }>;
+  // Projects, which the backend owns, and each one's audit trail.
+  listProjects(): Promise<ProjectListing>;
+  createProject(name: string, options?: { id?: string; version?: number; activate?: boolean; copyFrom?: string }): Promise<ProjectListing>;
+  renameProject(id: string, name: string, version?: number): Promise<ProjectListing>;
+  activateProject(id: string, version?: number): Promise<ProjectListing>;
+  deleteProject(id: string, version?: number): Promise<ProjectListing>;
+  getAudit(query?: AuditQuery): Promise<AuditPage>;
+  verifyAudit(): Promise<AuditVerification>;
+  /** Where the trail downloads from (real), or its text (demo). */
+  exportAudit(format: "csv" | "jsonl"): Promise<{ url?: string; text?: string; fileName: string }>;
+  /** A person confirmed a step of the journey: recorded in the trail. */
+  confirmStep(step: string, note?: string): Promise<void>;
   /** Compares Synapse with Fabric. With no items, every discovered object is checked. */
   runValidation(items?: PlanItem[], options?: Pick<RunOptions, "dataFilters">, runtime?: ValidationRuntimeOptions,
     onProgress?: (text: string) => void): Promise<ValidationRow[]>;

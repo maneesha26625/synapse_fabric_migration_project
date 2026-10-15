@@ -373,3 +373,22 @@ def test_the_upload_route_takes_only_a_zip_and_the_repository_route_only_json():
     finally:
         httpd.shutdown()
         httpd.server_close()
+
+
+def test_what_a_source_connection_did_is_recorded_without_any_secret(tmp_path, monkeypatch):
+    recorded = []
+    session = Session(audit=lambda action, **kwargs: recorded.append((action, kwargs)))
+    upload = session.upload_zip(zip_bytes(FILES), "ws.zip")
+    session.connect_repository({"kind": "zip", "uploadId": upload["uploadId"], "fileName": upload["fileName"], "environment": "Prod",
+                                "parameters": json.dumps({"ls_sql_connectionString": PROD_CS + "Password=hunter2;"})})
+    clone = tmp_path / "clone"
+    write_repo(clone, "synapse")
+    monkeypatch.setattr(service_module, "GitConnection", FakeGit(clone))
+    session.connect_repository({"kind": "git", "repositoryUrl": "https://github.com/contoso/synapse-ws.git", "rootFolder": "synapse",
+                                "environment": "Test"})
+    assert [action for action, _ in recorded] == ["source.uploaded", "source.repository", "source.repository"]
+    uploaded, from_zip, from_git = (kwargs for _, kwargs in recorded)
+    assert uploaded["details"]["name"] == "ws.zip" and uploaded["details"]["bytes"] > 0
+    assert from_zip["outcome"] == "done" and from_zip["details"]["parameters"] == 1 and from_zip["details"]["secrets"] == 1
+    assert from_git["details"]["label"] == "https://github.com/contoso/synapse-ws.git" and from_git["details"]["commit"] == "abc123"
+    assert "hunter2" not in json.dumps(recorded, default=str)

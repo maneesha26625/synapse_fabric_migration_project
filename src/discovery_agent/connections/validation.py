@@ -35,9 +35,12 @@ _SECRET_PATTERNS: Tuple[re.Pattern, ...] = (
     re.compile(r"\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?"),
     re.compile(r"\bBearer\s+\S+", re.IGNORECASE),
     # Connection-string and query-string spellings of the same thing.
+    # Storage account keys and shared access keys are spelled the same way in Azure connection strings.
     re.compile(
-        r"\b(?:access[_-]?token|refresh[_-]?token|client[_-]?secret|password|pwd|sig)"
-        r"\s*[=:]\s*\S+",
+        r"\b(?:access[_-]?token|refresh[_-]?token|client[_-]?secret|client[_-]?assertion|password|pwd|sig"
+        r"|account[_-]?key|shared[_-]?access[_-]?key|sharedaccesssignature|api[_-]?key)"
+        # also as a JSON key: "password": "..."
+        r"[\"']?\s*[=:]\s*\S+",
         re.IGNORECASE,
     ),
     # Credentials embedded in a URL: https://user:secret@host/...

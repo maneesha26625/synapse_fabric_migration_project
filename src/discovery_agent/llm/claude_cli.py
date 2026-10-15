@@ -11,7 +11,9 @@ accelerator never holds an API key.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -20,6 +22,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
+_log = logging.getLogger("discovery_agent.llm")
 DEFAULT_TIMEOUT = 180
 CONFIDENCE = ("high", "medium", "low")
 RESULT_SCHEMA = {
@@ -120,6 +123,21 @@ class ClaudeCli:
         return args
 
     def complete(self, prompt: str) -> Answer:
+        """One draft. Logged by its prompt's hash, the model, the time and the cost: never the prompt or the answer."""
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+        started = time.monotonic()
+        try:
+            answer = self._complete(prompt)
+        except ModelError as exc:
+            _log.warning("LLM call failed after %d ms: %s", int((time.monotonic() - started) * 1000), exc,
+                         extra={"promptHash": digest, "model": self.model or "default"})
+            raise
+        _log.info("LLM call answered by %s in %d ms", answer.model or self.model or "default", answer.duration_ms,
+                  extra={"promptHash": digest, "model": answer.model or self.model or "default", "costUsd": answer.cost_usd,
+                         "durationMs": answer.duration_ms, "confidence": answer.confidence})
+        return answer
+
+    def _complete(self, prompt: str) -> Answer:
         exe = executable()
         if exe is None:
             raise ModelError(self.available()["message"])

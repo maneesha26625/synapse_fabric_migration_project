@@ -8,7 +8,7 @@ import { AppStateProvider } from "../state/AppState";
 import { buildReport } from "../components/journey/report";
 import { buildTree } from "../components/journey/WorkspaceExplorer";
 import { mockApi, resetDemo } from "../mock/mockApi";
-import type { ConnectionConfig, ExecutionRun, FabricConfig, ResultsQuery } from "../types";
+import type { ConnectionConfig, ExecutionRun, FabricConfig, ResultsQuery, RunOptions } from "../types";
 
 const CONFIG: ConnectionConfig = {
   method: "azure_cli", tenantId: "", subscriptionId: "10eb96c3-ba3c-492e-b95b-e9f1d6d85d70",
@@ -647,7 +647,7 @@ describe("resetting a step", () => {
     expect(stored(JOURNEY)).toEqual([]);
   }, 20000);
 
-  it("resets Migrate by forgetting the run, so a fresh run can start", async () => {
+  it("resets Migrate by closing the run, which stays in the run history, so a fresh run can start", async () => {
     resetDemo();
     const items = await seedPlan(2);
     await mockApi.startExecution(items);
@@ -659,11 +659,12 @@ describe("resetting a step", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Reset step" })).toBeEnabled());
     await user.click(screen.getByRole("button", { name: "Reset step" }));
     const dialog = screen.getByRole("dialog", { name: "Reset Migrate?" });
-    expect(within(dialog).getByText(/The record of migration run #\d+/)).toBeInTheDocument();
+    expect(within(dialog).getByText(/Migration run #\d+ .* it is closed, and its record stays in the run history/)).toBeInTheDocument();
     expect(within(dialog).getByText(/anything already created in Fabric/)).toBeInTheDocument();
     await user.click(within(dialog).getByRole("button", { name: "Reset Migrate" }));
     expect(await screen.findByText("Nothing is running.", {}, { timeout: 5000 })).toBeInTheDocument();
     expect((await mockApi.getExecution()).state).toBe("idle");
+    expect(await screen.findByRole("table", { name: "Earlier runs" })).toBeInTheDocument();
     expect(stored(JOURNEY)).toEqual(["discover", "assess", "waves", "plan"]);
   }, 20000);
 });
@@ -1386,4 +1387,107 @@ describe("functions, roles and permissions (demo)", () => {
     expect(caps.stages.find((s) => s.key === "security")?.types).toEqual(["Security Object"]);
     expect(caps.stages.find((s) => s.key === "warehouse")?.types).toContain("Function");
   });
+});
+
+describe("run records, sign-off, projects and activity", () => {
+  const OPTIONS: RunOptions = { scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", dataRun: "run", collation: "match_synapse",
+    syncOverlap: "1h", existing: "skip", dataFilters: {}, gitCommit: "auto" };
+
+  async function readyToRun(count = 3) {
+    await discovered();
+    await mockApi.authenticateFabric(FABRIC);
+    await mockApi.testFabric(FABRIC);
+    return seedPlan(count);
+  }
+
+  it("holds a run that updates what Fabric has until a person signs it off, and records who did", async () => {
+    const items = await readyToRun();
+    const waiting = await mockApi.startExecution(items, { ...OPTIONS, existing: "update" });
+    expect(waiting.status).toBe("awaiting_approval");
+    expect(waiting.items.every((i) => i.status === "PENDING" || i.status === "DEFERRED")).toBe(true);
+    unlockTo("migrate");
+    const user = userEvent.setup();
+    go("/migration?step=migrate");
+    expect(await screen.findByText("This run waits for a person to sign it off", {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByText("WAITING FOR SIGN-OFF")).toBeInTheDocument();
+    await user.type(screen.getByLabelText(/Comment/), "Checked with the data owner");
+    await user.click(screen.getByRole("button", { name: /Sign off and run/ }));
+    await waitFor(async () => expect((await mockApi.getExecution()).status).not.toBe("awaiting_approval"));
+    const approved = (await mockApi.getAudit({ action: "run.approved" })).records[0];
+    expect(approved.actor).toEqual({ kind: "person", id: "Demo operator" });
+    expect(approved.reason).toBe("Checked with the data owner");
+    expect((await mockApi.getExecution()).approval?.automatic).toBe(false);
+  }, 20000);
+
+  it("keeps a closed run in the run history, where its record can still be read", async () => {
+    const items = await readyToRun(2);
+    await mockApi.startExecution(items, OPTIONS);
+    await mockApi.controlExecution("pause");
+    await mockApi.controlExecution("reset");
+    unlockTo("migrate");
+    const user = userEvent.setup();
+    go("/migration?step=migrate");
+    const history = await screen.findByRole("table", { name: "Earlier runs" }, { timeout: 5000 });
+    expect(within(history).getByText("CLOSED")).toBeInTheDocument();
+    await user.click(within(history).getByRole("button", { name: /View/ }));
+    expect(await screen.findByRole("table", { name: /^Objects of run/ })).toBeInTheDocument();
+    expect((await mockApi.getAudit({ action: "run.closed" })).records).toHaveLength(1);
+  }, 20000);
+
+  it("switches to a new project the backend keeps, and the trail says who made it", async () => {
+    const user = userEvent.setup();
+    go("/");
+    await user.click(await screen.findByRole("button", { name: /^Project: / }));
+    await user.click(screen.getByRole("menuitem", { name: "New project…" }));
+    await user.keyboard("Finance{Enter}");
+    expect(await screen.findByRole("button", { name: "Project: Finance" })).toBeInTheDocument();
+    const listing = await mockApi.listProjects();
+    expect(listing.projects.map((p) => p.name)).toEqual(["Synapse to Fabric migration", "Finance"]);
+    expect(listing.active).toBe(listing.projects[1].id);
+    const records = (await mockApi.getAudit({ action: "project" })).records;
+    expect(records.map((r) => r.action)).toEqual(["project.activated", "project.created"]);
+    expect(records.every((r) => r.actor.kind === "person")).toBe(true);
+  }, 15000);
+
+  it("shows the activity of the project and checks that the trail is intact", async () => {
+    const items = await readyToRun(2);
+    await mockApi.startExecution(items, OPTIONS);
+    unlockTo("migrate");
+    const user = userEvent.setup();
+    go("/migration?step=migrate");
+    await user.click(await screen.findByRole("button", { name: "Show activity" }, { timeout: 5000 }));
+    const table = await screen.findByRole("table", { name: "Audit trail, newest first" });
+    expect(await within(table).findByText("A migration run was asked for")).toBeInTheDocument();
+    expect(within(table).getAllByText("Accelerator").length).toBeGreaterThan(0); // its own approval, named as its own
+    await user.click(screen.getByRole("button", { name: /Check the trail/ }));
+    expect(await screen.findByText("The trail is intact")).toBeInTheDocument();
+  }, 20000);
+
+  it("hands this browser's projects to a backend that owns projects, once, carrying the discovery on", async () => {
+    localStorage.setItem("ma.apiMode", "real");
+    localStorage.setItem("ma.projects", JSON.stringify([{ id: "default", name: "Synapse to Fabric migration", createdAt: "2026-01-01T00:00:00Z" },
+      { id: "pabc", name: "Finance", createdAt: "2026-02-01T00:00:00Z" }]));
+    localStorage.setItem("ma.projects.current", JSON.stringify("pabc"));
+    let listing = { active: "default", projects: [{ id: "default", name: "Synapse to Fabric migration", createdAt: "2026-01-01T00:00:00Z" }], version: 1, persistent: true };
+    const posted: unknown[] = [];
+    const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === "/api/projects" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body));
+        posted.push(body);
+        listing = { ...listing, version: listing.version + 1, projects: [...listing.projects, { id: body.id, name: body.name, createdAt: "2026-10-15T00:00:00Z" }] };
+        return json({ ...listing, created: body.id });
+      }
+      if (url === "/api/projects") return json(listing);
+      if (url === "/api/projects/pabc/activate") {
+        listing = { ...listing, active: "pabc", version: listing.version + 1 };
+        return json(listing);
+      }
+      return json({ error: { code: "not_found", message: "No such endpoint." } }, 404);
+    }));
+    go("/");
+    expect(await screen.findByRole("button", { name: "Project: Finance" }, { timeout: 5000 })).toBeInTheDocument();
+    expect(posted).toEqual([{ name: "Finance", id: "pabc", copyFrom: "default" }]);
+    expect(stored("ma.projects.adopted")).toBe(true);
+  }, 15000);
 });

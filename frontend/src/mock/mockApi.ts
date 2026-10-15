@@ -16,6 +16,15 @@
 
 import {
   ApiRequestError,
+  type Actor,
+  type AuditPage,
+  type AuditRecord,
+  type Project,
+  type ProjectListing,
+  type RunApproval,
+  type RunHistory,
+  type RunPass,
+  type RunSummary,
   type Capabilities,
   type ConnectionConfig,
   type ConnectionCredentials,
@@ -142,9 +151,94 @@ const demoRunKey = (sim: { runId: string; retried: boolean }) => `${sim.runId}-$
 const COMMIT_MS = 1200;
 const gitConnected = () => fabric.status === "connected" && fabric.workspaceId === DEMO_FABRIC_WORKSPACES[0].id;
 interface SimItem { id: string; name: string; type: string; wave: number; table?: string; filter?: DataFilterInput }
-interface ExecSim { runId: string; items: SimItem[]; base: number; resumedAt: number | null; retried: boolean; credentials: string[]; options?: RunOptions; per: number; dur: number; failing: Set<string> }
+interface ExecSim {
+  runId: string; items: SimItem[]; base: number; resumedAt: number | null; retried: boolean; credentials: string[]; options?: RunOptions;
+  per: number; dur: number; failing: Set<string>;
+  // The run's record, as the backend keeps it: its sign-off, its passes, when it was made.
+  approval: RunApproval; rejected: boolean; createdAt: string; passes: RunPass[]; version: number;
+}
 let execSim: ExecSim | null = null;
 let runCounter = 0;
+/** Runs closed by Reset or replaced by a new one: the run history, newest first, with each run as it was left. */
+let closedRuns: ExecutionRun[] = [];
+let lastValidation: { rows: ValidationRow[]; finishedAt: string } | null = null;
+
+// ---- the demo audit trail: what the backend's would record, for the same actions ------------------
+const DEMO_PERSON: Actor = { kind: "person", id: "Demo operator" };
+const DEMO_SYSTEM: Actor = { kind: "system", id: "accelerator" };
+let trail: AuditRecord[] = [];
+function record(action: string, opts: { actor?: Actor; target?: { type: string; id: string | null }; outcome?: AuditRecord["outcome"];
+  details?: Record<string, unknown>; run?: string | null; reason?: string | null } = {}) {
+  const prev = trail.length ? trail[trail.length - 1].hash : "0".repeat(64);
+  const seq = trail.length + 1;
+  trail.push({ seq, at: new Date().toISOString(), action, actor: opts.actor ?? DEMO_PERSON, target: opts.target ?? null,
+    outcome: opts.outcome ?? "done", code: null, reason: opts.reason ?? null, details: opts.details ?? {},
+    correlationId: demoSha(`corr-${seq}`).slice(0, 16), project: mockActive(), run: opts.run ?? null, prev,
+    hash: demoSha(`${prev}-${seq}-${action}`).padEnd(64, "0") });
+}
+const DEMO_CATALOG: Record<string, string> = {
+  "system.started": "The API started", "project.created": "A project was created", "project.renamed": "A project was renamed",
+  "project.activated": "Another project was made the active one", "project.removed": "A project was taken off the list; its folder is archived",
+  "run.requested": "A migration run was asked for", "run.signoff_requested": "A run waits for a person to sign it off",
+  "run.approved": "A run was signed off", "run.rejected": "A run was declined at sign-off", "run.pause_requested": "A pause was asked for",
+  "run.resumed": "A run was resumed", "run.retried": "A run's failed objects were retried", "run.closed": "A run was closed; its record stays in the run history",
+  "validation.started": "Validation started", "journey.step_confirmed": "A person confirmed a step of the journey",
+  "audit.exported": "The audit trail was exported",
+};
+
+// ---- demo projects: kept in this browser, as projects always were in Demo data ---------------------
+const MOCK_PROJECTS = "ma.projects.mock";
+let projectsVersion = 1;
+function mockProjects(): { active: string; projects: Project[] } {
+  try {
+    const raw = localStorage.getItem(MOCK_PROJECTS);
+    const value = raw ? JSON.parse(raw) as { active: string; projects: Project[] } : null;
+    if (value?.projects?.length) return value;
+  } catch { /* storage unavailable */ }
+  return { active: "default", projects: [{ id: "default", name: "Synapse to Fabric migration", createdAt: new Date(0).toISOString() }] };
+}
+function saveMockProjects(value: { active: string; projects: Project[] }) {
+  projectsVersion += 1;
+  try { localStorage.setItem(MOCK_PROJECTS, JSON.stringify(value)); } catch { /* storage unavailable: kept for this visit */ }
+}
+const mockActive = () => mockProjects().active;
+const listing = (): ProjectListing => ({ ...mockProjects(), version: projectsVersion, persistent: true });
+function checkVersion(version?: number) {
+  if (version !== undefined && version !== projectsVersion) {
+    throw new ApiRequestError("stale", "The project list changed since this page read it. It has been read again; try once more.", 409);
+  }
+}
+
+/** What Demo data asks a person to sign off: like the backend's default rule, a run that changes what Fabric has. */
+function demoApproval(options?: RunOptions): RunApproval {
+  const reasons = [
+    ...(options?.existing === "update" ? ["it updates objects that are already in Fabric in place"] : []),
+    ...(options?.dataMode === "replace" && (!options?.stages?.length || options.stages.includes("data")) ? ["it empties tables that already have rows and loads them again"] : []),
+  ];
+  const now = new Date().toISOString();
+  const reason = reasons.length ? `This run changes what Fabric already has: ${reasons.join("; ")}.` : null;
+  return { policy: "overwrite", required: !!reason, reason, subjectHash: demoSha(JSON.stringify(options ?? {})).padEnd(64, "0"), requestedAt: now,
+    requestedBy: DEMO_PERSON, decision: reason ? null : "approved", by: reason ? null : DEMO_SYSTEM, at: reason ? null : now, comment: null,
+    automatic: !reason };
+}
+
+function summary(run: ExecutionRun): RunSummary {
+  return { runId: run.runId, status: run.status ?? "completed", pausedReason: run.pausedReason ?? null, createdAt: run.createdAt ?? "",
+    startedAt: run.startedAt ?? null, finishedAt: run.finishedAt ?? null, closedAt: run.closedAt ?? null, workspace: run.workspace ?? null,
+    warehouse: run.warehouse ?? null, requestedBy: run.requestedBy, approval: run.approval ?? null, passes: run.passes?.length ?? 0,
+    counts: { COMPLETED: run.completed, FAILED: run.failed, SKIPPED: run.skipped, DEFERRED: run.deferred, PENDING: run.pending } };
+}
+
+/** Close the current demo run: it leaves Migrate and stays in the run history, as it was left. */
+function closeRun(reason: string) {
+  if (!execSim) return;
+  const run = runNow();
+  const status = run.status === "completed" || run.status === "completed_with_failures" || run.status === "rejected" ? run.status : "cancelled";
+  closedRuns = [{ ...run, status, state: "completed", closedAt: new Date().toISOString(), resumable: false,
+    unresumableReason: "This run is not the current one; its record is kept as history." }, ...closedRuns];
+  record("run.closed", { target: { type: "run", id: run.runId }, run: run.runId, reason, details: { status } });
+  execSim = null;
+}
 
 const fresh = (): Session => ({
   connection: { status: "disconnected", ok: true, checks: [] },
@@ -441,12 +535,19 @@ function runNow(): ExecutionRun {
   if (allDone) logs.push(line(elapsed, "DONE", "run", "every pending object was processed"));
   const git = allDone ? demoRunCommit(sim, items, Math.max(0, (slot - 1) * sim.per + sim.dur), elapsed) : null;
   if (git && git.state !== "committing") logs.push(line(elapsed, "GIT", "run", git.message ?? git.state));
+  const waiting = sim.approval.required && sim.approval.decision === null;
+  const status: ExecutionRun["status"] = sim.rejected ? "rejected" : waiting ? "awaiting_approval"
+    : allDone ? (n("FAILED") ? "completed_with_failures" : "completed") : sim.resumedAt === null ? "paused" : "running";
   return {
     runId: sim.runId,
-    state: allDone ? "completed" : sim.resumedAt === null ? "paused" : "running",
+    state: sim.rejected || allDone ? "completed" : waiting || sim.resumedAt === null ? "paused" : "running",
     total: items.length, completed: n("COMPLETED"), inProgress: n("IN PROGRESS"), failed: n("FAILED"), pending: n("PENDING"),
     skipped: n("SKIPPED"), deferred: n("DEFERRED"), workspace: fabric.workspaceName ?? null, warehouse: WAREHOUSE,
-    options: sim.options, git, items, logs,
+    options: sim.options, git: sim.rejected || waiting ? null : git, items: sim.rejected || waiting ? items.map((i) => i.status === "DEFERRED" ? i : { ...i, status: "PENDING", step: "Waiting" }) : items,
+    logs: waiting ? [logs[0], line(0, "SIGN-OFF", "run", `Waiting for a person to sign it off. ${sim.approval.reason ?? ""}`)] : logs,
+    status, pausedReason: status === "paused" ? "by_person" : null, needsInput: [], blocked: 0, passes: sim.passes, version: sim.version,
+    createdAt: sim.createdAt, startedAt: sim.passes[0]?.startedAt ?? null, finishedAt: allDone && !waiting ? new Date(started + elapsed).toISOString() : null,
+    closedAt: null, requestedBy: DEMO_PERSON, approval: sim.approval, resumable: true, unresumableReason: null, executions: [],
   };
 }
 
@@ -521,6 +622,10 @@ export function resetDemo(): void {
   demoManualCommit = null;
   demoUncommitted = 0;
   demoCommittedRuns.clear();
+  closedRuns = [];
+  lastValidation = null;
+  trail = [];
+  projectsVersion = 1;
 }
 
 /** A small stand-in for the backend planner so the demo page is fully populated. */
@@ -1003,9 +1108,17 @@ export const mockApi: MigrationApi = {
     const rejected = candidates.find((i) => i.type === "View" || i.type === "Stored Procedure");
     const others = candidates.filter((i) => i !== rejected).slice(0, kept.length >= 20 ? 2 : kept.length >= 5 ? 1 : 0);
     const failing = new Set([...(rejected && kept.length >= 5 ? [rejected.id] : []), ...others.map((i) => i.id)]);
+    closeRun("replaced by a new run");
     runCounter += 1;
-    execSim = { runId: String(runCounter).padStart(3, "0"), items: kept, base: 0, resumedAt: Date.now(), retried: false,
-      credentials: Object.entries(credentials ?? {}).filter(([, f]) => Object.values(f).some((v) => v.trim())).map(([n]) => n), options, per, dur: Math.min(600, per * 2), failing };
+    const approval = demoApproval(options);
+    const runId = String(runCounter).padStart(3, "0");
+    const now = new Date().toISOString();
+    execSim = { runId, items: kept, base: 0, resumedAt: approval.required ? null : Date.now(), retried: false,
+      credentials: Object.entries(credentials ?? {}).filter(([, f]) => Object.values(f).some((v) => v.trim())).map(([n]) => n), options, per, dur: Math.min(600, per * 2), failing,
+      approval, rejected: false, createdAt: now, passes: approval.required ? [] : [{ n: 1, trigger: "start", status: "running", startedAt: now, finishedAt: null, by: DEMO_PERSON }], version: 1 };
+    record("run.requested", { target: { type: "run", id: runId }, run: runId, details: { objects: kept.length, stages: options?.stages ?? [] } });
+    if (approval.required) record("run.signoff_requested", { actor: DEMO_PERSON, target: { type: "run", id: runId }, run: runId, details: { reason: approval.reason, policy: "overwrite" } });
+    else record("run.approved", { actor: DEMO_SYSTEM, target: { type: "run", id: runId }, run: runId, details: { automatic: true, policy: "overwrite" } });
     return runNow();
   },
 
@@ -1016,25 +1129,165 @@ export const mockApi: MigrationApi = {
   async controlExecution(action: RunControl) {
     if (action === "reset") {
       if (runNow().state === "running") throw new ApiRequestError("run_in_progress", "The run is still working. Pause it, then reset.", 409);
-      execSim = null;
+      closeRun("closed by Reset");
       return runNow();
     }
     if (!execSim) throw new ApiRequestError("no_run", "There is no migration run.", 409);
+    const sim = execSim;
+    if (sim.approval.required && sim.approval.decision === null) {
+      if (action === "retry" || action === "resume") throw new ApiRequestError("not_signed_off", "This run is waiting for sign-off; sign it off before it runs.", 409);
+      return runNow();
+    }
+    if (sim.rejected) return runNow();
     const now = Date.now();
-    if (action === "pause" && execSim.resumedAt !== null) {
-      execSim.base += now - execSim.resumedAt;
-      execSim.resumedAt = null;
-    } else if (action === "resume" && execSim.resumedAt === null) {
-      execSim.resumedAt = now;
+    const pass = (trigger: RunPass["trigger"]) => {
+      const last = sim.passes[sim.passes.length - 1];
+      if (last && last.status === "running") Object.assign(last, { status: trigger === "retry" ? "finished" : "paused", finishedAt: new Date().toISOString() });
+      sim.passes = [...sim.passes, { n: sim.passes.length + 1, trigger, status: "running", startedAt: new Date().toISOString(), finishedAt: null, by: DEMO_PERSON }];
+    };
+    if (action === "pause" && sim.resumedAt !== null) {
+      sim.base += now - sim.resumedAt;
+      sim.resumedAt = null;
+      record("run.pause_requested", { target: { type: "run", id: sim.runId }, run: sim.runId });
+    } else if (action === "resume" && sim.resumedAt === null) {
+      sim.resumedAt = now;
+      pass("resume");
+      record("run.resumed", { target: { type: "run", id: sim.runId }, run: sim.runId });
     } else if (action === "retry") {
       // Failed objects run again from now, and succeed this time.
-      execSim.retried = true;
-      if (execSim.resumedAt === null) execSim.resumedAt = now;
+      sim.retried = true;
+      if (sim.resumedAt === null) sim.resumedAt = now;
+      pass("retry");
+      record("run.retried", { target: { type: "run", id: sim.runId }, run: sim.runId, details: { objects: runNow().failed } });
+    }
+    sim.version += 1;
+    return runNow();
+  },
+
+  async approveExecution(decision, comment) {
+    await sleep(150);
+    const sim = execSim;
+    if (!sim || !(sim.approval.required && sim.approval.decision === null)) throw new ApiRequestError("not_waiting", "This run is not waiting for sign-off.", 409);
+    const at = new Date().toISOString();
+    sim.approval = { ...sim.approval, decision: decision === "approve" ? "approved" : "rejected", by: DEMO_PERSON, at, comment: comment?.trim() || null, automatic: false };
+    sim.version += 1;
+    if (decision === "reject") {
+      sim.rejected = true;
+      record("run.rejected", { target: { type: "run", id: sim.runId }, run: sim.runId, reason: comment ?? null });
+    } else {
+      sim.resumedAt = Date.now();
+      sim.passes = [{ n: 1, trigger: "start", status: "running", startedAt: at, finishedAt: null, by: DEMO_PERSON }];
+      record("run.approved", { target: { type: "run", id: sim.runId }, run: sim.runId, reason: comment ?? null, details: { automatic: false } });
     }
     return runNow();
   },
 
+  async listRuns(): Promise<RunHistory> {
+    const current = execSim ? runNow() : null;
+    return { runs: [...(current ? [summary(current)] : []), ...closedRuns.map(summary)], current: current?.runId ?? null };
+  },
+
+  async getRun(runId: string) {
+    if (execSim && execSim.runId === runId) return runNow();
+    const found = closedRuns.find((r) => r.runId === runId);
+    if (!found) throw new ApiRequestError("not_found", "There is no such run.", 404);
+    return found;
+  },
+
+  async getValidation() {
+    return lastValidation ? { state: "completed", rows: lastValidation.rows, finishedAt: lastValidation.finishedAt } : { state: "idle" };
+  },
+
+  async listProjects() {
+    return listing();
+  },
+
+  async createProject(name: string, options?: { id?: string; version?: number; activate?: boolean; copyFrom?: string }) {
+    checkVersion(options?.version);
+    const clean = name.split(/\s+/).filter(Boolean).join(" ");
+    if (!clean) throw new ApiRequestError("invalid_request", "Give the project a name.", 400);
+    const value = mockProjects();
+    const id = options?.id || `p${Date.now().toString(36)}`;
+    if (value.projects.some((p) => p.id === id)) throw new ApiRequestError("project_exists", "There is already a project with this id.", 409);
+    const now = new Date().toISOString();
+    saveMockProjects({ active: options?.activate ? id : value.active, projects: [...value.projects, { id, name: clean, createdAt: now, updatedAt: now }] });
+    record("project.created", { target: { type: "project", id }, details: { name: clean } });
+    if (options?.activate) record("project.activated", { target: { type: "project", id }, details: { name: clean, previous: value.active } });
+    return { ...listing(), created: id };
+  },
+
+  async renameProject(id: string, name: string, version?: number) {
+    checkVersion(version);
+    const clean = name.split(/\s+/).filter(Boolean).join(" ");
+    if (!clean) throw new ApiRequestError("invalid_request", "Give the project a name.", 400);
+    const value = mockProjects();
+    const previous = value.projects.find((p) => p.id === id)?.name;
+    if (!previous) throw new ApiRequestError("project_not_found", "There is no such project.", 404);
+    saveMockProjects({ ...value, projects: value.projects.map((p) => (p.id === id ? { ...p, name: clean, updatedAt: new Date().toISOString() } : p)) });
+    record("project.renamed", { target: { type: "project", id }, details: { name: clean, previous } });
+    return listing();
+  },
+
+  async activateProject(id: string, version?: number) {
+    checkVersion(version);
+    const value = mockProjects();
+    const found = value.projects.find((p) => p.id === id);
+    if (!found) throw new ApiRequestError("project_not_found", "There is no such project.", 404);
+    if (value.active !== id) {
+      if (runNow().state === "running") throw new ApiRequestError("project_busy", "Not switched: A migration run is working; pause it or wait for it to finish.", 409);
+      saveMockProjects({ ...value, active: id });
+      record("project.activated", { target: { type: "project", id }, details: { name: found.name, previous: value.active } });
+    }
+    return listing();
+  },
+
+  async deleteProject(id: string, version?: number) {
+    checkVersion(version);
+    const value = mockProjects();
+    const found = value.projects.find((p) => p.id === id);
+    if (!found) throw new ApiRequestError("project_not_found", "There is no such project.", 404);
+    if (value.projects.length === 1) throw new ApiRequestError("last_project", "The last project cannot be deleted.", 409);
+    if (value.active === id) throw new ApiRequestError("project_active", "Switch to another project before deleting this one.", 409);
+    saveMockProjects({ ...value, projects: value.projects.filter((p) => p.id !== id) });
+    record("project.removed", { target: { type: "project", id }, details: { name: found.name } });
+    return listing();
+  },
+
+  async getAudit(q): Promise<AuditPage> {
+    const keep = (r: AuditRecord) => (q?.before === undefined || r.seq < q.before)
+      && (!q?.action || r.action === q.action || r.action.startsWith(`${q.action.replace(/\.$/, "")}.`))
+      && (!q?.actor || q.actor === r.actor.kind || q.actor === `${r.actor.kind}:${r.actor.id}`)
+      && (!q?.outcome || r.outcome === q.outcome) && (!q?.run || r.run === q.run);
+    const matched = [...trail].reverse().filter(keep);
+    const limit = Math.max(1, Math.min(q?.limit ?? 100, 500));
+    const page = matched.slice(0, limit);
+    return { records: page, next: matched.length > limit ? page[page.length - 1].seq : null, matched: matched.length, catalog: DEMO_CATALOG };
+  },
+
+  async verifyAudit() {
+    return { ok: true, records: trail.length, brokenAt: null, problem: null, head: trail.length ? trail[trail.length - 1].hash : "0".repeat(64) };
+  },
+
+  async exportAudit(format: "csv" | "jsonl") {
+    record("audit.exported", { target: { type: "project", id: mockActive() }, details: { format, records: trail.length } });
+    if (format === "jsonl") return { text: trail.map((r) => JSON.stringify(r)).join("\n") + "\n", fileName: `audit-${mockActive()}.jsonl` };
+    const cell = (v: unknown) => {
+      const text = v === null || v === undefined ? "" : typeof v === "string" ? v : JSON.stringify(v);
+      const safe = /^[=+\-@]/.test(text) ? `'${text}` : text;
+      return /[",\n]/.test(safe) ? `"${safe.replace(/"/g, '""')}"` : safe;
+    };
+    const rows = trail.map((r) => [r.seq, r.at, r.action, r.actor.kind, r.actor.id, r.target?.type, r.target?.id, r.outcome, r.code, r.reason,
+      r.details, r.correlationId, r.project, r.run, r.hash].map(cell).join(","));
+    return { text: ["seq,at,action,actorKind,actor,targetType,target,outcome,code,reason,details,correlationId,project,run,hash", ...rows].join("\n") + "\n",
+      fileName: `audit-${mockActive()}.csv` };
+  },
+
+  async confirmStep(step: string, note?: string) {
+    record("journey.step_confirmed", { target: { type: "step", id: step }, details: { step, ...(note ? { note } : {}) } });
+  },
+
   async runValidation(_items, _options, runtime, onProgress): Promise<ValidationRow[]> {
+    record("validation.started", { target: { type: "validation", id: null }, details: { probe: !!runtime?.probe, run: runtime?.run ?? [] } });
     onProgress?.("Comparing Synapse with Fabric (demo)");
     await sleep(500);
     const run = runNow();
@@ -1090,6 +1343,7 @@ export const mockApi: MigrationApi = {
         if (item) applyDemoRuntime(r, item.type, hash(item.id), runtime);
       }
     }
+    lastValidation = { rows, finishedAt: new Date().toISOString() };
     return rows;
   },
 

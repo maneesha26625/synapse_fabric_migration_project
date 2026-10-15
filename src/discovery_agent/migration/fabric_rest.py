@@ -13,6 +13,7 @@ with a long-running operation to poll. Both are handled here, as are paging
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 import urllib.error
@@ -20,6 +21,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
+_log = logging.getLogger("discovery_agent.fabric")
 _OPERATION_ID = re.compile(r"/operations/([0-9a-fA-F-]{36})")
 _JOB_INSTANCE = re.compile(r"/v1(/workspaces/[^/]+/items/[^/]+/jobs/instances/[0-9A-Za-z-]+)", re.IGNORECASE)
 FABRIC_HOST = "https://api.fabric.microsoft.com"
@@ -105,17 +107,28 @@ class FabricRestClient:
     def request(self, method: str, path_or_url: str, body: Optional[dict] = None) -> Tuple[int, Dict[str, str], Any]:
         url = self._url(path_or_url)
         data = json.dumps(body).encode("utf-8") if body is not None else None
+        path = urllib.parse.urlsplit(url).path  # never the query: it can carry a continuation token
         for attempt in range(MAX_THROTTLE_RETRIES + 1):
             headers = {"Authorization": "Bearer " + self._token(), "Accept": "application/json"}
             if data is not None:
                 headers["Content-Type"] = "application/json"
+            started = time.monotonic()  # not self._clock: that one decides deadlines, and the tests script it
             status, response_headers, raw = self._send(method, url, headers, data)
+            elapsed = int((time.monotonic() - started) * 1000)
+            fields = {"method": method, "path": path, "status": status, "durationMs": elapsed, "attempt": attempt + 1,
+                      "fabricRequestId": response_headers.get("requestid") or response_headers.get("x-ms-request-id")}
             if status == 429 and attempt < MAX_THROTTLE_RETRIES:
+                _log.warning("Fabric %s %s throttled (429); retrying", method, path, extra=fields)
                 self._sleep(self._retry_after(response_headers, default=5.0 * (attempt + 1)))
                 continue
             payload = _json(raw)
             if status >= 400:
-                raise self._error(status, payload)
+                error = self._error(status, payload)
+                # A 404 is often a question asked on purpose (is the workspace in Git? does this item exist?).
+                (_log.info if status == 404 else _log.warning)("Fabric %s %s -> %s %s (%d ms)", method, path, status, error.code,
+                                                               elapsed, extra={**fields, "code": error.code})
+                raise error
+            (_log.debug if method == "GET" else _log.info)("Fabric %s %s -> %s (%d ms)", method, path, status, elapsed, extra=fields)
             return status, response_headers, payload
         raise FabricApiError(429, "throttled", "Fabric kept throttling the requests. Try again in a few minutes.")
 

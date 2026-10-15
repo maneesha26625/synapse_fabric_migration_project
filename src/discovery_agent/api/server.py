@@ -33,8 +33,24 @@ web framework would be the first. The surface is small and fixed.
     POST   /api/migration/plan            planner: strategy, risks, effort, checks (read-only)
     POST   /api/migration/validate        start validation in the background: compare Synapse with Fabric, and check what runs
     GET    /api/migration/validation      the validation's progress, then its results
-    POST   /api/migration/start           start a run from the migration plan
+    POST   /api/migration/start           start a run from the migration plan (or ask for its sign-off)
+    POST   /api/migration/approve         a person signs a waiting run off, or declines it
     POST   /api/migration/control         pause | resume | retry | reset
+    GET    /api/migration/runs            every run of the project, newest first
+    GET    /api/migration/runs/{id}       one run, as its record has it
+    GET    /api/migration/runs/{id}/events  its events in order (after=, limit=)
+    GET    /api/migration/runs/{id}/artifacts/{hash}  what it sent to Fabric for an object (a definition, a statement)
+    GET    /api/migration/plans/{id}      one recorded plan version
+    GET    /api/migration/policy          run and object statuses, their moves, the sign-off rule
+    GET    /api/projects                  the projects, and which is active
+    POST   /api/projects                  create one (optionally carrying on another's saved discovery)
+    POST   /api/projects/{id}/rename      rename one
+    POST   /api/projects/{id}/activate    make it the active project
+    DELETE /api/projects/{id}             take it off the list (its folder is archived)
+    GET    /api/audit                     the project's audit trail, newest first
+    GET    /api/audit/export              the trail, as JSON lines or CSV
+    GET    /api/audit/verify              check the trail's hash chain
+    POST   /api/journey/confirm           a person confirmed a step of the journey
     GET    /api/transform/settings        whether LLM drafts can be generated here (Claude Code CLI)
     GET    /api/transform                 every object with a draft, an accepted transform or a job
     GET    /api/transform/objects/{id}    one object: source, rule output, draft, accepted code
@@ -64,23 +80,29 @@ Security posture, in order of importance:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import mimetypes
-import sys
+import re
+import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import parse_qsl, unquote, urlsplit
 
 from discovery_agent.api.repository_source import MAX_PARAMETERS_BYTES, MAX_ZIP_BYTES, sweep
 from discovery_agent.diagnostics import record_unexpected
+from discovery_agent.state import context, logs
+
+_log = logs.get("api")
 
 from discovery_agent.api.fabric import FabricError, FabricTarget
-from discovery_agent.api.persist import StateStore
 from discovery_agent.api.migration import MigrationService
+from discovery_agent.api.projects import ProjectsService, describe_start
 from discovery_agent.api.service import ApiError, Session
 from discovery_agent.api.transform import MAX_ACCEPT_BYTES, TransformService
+from discovery_agent.state.projects import ProjectError, Projects
 
 MAX_BODY_BYTES = 64 * 1024
 #: A repository request may carry an environment's parameters file.
@@ -89,6 +111,17 @@ _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "[::1]"}
 RESULTS_PREFIX = "/api/discovery/results/"
 TRANSFORM_OBJECT_PREFIX = "/api/transform/objects/"
 TRANSFORM_PROMPT_PREFIX = "/api/transform/prompt/"
+_RUN_PATH = re.compile(r"^/api/migration/runs/([0-9]{1,9})(/events)?$")
+_ARTIFACT_PATH = re.compile(r"^/api/migration/runs/([0-9]{1,9})/artifacts/([0-9a-f]{64})$")
+_PLAN_PATH = re.compile(r"^/api/migration/plans/(P[0-9]{1,9})$")
+_PROJECT_PATH = re.compile(r"^/api/projects/([A-Za-z0-9][A-Za-z0-9_-]{0,63})(?:/(rename|activate))?$")
+
+
+class RawResponse:
+    """A reply that is not JSON: a file to download."""
+
+    def __init__(self, body: bytes, content_type: str, filename: Optional[str] = None) -> None:
+        self.body, self.content_type, self.filename = body, content_type, filename
 
 
 def make_handler(
@@ -97,10 +130,21 @@ def make_handler(
     fabric: Optional[FabricTarget] = None,
     migration: Optional[MigrationService] = None,
     transforms: Optional[TransformService] = None,
+    project_of: Optional[Callable[[], Optional[str]]] = None,
+    projects: Optional[ProjectsService] = None,
 ):
     fabric = fabric or FabricTarget()
     transforms = transforms or TransformService(session, fabric)
     migration = migration or MigrationService(session, fabric, transforms=transforms)
+    if projects is not None and project_of is None:
+        project_of = projects.active_id
+    # Every request passes the projects' gate, so a switch of project runs alone (``ProjectsService.activate``).
+    gate = projects.gate.request if projects is not None else contextlib.nullcontext
+
+    def need_projects() -> ProjectsService:
+        if projects is None:
+            raise ApiError(404, "not_found", "Projects are not served by this API.")
+        return projects
 
     class Handler(BaseHTTPRequestHandler):
         server_version = "MigrationAcceleratorAPI"
@@ -108,25 +152,51 @@ def make_handler(
 
         # -- plumbing ------------------------------------------------------
 
+        _correlation: Optional[str] = None
+        _status = 0
+
         def log_message(self, format: str, *args) -> None:  # noqa: A002
-            # Method, path and status only. Never a body, never a header.
-            sys.stderr.write(f"{self.command} {urlsplit(self.path).path} -> {args[1] if len(args) > 1 else ''}\n")
+            # The request line is logged by _dispatch, with its duration and correlation id. Never a body or a header.
+            pass
+
+        def log_error(self, format: str, *args) -> None:  # noqa: A002
+            _log.warning("HTTP %s", format % args)
 
         def _send(self, status: int, payload: object) -> None:
             body = json.dumps(payload, default=str, separators=(",", ":")).encode("utf-8")
+            self._status = status
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
+            if self._correlation:
+                self.send_header("X-Correlation-Id", self._correlation)
             self.end_headers()
             if self.command != "HEAD":
                 self.wfile.write(body)
+
+        def _send_raw(self, reply: RawResponse) -> None:
+            self._status = 200
+            self.send_response(200)
+            self.send_header("Content-Type", reply.content_type)
+            self.send_header("Content-Length", str(len(reply.body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            if reply.filename:
+                self.send_header("Content-Disposition", f'attachment; filename="{reply.filename}"')
+            if self._correlation:
+                self.send_header("X-Correlation-Id", self._correlation)
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(reply.body)
 
         def _error(self, status: int, code: str, message: str, reference: Optional[str] = None) -> None:
             error = {"code": code, "message": message}
             if reference:
                 error["reference"] = reference
+            if self._correlation:
+                error["correlationId"] = self._correlation
             self._send(status, {"error": error})
 
         def _host_ok(self) -> bool:
@@ -134,10 +204,23 @@ def make_handler(
             host = header.split("]")[0] + "]" if header.startswith("[") else header.rsplit(":", 1)[0]
             return host in _LOOPBACK_HOSTS
 
+        def _length(self) -> int:
+            try:
+                return max(0, int(self.headers.get("Content-Length") or 0))
+            except ValueError:
+                raise ApiError(400, "invalid_request", "Content-Length is not a number.") from None
+
+        def _drain(self, length: int) -> None:
+            """Read a body that is refused, when it is small: a reply sent over unread bytes can reach the client as a
+            reset connection (Windows), so the refusal would never be seen."""
+            if 0 < length <= MAX_BODY_BYTES:
+                self.rfile.read(length)
+
         def _json_body(self, limit: int = MAX_BODY_BYTES) -> dict:
+            length = self._length()
             if "application/json" not in (self.headers.get("Content-Type") or ""):
+                self._drain(length)
                 raise ApiError(415, "unsupported_media_type", "Requests must be application/json.")
-            length = int(self.headers.get("Content-Length") or 0)
             if length > limit:
                 raise ApiError(413, "body_too_large", "The request is too large.")
             raw = self.rfile.read(length) if length else b"{}"
@@ -150,9 +233,10 @@ def make_handler(
             return body
 
         def _zip_body(self) -> bytes:
+            length = self._length()
             if (self.headers.get("Content-Type") or "").split(";")[0].strip() != "application/zip":
+                self._drain(length)
                 raise ApiError(415, "unsupported_media_type", "Upload the export as application/zip.")
-            length = int(self.headers.get("Content-Length") or 0)
             if not length:
                 raise ApiError(400, "invalid_zip", "The upload is empty.")
             if length > MAX_ZIP_BYTES:
@@ -160,18 +244,40 @@ def make_handler(
             return self.rfile.read(length)
 
         def _dispatch(self, handler) -> None:
-            if not self._host_ok():
-                self._error(403, "forbidden_host", "Requests must use a loopback host name.")
-                return
+            # One correlation id per request (the caller's X-Correlation-Id when it sends a plain one): it is in the
+            # response's header, on every log line the request writes, and on the background work it starts.
+            started = time.monotonic()
+            self._correlation = context.accept_correlation_id(self.headers.get("X-Correlation-Id"))
+            path = urlsplit(self.path).path
+            with context.bound(correlation=self._correlation, actor=context.operator()):
+                if not self._host_ok():
+                    self._error(403, "forbidden_host", "Requests must use a loopback host name.")
+                    self._logged(path, started)
+                    return
+                # Let in past a switch of project that may be running; only then is the project it works in read.
+                with gate(), context.bound(project=project_of() if project_of else None):
+                    self._answer(handler, path)
+                    self._logged(path, started)
+
+        def _answer(self, handler, path: str) -> None:
             try:
-                self._send(200, handler())
-            except (ApiError, FabricError) as exc:
+                result = handler()
+                if isinstance(result, RawResponse):
+                    self._send_raw(result)
+                else:
+                    self._send(200, result)
+            except (ApiError, FabricError, ProjectError) as exc:
                 self._error(exc.status, exc.code, exc.message)
             except Exception as exc:  # noqa: BLE001 - never surface a traceback to a browser
                 # The traceback goes to the API's log, redacted; the browser gets only the reference to find it by.
-                reference = record_unexpected(f"{self.command} {urlsplit(self.path).path}", exc)
+                reference = record_unexpected(f"{self.command} {path}", exc)
                 self._error(500, "internal_error", f"The server hit an unexpected problem (reference {reference}). "
                             "The details are in the API's log.", reference)
+
+        def _logged(self, path: str, started: float) -> None:
+            elapsed = int((time.monotonic() - started) * 1000)
+            _log.info("%s %s -> %s (%d ms)", self.command, path, self._status, elapsed,
+                      extra={"method": self.command, "path": path, "status": self._status, "durationMs": elapsed})
 
         # -- verbs ---------------------------------------------------------
 
@@ -196,6 +302,30 @@ def make_handler(
                 self._dispatch(migration.validation_state)
             elif path == "/api/migration/run":
                 self._dispatch(migration.state)
+            elif path == "/api/migration/runs":
+                self._dispatch(migration.runs)
+            elif path == "/api/migration/policy":
+                self._dispatch(migration.policy)
+            elif _RUN_PATH.match(path):
+                run_id, events = _RUN_PATH.match(path).groups()
+                if events:
+                    self._dispatch(lambda: migration.run_events(run_id, query.get("after"), query.get("limit")))
+                else:
+                    self._dispatch(lambda: migration.run_record(run_id))
+            elif _ARTIFACT_PATH.match(path):
+                run_id, digest = _ARTIFACT_PATH.match(path).groups()
+                self._dispatch(lambda: RawResponse(*migration.artifact(run_id, digest)))
+            elif _PLAN_PATH.match(path):
+                version_id = _PLAN_PATH.match(path).group(1)
+                self._dispatch(lambda: migration.plan_version(version_id))
+            elif path == "/api/projects":
+                self._dispatch(lambda: need_projects().listing())
+            elif path == "/api/audit":
+                self._dispatch(lambda: need_projects().audit_query(query))
+            elif path == "/api/audit/verify":
+                self._dispatch(lambda: need_projects().audit_verify(query))
+            elif path == "/api/audit/export":
+                self._dispatch(lambda: RawResponse(*need_projects().audit_export(query)))
             elif path.startswith("/api/azure/"):
                 self._dispatch(lambda: session.azure_options(path[len("/api/azure/"):], query))
             elif path == "/api/dependencies":
@@ -244,6 +374,9 @@ def make_handler(
                 "/api/migration/validate": lambda: migration.start_validation(self._json_body()),
                 "/api/migration/start": lambda: migration.start(self._json_body()),
                 "/api/migration/control": lambda: migration.control(self._json_body()),
+                "/api/migration/approve": lambda: migration.approve(self._json_body()),
+                "/api/projects": lambda: need_projects().create(self._json_body()),
+                "/api/journey/confirm": lambda: need_projects().confirm_step(self._json_body()),
                 "/api/transform/generate": lambda: transforms.generate(self._json_body()),
                 "/api/transform/accept": lambda: transforms.accept(self._json_body(MAX_ACCEPT_BYTES)),
                 "/api/transform/discard": lambda: transforms.discard(self._json_body()),
@@ -251,6 +384,11 @@ def make_handler(
                 "/api/discovery/start": session.start_discovery,
             }
             handler = routes.get(path)
+            found = _PROJECT_PATH.match(path)
+            if handler is None and found and found.group(2):
+                project_id, verb = found.groups()
+                handler = (lambda: need_projects().rename(project_id, self._json_body())) if verb == "rename" else \
+                    (lambda: need_projects().activate(project_id, self._json_body()))
             if handler is None:
                 self._error(404, "not_found", "No such endpoint.")
                 return
@@ -263,6 +401,10 @@ def make_handler(
                 self._dispatch(session.reset_discovery)
             elif urlsplit(self.path).path == "/api/fabric/connection":
                 self._dispatch(fabric.disconnect)
+            elif _PROJECT_PATH.match(urlsplit(self.path).path) and not _PROJECT_PATH.match(urlsplit(self.path).path).group(2):
+                project_id = _PROJECT_PATH.match(urlsplit(self.path).path).group(1)
+                query = dict(parse_qsl(urlsplit(self.path).query))
+                self._dispatch(lambda: need_projects().remove(project_id, query))
             else:
                 self._error(404, "not_found", "No such endpoint.")
 
@@ -291,11 +433,24 @@ def make_handler(
     return Handler
 
 
-def create_server(host: str, port: int, static_root: Optional[Path] = None) -> ThreadingHTTPServer:
-    """The API as it runs for real: the last discovery and Fabric target are restored from, and saved to, disk."""
+def create_server(host: str, port: int, static_root: Optional[Path] = None, projects: Optional[Projects] = None) -> ThreadingHTTPServer:
+    """The API as it runs for real. Everything a project keeps (its discovery, Fabric target, runs, plan versions,
+    validation and audit trail) is restored from, and saved to, the active project's folder."""
     # The uploads and working copies of an API process that has ended (a restart, or --reload) are read by nobody now.
     removed = sweep()
     if removed:
-        sys.stderr.write(f"Removed {removed} uploaded ZIP and working-copy folder(s) left by API processes that have ended.\n")
-    store = StateStore()
-    return ThreadingHTTPServer((host, port), make_handler(Session(store), static_root, fabric=FabricTarget(store)))
+        _log.info("Removed %d uploaded ZIP and working-copy folder(s) left by API processes that have ended.", removed)
+    projects = projects or Projects()
+    hub = ProjectsService(projects)
+    active = hub.active_id()
+    with context.bound(actor=context.system(), project=active):
+        session = Session(projects.pickle_store(active), records=projects.store(active), audit=hub.audit)
+        fabric = FabricTarget(projects.pickle_store(active), audit=hub.audit)
+        transforms = TransformService(session, fabric, audit=hub.audit)
+        migration = MigrationService(session, fabric, transforms=transforms, records=projects.store(active), audit=hub.audit)
+        hub.attach(session, fabric, migration, transforms)
+        hub.audit("system.started", details=describe_start(projects))
+    server = ThreadingHTTPServer((host, port), make_handler(session, static_root, fabric=fabric, migration=migration,
+                                                            transforms=transforms, projects=hub))
+    server.projects = hub  # type: ignore[attr-defined] - for the entry point, which records the stop
+    return server

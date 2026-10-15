@@ -714,7 +714,7 @@ def test_planning_is_told_which_linked_services_have_credentials_never_the_crede
         assert invalid.value.code == "invalid_request"
 
 
-def test_an_unexpected_error_is_logged_once_under_the_reference_each_object_shows(capsys):
+def test_an_unexpected_error_is_logged_once_under_the_reference_each_object_shows(caplog):
     class Boom(FakeRest):
         def list(self, path):
             raise KeyError("password=hunter2")
@@ -722,9 +722,9 @@ def test_an_unexpected_error_is_logged_once_under_the_reference_each_object_show
     errors = {i.error for i in run.items}
     assert all(i.status == FAILED for i in run.items) and len(errors) == 1
     reference = re.search(r"\(reference ([0-9a-f]{8})\)$", errors.pop()).group(1)
-    log = capsys.readouterr().err
+    log = caplog.text
     # One traceback for one fault, however many objects it hit; and no secret in it, or on any object.
-    assert log.count("ERROR [") == 1 and f"ERROR [{reference}] migration run 001: A: unexpected KeyError" in log
+    assert log.count("unexpected KeyError") == 1 and f"[{reference}] migration run 001: A: unexpected KeyError" in log
     assert "Traceback" in log and "hunter2" not in log and all("hunter2" not in i.error for i in run.items)
 
 

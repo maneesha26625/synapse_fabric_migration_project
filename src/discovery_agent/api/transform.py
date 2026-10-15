@@ -22,6 +22,7 @@ What this changes about the accelerator's principles, deliberately and only on r
 
 from __future__ import annotations
 
+import hashlib
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +33,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from discovery_agent.api.migration import rewritable, sources_for
 from discovery_agent.api.service import ApiError
 from discovery_agent.diagnostics import record_unexpected, unexpected_message
+from discovery_agent.state import context as work_context  # not ``context``: that name is the LLM's subject builder
 from discovery_agent.llm import checks, context, templates
 from discovery_agent.llm.claude_cli import ClaudeCli, ModelError
 from discovery_agent.llm.store import TransformStore
@@ -67,10 +69,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _hash(text: str) -> str:
+    """A short fingerprint of a prompt or of code: what the trail keeps instead of the text itself."""
+    return hashlib.sha256(str(text).encode("utf-8")).hexdigest()[:16]
+
+
 class TransformService:
     def __init__(self, session: Any, fabric: Any = None, model: Any = None, store: Optional[TransformStore] = None,
-                 prompts: Optional[Path] = None, workers: Optional[int] = None, synchronous: bool = False) -> None:
+                 prompts: Optional[Path] = None, workers: Optional[int] = None, synchronous: bool = False,
+                 audit: Any = None) -> None:
         self._session = session
+        #: Records what was asked of the model, what it wrote, and what a person accepted (``state.audit``); never raises.
+        self._audit = audit or (lambda *args, **kwargs: None)
         self._fabric = fabric
         self._model = model or ClaudeCli()
         self._store = store or TransformStore(transforms_dir())
@@ -85,6 +95,12 @@ class TransformService:
     @staticmethod
     def enabled() -> bool:
         return (os.environ.get("MIGRATION_LLM") or "on").strip().lower() not in _OFF
+
+    def busy(self) -> Optional[str]:
+        """Why the project cannot be switched now (drafts are being written for its objects), or None."""
+        with self._lock:
+            working = sum(1 for j in self._jobs.values() if j.get("state") in (QUEUED, RUNNING))
+        return f"{working} LLM draft(s) are being written; wait for them to finish." if working else None
 
     # -- resolving one object -------------------------------------------------------
 
@@ -245,6 +261,8 @@ class TransformService:
             os.replace(tmp, path)
         except OSError as exc:
             raise ApiError(500, "write_failed", f"The requirements could not be saved: {exc.strerror or exc}.") from exc
+        self._audit("transform.requirements", target={"type": "requirements", "id": "project.md"},
+                    details={"chars": len(text), "hash": _hash(text)})
         return self.project()
 
     def prompt(self, object_id: str) -> dict:
@@ -281,14 +299,19 @@ class TransformService:
             if self._synchronous:
                 self._work(source, subject, prompt)
             else:
-                self._pool.submit(self._work, source, subject, prompt)
+                self._pool.submit(work_context.carried(self._work), source, subject, prompt)
             results.append({"objectId": oid, "state": QUEUED, "error": None})
+        queued = [r["objectId"] for r in results if r["state"] == QUEUED]
+        if queued:
+            self._audit("transform.requested", target={"type": "objects", "id": queued[0] if len(queued) == 1 else None},
+                        details={"objects": queued, "model": available.get("model")})
         return {"items": results}
 
     def _work(self, source: Source, subject: context.Subject, prompt: str) -> None:
         oid = source.id
         with self._lock:
             self._jobs[oid] = {**self._jobs.get(oid, {}), "state": RUNNING}
+        target = {"type": "object", "id": oid}
         try:
             answer = self._model.complete(prompt)
             found = checks.run(subject.kind, answer.code, answer.unconverted, _original(source))
@@ -303,15 +326,27 @@ class TransformService:
         except ModelError as exc:
             with self._lock:
                 self._jobs[oid] = {**self._jobs.get(oid, {}), "state": FAILED_JOB, "error": str(exc)}
+            self._audit("transform.drafted", target=target, actor=self._agent(None), outcome="failed", code="model_error",
+                        details={"promptHash": _hash(prompt), "message": str(exc)})
             return
         except Exception as exc:  # noqa: BLE001 - one draft never takes the service down; the API's log gets the traceback
             reference = record_unexpected(f"LLM draft for {source.name}", exc)
+            message = unexpected_message("The draft could not be made", exc, reference)
             with self._lock:
-                self._jobs[oid] = {**self._jobs.get(oid, {}), "state": FAILED_JOB,
-                                   "error": unexpected_message("The draft could not be made", exc, reference)}
+                self._jobs[oid] = {**self._jobs.get(oid, {}), "state": FAILED_JOB, "error": message}
+            self._audit("transform.drafted", target=target, actor=self._agent(None), outcome="failed", code="draft_failed",
+                        details={"promptHash": _hash(prompt), "message": message})
             return
         with self._lock:
             self._jobs.pop(oid, None)
+        self._audit("transform.drafted", target=target, actor=self._agent(answer.model),
+                    details={"model": answer.model, "confidence": answer.confidence, "promptHash": _hash(prompt),
+                             "codeHash": _hash(answer.code), "checks": sorted({c.get("level") for c in found})})
+
+    @staticmethod
+    def _agent(model: Optional[str]) -> Any:
+        """The model as the trail names it: an agent, never the person who asked for the draft."""
+        return work_context.Actor(work_context.AGENT, model or "llm")
 
     def accept(self, body: dict) -> dict:
         oid = str(body.get("id") or "")
@@ -337,6 +372,8 @@ class TransformService:
         record["draft"] = None
         record.update({"name": source.name, "type": source.type, "kind": subject.kind})
         self._store.put(record)
+        self._audit("transform.accepted", target={"type": "object", "id": oid},
+                    details={"edited": edited, "codeHash": _hash(code.strip()), "sourceHash": subject.source_hash})
         return self.object(oid)
 
     def discard(self, body: dict) -> dict:
@@ -355,6 +392,7 @@ class TransformService:
             else:
                 record["draft"] = None
                 self._store.put(record)
+            self._audit("transform.discarded", target={"type": "object", "id": oid}, details={"scope": scope})
         return self.object(oid)
 
     # -- for a migration run ---------------------------------------------------------------

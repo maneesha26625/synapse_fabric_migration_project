@@ -1,17 +1,29 @@
 """The migration run behind the Migrate step.
 
-    GET  /api/migration/run        the current run (or an idle one)
-    POST /api/migration/start      {items: [{id, wave}]} -> starts a run
-    POST /api/migration/control    {action: pause | resume | retry | reset}
+    GET  /api/migration/run              the current run (or an idle one)
+    POST /api/migration/start            {items: [{id, wave}]} -> starts a run (or asks for its sign-off)
+    POST /api/migration/approve          {decision: approve | reject, comment?} -> a person signs a waiting run off
+    POST /api/migration/control          {action: pause | resume | retry | reset, version?, credentials?}
+    GET  /api/migration/runs             every run of the project, newest first
+    GET  /api/migration/runs/{id}        one run as its record has it
+    GET  /api/migration/runs/{id}/events its events in order (``after``, ``limit``)
+    GET  /api/migration/plans/{id}       one recorded plan version
+    GET  /api/migration/policy           the run and object statuses, their moves, the sign-off rule
 
 A run needs a finished discovery (the Session) and a connected Fabric target
 (FabricTarget), signed in with either the Azure CLI or the Fabric CLI, whose
 workspace is on a Fabric capacity. It runs on one background thread; the page
 polls ``GET /api/migration/run``. Only one run at a time.
+
+Every run is recorded in the project's store (``state.runs``): its status changes and every change to an object,
+as they happen. A restart, or a switch of project and back, brings the current run back; one the process stopped
+under is paused as interrupted, and Resume carries it on where it was, checking Fabric first for anything it was
+in the middle of making. Reset closes a run and keeps its record, as the run history.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
 from datetime import datetime, timezone
@@ -20,6 +32,10 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from discovery_agent.api.fabric import FabricError, FabricTarget
 from discovery_agent.api.service import ApiError, Session
 from discovery_agent.diagnostics import record_unexpected, redacted, unexpected_message
+from discovery_agent.state import approvals, context
+from discovery_agent.state.runs import RunRecorder
+from discovery_agent.state.store import Store
+from discovery_agent.migration import failures, run_state
 from discovery_agent.migration import planner as planning
 from discovery_agent.migration.fabric_rest import NO_CAPACITY, FabricApiError, FabricRestClient
 from discovery_agent.migration.preflight import code_text as preflight_code_text
@@ -37,9 +53,11 @@ from discovery_agent.migration.runner import (
     DEFERRED,
     ENVIRONMENT,
     FUNCTION,
+    IN_PROGRESS,
     MIGRATABLE,
     MISSING,
     NOTEBOOK,
+    PENDING,
     PIPELINE,
     POOL,
     PROCEDURE,
@@ -63,6 +81,8 @@ from discovery_agent.sql.auth import AccessTokenAuthentication
 from discovery_agent.sql.config import SqlConnectionConfig
 from discovery_agent.sql.connection import PyodbcConnector
 from discovery_agent.sql.models import SqlTable
+
+_log = logging.getLogger("discovery_agent.migration")
 
 MAX_ITEMS = 10000
 #: Runner kinds that this build creates in Fabric (everything else is deferred).
@@ -501,6 +521,52 @@ def filterable_tables(job: Any) -> List[dict]:
     return out
 
 
+#: For each kind, the kinds it needs to exist in Fabric before it can be made. One of those failing in this pass
+#: blocks it (a view on a table, a pipeline on the notebooks it runs); kinds that only need them at run time
+#: (a notebook reading a table, a procedure, with SQL's deferred name resolution) are never held up.
+_BLOCKING_NEEDS = {VIEW: {TABLE, VIEW, FUNCTION}, FUNCTION: {TABLE, VIEW, FUNCTION},
+                   PIPELINE: {NOTEBOOK, PIPELINE, SPARKJOB, CONNECTION}, SCHEDULE: {PIPELINE}}
+_RUN_ID = re.compile(r"^[0-9]{3,9}$")
+_PLAN_ID = re.compile(r"^P[0-9]{3,9}$")
+
+
+def run_needs(sources: List[Source], job: Any) -> Dict[str, List[str]]:
+    """What each object of a run needs from the same run before it can be made: from the dependency graph,
+    where making it needs the other in Fabric; and each table's data load needs its table."""
+    kinds = {s.id: s.kind for s in sources}
+    needs: Dict[str, List[str]] = {}
+    for edge in (getattr(job, "graph", None) or {}).get("edges", []):
+        source, target = str(edge.get("source")), str(edge.get("target"))
+        if source in kinds and target in kinds and kinds[target] in _BLOCKING_NEEDS.get(kinds[source], ()):
+            needs.setdefault(source, []).append(target)
+    for s in sources:
+        if s.kind == DATA and s.id.endswith("#data") and s.id[:-5] in kinds:
+            needs.setdefault(s.id, []).append(s.id[:-5])
+    return needs
+
+
+def _no_audit(*args: Any, **kwargs: Any) -> None:
+    return None
+
+
+def _event_line(event: Dict[str, Any]) -> str:
+    """A log event as the run's log shows it (``MigrationRun.log``)."""
+    return f"{event.get('at')}  {str(event.get('level') or ''):<10}{event.get('object')}: {event.get('message')}"
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _int(value: Any, default: int, name: str) -> int:
+    if value in (None, ""):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ApiError(400, "invalid_request", f"{name} must be a whole number.") from None
+
+
 class MigrationService:
     def __init__(
         self,
@@ -511,6 +577,8 @@ class MigrationService:
         source_factory: Optional[Callable[[], Any]] = None,
         transforms: Any = None,
         driver: Optional[Callable[[], str]] = None,
+        records: Optional[Store] = None,
+        audit: Optional[Callable[..., Any]] = None,
     ) -> None:
         self._session = session
         self._source_factory = source_factory
@@ -523,7 +591,10 @@ class MigrationService:
         self._fabric = fabric
         self._lock = threading.Lock()
         self._run: Optional[MigrationRun] = None
+        #: The current pass's thread, and every pass thread not yet finished (one may still be tidying up a run
+        #: that a new run or a Reset has already closed).
         self._thread: Optional[threading.Thread] = None
+        self._threads: List[threading.Thread] = []
         self._counter = 0
         self._history: List[dict] = []
         #: The background validation: its state, progress and, once finished, its rows.
@@ -534,12 +605,161 @@ class MigrationService:
         self._git_thread: Optional[threading.Thread] = None
         self._rest_factory = rest_factory or fabric.rest_client
         self._sql_factory = sql_factory or self._open_sql
+        #: The project's durable record (``state.store.Store``): its runs, plan versions, validation and commits.
+        #: None: everything is kept in memory only (the tests that build the service on its own).
+        self._records = records
+        self._runs = RunRecorder(records) if records is not None else None
+        #: Records what people and the accelerator do (``state.audit``); never raises.
+        self._audit = audit or _no_audit
+        #: Changes with every switch of project: a request that read the project before one is refused, never written
+        #: into the next project.
+        self._generation = 0
+        self._load_project()
 
     def _open_sql(self, host: str, database: str) -> Any:
         """A writable session on a Fabric Warehouse, signed in for the Fabric Target's tenant."""
         config = SqlConnectionConfig(server=host, database=database, application_name="synapse-fabric-migration")
         auth = AccessTokenAuthentication(token_provider=self._fabric.sql_token_provider())
         return PyodbcConnector(config, auth, readonly=False).connect()
+
+    # -- the project's record ---------------------------------------------------------------------------
+
+    def _load_project(self) -> None:
+        """What the project keeps comes back: plan versions, the last validation and commit, and the current run,
+        which is recovered if the process stopped while it was working."""
+        if self._records is None:
+            return
+        recent = self._records.records("plans", newest_first=True, limit=MAX_HISTORY)
+        self._history = [{**p, "id": f"P{p['seq']:03d}"} for p in reversed(recent)]
+        validation = self._records.get("validation") or {"state": "idle"}
+        if validation.get("state") == "running":
+            validation = {"state": "failed", "startedAt": validation.get("startedAt"), "error": {
+                "code": "interrupted", "message": "The validation was cut short when the accelerator stopped. Run it again."}}
+            self._put("validation", validation)
+        self._validation = validation
+        self._last_commit = self._records.get("git")
+        pointer = self._runs.pointer()
+        # After the highest run recorded, whatever the pointer says: a run's record is never written over.
+        self._counter = max(pointer["counter"], self._runs.highest())
+        if not pointer["current"]:
+            return
+        loaded = self._runs.load(pointer["current"])
+        if loaded is None:
+            return
+        run = self._restore_run(loaded)
+        self._run = run
+        if run.status in run_state.WORKING:
+            self._recover(run)
+        elif run.status not in run_state.TERMINAL:
+            # Waiting for sign-off, paused, or finished with failures: whatever carries it on needs the credentials
+            # it was given again, since they are never kept.
+            with run.lock:
+                run.needs_input = self._needed_credentials(run)
+            run.save()
+
+    def _restore_run(self, loaded: Dict[str, Any]) -> MigrationRun:
+        """A recorded run, rebuilt from the project's discovery when that is still the one the run was made from."""
+        document, items = loaded["run"], loaded["items"]
+        pins = document.get("pins") or {}
+        try:
+            job, pool = self._session.migration_snapshot()
+        except ApiError:
+            job, pool = None, None
+        made_from = (pins.get("snapshot") or {}).get("fingerprint")
+        now_from = (getattr(job, "snapshot", None) or {}).get("fingerprint") if job is not None else None
+        same = job is not None and (made_from is None or made_from == now_from)
+        sources = None
+        if same:
+            options = {"stages": document.get("stages") or list(capabilities.STAGE_KEYS), "scope": document.get("scope") or "all",
+                       "dataFilters": parse_data_filters(pins.get("dataFilters"))}
+            sources = apply_stages(sources_for(pins.get("plan") or [], job, pool), options)
+            if self._transforms is not None:
+                self._transforms.apply(sources)
+        run = MigrationRun.restore(document, items, sources, self._runs)
+        if job is not None and not same:
+            run.resumable = False
+            run.unresumable_reason = ("Discovery has been run again since this run was made, so it cannot carry on from where it "
+                                      "stopped. Its record is kept; start a new run from the new discovery.")
+        run.logs = [_event_line(e) for e in self._runs.events(run.run_id) if e.get("type") == "log"][-2000:]
+        return run
+
+    def _recover(self, run: MigrationRun) -> None:
+        """The process stopped while this run was working. Put it on hold, honestly, so Resume carries on safely."""
+        with context.bound(actor=context.system(), run=run.run_id):
+            needed = self._needed_credentials(run)
+            with run.lock:
+                run.needs_input = needed
+            names = run.interrupt()
+            run.log("RECOVERED", "run", "The accelerator stopped while this run was working. It is paused; Resume carries on "
+                    "from where it stopped" + (f" (it was working on {', '.join(names[:5])})" if names else "") + "."
+                    + (f" Enter the credentials for {', '.join(needed)} first: they are never kept." if needed else ""))
+            self._audit("run.interrupted", target={"type": "run", "id": run.run_id}, run_id=run.run_id,
+                        details={"working": names, "needsInput": needed})
+
+    def _needed_credentials(self, run: MigrationRun) -> List[str]:
+        """The connections whose credentials the run was given, still needs for what is left, and does not have."""
+        given = set(run.pins.get("credentialNames") or [])
+        if not given:
+            return []
+        waiting = [i.source for i in run.items if i.status in (PENDING, IN_PROGRESS, run_state.ITEM_FAILED, run_state.BLOCKED)]
+        needed = {s.name for s in waiting if s.kind == CONNECTION} & given
+        if any(s.kind == DATA for s in waiting) and run.source_connection_name in given:
+            needed.add(run.source_connection_name)
+        return sorted(n for n in needed if n not in self._credentials)
+
+    def _save_pointer(self, current: Optional[str]) -> None:
+        if self._runs is not None:
+            try:
+                self._runs.set_pointer(current, self._counter)
+            except OSError as exc:
+                _log.warning("Could not save which run is current: %s", exc)
+
+    def _put(self, name: str, value: Any) -> None:
+        if self._records is not None:
+            try:
+                self._records.put(name, value)
+            except OSError as exc:
+                _log.warning("Could not save %s: %s", name, exc)
+
+    def _busy_reason(self) -> Optional[str]:
+        """Why the project cannot be switched now, or None. Call with ``_lock`` held."""
+        if self._busy():
+            return "A migration run is working; pause it or wait for it to finish."
+        if any(t.is_alive() for t in self._threads):
+            return "A migration run is finishing; try again in a moment."
+        if self._validation_thread is not None and self._validation_thread.is_alive():
+            return "Validation is running; wait for it to finish."
+        if self._git_thread is not None and self._git_thread.is_alive():
+            return "A Fabric Git commit is running; wait for it to finish."
+        return None
+
+    def busy_reason(self) -> Optional[str]:
+        """Why the project cannot be switched now, or None."""
+        with self._lock:
+            return self._busy_reason()
+
+    def switch(self, records: Optional[Store]) -> None:
+        """Hold another project's runs, plan versions, validation and commits instead.
+
+        The check, the swap and the load happen under one hold of the lock, so nothing (a Start from another page)
+        can land in between: it waits, then finds the new project, or is refused as made for the old one."""
+        with self._lock:
+            reason = self._busy_reason()
+            if reason:
+                raise ApiError(409, "migration_busy", reason)
+            self._generation += 1
+            self._records = records
+            self._runs = RunRecorder(records) if records is not None else None
+            self._run, self._thread, self._threads, self._credentials = None, None, [], {}
+            self._history, self._validation, self._last_commit, self._counter = [], {"state": "idle"}, None, 0
+            self._load_project()  # takes no lock of this service's
+
+    def _same_project(self, generation: int) -> None:
+        """Refuse to write what was read from a project the service no longer holds. Call with ``_lock`` held."""
+        if generation != self._generation:
+            raise ApiError(409, "project_switched", "The project was switched while this was being prepared. Try again.")
+
+    # -- capacity and blocking risks ----------------------------------------------------------------
 
     def _check_capacity(self, workspace_id: str) -> None:
         """Refuse up front when the workspace cannot hold Fabric items at all."""
@@ -551,8 +771,9 @@ class MigrationService:
             raise ApiError(409, "no_fabric_capacity", NO_CAPACITY + ".")
 
     def _refuse_blocking(self, plan: List[dict], options: dict, credentials: Dict[str, Dict[str, str]], job: Any,
-                         pool: Optional[str]) -> None:
-        """Refuse a run the planner finds a blocking risk in: one that would fail or do the wrong thing.
+                         pool: Optional[str]) -> dict:
+        """Refuse a run the planner finds a blocking risk in: one that would fail or do the wrong thing. Returns the
+        planner's analysis, so the run can say what it was started from.
 
         The Plan step holds Start back for the same reason; this is the same rule where no page can skip it,
         worked out again on what this run is given, so a plan scored earlier cannot slip one through."""
@@ -563,12 +784,19 @@ class MigrationService:
             more = f" There {'is' if len(blocking) == 4 else 'are'} {len(blocking) - 3} more in Plan." if len(blocking) > 3 else ""
             raise ApiError(409, "plan_blocked", f"The run was not started: the plan has {len(blocking)} blocking "
                            f"risk{'s' if len(blocking) != 1 else ''}. {shown}{more} Resolve them in Plan, then start the run.")
+        return result
 
     # -- routes ------------------------------------------------------------
 
     def state(self) -> dict:
         run = self._run
         return run.to_dict() if run is not None else dict(IDLE)
+
+    @staticmethod
+    def policy() -> dict:
+        """How runs and their objects move, and the sign-off rule in force: what the page reads instead of a copy."""
+        return {**run_state.describe(), "signoff": approvals.policy(), "signoffPolicies": list(approvals.POLICIES),
+                "failureCategories": {c: failures.MEANING[c] for c in failures.CATEGORIES}}
 
     def _assessment(self, plan: List[dict], options: dict, credential_names: Set[str], job: Any,
                     pool: Optional[str]) -> Tuple[dict, List[Source]]:
@@ -590,7 +818,8 @@ class MigrationService:
         return planning.analyze(objects, content_findings(sources, names, pool or "", options["storageRoutes"]), checks), sources
 
     def analyze(self, body: dict) -> dict:
-        """The planner's strategy, risks, effort and checks for a plan. Reads, never writes."""
+        """The planner's strategy, risks, effort and checks for a plan. Reads, never writes (but for the plan
+        version it records with ``record``)."""
         plan = body.get("items")
         if not isinstance(plan, list) or not all(isinstance(p, dict) for p in plan) or len(plan) > MAX_ITEMS:
             raise ApiError(400, "invalid_plan", "The migration plan is not in a valid format.")
@@ -600,23 +829,56 @@ class MigrationService:
                            "names of the linked services that have them (credentialNames).")
         options = parse_options(body)
         names = parse_credential_names(body.get("credentialNames"))
+        generation = self._generation
         job, pool = self._session.migration_snapshot()
         result, sources = self._assessment(plan, options, names, job, pool)
         result["storage"] = self._storage_suggestions(sources, job)
         result["options"] = {**options, "dataFilters": {k: f.to_dict() for k, f in options["dataFilters"].items()}}
         if body.get("record"):
-            with self._lock:
-                entry = {
-                    "id": f"P{len(self._history) + 1:03d}", "plannerVersion": result["plannerVersion"],
-                    "fingerprint": result["fingerprint"], "objects": result["objects"],
-                    "effortDays": result["effortDays"], "waves": len(result["waves"]),
-                    "readiness": result["readiness"], "blocking": result["blocking"],
-                    "createdAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "status": "COMPLETED",
-                }
-                self._history = (self._history + [entry])[-MAX_HISTORY:]
+            self._record_plan(plan, result, job, generation)
         with self._lock:
-            result["history"] = list(reversed(self._history))
+            result["history"] = [{k: v for k, v in h.items() if k not in ("items", "options", "seq")} for h in reversed(self._history)]
         return result
+
+    def _record_plan(self, plan: List[dict], result: dict, job: Any, generation: int) -> None:
+        """Keep this plan as the project's next plan version: what was planned, from which discovery, by whom."""
+        snapshot = getattr(job, "snapshot", None) or {}
+        entry = {
+            "plannerVersion": result["plannerVersion"], "fingerprint": result["fingerprint"], "objects": result["objects"],
+            "effortDays": result["effortDays"], "waves": len(result["waves"]), "readiness": result["readiness"],
+            "blocking": result["blocking"], "createdAt": _now(), "status": "COMPLETED", "snapshot": snapshot.get("id"),
+            "by": context.actor().to_dict(),
+            # The plan itself, so a version can be read back: its objects and waves, and the options (never credentials).
+            "items": [{"id": str(p.get("id") or ""), "wave": _int(p.get("wave"), 1, "wave")} for p in plan],
+            "options": dict(result["options"]),
+        }
+        with self._lock:
+            self._same_project(generation)
+            if self._records is not None:
+                try:
+                    recorded = self._records.append("plans", entry)
+                    entry = {**recorded, "id": f"P{recorded['seq']:03d}"}
+                except OSError as exc:
+                    _log.warning("Could not record the plan version: %s", exc)
+            entry.setdefault("id", f"P{len(self._history) + 1:03d}")
+            self._history = (self._history + [entry])[-MAX_HISTORY:]
+        self._audit("plan.recorded", target={"type": "plan", "id": entry["id"]}, details={
+            "fingerprint": entry["fingerprint"], "objects": entry["objects"], "readiness": entry["readiness"],
+            "blocking": entry["blocking"], "snapshot": entry.get("snapshot")})
+
+    def plan_version(self, version_id: str) -> dict:
+        """One recorded plan version, with its objects and options."""
+        if not _PLAN_ID.match(version_id or ""):
+            raise ApiError(404, "not_found", "There is no such plan version.")
+        found = next((dict(h) for h in self._history if h.get("id") == version_id), None)
+        if found is None and self._records is not None:
+            seq = int(version_id[1:])
+            found = next(({**r, "id": version_id} for r in self._records.records("plans", after=seq - 1, limit=1)
+                          if r["seq"] == seq), None)
+        if found is None:
+            raise ApiError(404, "not_found", "There is no such plan version.")
+        found.pop("seq", None)
+        return found
 
     def _fabric_connections(self) -> List[Dict[str, Any]]:
         """Fabric connections the signed-in user can see; empty when the target is not connected or cannot be read."""
@@ -653,7 +915,17 @@ class MigrationService:
                 candidates.append({"id": None, "name": f"{name} (created by the Connections stage)", "path": url, "linkedService": name})
         return storage_remap.suggest(found, candidates)
 
+    # -- a run's life -------------------------------------------------------------------------------
+
     def start(self, body: dict) -> dict:
+        try:
+            return self._start(body)
+        except (ApiError, FabricError) as exc:
+            self._audit("run.refused", target={"type": "run", "id": None}, outcome="refused", code=exc.code,
+                        details={"message": exc.message})
+            raise
+
+    def _start(self, body: dict) -> dict:
         plan = body.get("items")
         if not isinstance(plan, list) or not plan:
             raise ApiError(400, "empty_plan", "The migration plan is empty.")
@@ -661,22 +933,27 @@ class MigrationService:
             raise ApiError(400, "invalid_plan", "The migration plan is not in a valid format.")
         options = parse_options(body)
         credentials = parse_credentials(body.pop("credentials", None))
+        # Everything that can refuse the request is checked before anything changes: a refused Start never touches
+        # the current run.
+        entries = [{"id": str(p.get("id") or ""), "wave": _int(p.get("wave"), 1, "wave")} for p in plan]
         scope, stop_on_failure = options["scope"], options["stopOnFailure"]
+        generation = self._generation
         job, pool = self._session.migration_snapshot()
         workspace_id, workspace_name, method = self._fabric.migration_target()
         if self._busy():
             raise ApiError(409, "run_in_progress", "A migration run is already in progress. Pause it or wait for it to finish.")
         self._check_capacity(workspace_id)
-        self._refuse_blocking(plan, options, credentials, job, pool)
+        analysis = self._refuse_blocking(plan, options, credentials, job, pool)
         with self._lock:
+            self._same_project(generation)
             if self._busy():
                 raise ApiError(409, "run_in_progress", "A migration run is already in progress. Pause it or wait for it to finish.")
-            self._counter += 1
             sources = apply_stages(sources_for(plan, job, pool), options)
             if not [s for s in sources if s.kind not in (DEFERRED, MISSING)]:
                 raise ApiError(400, "nothing_to_migrate", "No object in the plan can be created by this build. Choose scope All to see them listed as deferred.")
             transform_log = self._transforms.apply(sources) if self._transforms is not None else []
-            run = MigrationRun(f"{self._counter:03d}", sources, workspace_id, workspace_name, warehouse_name_for(pool))
+            run = MigrationRun(f"{self._counter + 1:03d}", sources, workspace_id, workspace_name, warehouse_name_for(pool),
+                               recorder=self._runs, needs=run_needs(sources, job))
             via = "Azure CLI" if method == "azure_cli" else "Fabric CLI"
             run.scope, run.stop_on_failure = scope, stop_on_failure
             run.stages, run.pool_name = list(options["stages"]), pool or ""
@@ -684,16 +961,93 @@ class MigrationService:
                             "existing": options["existing"], "storageRoutes": options["storageRoutes"],
                             "syncOverlap": options["syncOverlap"], "gitCommit": options["gitCommit"]}
             self._describe_source(run, job, pool)
+            snapshot = getattr(job, "snapshot", None) or {}
+            # What the run was made from, so its record can say, and a later reader can check, exactly that.
+            run.pins = {"plan": entries, "plannerFingerprint": analysis.get("fingerprint"), "readiness": analysis.get("readiness"),
+                        "snapshot": {"id": snapshot.get("id"), "fingerprint": snapshot.get("fingerprint")} if snapshot else None,
+                        "credentialNames": sorted(credentials), "signedInWith": via,
+                        "dataFilters": {k: f.to_dict() for k, f in options["dataFilters"].items()}}
+            reason = approvals.required(run.settings, run.stages)
+            run.approval = approvals.request(reason, approvals.subject_hash(entries, run.settings, run.stages))
+            # Nothing is left to refuse: the new run replaces the current one, which is closed and kept in the history.
+            if self._run is not None:
+                self._close_run(self._run, "replaced by a new run")
+            self._counter += 1
             if credentials:
                 self._credentials = credentials
+            self._run = run
+            run.save()
+            self._save_pointer(run.run_id)
             run.log("RUN", "run", f"{len(sources)} objects, workspace {workspace_name}, warehouse {run.warehouse}, signed in with {via}")
             reviewed = sum(1 for s in sources if s.override)
             if reviewed:
                 run.log("NOTE", "run", f"{reviewed} object{'s' if reviewed != 1 else ''} use{'s' if reviewed == 1 else ''} an accepted LLM-assisted transform")
             for line in transform_log:
                 run.log("NOTE", "run", line)
-            self._run = run
-            self._spawn(run)
+            self._audit("run.requested", target={"type": "run", "id": run.run_id}, run_id=run.run_id, details={
+                "objects": len(sources), "stages": list(run.stages), "existing": options["existing"],
+                "dataMode": options["dataMode"], "dataRun": options["dataRun"], "credentialNames": sorted(credentials),
+                "workspace": workspace_name, "warehouse": run.warehouse, "plannerFingerprint": analysis.get("fingerprint"),
+                "snapshot": (run.pins.get("snapshot") or {}).get("id")})
+            if reason:
+                run.transition(run_state.AWAITING_APPROVAL, reason)
+                run.log("SIGN-OFF", "run", f"Waiting for a person to sign it off. {reason}")
+                self._audit("run.signoff_requested", target={"type": "run", "id": run.run_id}, run_id=run.run_id,
+                            details={"reason": reason, "policy": run.approval["policy"]})
+                return run.to_dict()
+            self._audit("run.approved", target={"type": "run", "id": run.run_id}, run_id=run.run_id, actor=context.system(),
+                        details={"automatic": True, "policy": run.approval["policy"]})
+            self._spawn(run, "start")
+            return run.to_dict()
+
+    def approve(self, body: dict) -> dict:
+        """A person signs a waiting run off (``decision: approve``), and it starts; or declines it (``reject``)."""
+        decision = str(body.get("decision") or "")
+        if decision not in ("approve", "reject"):
+            raise ApiError(400, "invalid_request", "Choose approve or reject.")
+        with self._lock:
+            run = self._run
+            if run is None or (body.get("runId") and str(body.get("runId")) != run.run_id):
+                raise ApiError(409, "no_run", "There is no such run waiting for sign-off.")
+            if run.status != run_state.AWAITING_APPROVAL:
+                raise ApiError(409, "not_waiting", "This run is not waiting for sign-off.")
+            asked = run.approval or {}
+            digest = approvals.subject_hash(run.pins.get("plan") or [], run.settings, run.stages)
+            if digest != asked.get("subjectHash") or (body.get("subjectHash") and body.get("subjectHash") != digest):
+                raise ApiError(409, "stale", "What is signed off is not what this run would do. Read the run again.")
+            if decision == "approve":
+                if not run.resumable:
+                    raise ApiError(409, "not_resumable", run.unresumable_reason
+                                   or "This run cannot run any more. Decline it, or close it with Reset.")
+                self._take_credentials(run, body)
+            try:
+                record = approvals.decide(asked, decision == "approve", str(body.get("comment") or ""))
+            except PermissionError as exc:
+                raise ApiError(403, "person_only", str(exc)) from exc
+            with run.lock:
+                run.approval = record
+            if self._records is not None:
+                try:
+                    self._records.append("approvals", {"subject": {"type": "run", "id": run.run_id, "hash": digest},
+                                                       "decision": record["decision"], "by": record["by"], "at": record["at"],
+                                                       "comment": record["comment"]})
+                except OSError as exc:
+                    _log.warning("Could not record the sign-off: %s", exc)
+            said = f": {record['comment']}" if record["comment"] else ""
+            details = {"comment": record["comment"], "subjectHash": digest}
+            if decision == "reject":
+                run.transition(run_state.REJECTED, "declined at sign-off")
+                run.log("REJECTED", "run", f"Declined at sign-off by {record['by']['id']}{said}")
+                self._audit("run.rejected", target={"type": "run", "id": run.run_id}, run_id=run.run_id,
+                            reason=record["comment"], details=details)
+                return run.to_dict()
+            with run.lock:
+                run.needs_input = []
+            run.transition(run_state.QUEUED, "signed off")
+            run.log("APPROVED", "run", f"Signed off by {record['by']['id']}{said}")
+            self._audit("run.approved", target={"type": "run", "id": run.run_id}, run_id=run.run_id,
+                        reason=record["comment"], details={**details, "automatic": False})
+            self._spawn(run, "start")
             return run.to_dict()
 
     def control(self, body: dict) -> dict:
@@ -704,47 +1058,150 @@ class MigrationService:
             run = self._run
             if run is None:
                 raise ApiError(409, "no_run", "There is no migration run.")
+            expected = body.get("version")
+            if expected is not None and _int(expected, -1, "version") != run.version:
+                raise ApiError(409, "stale", "The run changed since this page read it. Read it again, then try once more.")
+            self._settle(run)
             if action == "pause":
-                if run.state == "running":
+                if run.status in run_state.WORKING:
                     run.pause.set()
                     run.log("PAUSE", "run", "pause requested; stopping after the current object")
+                    self._audit("run.pause_requested", target={"type": "run", "id": run.run_id}, run_id=run.run_id)
             elif action == "resume":
-                if run.state == "paused" and not self._busy():
+                if run.status == run_state.PAUSED and not self._busy():
+                    self._ready_to_carry_on(run, body)
                     run.pause.clear()
-                    run.halt_waived, run.halted_reason = True, None
                     with run.lock:
-                        run.state = "running"
+                        run.halt_waived, run.halted_reason, run.needs_input = True, None, []
+                    run.transition(run_state.QUEUED, "resume requested")
                     run.log("RESUME", "run", "resumed")
-                    self._spawn(run)
+                    self._audit("run.resumed", target={"type": "run", "id": run.run_id}, run_id=run.run_id)
+                    self._spawn(run, "resume")
             elif action == "retry":
                 if self._busy():
                     raise ApiError(409, "run_in_progress", "Wait for the run to finish or pause it before retrying.")
-                with run.lock:
-                    failed = [i for i in run.items if i.status == "FAILED"]
-                    for item in failed:
-                        item.status, item.step, item.error, item.started_at, item.completed_at = "PENDING", "Waiting", None, None, None
-                    run.state = "running"
+                if run.status == run_state.AWAITING_APPROVAL:
+                    raise ApiError(409, "not_signed_off", "This run is waiting for sign-off; sign it off before it runs.")
+                if run.status in run_state.TERMINAL:
+                    return run.to_dict()  # a completed, cancelled or declined run is done: nothing carries it on
+                self._ready_to_carry_on(run, body)
+                again = [i for i in run.items if i.status in run_state.NEEDS_ATTENTION]
+                for item in again:
+                    run.update(item, status=PENDING, step="Waiting", error=None, started_at=None, completed_at=None, category=None)
                 run.pause.clear()
-                run.halt_waived, run.halted_reason = False, None
-                run.log("RETRY", "run", f"retrying {len(failed)} failed objects")
-                self._spawn(run)
+                with run.lock:
+                    run.halt_waived, run.halted_reason, run.needs_input = False, None, []
+                run.transition(run_state.QUEUED, "retry requested")
+                run.log("RETRY", "run", f"retrying {len(again)} failed objects")
+                self._audit("run.retried", target={"type": "run", "id": run.run_id}, run_id=run.run_id,
+                            details={"objects": len(again)})
+                self._spawn(run, "retry")
             else:
                 raise ApiError(400, "invalid_action", "Choose pause, resume, retry or reset.")
             return run.to_dict()
 
+    def _settle(self, run: MigrationRun) -> None:
+        """A run whose pass has no thread left is never shown as working: what it was doing goes back in the queue."""
+        if run.status in run_state.WORKING and not (self._thread is not None and self._thread.is_alive()):
+            run.abort("Its pass ended without finishing.")
+
+    def _take_credentials(self, run: MigrationRun, body: dict) -> None:
+        """Credentials sent with a request that carries a run on, taken for the run's life, in memory only; and a
+        refusal while any it needs are missing (they were lost with a restart: they are never kept)."""
+        given = parse_credentials(body.get("credentials"))
+        if given:
+            self._credentials.update(given)
+        missing = [n for n in run.needs_input if n not in self._credentials]
+        if missing:
+            raise ApiError(409, "needs_input", f"Enter the credentials for {', '.join(missing)} in Plan, Stages & credentials, "
+                           "then carry on. They are never kept, so a restart of the accelerator loses them.")
+
+    def _ready_to_carry_on(self, run: MigrationRun, body: dict) -> None:
+        """Refuse to carry a run on that cannot: the discovery it was made from is gone, or it needs credentials."""
+        if not run.resumable:
+            raise ApiError(409, "not_resumable", run.unresumable_reason or "This run cannot carry on.")
+        self._take_credentials(run, body)
+
+    def _close_run(self, run: MigrationRun, reason: str) -> None:
+        """The run stops being the project's current one. One that was not done is cancelled; its record stays."""
+        run.pause.set()  # a closed run can never be resumed
+        self._settle(run)
+        if run.status not in run_state.TERMINAL:
+            run.transition(run_state.CANCELLED, reason)
+        with run.lock:
+            run.closed_at = _now()
+        run.save()
+        run.log("CLOSED", "run", f"{reason}; its record is kept in the run history")
+        self._audit("run.closed", target={"type": "run", "id": run.run_id}, run_id=run.run_id,
+                    reason=reason, details={"status": run.status})
+
     def reset(self) -> dict:
-        """Forget the run's record, and the credentials it was given, so the next
-        run starts fresh. Objects already created in Fabric stay there: a new
-        run skips what exists, it never deletes or overwrites."""
+        """Close the current run: it stops being the one Migrate shows, and its record stays in the run history.
+        The credentials it was given are forgotten. Objects already created in Fabric stay there: a new run skips
+        what exists, it never deletes or overwrites."""
         with self._lock:
             if self._busy():
                 raise ApiError(409, "run_in_progress",
                                "The run is still working. Pause it, wait for the current object to finish, then reset.")
             if self._run is not None:
-                self._run.pause.set()  # a forgotten run can never be resumed
+                self._close_run(self._run, "closed by Reset")
             self._run = None
             self._credentials = {}
+            self._save_pointer(None)
         return dict(IDLE)
+
+    # -- the run history ------------------------------------------------------------------------------
+
+    def runs(self) -> dict:
+        """Every run of the project, newest first, and which is current."""
+        current = self._run
+        listed = self._runs.runs() if self._runs is not None else []
+        if current is not None:
+            mine = self._summary(current)
+            listed = [mine if r.get("runId") == current.run_id else r for r in listed]
+            if not any(r.get("runId") == current.run_id for r in listed):
+                listed.insert(0, mine)
+        return {"runs": listed, "current": current.run_id if current is not None else None}
+
+    @staticmethod
+    def _summary(run: MigrationRun) -> dict:
+        document = run.document()
+        summary = {k: document.get(k) for k in ("runId", "status", "pausedReason", "createdAt", "startedAt", "finishedAt",
+                                                "closedAt", "workspace", "warehouse", "requestedBy", "counts", "approval")}
+        return {**summary, "passes": len(run.passes)}
+
+    def run_record(self, run_id: str) -> dict:
+        """One run as its record has it: the current one live, any other as it was left."""
+        run = self._run
+        if run is not None and run.run_id == run_id:
+            return run.to_dict()
+        loaded = self._runs.load(run_id) if self._runs is not None and _RUN_ID.match(run_id or "") else None
+        if loaded is None:
+            raise ApiError(404, "not_found", "There is no such run.")
+        shell = MigrationRun.restore(loaded["run"], loaded["items"], None, None)
+        shell.logs = [_event_line(e) for e in self._runs.events(run_id) if e.get("type") == "log"][-2000:]
+        shell.unresumable_reason = "This run is not the current one; its record is kept as history."
+        return shell.to_dict()
+
+    def run_events(self, run_id: str, after: Any = None, limit: Any = None) -> dict:
+        """A run's events in order, after ``after``: every log line, change of status and change to an object."""
+        if self._runs is None or not _RUN_ID.match(run_id or "") or self._runs.store.get(f"runs/{run_id}/run") is None:
+            raise ApiError(404, "not_found", "There is no such run.")
+        start = max(0, _int(after, 0, "after"))
+        events = self._runs.events(run_id, after=start, limit=max(1, min(_int(limit, 500, "limit"), 2000)))
+        return {"runId": run_id, "events": events, "last": events[-1]["seq"] if events else start}
+
+    def artifact(self, run_id: str, digest: str) -> Tuple[bytes, str, str]:
+        """What a run sent to Fabric for one of its objects, as it was kept: a definition (JSON) or a statement (SQL).
+        Only what the run's own record names can be read. Returns (bytes, media type, file name)."""
+        record = self.run_record(run_id)
+        part = next((p for i in record.get("items") or [] for p in ((i.get("artifact") or {}).get("parts") or [])
+                     if p.get("hash") == digest), None)
+        data = self._records.blob(digest) if part is not None and self._records is not None else None
+        if data is None:
+            raise ApiError(404, "not_found", "This run kept nothing under that name.")
+        sql = part.get("kind") == "sql"
+        return data, "text/plain; charset=utf-8" if sql else "application/json", f"run-{run_id}-{digest[:12]}.{'sql' if sql else 'json'}"
 
     # -- internals ---------------------------------------------------------
 
@@ -753,7 +1210,7 @@ class MigrationService:
         tidies up (closing sessions, handing the commit to its own thread), so the run is free."""
         if self._thread is None or not self._thread.is_alive():
             return False
-        return self._run is None or self._run.state == "running"
+        return self._run is not None and self._run.status in run_state.WORKING
 
     def start_validation(self, body: dict) -> dict:
         """Validate in the background, so runs in Fabric can be followed for as long as they take. Poll ``validation_state``."""
@@ -762,28 +1219,40 @@ class MigrationService:
         with self._lock:
             if self._validation_thread is not None and self._validation_thread.is_alive():
                 raise ApiError(409, "validation_running", "Validation is already running; wait for it to finish.")
-            started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            started = _now()
             self._validation = {"state": "running", "progress": "Starting", "startedAt": started}
+            self._put("validation", self._validation)
+            runtime = body.get("runtime") if isinstance(body.get("runtime"), dict) else {}
+            self._audit("validation.started", target={"type": "validation", "id": started}, details={
+                "probe": bool(runtime.get("probe", True)) if runtime else False,
+                "run": [str(k) for k in runtime.get("run") or []] if isinstance(runtime.get("run"), list) else [],
+                "objects": len(body["items"]) if isinstance(body.get("items"), list) else None})
 
             def work() -> None:
                 def progress(text: str) -> None:
                     self._validation = {**self._validation, "progress": text}
                 try:
                     out = self.validate(body, progress=progress)
-                    self._validation = {"state": "completed", "startedAt": started,
-                                        "finishedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), **out}
+                    self._validation = {"state": "completed", "startedAt": started, "finishedAt": _now(), **out}
+                    self._audit("validation.completed", target={"type": "validation", "id": started}, actor=context.system(),
+                                details={"summary": out.get("summary")})
                 except ApiError as exc:
                     self._validation = {"state": "failed", "startedAt": started, "error": {"code": exc.code, "message": exc.message}}
+                    self._audit("validation.completed", target={"type": "validation", "id": started}, actor=context.system(),
+                                outcome="failed", code=exc.code, details={"message": exc.message})
                 except Exception as exc:  # noqa: BLE001 - reported, never raised into the thread; the API's log gets the traceback
                     reference = record_unexpected("validation", exc)
                     self._validation = {"state": "failed", "startedAt": started, "error": {
                         "code": "validation_failed", "reference": reference,
                         "message": f"Validation stopped: {type(exc).__name__}: {redacted(str(exc)[:300])} (reference {reference}). "
                                    "The details are in the API's log."}}
+                    self._audit("validation.completed", target={"type": "validation", "id": started}, actor=context.system(),
+                                outcome="failed", code="validation_failed", details={"message": self._validation["error"]["message"]})
+                finally:
+                    self._put("validation", self._validation)
 
             snapshot = dict(self._validation)  # before the thread starts: a quick validation may finish first
-            self._validation_thread = threading.Thread(target=work, name="validation", daemon=True)
-            self._validation_thread.start()
+            self._validation_thread = context.spawn(work, name="validation")
             return snapshot
 
     def validation_state(self) -> dict:
@@ -853,7 +1322,8 @@ class MigrationService:
         return {"stages": capabilities.describe(), "defaults": capabilities.default_settings(), "linkedServices": linked,
                 "dataTables": tables}
 
-    def _spawn(self, run: MigrationRun) -> None:
+    def _spawn(self, run: MigrationRun, trigger: str = "start") -> None:
+        """Start a pass over the run's pending objects on its own thread. Call with ``_lock`` held."""
         factory = self._source_factory or getattr(self._session, "source_sql_factory", lambda: None)()
         files = None
         if run.settings.get("storageRoutes"):
@@ -861,18 +1331,41 @@ class MigrationService:
                 files = OneLakeFiles(self._fabric.storage_token_provider())
             except Exception:  # noqa: BLE001 - only Spark job main files need it; without it they are reported, not copied
                 files = None
-        migrator = Migrator(run, self._rest_factory, self._sql_factory, sleep=_sleep,
-                            source_factory=factory, credentials=self._credentials, onelake=files)
+        migrator = Migrator(run, self._rest_factory, self._sql_factory, sleep=_sleep, source_factory=factory,
+                            credentials=self._credentials, onelake=files, trigger=trigger, artifacts=self._records)
 
         def work() -> None:
-            migrator.execute()
+            try:
+                migrator.execute()
+            except Exception as exc:  # noqa: BLE001 - the pass could not even start; the run says so, never a dead thread
+                reference = record_unexpected(f"migration run {run.run_id}", exc)
+                run.abort(unexpected_message("The pass could not run", exc, reference))
+            status, paused = migrator.outcome or (run.status, run.paused_reason)
+            with context.bound(actor=context.system()):
+                self._audit_pass(run, status, paused)
             # A pause or a stop-on-failure halt returns early; Resume and Retry come back
             # through here, so the commit happens whenever the run actually completes.
-            if run.state == "completed" and run.settings.get("gitCommit", "auto") == "auto":
+            if run_state.legacy_state(status) == "completed" and run.settings.get("gitCommit", "auto") == "auto":
                 self._start_commit_after_run(run)
 
-        self._thread = threading.Thread(target=work, name=f"migration-{run.run_id}", daemon=True)
-        self._thread.start()
+        self._thread = context.spawn(work, name=f"migration-{run.run_id}", run=run.run_id)
+        self._threads = [t for t in self._threads if t.is_alive()] + [self._thread]
+
+    def _audit_pass(self, run: MigrationRun, status: str, paused: Optional[str]) -> None:
+        target = {"type": "run", "id": run.run_id}
+        if status == run_state.PAUSED:
+            details = {"pausedReason": paused, "reason": run.halted_reason}
+            if paused == run_state.HALTED:
+                self._audit("run.halted", target=target, run_id=run.run_id, details=details)
+            else:
+                self._audit("run.paused", target=target, run_id=run.run_id, details=details)
+            return
+        counts = run.counts()
+        self._audit("run.completed", target=target, run_id=run.run_id,
+                    outcome="done" if status == run_state.COMPLETED else "failed",
+                    details={"status": status, "completed": counts.get(COMPLETED, 0), "failed": counts.get(run_state.ITEM_FAILED, 0),
+                             "blocked": counts.get(run_state.BLOCKED, 0), "skipped": counts.get(run_state.SKIPPED, 0),
+                             "deferred": counts.get(run_state.DEFERRED, 0), "passes": len(run.passes)})
 
     def _start_commit_after_run(self, run: MigrationRun) -> None:
         """Commit on a thread of its own, so the run is free (Retry, Reset) the moment it completes.
@@ -883,8 +1376,9 @@ class MigrationService:
             if self._git_thread is not None and self._git_thread.is_alive():
                 with run.lock:
                     run.git = {"state": "blocked", "message": "Another commit was still running. Use Commit now when it finishes."}
+                run.save()
                 return
-            self._git_thread = threading.Thread(target=self._commit_after_run, args=(run,), name=f"fabric-git-{run.run_id}", daemon=True)
+            self._git_thread = context.thread(self._commit_after_run, run, name=f"fabric-git-{run.run_id}", run=run.run_id)
             with run.lock:
                 run.git = {"state": "committing", "message": "Committing the migrated items to Fabric Git…"}
             self._git_thread.start()
@@ -900,40 +1394,49 @@ class MigrationService:
     def _commit(self, workspace_id: str, comment: str, run: MigrationRun) -> dict:
         """Commit what ``run`` created or updated to the workspace's Fabric Git branch, and nothing else waiting there.
         Never raises: the answer says what happened."""
-        started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        started = _now()
         try:
             client = self._rest_factory()
             conn = fabric_git.connection(client, workspace_id)
             if not conn.connected:
-                return {"state": "skipped", "message": fabric_git.KNOWN_NOT_CONNECTED, "at": started}
-            result = fabric_git.commit(client, workspace_id, comment, only=git_items(run))
-            out = {"state": result.state, "items": result.items, "skipped": result.skipped, "others": result.others,
-                   "commit": result.commit, "branch": conn.branch, "commitUrl": fabric_git.commit_url(conn, result.commit),
-                   "pullRequestUrl": fabric_git.pull_request_url(conn), "at": started}
-            out["message"] = (f"Committed {result.items} item(s) to {conn.branch}." if result.state == "committed"
-                              else "Nothing new to commit: the branch already has everything the run created.")
-            if result.skipped:
-                out["message"] += f" Left out {len(result.skipped)} data-load pipeline(s): they are rebuilt per environment."
-            if result.others:
-                shown = ", ".join(result.others[:5]) + (f" and {len(result.others) - 5} more" if len(result.others) > 5 else "")
-                out["message"] += (f" Left out {len(result.others)} other change(s) waiting in the workspace that this run did not "
-                                   f"make ({shown}): commit them from Fabric's Source control panel if they belong in Git.")
-            return out
+                out = {"state": "skipped", "message": fabric_git.KNOWN_NOT_CONNECTED, "at": started}
+            else:
+                result = fabric_git.commit(client, workspace_id, comment, only=git_items(run))
+                out = {"state": result.state, "items": result.items, "skipped": result.skipped, "others": result.others,
+                       "commit": result.commit, "branch": conn.branch, "commitUrl": fabric_git.commit_url(conn, result.commit),
+                       "pullRequestUrl": fabric_git.pull_request_url(conn), "at": started}
+                out["message"] = (f"Committed {result.items} item(s) to {conn.branch}." if result.state == "committed"
+                                  else "Nothing new to commit: the branch already has everything the run created.")
+                if result.skipped:
+                    out["message"] += f" Left out {len(result.skipped)} data-load pipeline(s): they are rebuilt per environment."
+                if result.others:
+                    shown = ", ".join(result.others[:5]) + (f" and {len(result.others) - 5} more" if len(result.others) > 5 else "")
+                    out["message"] += (f" Left out {len(result.others)} other change(s) waiting in the workspace that this run did not "
+                                       f"make ({shown}): commit them from Fabric's Source control panel if they belong in Git.")
         except fabric_git.GitNotReady as exc:
-            return {"state": "blocked", "message": str(exc), "at": started}
+            out = {"state": "blocked", "message": str(exc), "at": started}
         except FabricApiError as exc:
-            return {"state": "failed", "message": exc.message, "code": exc.code, "at": started}
+            out = {"state": "failed", "message": exc.message, "code": exc.code, "at": started}
         except Exception as exc:  # noqa: BLE001 - a commit problem is reported, never raised into the run; the API's log gets it
             reference = record_unexpected("the Fabric Git commit", exc)
-            return {"state": "failed", "message": unexpected_message("The commit could not be made", exc, reference), "at": started}
+            out = {"state": "failed", "message": unexpected_message("The commit could not be made", exc, reference), "at": started}
+        outcome = {"committed": "done", "nothing": "done", "skipped": "refused", "blocked": "refused"}.get(out["state"], "failed")
+        self._audit("git.commit", target={"type": "run", "id": run.run_id}, run_id=run.run_id, outcome=outcome,
+                    code=out.get("code") or out["state"],
+                    details={"state": out["state"], "items": out.get("items"), "branch": out.get("branch"),
+                             "commit": out.get("commit"), "others": len(out.get("others") or []), "message": out.get("message")})
+        return out
 
     def _commit_after_run(self, run: MigrationRun) -> None:
-        result = self._commit(run.workspace_id, self._git_comment(run), run)
+        with context.bound(actor=context.system()):
+            result = self._commit(run.workspace_id, self._git_comment(run), run)
         with run.lock:
             run.git = result
+        run.save()
         run.log("GIT", "run", result.get("message") or result.get("state", ""))
         with self._lock:
             self._last_commit = result
+        self._put("git", result)
 
     def git_state(self) -> dict:
         """Where the target workspace is connected in Fabric Git, what waits to be committed, and the
@@ -974,6 +1477,8 @@ class MigrationService:
                 raise ApiError(409, "run_in_progress", "A migration run is working. It commits by itself when it completes.")
             if self._git_thread is not None and self._git_thread.is_alive():
                 raise ApiError(409, "commit_in_progress", "A commit is already running.")
+            self._audit("git.commit_requested", target={"type": "run", "id": run.run_id}, run_id=run.run_id,
+                        details={"comment": comment})
 
             def work() -> None:
                 result = self._commit(workspace_id, comment, run)
@@ -982,9 +1487,10 @@ class MigrationService:
                     if self._run is run:
                         with run.lock:
                             run.git = result
+                run.save()
+                self._put("git", result)
 
-            self._git_thread = threading.Thread(target=work, name="fabric-git-commit", daemon=True)
-            self._git_thread.start()
+            self._git_thread = context.spawn(work, name="fabric-git-commit", run=run.run_id)
         return self.git_state()
 
 

@@ -49,6 +49,11 @@ def _isolated_local_state(tmp_path, monkeypatch):
 
     monkeypatch.setenv("MIGRATION_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("MIGRATION_TRANSFORMS_DIR", str(tmp_path / "transforms"))
+    monkeypatch.setenv("MIGRATION_LOG_DIR", str(tmp_path / "logs"))
+    # Runs start without a person's sign-off unless a test asks for one (``MIGRATION_SIGNOFF``, ``state.approvals``),
+    # and the operator a test sees is a fixed name, never this machine's account.
+    monkeypatch.setenv("MIGRATION_SIGNOFF", "never")
+    monkeypatch.setenv("MIGRATION_OPERATOR", "Test Operator")
     monkeypatch.setattr(repository_source, "UPLOAD_ROOT", tmp_path / "uploads")
     monkeypatch.setattr(repository_source, "WORK_ROOT", tmp_path / "environments")
 

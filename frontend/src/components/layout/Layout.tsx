@@ -23,7 +23,22 @@ function Presence({ label, name, ok, busy }: { label: string; name: string | nul
  * project names a migration and keeps its own plan, options and progress.
  */
 function ProjectMenu() {
-  const { projects, project, selectProject, addProject, renameProject, deleteProject } = useMigration();
+  const { projects, project, selectProject, addProject, renameProject, deleteProject, backendProjects } = useMigration();
+  const [busy, setBusy] = useState(false);
+  // Each refuses when it cannot be done now (a switch while a run works, a list changed meanwhile): say why.
+  const attempt = async (work: () => Promise<void>, done?: string) => {
+    setBusy(true);
+    try {
+      await work();
+      if (done) notify(done);
+      return true;
+    } catch (e) {
+      notify(e instanceof Error ? e.message : "That could not be done.");
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
   const [open, setOpen] = useState(false);
   const [dialog, setDialog] = useState<"new" | "rename" | "delete" | null>(null);
   const [name, setName] = useState("");
@@ -52,12 +67,12 @@ function ProjectMenu() {
   };
   const show = (d: "new" | "rename" | "delete") => { setOpen(false); setName(d === "rename" ? project.name : ""); setDialog(d); };
   const close = useCallback(() => setDialog(null), []);
-  const submit = () => {
+  const submit = async () => {
     const value = name.trim();
     if (!value) return;
-    if (dialog === "new") { addProject(value); notify(`Project “${value}” created.`); }
-    else if (dialog === "rename") { renameProject(project.id, value); notify(`Project renamed to “${value}”.`); }
-    setDialog(null);
+    const ok = dialog === "new" ? await attempt(() => addProject(value), `Project “${value}” created.`)
+      : await attempt(() => renameProject(project.id, value), `Project renamed to “${value}”.`);
+    if (ok) setDialog(null);
   };
 
   return (
@@ -73,7 +88,7 @@ function ProjectMenu() {
           <div className="menu-label" aria-hidden="true">Projects</div>
           {projects.map((p) => (
             <button key={p.id} type="button" role="menuitemradio" aria-checked={p.id === project.id} className="menu-item"
-              onClick={() => { selectProject(p.id); setOpen(false); trigger.current?.focus(); }}>
+              disabled={busy} onClick={() => { setOpen(false); trigger.current?.focus(); if (p.id !== project.id) void attempt(() => selectProject(p.id), `Switched to “${p.name}”.`); }}>
               <span className="menu-check" aria-hidden="true">{p.id === project.id && <Check size={14} />}</span>
               <span className="menu-text">{p.name}</span>
             </button>
@@ -87,17 +102,21 @@ function ProjectMenu() {
       )}
 
       {(dialog === "new" || dialog === "rename") && (
-        <Modal title={dialog === "new" ? "New project" : "Rename project"} onClose={close} onSubmit={submit}
-          footer={<><Button onClick={close}>Cancel</Button><Button type="submit" variant="primary" disabled={!name.trim()}>{dialog === "new" ? "Create" : "Rename"}</Button></>}>
+        <Modal title={dialog === "new" ? "New project" : "Rename project"} onClose={close} onSubmit={() => void submit()}
+          footer={<><Button onClick={close}>Cancel</Button><Button type="submit" variant="primary" disabled={!name.trim() || busy}>{dialog === "new" ? "Create" : "Rename"}</Button></>}>
           <TextField label="Project name" value={name} onChange={(e) => setName(e.target.value)} maxLength={80} />
-          {dialog === "new" && <p className="faint">A project names a migration and keeps its own plan, options and progress in this browser. The backend holds one connection at a time.</p>}
+          {dialog === "new" && <p className="faint">{backendProjects
+            ? "A project is one migration: the backend keeps its own discovery, Fabric target, runs and audit trail, and switches to it now. The Synapse sign-in stays as it is."
+            : "A project names a migration and keeps its own plan, options and progress in this browser. This backend holds one connection at a time."}</p>}
         </Modal>
       )}
       {dialog === "delete" && (
-        <ConfirmDialog title={`Delete “${project.name}”?`} confirmLabel="Delete project" onCancel={close}
-          onConfirm={() => { const gone = project.name; deleteProject(project.id); setDialog(null); notify(`Project “${gone}” deleted.`); }}>
-          <p>This removes the project from this browser: its plan, stage options and the steps you confirmed.</p>
-          <p className="muted">Nothing in Synapse or Fabric changes, and the connections stay as they are.</p>
+        <ConfirmDialog title={`Delete “${project.name}”?`} confirmLabel="Delete project" onCancel={close} busy={busy}
+          onConfirm={() => { const gone = project.name; void attempt(() => deleteProject(project.id), `Project “${gone}” deleted.`).then((ok) => ok && setDialog(null)); }}>
+          {backendProjects
+            ? <p>This takes the project off the list and switches to another one. The backend archives its folder (its discovery, runs and audit trail) rather than deleting it.</p>
+            : <p>This removes the project from this browser: its plan, stage options and the steps you confirmed.</p>}
+          <p className="muted">Nothing in Synapse or Fabric changes.</p>
         </ConfirmDialog>
       )}
     </div>

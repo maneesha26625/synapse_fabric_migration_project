@@ -1,15 +1,15 @@
-import { CheckCircle2, CircleAlert, GitPullRequest, Pause, Play, RotateCcw, ScrollText, XCircle } from "lucide-react";
+import { CheckCircle2, CircleAlert, GitPullRequest, Pause, Play, RotateCcw, ScrollText, ShieldCheck, XCircle } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { MetricCard } from "../shared/Metrics";
-import { Banner, Button, Card, EmptyState, Modal, StatusBadge, type Tone } from "../shared/Shared";
+import { Banner, Button, Card, EmptyState, Modal, StatusBadge, TextField, type Tone } from "../shared/Shared";
 import { useAppState } from "../../state/AppState";
 import { useMigration } from "../../state/MigrationState";
-import type { ExecItem } from "../../types";
+import type { ExecItem, ExecutionRun } from "../../types";
 import { STRATEGY_TONE } from "./StrategyPanel";
 import { LlmBadge, useAcceptedTransforms } from "../discovery/LlmBadge";
 
-const TONE: Record<ExecItem["status"], Tone> = { PENDING: "neutral", "IN PROGRESS": "info", COMPLETED: "success", FAILED: "error", SKIPPED: "neutral", DEFERRED: "warning" };
+export const TONE: Record<ExecItem["status"], Tone> = { PENDING: "neutral", "IN PROGRESS": "info", COMPLETED: "success", FAILED: "error", SKIPPED: "neutral", DEFERRED: "warning", BLOCKED: "warning" };
 const time = (iso: string | null) => (iso ? new Date(iso).toLocaleTimeString() : "—");
 
 type WaveState = "done" | "active" | "failed" | "pending";
@@ -18,12 +18,12 @@ type WaveState = "done" | "active" | "failed" | "pending";
 type View = "attention" | "done" | "all" | "migrated" | "skipped" | "deferred" | "failed" | "pending";
 const VIEW_STATUSES: Record<View, ExecItem["status"][] | null> = {
   all: null,
-  attention: ["FAILED", "DEFERRED"],
+  attention: ["FAILED", "BLOCKED", "DEFERRED"],
   done: ["COMPLETED", "SKIPPED"],
   migrated: ["COMPLETED"],
   skipped: ["SKIPPED"],
   deferred: ["DEFERRED"],
-  failed: ["FAILED"],
+  failed: ["FAILED", "BLOCKED"],
   pending: ["PENDING", "IN PROGRESS"],
 };
 const CARD_LABEL: Partial<Record<View, string>> = {
@@ -138,6 +138,90 @@ function GitRunBanner() {
   );
 }
 
+/** How a run's status reads on its badge. */
+export function runBadge(run: Pick<ExecutionRun, "state" | "status" | "failed" | "blocked">): { tone: Tone; label: string } {
+  switch (run.status) {
+    case "awaiting_approval": return { tone: "warning", label: "WAITING FOR SIGN-OFF" };
+    case "queued": return { tone: "info", label: "STARTING" };
+    case "completed_with_failures": return { tone: "warning", label: "COMPLETED WITH FAILURES" };
+    case "failed": return { tone: "error", label: "FAILED" };
+    case "cancelled": return { tone: "neutral", label: "CLOSED" };
+    case "rejected": return { tone: "neutral", label: "DECLINED" };
+    default: break;
+  }
+  const tone: Tone = run.state === "completed" ? (run.failed || run.blocked ? "warning" : "success") : run.state === "paused" ? "warning" : "info";
+  return { tone, label: run.state.toUpperCase() };
+}
+
+/** A run that changes what Fabric already has waits for a person to sign it off before it writes anything. */
+function SignOffCard() {
+  const { execution: run, approveExecution } = useMigration();
+  const [comment, setComment] = useState("");
+  const [busy, setBusy] = useState<"approve" | "reject" | null>(null);
+  if (run.status !== "awaiting_approval" || !run.approval) return null;
+  const decide = async (decision: "approve" | "reject") => {
+    setBusy(decision);
+    await approveExecution(decision, comment.trim() || undefined);
+    setBusy(null);
+  };
+  const needs = run.needsInput ?? [];
+  return (
+    <Banner tone="warning" title="This run waits for a person to sign it off"
+      actions={<>
+        <Button variant="primary" onClick={() => void decide("approve")} disabled={busy !== null}><ShieldCheck size={14} aria-hidden="true" />{busy === "approve" ? "Signing off…" : "Sign off and run"}</Button>
+        <Button onClick={() => void decide("reject")} disabled={busy !== null}>{busy === "reject" ? "Declining…" : "Decline"}</Button>
+      </>}>
+      <p style={{ margin: "0 0 6px" }}>{run.approval.reason} Nothing has been written to Fabric yet.</p>
+      {needs.length > 0 && <p className="muted" style={{ margin: "0 0 6px" }}>The accelerator was restarted since this run was asked for, and credentials are never kept: enter them again for {needs.join(", ")} in Plan, Stages & credentials, then sign off.</p>}
+      <TextField label="Comment (kept with the sign-off)" optional value={comment} onChange={(e) => setComment(e.target.value)} maxLength={500} />
+      <p className="faint" style={{ margin: "4px 0 0" }}>Asked for by {run.approval.requestedBy?.id ?? "the operator"} under the “{run.approval.policy}” sign-off rule. Your name, the time and the comment are recorded in the audit trail.</p>
+    </Banner>
+  );
+}
+
+/** Why the run is not working right now, and what carries it on. */
+function PausedBanner() {
+  const { execution: run } = useMigration();
+  if (run.state !== "paused" || run.status === "awaiting_approval") return null;
+  const needs = run.needsInput ?? [];
+  if (run.resumable === false) {
+    return <Banner tone="warning" title="This run cannot carry on">{run.unresumableReason} Use Start over (top right) to close it; its record stays in the run history.</Banner>;
+  }
+  if (run.pausedReason === "interrupted") {
+    return (
+      <Banner tone="warning" title="The accelerator stopped while this run was working">
+        Resume carries it on from where it stopped. Anything it was in the middle of making is checked in Fabric first, so nothing is made twice.
+        {needs.length > 0 && ` Enter the credentials for ${needs.join(", ")} again in Plan, Stages & credentials first: they are never kept.`}
+      </Banner>
+    );
+  }
+  if (needs.length > 0) {
+    return <Banner tone="warning" title="Credentials needed again">The accelerator was restarted, and credentials are never kept: enter them for {needs.join(", ")} in Plan, Stages & credentials, then Resume.</Banner>;
+  }
+  return null;
+}
+
+/** The jobs the run started in Fabric (its data pipelines' runs), so each can be found in Fabric's Monitoring hub. */
+function ExecutionsList() {
+  const { execution: run } = useMigration();
+  const jobs = run.executions ?? [];
+  if (!jobs.length) return null;
+  return (
+    <Card title="Started in Fabric" subtitle="Data pipeline runs this migration started. After a restart, a run still going is followed to its end, never started twice.">
+      <ul style={{ listStyle: "none", padding: 0, margin: 0, display: "grid", gap: 8 }} aria-label="Jobs started in Fabric">
+        {jobs.map((j) => (
+          <li key={j.id}>
+            <StatusBadge tone={j.status === "Completed" ? "success" : j.status === "running" ? "info" : "error"} running={j.status === "running"}>{j.status.toUpperCase()}</StatusBadge>{" "}
+            <strong>{j.pipeline ?? j.kind}</strong>
+            <span className="muted"> · wave {j.wave ?? "—"} · {(j.tables ?? []).length} table{(j.tables ?? []).length === 1 ? "" : "s"} · started {time(j.startedAt)}{j.finishedAt ? `, finished ${time(j.finishedAt)}` : ""}</span>
+            {j.note && <div className="faint">{j.note}</div>}
+          </li>
+        ))}
+      </ul>
+    </Card>
+  );
+}
+
 /** Run the migration: what to run, the controls, one card per wave, and the state of every object. */
 export function RunPanel() {
   const { mode } = useAppState();
@@ -157,6 +241,9 @@ export function RunPanel() {
 
   const running = run.state === "running";
   const started = run.state !== "idle";
+  const waiting = run.status === "awaiting_approval";
+  const needsAttention = run.failed + (run.blocked ?? 0);
+  const badge = runBadge(run);
   const blocked = (analysis?.blocking ?? 0) > 0;
   const ready = plan.length > 0 && fabric.status === "connected" && !blocked && analysis !== null && options.stages.length > 0;
   // Only waiting for the plan's score (after a reload, or an edit): not a problem to report.
@@ -169,23 +256,26 @@ export function RunPanel() {
     for (const i of run.items) byWave.set(i.wave ?? 1, [...(byWave.get(i.wave ?? 1) ?? []), i]);
     return [...byWave.entries()].sort((a, b) => a[0] - b[0]).map(([wave, items]) => {
       const done = items.filter((i) => finished(i.status)).length;
-      const state: WaveState = items.some((i) => i.status === "FAILED") ? "failed" : done === items.length ? "done" : items.some((i) => i.status === "IN PROGRESS") || done > 0 ? "active" : "pending";
+      const state: WaveState = items.some((i) => i.status === "FAILED" || i.status === "BLOCKED") ? "failed" : done === items.length ? "done" : items.some((i) => i.status === "IN PROGRESS") || done > 0 ? "active" : "pending";
       return { wave, items, done, state, types: [...new Set(items.map((i) => i.type))] };
     });
   }, [run.items]);
 
   const statuses = VIEW_STATUSES[view];
   const rows = statuses ? run.items.filter((i) => statuses.includes(i.status)) : run.items;
-  const attention = run.items.filter((i) => i.status === "FAILED").length;
+  const attention = run.items.filter((i) => i.status === "FAILED" || i.status === "BLOCKED").length;
 
   return (
     <>
       <Card eyebrow="Run the migration" title={started ? `Migration Run #${run.runId}` : "Migration run"}
         subtitle={started && (run.workspace || run.warehouse) ? `Fabric workspace ${run.workspace ?? "—"} · Warehouse ${run.warehouse ?? "—"}` : "Each wave is a step; each step's objects are created in dependency order."}
-        actions={started ? <StatusBadge tone={run.state === "completed" ? (run.failed ? "warning" : "success") : run.state === "paused" ? "warning" : "info"} running={running}>{run.state.toUpperCase()}</StatusBadge> : undefined}>
+        actions={started ? <StatusBadge tone={badge.tone} running={running}>{badge.label}</StatusBadge> : undefined}>
         {mode === "mock" && <Banner tone="info" title="Demo run">Results are simulated the way a real run reports them. A run takes about a minute, and a few objects fail on purpose so you can try Retry failed.</Banner>}
         {mode === "real" && <Banner tone="info" title="What a run does">Each stage you switched on is carried out in dependency order: Warehouse and schema, table data, Spark, notebooks, connections, pipelines, jobs, scripts, schedules and shortcuts. Nothing already in Fabric is overwritten, so a run can be repeated safely.{fabric.method === "fabric_cli" && " With the Fabric CLI the first SQL object opens one Microsoft sign-in window on the machine running the server."}</Banner>}
         {executionError && <Banner tone="error" title="Execution">{executionError}</Banner>}
+        <SignOffCard />
+        <PausedBanner />
+        {run.status === "failed" && <Banner tone="error" title="The run stopped">The workspace refused it, or the accelerator hit a problem of its own: the log says which. Fix the cause, then Retry failed carries it on.</Banner>}
         {run.haltedReason && run.state === "paused" && <Banner tone="warning" title="Run stopped at a wave boundary">{run.haltedReason}</Banner>}
         <GitRunBanner />
         {planChanged && run.state === "completed" && <Banner tone="info" title="The plan has changed since this run">Press Start new run to migrate the current plan.</Banner>}
@@ -211,12 +301,12 @@ export function RunPanel() {
           <Button variant="primary" onClick={() => void startExecution(only || undefined)} disabled={!ready || running || (started && run.state !== "completed")}>
             <Play size={14} aria-hidden="true" />{onlyLabel ? `Run ${onlyLabel} only` : run.state === "completed" ? "Start new run" : "Start migration"}
           </Button>
-          {run.state === "paused" ? (
-            <Button onClick={() => void controlExecution("resume")}><Play size={14} aria-hidden="true" />Resume</Button>
+          {run.state === "paused" && !waiting ? (
+            <Button onClick={() => void controlExecution("resume")} disabled={run.resumable === false}><Play size={14} aria-hidden="true" />Resume</Button>
           ) : (
             <Button onClick={() => void controlExecution("pause")} disabled={!running}><Pause size={14} aria-hidden="true" />Pause</Button>
           )}
-          <Button onClick={() => void controlExecution("retry")} disabled={!run.failed || running}><RotateCcw size={14} aria-hidden="true" />Retry failed</Button>
+          <Button onClick={() => void controlExecution("retry")} disabled={!(needsAttention || run.status === "failed") || running || waiting || run.resumable === false}><RotateCcw size={14} aria-hidden="true" />Retry failed</Button>
           <Button onClick={() => setLogs(true)} disabled={!started}><ScrollText size={14} aria-hidden="true" />View logs</Button>
           <span className="spacer" />
           <span className="muted">{options.stages.length} stage{options.stages.length === 1 ? "" : "s"} on · {options.scope === "automated" ? "automated objects only" : "everything in the plan"}{options.stopOnFailure ? " · stop on failure" : ""}{options.gitCommit === "off" ? " · no Git commit" : ""} · change in Plan</span>
@@ -236,13 +326,14 @@ export function RunPanel() {
         <Card><EmptyState icon={<Play size={22} />} title="Nothing is running.">Start the migration to see each wave's progress and every object's result.</EmptyState></Card>
       ) : (
         <>
-          <RunProgress done={run.completed + (run.skipped ?? 0)} deferred={run.deferred ?? 0} failed={run.failed} total={run.total} />
+          <RunProgress done={run.completed + (run.skipped ?? 0)} deferred={run.deferred ?? 0} failed={needsAttention} total={run.total} />
           <div className="grid cols-6">
             <MetricCard label="Total" value={run.total.toLocaleString()} {...card("all")} />
             <MetricCard label="Migrated" value={<span className="tone-success">{run.completed.toLocaleString()}</span>} {...card("migrated")} />
             <MetricCard label="Skipped" value={(run.skipped ?? 0).toLocaleString()} hint="Already in Fabric" {...card("skipped")} />
             <MetricCard label="Left for a person" value={<span className={run.deferred ? "tone-warning" : undefined}>{(run.deferred ?? 0).toLocaleString()}</span>} hint="Set up by hand, or needs input" {...card("deferred")} />
-            <MetricCard label="Failed" value={<span className={run.failed ? "tone-error" : undefined}>{run.failed.toLocaleString()}</span>} {...card("failed")} />
+            <MetricCard label="Failed" value={<span className={needsAttention ? "tone-error" : undefined}>{needsAttention.toLocaleString()}</span>}
+              hint={run.blocked ? `${run.blocked.toLocaleString()} blocked by what failed` : undefined} {...card("failed")} />
             <MetricCard label="Pending" value={(run.pending + run.inProgress).toLocaleString()} {...card("pending")} />
           </div>
           <div ref={table} />
@@ -262,7 +353,7 @@ export function RunPanel() {
                 <div className="bar" role="progressbar" aria-valuenow={Math.round((s.done / s.items.length) * 100)} aria-valuemin={0} aria-valuemax={100} aria-label={`Wave ${s.wave} progress`}>
                   <span className={`fill ${s.state === "failed" ? "error" : s.state === "done" ? "success" : "info"}`} style={{ width: `${(s.done / s.items.length) * 100}%` }} />
                 </div>
-                <p className="faint">{s.done.toLocaleString()} of {s.items.length.toLocaleString()} finished{s.items.some((x) => x.status === "FAILED") ? ` · ${s.items.filter((x) => x.status === "FAILED").length} failed` : ""}</p>
+                <p className="faint">{s.done.toLocaleString()} of {s.items.length.toLocaleString()} finished{s.items.some((x) => x.status === "FAILED") ? ` · ${s.items.filter((x) => x.status === "FAILED").length} failed` : ""}{s.items.some((x) => x.status === "BLOCKED") ? ` · ${s.items.filter((x) => x.status === "BLOCKED").length} blocked` : ""}</p>
               </section>
             ))}
           </div>
@@ -304,6 +395,10 @@ export function RunPanel() {
             </div>
             {rows.length > 500 && <p className="faint">Showing the first 500 of {rows.length.toLocaleString()} objects.</p>}
           </Card>
+          <ExecutionsList />
+          {(run.passes?.length ?? 0) > 1 && (
+            <p className="faint">{run.passes!.length} passes: {run.passes!.map((x) => `${x.trigger} (${x.status})`).join(", ")}.</p>
+          )}
         </>
       )}
 

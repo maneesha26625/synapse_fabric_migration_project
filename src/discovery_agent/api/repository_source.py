@@ -46,6 +46,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from discovery_agent.connections.validation import REDACTED
+from discovery_agent.state.processes import alive as _alive
 from discovery_agent.source_strategy import P0Artifact
 
 #: The folders a Synapse repository keeps its definitions in.
@@ -135,40 +136,6 @@ def _remove(folder: Path) -> None:
         _owner_file(folder).unlink()
     except OSError:
         pass
-
-
-def _alive(pid: int) -> bool:
-    """Whether a process with this id still runs. In doubt, yes: a folder is kept rather than removed under a reader."""
-    if pid <= 0:
-        return False
-    if pid == os.getpid():
-        return True
-    if os.name == "nt":
-        import ctypes  # noqa: PLC0415 - Windows only
-        from ctypes import wintypes  # noqa: PLC0415
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
-        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-        if not handle:
-            return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: no process has this id
-        try:
-            code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return True
-            return code.value == 259  # STILL_ACTIVE
-        finally:
-            kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)  # signal 0 only asks whether it exists (never sent on Windows, where it would end the process)
-    except ProcessLookupError:
-        return False
-    except OSError:
-        return True
-    return True
 
 
 def sweep(roots: Optional[Sequence[Path]] = None) -> int:

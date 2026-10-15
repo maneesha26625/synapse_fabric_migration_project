@@ -9,6 +9,7 @@ import { CompletionSummary, ValidatePanel } from "../components/journey/panels/V
 import { WavesPanel } from "../components/journey/panels/WavesPanel";
 import { WorkspaceExplorer } from "../components/journey/WorkspaceExplorer";
 import { ReleasePath } from "../components/journey/ReleasePath";
+import { ActivityPanel } from "../components/journey/ActivityPanel";
 import { downloadReport } from "../components/journey/report";
 import { ResetStepButton } from "../components/journey/ResetStep";
 import { useJourney, type StepStatus } from "../components/journey/useJourney";
@@ -111,7 +112,7 @@ function NextBar({ step, steps, onGo }: { step: StepStatus; steps: StepStatus[];
       : step.paused || step.stale ? <AlertTriangle size={20} className="tone-warning" aria-hidden="true" />
       : <Circle size={18} className="faint" aria-hidden="true" />;
     title = step.running ? `${step.title} in progress`
-      : step.paused ? `${step.title} is paused`
+      : step.paused ? `${step.title} ${step.pausedTitle ?? "is paused"}`
       : step.stale ? (step.key === "plan" ? "The plan needs rebuilding" : `${step.title} needs to run again`)
       : `${step.title} is not finished`;
     detail = step.stale
@@ -294,6 +295,7 @@ export function Workspace() {
             <div className="step-body" key={`${selected}-${resetNonce}`}>{PANELS[selected]()}</div>
             <NextBar step={step} steps={steps} onGo={select} />
           </section>
+          <ActivityPanel />
         </div>
       </div>
     </div>

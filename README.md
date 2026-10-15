@@ -30,6 +30,7 @@ generated sample data, with no Azure, Synapse or Fabric needed.
 [Migration](#migration) ·
 [LLM-assisted transformation](#llm-assisted-transformation) ·
 [Fabric Git (Dev)](#fabric-git-dev) ·
+[Projects, run records and the audit trail](#projects-run-records-and-the-audit-trail) ·
 [Tests](#tests)
 
 ## What it does
@@ -43,7 +44,7 @@ before the next one opens.
 | 2 | **Assess** | Classifies every object by how it moves: **Direct** (a matching Fabric component exists), **Reconfigure** (same idea, configured differently), **Transform** (code or settings change), **Manual** (needs a person), **Review** (no reliable one-to-one mapping). Also shows the Synapse → Fabric component mapping. | Nothing |
 | 3 | **Waves** | Builds the dependency graph and groups objects into waves, so nothing is created before what it depends on. | Nothing |
 | 4 | **Plan** | Chooses what moves. A deterministic planner gives each object a strategy, lists risks by severity, estimates effort and scores readiness (0–100). Stages, their options and any credentials are set here. | Nothing |
-| 5 | **Migrate** | Pre-run checks, then the run, wave by wave: Warehouse and schemas, empty tables, views, procedures, data pipelines that load the rows, notebooks, connections, pipelines, Spark, jobs, scripts, schedules and shortcuts. Safe to re-run; Retry failed re-runs only the failures. When the Fabric workspace is connected to Git, the run is then committed to its branch (`dev`), ready for a pull request. | **Fabric only** (and, through Fabric, its Git branch) |
+| 5 | **Migrate** | Pre-run checks, then the run, wave by wave: Warehouse and schemas, empty tables, views, procedures, data pipelines that load the rows, notebooks, connections, pipelines, Spark, jobs, scripts, schedules and shortcuts. Safe to re-run; Retry failed re-runs only the failures. A run that changes what Fabric already has waits for a person to sign it off first. Every run is recorded as it happens: a restart brings it back paused, Resume carries it on without making anything twice, and closed runs stay in the run history. When the Fabric workspace is connected to Git, the run is then committed to its branch (`dev`), ready for a pull request. | **Fabric only** (and, through Fabric, its Git branch) |
 | 6 | **Validate** | Compares Synapse with Fabric, object by object: columns and types, row counts, definitions, notebook cells, pipeline activities. It also checks each object **runs in Fabric**: tables and views are queried, procedures compiled, and pipelines, notebooks and Spark jobs judged by their latest run (or run now, on request). | Nothing, unless you ask it to run items or procedures (procedures are rolled back) |
 
 ## Principles
@@ -70,7 +71,8 @@ before the next one opens.
   give up (for linked services and the data-load connection) are typed into the
   Plan step, sent once when the run starts, held in memory, and never stored,
   logged or returned. Planning is told only which linked services have them, and
-  refuses a request that carries them. A secret in an environment's parameters
+  refuses a request that carries them. A restart forgets them, so a run carried
+  on after one asks for them again. A secret in an environment's parameters
   file never reaches the disk either.
 * **Deterministic by default.** The same workspace and the same plan give the same
   result. Parsers and rules do the work. A language model is used only when a person
@@ -78,6 +80,13 @@ before the next one opens.
   and a run uses the result only after that person has reviewed and accepted it.
 * **Honest about limits.** Anything that cannot be converted is reported, with
   the reason, as a risk before the run and as *left for a person* after it.
+* **Everything is on record.** Every run is written down as it happens: each
+  change of status and each object's outcome, and exactly what was sent to
+  Fabric. Every action goes into the project's hash-chained audit trail with
+  who did it, what, when and how it ended, whether it was a person, the LLM or
+  the accelerator itself. What the accelerator does on its own (approving a run
+  that needs no sign-off, recovering a run after a restart) is recorded as its
+  own, never as a person's. See [Projects, run records and the audit trail](#projects-run-records-and-the-audit-trail).
 
 ## Quick start
 
@@ -98,16 +107,23 @@ and opens the browser. **Run it once; you don't restart anything by hand after t
 
 * The API runs with `--reload` and restarts itself within a second when code under `src/` changes.
   The UI dev server reloads the page itself.
-* The last discovery and the Fabric target come back after every restart. They're saved in
-  `.accelerator/state`, which is git-ignored; set `MIGRATION_STATE=off` to keep nothing. Tokens,
-  passwords and credentials are never saved. The Synapse sign-in isn't kept either, so after a
-  restart sign in to Synapse again only to run discovery again, load table data, or count rows in Validate.
+* Everything a project keeps comes back after every restart: its discovery, Fabric target, runs,
+  plan versions, last validation and audit trail. A run the restart cut short comes back paused, and
+  Resume carries it on. They're saved in `.accelerator/state/projects/<project>/`, which is
+  git-ignored; set `MIGRATION_STATE=off` to keep nothing. Tokens, passwords and credentials are never
+  saved. The Synapse sign-in isn't kept either, so after a restart sign in to Synapse again only to run
+  discovery again, load table data, or count rows in Validate.
 * Running `start-ui.ps1` again is safe: what is already running is reused, and the API refuses to
-  start a second copy on the same port.
+  start a second copy on the same port. It also refuses to start on a state folder another running API
+  is using (give it its own with `MIGRATION_STATE_DIR`): two writers would corrupt each other's records.
+* The API logs to its console and, as JSON lines, to `.accelerator/logs/api.jsonl` (10 MB, five kept).
+  Each line carries the request's **correlation id** (also sent back as `X-Correlation-Id`, and carried
+  by everything the request started: a discovery, a run, a validation, an LLM draft, a commit), who asked,
+  the project and the run. Secrets are masked before anything is written.
 * An unexpected error never shows a traceback in the browser. It is written, redacted, to the API's
-  own output (its console, or `.accelerator\api.log` when it runs as the scheduled task), and the
-  message on screen quotes its reference, such as *reference 7f3a2c1b*, so you can find it there.
-  This covers a request, discovery, a run's object, validation, an LLM draft and the Fabric Git commit.
+  log, and the message on screen quotes its reference, such as *reference 7f3a2c1b*, so you can find
+  it there. This covers a request, discovery, a run's object, validation, an LLM draft and the Fabric
+  Git commit.
 
 **Keep the API running in the background (recommended).** `.\install-api-service.ps1` creates a
 Windows scheduled task, `MigrationAcceleratorAPI`, that runs the API hidden with auto-reload. It
@@ -258,7 +274,7 @@ so the page stays readable:
 | Assess | A tile and percentage per class, and a bar across all of them | By workstream, Objects, Component mapping |
 | Waves | Objects, dependencies, waves | Waves (one row per wave with its object types), Dependency graph |
 | Plan | Readiness, objects, automated, needs a person, effort, blocking | Readiness & risks, Objects in plan, Strategy by type, Stages & credentials (configuration only: nothing runs from Plan) |
-| Migrate | Pre-run checks, then the run: every stage that is on or a single stage, progress by wave, every object's result, pause, resume, Retry failed; once it completes, the commit to Fabric Git with **Open pull request dev → main**, or **Commit now** | — |
+| Migrate | Pre-run checks, then the run: every stage that is on or a single stage, progress by wave, every object's result, pause, resume, Retry failed; the **sign-off** card when the run waits for one; why a run is paused (by you, at a wave with failures, or cut short by a restart) and the credentials to enter again; objects **blocked** by a failure they depend on; the data-pipeline runs it started in Fabric; once it completes, the commit to Fabric Git with **Open pull request dev → main**, or **Commit now**; and the **run history** | — |
 | Validate | Checks, match, review, mismatch (each one filters) | One tab per category |
 
 The bar at the foot of every step says where it stands and how to move on:
@@ -272,18 +288,18 @@ and every validation check.
 
 **Starting a step over.** Every step has **Reset step** in its header. It
 clears that step and every step after it (the discovered inventory, the plan
-with its options and typed credentials, the record of the run, the validation
-results, and their confirmations), then lets you do them again from the
-start. A dialog lists exactly what will be cleared first, and says what is not
+with its options and typed credentials, the current run, which is closed and
+kept in the run history, the validation results, and their confirmations),
+then lets you do them again from the start. A dialog lists exactly what will be cleared first, and says what is not
 touched: the connections, everything in Synapse, and anything already created
 in Fabric (a new run skips what exists; nothing is deleted). Reset is refused,
 with the reason, while discovery, a run or a validation is working. Running
 discovery again from Discover asks first when later steps are confirmed.
 
 **Results that disappear.** Confirmations are kept per project in the
-browser, but the discovery and the run live in the backend's memory and the
-validation results in the page's. When a confirmed step's results are gone
-(the source was signed out, the server restarted, or Demo data was reloaded),
+browser; the discovery, the run and the last validation are kept per project by
+the backend, and come back after a restart. When a confirmed step's results are
+gone (the source was signed out, a step was reset, or Demo data was reloaded),
 its box says *Run again* (*Rebuild* for an empty plan), the steps after it wait,
 and *Migration complete* is hidden until it has been redone; the later steps
 then come back by themselves.
@@ -310,6 +326,13 @@ the ongoing CI/CD flow, a six-item checklist kept per project in this browser
 Test and Prod stay *to do*: whether they were deployed is not something the
 app can see yet.
 
+**Activity.** Under the step, **Show activity** opens the project's audit
+trail, newest first: who did what (a person, the LLM, or the accelerator),
+to what, when and how it ended, filtered by kind of action and by who did it.
+**Check the trail** walks its hash chain and says whether any record was
+changed, removed or moved; **CSV** and **JSON lines** download it (the JSON
+lines keep the hashes, so the trail can be checked elsewhere).
+
 ### Migration assistant (preview)
 
 The round **+** button at the bottom right (or **Ctrl+I**) opens the
@@ -329,8 +352,10 @@ view, and the action bars sit at the end of the page.
 
 Connections and Migration (Migration opens once a source is connected), a
 status chip for each side, the **project menu** (switch projects, or create,
-rename and delete one; each project keeps its own plan, stage options and
-progress in this browser), **Export** (the discovered inventory as JSON),
+rename and delete one; each project is the backend's, with its own discovery,
+Fabric target, runs and audit trail, while its plan, stage options and
+confirmations are kept in this browser; a switch is refused while something of
+the current project is still working), **Export** (the discovered inventory as JSON),
 **Refresh**, and the **Live / Demo** switch. In Live mode, if the backend does
 not answer, a bar under the top bar says so, with **Retry** and **Use Demo
 data**.
@@ -346,7 +371,9 @@ data**.
     ├─ discovery, extractors/, records, sql/, synapse/   read the source into Unified Discovery Records
     ├─ mapping/              Synapse → Fabric mapping, classification, dependency waves
     ├─ api/fabric.py         Fabric sign-in through the Azure CLI or the Fabric CLI
-    └─ migration/            planner, stages, T-SQL rules, Fabric REST, data pipelines, validation, Fabric Git
+    ├─ migration/            planner, stages, T-SQL rules, Fabric REST, data pipelines, validation, Fabric Git
+    └─ state/                projects, run records, sign-off, audit trail, logs and correlation ids
+             │               (.accelerator/state/projects/<project>/, .accelerator/logs/)
              │
              ▼
  Microsoft Fabric: REST API, Warehouse SQL endpoint, data pipelines, Git integration
@@ -367,13 +394,15 @@ Live mode that is `realApi.ts` and the local API; in Demo mode it is
 | `src/discovery_agent/connections/` | Authentication and every external connection. The only place that signs in. |
 | `src/discovery_agent/discovery.py`, `records.py`, `extractors/`, `sql/`, `synapse/`, `acquisition/`, `artifacts/` | The discovery engine: what the workspace, the SQL pool and the Git repository say, merged into one record per object. |
 | `src/discovery_agent/mapping/` | `synapse_fabric_mapping.py` (Fabric target, classification and workstream for each object type and pipeline activity) and `waves.py` (dependency waves). |
-| `src/discovery_agent/migration/` | The planner, the eleven stages, the T-SQL rules, Fabric REST calls, data pipelines, validation, and `fabric_git.py` (the target workspace's Fabric Git: status, commit, pull-request link). See [Migration](#migration) and [Fabric Git (Dev)](#fabric-git-dev). |
-| `src/discovery_agent/api/` | The local HTTP API: `service.py` (connections, discovery, results), `fabric.py` (Fabric sign-in), `migration.py` (plan, run, validate), `mapping.py`, `server.py`. |
+| `src/discovery_agent/migration/` | The planner, the eleven stages, the T-SQL rules, Fabric REST calls, data pipelines, validation, `fabric_git.py` (the target workspace's Fabric Git: status, commit, pull-request link), `run_state.py` (the statuses of a run and its objects, and the moves between them) and `failures.py` (what kind of failure an object's error is). See [Migration](#migration) and [Fabric Git (Dev)](#fabric-git-dev). |
+| `src/discovery_agent/state/` | What the backend keeps and records: `store.py` (a project's files: versioned documents, append-only streams, blobs, leases), `projects.py`, `runs.py` (run records), `approvals.py` (sign-off), `audit.py` (the hash-chained trail), `context.py` (correlation id and actor), `logs.py` (JSON logs), `processes.py`. See [Projects, run records and the audit trail](#projects-run-records-and-the-audit-trail). |
+| `src/discovery_agent/api/` | The local HTTP API: `service.py` (connections, discovery, results), `fabric.py` (Fabric sign-in), `migration.py` (plan, run, sign-off, run history, validate), `projects.py` (projects, the audit trail), `mapping.py`, `server.py`. |
 | `prompts/transform/` | The prompt templates for LLM-assisted transformation: `base.md`, one file per object type, and `project.md` for your project's own rules. |
 | `transforms/` | Drafts and accepted LLM-assisted transforms, one JSON file per object (created on first use; git-ignored, because it holds the client's code). |
 | `tests/` | The backend test suite; runs offline. |
 | `docs/` | [discovery.md](docs/discovery.md), [p0_source_strategy.md](docs/p0_source_strategy.md), [unified_discovery_record.md](docs/unified_discovery_record.md), and the *Synapse to Fabric Transformation Guide* (Word): what changes between Synapse and Fabric, what is automated and what needs a person. |
 | `input/` | Where Git repositories are cloned for discovery (gitignored). |
+| `.accelerator/` | Created by the API (gitignored): `state/` (the projects and what each keeps) and `logs/api.jsonl`. |
 | `start-ui.ps1` | Starts the API and the UI together on Windows. |
 
 ## API
@@ -388,9 +417,11 @@ All under `/api`, JSON in and out. Nothing returns a token or a secret.
 | Mapping and waves | `GET /mapping/components` · `GET /dependencies` |
 | Fabric connection | `GET /fabric/connection` · `POST /fabric/authenticate` · `POST /fabric/workspaces` · `POST /fabric/test` · `DELETE /fabric/connection` |
 | LLM transformation | `GET /transform/settings` · `GET /transform` · `GET /transform/objects/<id>` · `GET /transform/prompt/<id>` · `POST /transform/generate` (`ids`) · `POST /transform/accept` (`id`, optional edited `code`) · `POST /transform/discard` (`id`, `scope`: `draft` or `all`) · `GET /transform/candidates` · `GET`/`POST /transform/project` |
-| Migration | `GET /migration/capabilities` · `POST /migration/plan` (`credentialNames`: which linked services have credentials; a request carrying the credentials themselves is refused) · `POST /migration/start` (refused with `plan_blocked` while the planner finds a blocking risk) · `GET /migration/run` (with `git`: the commit after the run) · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: forget the run's record, refused while it is working) · `POST /migration/validate` (starts it in the background) · `GET /migration/validation` |
+| Migration | `GET /migration/capabilities` · `POST /migration/plan` (`credentialNames`: which linked services have credentials; a request carrying the credentials themselves is refused; `record` keeps it as a plan version) · `POST /migration/start` (refused with `plan_blocked` while the planner finds a blocking risk; a run that changes what Fabric has answers `awaiting_approval`) · `POST /migration/approve` (`decision`: `approve` or `reject`, `comment`, `subjectHash`; a person only) · `GET /migration/run` (with `status`, `pausedReason`, `needsInput`, `passes`, `approval`, `executions`, and `git`: the commit after the run) · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: close the run, keeping its record; `version` refuses a page that read an older run; `credentials` for the connections a restart lost) · `GET /migration/runs` · `GET /migration/runs/<id>` · `GET /migration/runs/<id>/events?after=&limit=` · `GET /migration/runs/<id>/artifacts/<sha256>` (what the run sent to Fabric for an object) · `GET /migration/plans/<P001>` · `GET /migration/policy` · `POST /migration/validate` (starts it in the background) · `GET /migration/validation` (also the last one, after a restart) |
+| Projects | `GET /projects` · `POST /projects` (`name`, `id?`, `version?`, `activate?`, `copyFrom?`) · `POST /projects/<id>/rename` · `POST /projects/<id>/activate` (refused with `project_busy` while something of the current project works) · `DELETE /projects/<id>?version=` (archives the folder) |
+| Audit trail | `GET /audit` (newest first; `action` (a family such as `run`), `actor` (`person`, `system`, `agent` or `kind:id`), `outcome`, `run`, `since`, `until`, `correlationId`, `limit`, `before` to page back, `project` for another project's trail) · `GET /audit/verify` · `GET /audit/export?format=jsonl|csv` · `POST /journey/confirm` (`step`, `note?`) |
 | Fabric Git | `GET /fabric/git` (the target workspace's branch, head, uncommitted / incoming / conflicting items, data-load pipelines kept out, the pull-request link, the last commit) · `POST /fabric/git/commit` (`{comment?}`; commits what the current run created or updated, in the background; refused with no run, or while a run or another commit is working) |
-| Errors | Every error is `{"error": {"code", "message"}}`. An unexpected one is a 500 with `code: internal_error` and a `reference`; the traceback is in the API's log under that reference, redacted, and never in the response |
+| Errors | Every error is `{"error": {"code", "message", "correlationId"}}`. An unexpected one is a 500 with `code: internal_error` and a `reference`; the traceback is in the API's log under that reference, redacted, and never in the response. A change refused because what it was based on moved on is a 409 with `code: stale`: read again and retry |
 
 ## What is automated, manual, or coming
 
@@ -1239,18 +1270,159 @@ connection string or table data is ever sent. If this client's code must not lea
 
 **Demo mode** shows the whole flow with canned drafts, and no model is called.
 
+## Projects, run records and the audit trail
+
+What the backend keeps, and how a run is recorded, carried on and signed off
+(`src/discovery_agent/state/`, `migration/run_state.py`, `migration/failures.py`).
+
+### Projects
+
+A project is one migration engagement, and the backend owns them; one is
+active at a time. Each keeps its own folder, `.accelerator/state/projects/<id>/`:
+
+| File | What it holds |
+|---|---|
+| `discovery.pickle`, `fabric_target.pickle` | The finished discovery and the Fabric target's selection, restored at start |
+| `snapshots.jsonl` | One record per discovery: what it saw, a fingerprint over every object and definition, whether all of the source could be read |
+| `plans.jsonl` | Plan versions (`P001`, …): the objects and waves, the options, the planner's score, the discovery it was made from, who recorded it |
+| `migration.json`, `runs/<id>/` | Which run is current, and each run's record (below) |
+| `approvals.jsonl` | Every sign-off decision |
+| `validation.json`, `git.json` | The last validation, and the last Fabric Git commit |
+| `audit.jsonl` | The audit trail (below) |
+| `blobs/` | What the runs sent to Fabric, by hash |
+
+**Switching** to another project (the project menu, `POST /projects/<id>/activate`)
+is like restarting into it: its discovery and Fabric target come back the way they
+do after a restart, and the Synapse sign-in stays where it is. It is refused while
+anything of the current project is still working (a discovery, a sign-in window,
+a run, a validation, a commit or an LLM draft). Like a restart, it runs alone: it
+waits for the requests already being answered (up to 15 seconds, then it is refused)
+and holds new ones until it is done, so no request reads one project and writes the
+next. A switch that fails half way is undone for each service that had switched.
+Project ids are lower case, since Windows folder names ignore case. **Deleting** a project archives its folder under `archive/`;
+nothing is deleted, and neither the active project nor the last one can go.
+Accepted LLM transforms are shared by every project (they apply only where an
+object's source is exactly the one they were made from).
+
+**From the single-project version:** on its first start, the backend creates
+the `default` project and copies the discovery and Fabric target saved before
+into it; the originals stay where they were. The browser then hands its own
+projects to the backend once, keeping their ids, so each one's plan and options
+carry on; the project the browser was on carries on the saved discovery. Against
+an older backend, projects stay labels kept in the browser, as before.
+
+### Run records
+
+Every change to a run goes through one place that checks the move and writes it
+down in the same step, so a run's record is complete by construction:
+`runs/<id>/run.json` (its status, options, passes, sign-off, and what it was made
+from: the plan entries, the discovery snapshot, the planner's fingerprint and the
+*names* of the connections it was given credentials for), `runs/<id>/events.jsonl`
+(every status change, every change to an object and every log line, in order,
+each with its correlation id and actor) and `runs/<id>/items.json` (the objects
+after the last pass). Run numbers carry on after the highest run recorded, so a
+record is never written over; error texts and log lines are masked for secrets
+before they are kept; and no object is left *in progress* when a pass ends,
+whatever stopped it.
+
+| Run status | Meaning | What moves it on |
+|---|---|---|
+| `awaiting_approval` | A person must sign it off before it writes anything | **Sign off and run**, or **Decline** (`rejected`, final) |
+| `queued`, `running` | A pass is working | It ends by itself, or **Pause** |
+| `paused` | Stopped between objects: by you, at a wave with failures (*stop on failure*), or cut short by a restart (`interrupted`) | **Resume** (a new pass) |
+| `completed_with_failures`, `failed` | The pass ended with objects failed or blocked, or the workspace refused it | **Retry failed** (a new pass) |
+| `completed` | Done | Final |
+| `cancelled` | Closed by **Reset step** or replaced by a new run | Final; its record stays in the **run history** |
+
+Start, each Resume and each Retry are *passes* of the same run. An object
+**blocked** by a failure is not attempted: a view whose table failed, a pipeline
+whose notebook or connection failed, a schedule whose pipeline failed, a table's
+data whose table failed. It says what it needed, and Retry failed runs both
+again. Kinds that only need something when they run (a notebook reading a
+table) are never held back.
+
+Every object error is classified once: `TRANSIENT`, `AUTH`, `CAPACITY`,
+`CONFIG`, `UNSUPPORTED`, `DEPENDENCY`, `CONFLICT`, `INTERRUPTED` or `UNKNOWN`
+(`GET /migration/policy` lists what each one means). Only a `TRANSIENT` failure
+(a 5xx, a timeout, Fabric unreachable) is retried by the pass itself, twice with
+back-off, and only for kinds that are made, or found and left, by name, so a
+retry can never make anything twice.
+
+**After a restart** a run that was working comes back `paused` (`interrupted`).
+What it was in the middle of goes back in the queue, marked: the next pass looks
+for it in Fabric first and, finding it, records that this run made it. A data
+pipeline run the run had started is followed to its end rather than started
+again beside it (a run Fabric no longer knows is left for a person; one it cannot
+answer about right now is asked about again on the next pass). And no load starts
+while Fabric's own job list shows the wave's pipeline running for anything else, a
+run since closed or a person in Fabric: a second load beside it could copy rows
+twice, or empty a table under it. Credentials
+are never kept, so the run lists the connections it needs again
+(`needsInput`) and Resume, Retry and sign-off accept them. A run made from a
+discovery that has since been run again cannot carry on; its record stays.
+
+**What was sent to Fabric** for each object (item definitions, and every SQL
+statement the Warehouse accepted) is kept under its SHA-256 in the project's
+`blobs/`, named on the object (`artifact.parts`) and readable with
+`GET /migration/runs/<id>/artifacts/<sha256>`. A connection's request is never
+kept: it carries credentials.
+
+### Sign-off
+
+`MIGRATION_SIGNOFF` decides which runs a person signs off before they write to
+Fabric:
+
+| Value | A person signs off |
+|---|---|
+| `overwrite` (default) | Runs that change what Fabric already has: *Update objects that are already in Fabric*, or Table data with *Replace it* |
+| `always` | Every run |
+| `never` | No run |
+
+A run that needs no sign-off is approved by the accelerator, and recorded as
+such (`by: system`, `automatic: true`). Only a person can sign off. What is
+signed off is the run's exact inputs, hashed (`subjectHash`): its plan, options
+and stages, which a run never changes once made.
+
+### Audit trail
+
+`audit.jsonl` holds one record per action: what it was (a closed catalog:
+`project.*`, `source.*`, `discovery.*`, `fabric.*`, `plan.recorded`, `run.*`,
+`validation.*`, `git.*`, `transform.*`, `journey.step_confirmed`, `system.*`,
+`audit.exported`), who did it (`person`: `MIGRATION_OPERATOR`, else the account
+the API runs as; `agent`: the LLM, for a draft it wrote; `system`: the accelerator
+itself), the target, the outcome (`done`, `failed`, `refused`) with a code and a
+reason, the details its action allows (nothing else is kept, and text is masked
+for secrets), and the correlation id, project and run. Each record carries the
+hash of the one before it and its own, so `GET /audit/verify` shows where the file
+was changed, if it was; it shows *that* it was changed, not who changed it.
+Writing a record never fails the action it records.
+
+### Settings
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MIGRATION_STATE_DIR` | `.accelerator/state` | Where the projects are kept. One API per folder. |
+| `MIGRATION_STATE` | `on` | `off` keeps everything for the life of the process only. |
+| `MIGRATION_LOG_DIR` | `.accelerator/logs` | Where `api.jsonl` is written. |
+| `MIGRATION_LOG` | `on` | `off` writes no log file: the console only. |
+| `MIGRATION_LOG_LEVEL` | `INFO` | `DEBUG` adds every Fabric read and every Warehouse statement (by kind and hash, never its text). |
+| `MIGRATION_SIGNOFF` | `overwrite` | Which runs a person signs off: `never`, `overwrite` or `always`. |
+| `MIGRATION_OPERATOR` | the account the API runs as | The person the log and the audit trail name. |
+
 ## Tests
 
 ```
-pytest                                  # backend: 1,526 tests pass, 104 skipped (below)
-cd frontend && npm run typecheck && npm test   # UI: type check and 71 tests
+pytest                                  # backend: 1,620 tests pass, 104 skipped (below)
+cd frontend && npm run typecheck && npm test   # UI: type check and 76 tests
 ```
 
 **Safe to run beside a live session.** `tests/conftest.py` points everything a
 real session keeps on the machine into each test's own temporary folder:
-`MIGRATION_STATE_DIR` (the saved discovery and Fabric target),
-`MIGRATION_TRANSFORMS_DIR` (accepted LLM transforms), and the upload and
-working-copy folders under `input/`. A test API used to delete a running
+`MIGRATION_STATE_DIR` (the projects, their discoveries, runs and audit trails),
+`MIGRATION_TRANSFORMS_DIR` (accepted LLM transforms), `MIGRATION_LOG_DIR`, and
+the upload and working-copy folders under `input/`. It also fixes the operator's
+name and sets `MIGRATION_SIGNOFF=never`, so a test asks for a sign-off only when
+it means to. A test API used to delete a running
 session's saved `discovery.pickle` and leave uploads behind; a test now checks
 that nothing points at the real folders. (`MIGRATION_STATE=off` alone was never
 enough: a reset or sign-out still deleted the saved file. Switched off, the
@@ -1277,6 +1449,25 @@ SYNAPSE_SQL_INTEGRATION=1 SYNAPSE_SQL_SERVER=... SYNAPSE_SQL_DATABASE=... pytest
 CONNECTIONS_INTEGRATION=1 AZURE_SUBSCRIPTION_ID=... SYNAPSE_RESOURCE_GROUP=...   SYNAPSE_WORKSPACE_NAME=... SYNAPSE_SQL_POOL=... pytest
 ```
 
+The state tests: `tests/test_state.py` (the store's documents, streams, blobs
+and leases; process identity across reused ids; projects, their adoption and
+archive; the single API per folder; the run and object state machines; every
+failure class; sign-off; and the audit trail's allow-listed details, redaction,
+hash chain, paging, exports and catalog), `tests/test_run_records.py` (a run
+recorded as it happens; a restart that cut a run short, resumed without making
+anything twice; credentials asked for again and never written; a run made from an
+older discovery; sign-off approved, declined and kept across a restart; blocked
+objects; a fault in the runner itself; pipeline runs followed after a restart;
+what was sent kept by hash, never a connection's credentials),
+`tests/test_projects_api.py` (projects, switching with its refusal, its undo and
+running alone, no deadlock between a switch and a service recording an action, and
+the trail over HTTP) and `tests/test_logging.py` (correlation ids on every line and
+across threads, masking). They include the cases a code review found: a line cut
+short inside a character, a refused Start that must leave the current run alone, a
+Start prepared before a switch, run numbers after a lost pointer, a wave whose
+tables must not stay *in progress*, a load never started beside a running one, and
+a retry that finds what a lost answer made.
+
 The Fabric Git tests (`tests/test_fabric_git.py`) use a fake Fabric REST
 client: the connection and status (including a status that answers 202 and is
 followed), a selective commit that leaves out data-load pipelines and
@@ -1300,6 +1491,8 @@ backend-unavailable bar, the dialogs that ask first, every step's panel, the
 workspace explorer, the release path (with its live Fabric Git chip), a run
 committed to Fabric Git with its pull-request link, *Commit now* after a run
 with committing off, the assistant, the old page addresses, that a typed
-credential never reaches browser storage, and that planning is told only which
+credential never reaches browser storage, that planning is told only which
 linked services have credentials (never what they are, and not again on every
-key typed).
+key typed), a run held for sign-off and signed off, a closed run in the run
+history, a new project switched to and recorded, the activity and its check,
+and a browser's projects handed once to a backend that owns them.

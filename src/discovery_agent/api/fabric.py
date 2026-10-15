@@ -34,6 +34,7 @@ import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from discovery_agent.diagnostics import record_unexpected
+from discovery_agent.state import context
 
 FABRIC_RESOURCE = "https://api.fabric.microsoft.com"
 FABRIC_API = FABRIC_RESOURCE + "/v1"
@@ -119,13 +120,19 @@ def _clean_workspaces(items: List[dict]) -> List[dict]:
 class FabricTarget:
     """One Fabric target connection, in memory, guarded by a lock."""
 
-    def __init__(self, store: Any = None) -> None:
+    def __init__(self, store: Any = None, audit: Optional[Callable[..., Any]] = None) -> None:
         self._lock = threading.RLock()
         self._gen = 0  # bumps on every authenticate/disconnect so a stale sign-in is ignored
         self._login_proc: Optional[subprocess.Popen] = None
         self._store = store
+        #: Records sign-ins and the target chosen (``state.audit``); never raises.
+        self._audit = audit or (lambda *args, **kwargs: None)
         self._reset()
-        saved = store.load(TARGET_STATE) if store is not None else None
+        self._restore_saved()
+
+    def _restore_saved(self) -> None:
+        """Reconnect to the selection saved for this project, in the background, with no sign-in window."""
+        saved = self._store.load(TARGET_STATE) if self._store is not None else None
         if isinstance(saved, dict) and saved.get("method") in METHODS and _GUID.match(str(saved.get("workspaceId") or "")):
             self.method = saved["method"]
             self.account = saved.get("account")
@@ -134,7 +141,18 @@ class FabricTarget:
             self.status = "signing_in"
             self.message = "Reconnecting to the Fabric workspace from the last session…"
             self._gen += 1
-            threading.Thread(target=self._restore, args=(saved["method"], saved["workspaceId"], self._gen), daemon=True).start()
+            context.spawn(self._restore, saved["method"], saved["workspaceId"], self._gen, name="fabric-restore")
+
+    def switch(self, store: Any) -> None:
+        """Hold another project's Fabric target instead: as after a restart into that project, its saved selection
+        is checked again with the CLI session the machine already has. A sign-in waiting in a window is dropped."""
+        with self._lock:
+            self._gen += 1
+            if self._login_proc is not None and self._login_proc.poll() is None:
+                _kill_tree(self._login_proc)
+            self._reset()
+            self._store = store
+            self._restore_saved()
 
     def _restore(self, method: str, wid: str, gen: int) -> None:
         """Check the saved selection again with the CLI session already on this machine. No sign-in window."""
@@ -146,6 +164,10 @@ class FabricTarget:
                     return
                 self._verify(method, wid, checks)
                 self.checks, self.status, self.message = checks, "connected", None
+                name = self.workspace_name or wid
+            self._audit("fabric.connected", target={"type": "workspace", "id": wid}, actor=context.system(),
+                        details={"workspace": name, "method": method, "restored": True,
+                                 "checks": [{"label": c.get("label"), "ok": c.get("ok")} for c in checks]})
         except FabricError as exc:
             with self._lock:
                 if gen != self._gen:
@@ -153,6 +175,8 @@ class FabricTarget:
                 name = self.workspace_name or wid
                 self._reset()
                 self.message = f"Could not reconnect to {name} from the last session ({exc.message}) Log in again."
+            self._audit("fabric.connected", target={"type": "workspace", "id": wid}, actor=context.system(), outcome="failed",
+                        code=exc.code, reason=exc.message, details={"workspace": name, "method": method, "restored": True})
         except Exception as exc:  # noqa: BLE001 - a restore never takes the API down; the API's log gets the traceback
             reference = record_unexpected("restoring the Fabric target", exc)
             with self._lock:
@@ -190,10 +214,13 @@ class FabricTarget:
             self._gen += 1
             if self._login_proc is not None and self._login_proc.poll() is None:
                 _kill_tree(self._login_proc)
+            workspace = self.workspace_name or self.workspace_id
             self._reset()
             if self._store is not None:
                 self._store.forget(TARGET_STATE)
-            return self.state()
+            state = self.state()
+        self._audit("fabric.disconnected", target={"type": "workspace", "id": workspace}, details={"workspace": workspace})
+        return state
 
     def authenticate(self, body: dict) -> dict:
         """Start a browser sign-in and return at once; the UI polls ``state``."""
@@ -209,7 +236,7 @@ class FabricTarget:
             self.message = "Waiting for you to finish signing in in the browser window…"
             self._gen += 1
             gen = self._gen
-        threading.Thread(target=self._sign_in, args=(method, gen), daemon=True).start()
+        context.spawn(self._sign_in, method, gen, name="fabric-sign-in")
         return self.state()
 
     def _sign_in(self, method: str, gen: int) -> None:
@@ -226,11 +253,16 @@ class FabricTarget:
                 self.workspaces = self._list(method)
                 self.status = "authenticated"
                 self.message = None
+                account, tenant, found = self.account, self.tenant, len(self.workspaces)
+            self._audit("fabric.signed_in", target={"type": "account", "id": account},
+                        details={"method": method, "account": account, "tenant": tenant, "workspaces": found})
         except FabricError as exc:
             with self._lock:
                 if gen == self._gen:
                     self.status = "failed"
                     self.message = exc.message
+            self._audit("fabric.signed_in", target={"type": "account", "id": None}, outcome="failed", code=exc.code,
+                        reason=exc.message, details={"method": method})
 
     def _browser_login(self, method: str, gen: int) -> None:
         """Always sign in: an existing CLI session is never reused silently, so the
@@ -285,12 +317,18 @@ class FabricTarget:
                 self.status = "failed"
                 self.message = exc.message
                 checks.append({"label": "Workspace accessible" if checks else "Authentication", "ok": False, "detail": exc.message})
+                self._audit("fabric.connected", target={"type": "workspace", "id": wid}, outcome="failed", code=exc.code,
+                            reason=exc.message, details={"method": method,
+                                                         "checks": [{"label": c.get("label"), "ok": c.get("ok")} for c in checks]})
                 raise FabricError(exc.status, exc.code, exc.message) from exc
             self.status = "connected"
             self.message = None
             if self._store is not None:
                 self._store.save(TARGET_STATE, {"method": method, "account": self.account, "workspaceId": self.workspace_id,
                                                 "workspaceName": self.workspace_name})
+            self._audit("fabric.connected", target={"type": "workspace", "id": wid},
+                        details={"workspace": self.workspace_name or wid, "method": method, "capacity": bool(self.capacity_id),
+                                 "checks": [{"label": c.get("label"), "ok": c.get("ok")} for c in checks]})
             return self.state()
 
     # -- for the migration run ----------------------------------------
