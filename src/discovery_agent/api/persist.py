@@ -13,9 +13,10 @@ Microsoft window by design, so after a restart the source shows as signed out un
 it is only needed to run discovery again, load table data and count Synapse rows in Validate.
 
 Files live in ``.accelerator/state`` beside the repository (``MIGRATION_STATE_DIR`` to move them;
-``MIGRATION_STATE=off`` to keep nothing). They hold the discovered definitions, like the ``transforms``
-folder does, so the folder is git-ignored. They are Python pickles: only this process writes them, and only
-from this folder are they read.
+``MIGRATION_STATE=off`` to keep nothing: the folder is then never read, written or emptied). They hold the
+discovered definitions, like the ``transforms`` folder does, so the folder is git-ignored. They are Python
+pickles: only this process writes them, and only from this folder are they read. The tests point
+``MIGRATION_STATE_DIR`` at a folder of their own, so a test run never touches a real session's files.
 """
 
 from __future__ import annotations
@@ -92,6 +93,8 @@ class StateStore:
         return None
 
     def forget(self, name: str) -> None:
+        if not self.enabled():
+            return  # switched off, the folder is never read, written or emptied
         try:
             self._path(name).unlink()
         except FileNotFoundError:

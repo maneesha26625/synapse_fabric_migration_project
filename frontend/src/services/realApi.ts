@@ -159,10 +159,10 @@ export const realApi: MigrationApi = {
   commitFabricGit: (comment) =>
     request<FabricGitState>("/api/fabric/git/commit", { method: "POST", body: JSON.stringify(comment ? { comment } : {}) }),
   getCapabilities: () => request<Capabilities>("/api/migration/capabilities"),
-  analyzePlan: (items, record, options, credentials) =>
+  analyzePlan: (items, record, options, credentialNames) =>
     request<PlanAnalysis>("/api/migration/plan", {
       method: "POST",
-      body: JSON.stringify({ items, record: !!record, ...(options ? { options } : {}), ...(credentials ? { credentials } : {}) }),
+      body: JSON.stringify({ items, record: !!record, ...(options ? { options } : {}), ...(credentialNames?.length ? { credentialNames } : {}) }),
     }),
   startExecution: (items, options, credentials) =>
     request<ExecutionRun>("/api/migration/start", {

@@ -940,6 +940,15 @@ def test_the_service_exposes_the_stages_and_the_linked_services_that_need_creden
     assert "TOPSECRET" not in json.dumps(caps)
 
 
+def test_planning_counts_a_linked_service_as_having_credentials_from_its_name_alone():
+    svc = MigrationService(FakeSession(fake_job2()), SimpleNamespace(state=lambda: {"status": "connected", "workspaceName": "W", "capacityAssigned": True},
+                                                                  migration_target=lambda: (WS, "W", "azure_cli")),
+                           rest_factory=lambda: StageRest(), driver=lambda: "ODBC Driver 18 for SQL Server")
+    plan = {"items": [{"id": "ls1", "wave": 1}], "options": {"stages": ["connections"]}}
+    assert "NEEDS_CREDENTIALS" in {r["code"] for r in svc.analyze(plan)["risks"]}
+    assert "NEEDS_CREDENTIALS" not in {r["code"] for r in svc.analyze({**plan, "credentialNames": ["ls_sql"]})["risks"]}
+
+
 def test_the_data_stage_asks_for_a_credential_for_the_synapse_pool_connection():
     session = FakeSession(fake_job2())
     session.source_endpoint = lambda: ("ws", "ws.sql.azuresynapse.net", "pool01")

@@ -77,6 +77,24 @@ def test_state_can_be_switched_off(store, monkeypatch):
     assert not (store.directory / f"{DISCOVERY_STATE}.pickle").exists()
 
 
+def test_switched_off_the_state_folder_is_not_emptied_either(store, monkeypatch):
+    store.save(DISCOVERY_STATE, {"kept": True})
+    monkeypatch.setenv("MIGRATION_STATE", "off")
+    store.forget(DISCOVERY_STATE)  # what a reset or a sign-out does
+    assert (store.directory / f"{DISCOVERY_STATE}.pickle").exists()
+
+
+def test_no_test_reads_writes_or_deletes_a_real_sessions_files(tmp_path):
+    # tests/conftest.py points everything a session keeps on the machine into the test's own folder: a test API
+    # used to delete a running session's saved discovery, and leave uploads in input/.
+    from discovery_agent.api import repository_source
+    from discovery_agent.api.transform import transforms_dir
+
+    assert StateStore().directory == tmp_path / "state"
+    assert transforms_dir() == tmp_path / "transforms"
+    assert (repository_source.UPLOAD_ROOT, repository_source.WORK_ROOT) == (tmp_path / "uploads", tmp_path / "environments")
+
+
 # -- the Fabric target ------------------------------------------------------------------------------
 
 from discovery_agent.api import fabric as fabric_module  # noqa: E402

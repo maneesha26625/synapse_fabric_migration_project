@@ -39,6 +39,20 @@ def _isolated_sign_in_state(tmp_path, monkeypatch):
     reset_credentials()
 
 
+@pytest.fixture(autouse=True)
+def _isolated_local_state(tmp_path, monkeypatch):
+    """No test reads, writes or deletes what a real session keeps on this machine: the API's saved discovery and
+    Fabric target (``.accelerator/state``), accepted LLM transforms (``transforms/``), and uploaded ZIPs and
+    environment working copies (``input/``). A test API started with ``create_server`` used to delete a running
+    session's saved discovery, and leave its uploads behind."""
+    from discovery_agent.api import repository_source
+
+    monkeypatch.setenv("MIGRATION_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("MIGRATION_TRANSFORMS_DIR", str(tmp_path / "transforms"))
+    monkeypatch.setattr(repository_source, "UPLOAD_ROOT", tmp_path / "uploads")
+    monkeypatch.setattr(repository_source, "WORK_ROOT", tmp_path / "environments")
+
+
 #: Every smoke module skips on this: the snapshot is gitignored, so a fresh
 #: checkout has none until acquisition has been run once.
 requires_snapshot = pytest.mark.skipif(

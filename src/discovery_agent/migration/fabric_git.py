@@ -16,11 +16,13 @@ own Git sign-in (single sign-on for Azure DevOps).
     GET   /v1/workspaces/{id}/git/status             what changed on each side (may answer 202)
     POST  /v1/workspaces/{id}/git/commitToGit        commit (a long-running operation)
 
-The commit is selective: it takes the items added or changed in the workspace and
-leaves out the tool's own one-off plumbing, the per-wave load pipelines and the
-sync pipeline, which belong to each environment's data load rather than to the
-reviewed solution. It never commits a deletion, and it never commits over changes
-the branch has that the workspace does not: those need a person.
+The commit is selective: it takes the items a run created or updated and leaves out
+the tool's own one-off plumbing, the per-wave load pipelines and the sync pipeline,
+which belong to each environment's data load rather than to the reviewed solution.
+Anything else waiting in the workspace (an edit made by hand, an item from outside
+the migration) is left for a person and listed, never swept into the migration's
+commit. It never commits a deletion, and it never commits over changes the branch
+has that the workspace does not: those need a person.
 """
 
 from __future__ import annotations
@@ -28,7 +30,7 @@ from __future__ import annotations
 import re
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Collection, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from discovery_agent.migration.fabric_rest import FabricApiError
 
@@ -239,6 +241,8 @@ class CommitResult:
     skipped: List[str] = field(default_factory=list)  # plumbing left out, by name
     commit: Optional[str] = None
     batches: int = 0
+    #: Changes waiting in the workspace that the run did not make (``commit(only=...)``), left out, by name.
+    others: List[str] = field(default_factory=list)
 
 
 def _commit_batch(client: Any, workspace_id: str, items: Sequence[dict], comment: str) -> None:
@@ -253,8 +257,13 @@ def _too_large(exc: FabricApiError) -> bool:
     return exc.status == 413 or "size" in text or "too large" in text or "toolarge" in text
 
 
-def commit(client: Any, workspace_id: str, comment: str, *, exclude: Sequence[str] = ()) -> CommitResult:
+def commit(client: Any, workspace_id: str, comment: str, *, exclude: Sequence[str] = (),
+           only: Optional[Collection[Tuple[str, str]]] = None) -> CommitResult:
     """Commit what the workspace added or changed, except plumbing, to the connected branch.
+
+    ``only`` limits the commit to those (item type, display name) pairs, the items a run created
+    or updated; every other change waiting in the workspace is left out and listed in ``others``.
+    Without it, everything the workspace added or changed is committed.
 
     Refuses, with the reason, when the branch has changes the workspace does not
     (an update in Fabric must come first) or when an item changed on both sides
@@ -273,11 +282,17 @@ def commit(client: Any, workspace_id: str, comment: str, *, exclude: Sequence[st
         raise GitNotReady(f"The {conn.branch} branch has {len(current.incoming)} change(s) the workspace doesn't have yet. "
                           "In Fabric, open Source control and choose Update all, then commit again.")
     wanted = {str(n).lower() for n in exclude}
+    allowed = None if only is None else {(str(t).lower(), str(n).lower()) for t, n in only}
+
+    def ours(change: Mapping[str, Any]) -> bool:
+        return allowed is None or (_type(change).lower(), _name(change).lower()) in allowed
+
+    candidates = [c for c in current.outgoing if not is_plumbing(c) and _name(c).lower() not in wanted]
     skipped = sorted(_name(c) for c in current.outgoing if is_plumbing(c) or _name(c).lower() in wanted)
-    items = [_identifier(c) for c in current.outgoing
-             if not is_plumbing(c) and _name(c).lower() not in wanted and _identifier(c)]
+    others = sorted(_name(c) for c in candidates if not ours(c))
+    items = [_identifier(c) for c in candidates if ours(c) and _identifier(c)]
     if not items:
-        return CommitResult("nothing", skipped=skipped)
+        return CommitResult("nothing", skipped=skipped, others=others)
     text = comment_for(comment)
     batches = 0
     pending: List[List[dict]] = [items]
@@ -298,7 +313,7 @@ def commit(client: Any, workspace_id: str, comment: str, *, exclude: Sequence[st
             raise
         batches += 1
     head = connection(client, workspace_id).head
-    return CommitResult("committed", items=len(items), skipped=skipped, commit=head, batches=batches)
+    return CommitResult("committed", items=len(items), skipped=skipped, commit=head, batches=batches, others=others)
 
 
 def describe(client: Any, workspace_id: str, target: str = DEFAULT_TARGET_BRANCH) -> Dict[str, Any]:

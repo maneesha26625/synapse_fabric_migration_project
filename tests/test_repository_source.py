@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import subprocess
+import sys
 import time
 import zipfile
 from pathlib import Path
@@ -82,9 +85,9 @@ def test_parameters_are_read_from_an_arm_file_or_a_flat_object_and_references_ar
 
 def test_parameters_go_into_a_working_copy_and_the_source_is_untouched(tmp_path):
     repo = write_repo(tmp_path / "repo", "synapse")
-    copy, applied, unmatched = rs.prepare(repo, rs.parse_parameters(PROD_PARAMETERS))
+    copy, applied, unmatched, secrets = rs.prepare(repo, rs.parse_parameters(PROD_PARAMETERS))
     assert applied == ["ls_adls_properties_typeProperties_url", "ls_sql_connectionString"]
-    assert unmatched == ["workspaceName"]
+    assert unmatched == ["workspaceName"] and secrets == []
     ls = json.loads((copy / "linkedService/ls_sql.json").read_text())
     assert ls["properties"]["typeProperties"]["connectionString"] == PROD_CS
     assert json.loads((repo / "linkedService/ls_sql.json").read_text())["properties"]["typeProperties"]["connectionString"] == DEV_CS
@@ -94,7 +97,7 @@ def test_parameters_go_into_a_working_copy_and_the_source_is_untouched(tmp_path)
 
 def test_a_parameter_for_a_property_that_does_not_exist_is_reported_not_invented(tmp_path):
     repo = write_repo(tmp_path / "repo")
-    _, applied, unmatched = rs.prepare(repo, {"ls_adls_properties_typeProperties_accountKey": "k", "ls_sql_x": "y"})
+    _, applied, unmatched, _ = rs.prepare(repo, {"ls_adls_properties_typeProperties_accountKey": "k", "ls_sql_x": "y"})
     assert applied == [] and unmatched == ["ls_adls_properties_typeProperties_accountKey", "ls_sql_x"]
 
 
@@ -102,6 +105,93 @@ def test_discard_never_removes_anything_outside_its_own_folder(tmp_path):
     outside = write_repo(tmp_path / "keep")
     rs.discard(outside)
     assert outside.exists()
+
+
+SECURE_SERVICES = {
+    "ls_blob": {"name": "ls_blob", "properties": {"type": "AzureBlobStorage", "typeProperties": {
+        "connectionString": {"type": "SecureString", "value": "**********"}, "sasToken": {"type": "SecureString", "value": "**********"}}}},
+    "ls_ora": {"name": "ls_ora", "properties": {"type": "Oracle", "typeProperties": {
+        "host": "dev-ora", "password": {"type": "SecureString", "value": "**********"}}}},
+}
+
+
+def test_secrets_in_an_environments_parameters_never_reach_the_working_copy(tmp_path):
+    repo = write_repo(tmp_path / "repo")
+    for name, doc in SECURE_SERVICES.items():
+        (repo / f"linkedService/{name}.json").write_text(json.dumps(doc), encoding="utf-8")
+    copy, applied, unmatched, secrets = rs.prepare(repo, {
+        "ls_sql_connectionString": "Server=tcp:prod-ws.sql.azuresynapse.net,1433;Database=prodpool;User ID=etl;Password=hunter2;",
+        "ls_blob_connectionString": "DefaultEndpointsProtocol=https;AccountName=prodlake;AccountKey=c2VjcmV0a2V5;",
+        "ls_blob_properties_typeProperties_sasToken": "sv=2022-11-02&sig=c2lnbmF0dXJl",
+        "ls_ora_properties_typeProperties_host": "prod-ora",
+        "ls_ora_properties_typeProperties_password": "hunter2",
+    })
+    # A connection string or a URL keeps what is not secret (the Prod server, the account) with its credential masked;
+    # a value that is nothing but a secret is left out, and the committed placeholder stays.
+    assert applied == ["ls_blob_connectionString", "ls_blob_properties_typeProperties_sasToken", "ls_ora_properties_typeProperties_host",
+                       "ls_sql_connectionString"]
+    assert secrets == ["ls_blob_connectionString", "ls_blob_properties_typeProperties_sasToken", "ls_ora_properties_typeProperties_password",
+                       "ls_sql_connectionString"] and unmatched == []
+    sql = json.loads((copy / "linkedService/ls_sql.json").read_text())["properties"]["typeProperties"]["connectionString"]
+    assert sql == "Server=tcp:prod-ws.sql.azuresynapse.net,1433;Database=prodpool;User ID=etl;Password=[redacted];"
+    ora = json.loads((copy / "linkedService/ls_ora.json").read_text())["properties"]["typeProperties"]
+    assert ora == {"host": "prod-ora", "password": {"type": "SecureString", "value": "**********"}}
+    written = "".join(p.read_text(encoding="utf-8") for p in copy.rglob("*.json"))
+    assert "AccountName=prodlake" in written
+    for secret in ("hunter2", "c2VjcmV0a2V5", "c2lnbmF0dXJl"):
+        assert secret not in written
+
+
+def test_the_connection_check_says_which_secrets_were_kept_off_disk():
+    session = Session()
+    upload = session.upload_zip(zip_bytes(FILES), "ws.zip")
+    state = session.connect_repository({"kind": "zip", "uploadId": upload["uploadId"], "fileName": upload["fileName"], "environment": "Prod",
+                                        "parameters": json.dumps({"ls_sql_connectionString": PROD_CS + "Password=hunter2;"})})
+    assert state["ok"] and state["repository"]["secrets"] == ["ls_sql_connectionString"]
+    check = next(c for c in state["checks"] if c["name"] == "Prod parameters")
+    assert "1 of 1 values applied" in check["message"] and "secrets kept off disk" in check["message"]
+    assert "hunter2" not in json.dumps(state)
+
+
+def test_uploads_and_working_copies_are_swept_only_once_the_process_that_made_them_has_ended(monkeypatch):
+    upload_id, folder = rs.extract_zip(zip_bytes(FILES))
+    copy, *_ = rs.prepare(folder, None)
+    for made in (folder, copy):
+        assert json.loads(made.with_name(made.name + ".owner").read_text())["pid"] == os.getpid()
+    legacy = rs.WORK_ROOT / ("0" * 32)
+    legacy.mkdir(parents=True)  # made before folders had an owner: nothing says no running process reads it
+    assert rs.sweep() == 0 and folder.exists() and copy.exists()  # this process, which made them, still runs
+    monkeypatch.setattr(rs, "_alive", lambda pid: False)  # ...and now it has ended
+    assert rs.sweep() == 2
+    assert not folder.exists() and not copy.exists() and legacy.exists()
+    assert not [p for p in (*rs.UPLOAD_ROOT.iterdir(), *rs.WORK_ROOT.iterdir()) if p.name.endswith(".owner")]
+
+
+def test_a_process_that_has_ended_is_not_alive_and_this_one_is():
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    assert rs._alive(os.getpid()) and not rs._alive(child.pid) and not rs._alive(0)  # noqa: SLF001
+
+
+def test_a_new_upload_replaces_the_one_this_process_kept_before():
+    session = Session()
+    first = session.upload_zip(zip_bytes(FILES), "a.zip")
+    second = session.upload_zip(zip_bytes(FILES), "b.zip")
+    assert not (rs.UPLOAD_ROOT / first["uploadId"]).exists() and (rs.UPLOAD_ROOT / second["uploadId"]).exists()
+    with pytest.raises(ApiError, match="Upload the ZIP again"):
+        session.connect_repository({"kind": "zip", "uploadId": first["uploadId"], "environment": "Dev"})
+
+
+def test_a_working_copy_that_cannot_be_prepared_is_not_left_behind(tmp_path, monkeypatch):
+    repo = write_repo(tmp_path / "repo")
+
+    def broken(root, values):
+        raise OSError("the disk is full")
+
+    monkeypatch.setattr(rs, "apply_parameters", broken)
+    with pytest.raises(OSError):
+        rs.prepare(repo, {"ls_sql_connectionString": PROD_CS})
+    assert not rs.WORK_ROOT.exists() or not list(rs.WORK_ROOT.iterdir())
 
 
 # ---- the ZIP and the root folder ---------------------------------------------------------------

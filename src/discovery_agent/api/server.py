@@ -55,7 +55,9 @@ Security posture, in order of importance:
   CORS preflight, which is never granted, so a malicious page cannot drive
   the API through the operator's browser.
 * Request bodies are capped, never logged, and never echoed. Error responses
-  carry a stable code and a message written for a person -- no traceback.
+  carry a stable code and a message written for a person -- no traceback. An
+  unexpected error's traceback is written, redacted, to the API's log under a
+  short reference, and the response carries only that reference.
 * No token, secret or authorization header is ever returned: the connection
   layer that holds them is not reachable from here.
 """
@@ -71,7 +73,8 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qsl, unquote, urlsplit
 
-from discovery_agent.api.repository_source import MAX_PARAMETERS_BYTES, MAX_ZIP_BYTES
+from discovery_agent.api.repository_source import MAX_PARAMETERS_BYTES, MAX_ZIP_BYTES, sweep
+from discovery_agent.diagnostics import record_unexpected
 
 from discovery_agent.api.fabric import FabricError, FabricTarget
 from discovery_agent.api.persist import StateStore
@@ -120,8 +123,11 @@ def make_handler(
             if self.command != "HEAD":
                 self.wfile.write(body)
 
-        def _error(self, status: int, code: str, message: str) -> None:
-            self._send(status, {"error": {"code": code, "message": message}})
+        def _error(self, status: int, code: str, message: str, reference: Optional[str] = None) -> None:
+            error = {"code": code, "message": message}
+            if reference:
+                error["reference"] = reference
+            self._send(status, {"error": error})
 
         def _host_ok(self) -> bool:
             header = self.headers.get("Host") or ""
@@ -161,8 +167,11 @@ def make_handler(
                 self._send(200, handler())
             except (ApiError, FabricError) as exc:
                 self._error(exc.status, exc.code, exc.message)
-            except Exception:  # noqa: BLE001 - never surface a traceback to a browser
-                self._error(500, "internal_error", "The server hit an unexpected problem.")
+            except Exception as exc:  # noqa: BLE001 - never surface a traceback to a browser
+                # The traceback goes to the API's log, redacted; the browser gets only the reference to find it by.
+                reference = record_unexpected(f"{self.command} {urlsplit(self.path).path}", exc)
+                self._error(500, "internal_error", f"The server hit an unexpected problem (reference {reference}). "
+                            "The details are in the API's log.", reference)
 
         # -- verbs ---------------------------------------------------------
 
@@ -284,5 +293,9 @@ def make_handler(
 
 def create_server(host: str, port: int, static_root: Optional[Path] = None) -> ThreadingHTTPServer:
     """The API as it runs for real: the last discovery and Fabric target are restored from, and saved to, disk."""
+    # The uploads and working copies of an API process that has ended (a restart, or --reload) are read by nobody now.
+    removed = sweep()
+    if removed:
+        sys.stderr.write(f"Removed {removed} uploaded ZIP and working-copy folder(s) left by API processes that have ended.\n")
     store = StateStore()
     return ThreadingHTTPServer((host, port), make_handler(Session(store), static_root, fabric=FabricTarget(store)))

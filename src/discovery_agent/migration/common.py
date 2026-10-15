@@ -61,6 +61,11 @@ class Source:
     masks: Tuple[Any, ...] = ()
 
 
+def lakehouse_name(warehouse: str) -> str:
+    """The Lakehouse a run creates beside its Warehouse, for OneLake shortcuts and storage routed through them."""
+    return f"{warehouse}_lakehouse"
+
+
 def override_note(source: Source) -> str:
     """The run-log note that says an object was created from reviewed, LLM-assisted code."""
     edited = " and edited" if (source.override or {}).get("edited") else ""

@@ -356,18 +356,23 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     if (patch.stages) stagesChosen.current = true;
     setOptionsState((o) => ({ ...o, ...patch }));
   }, []);
+  // Planning only needs to know which linked services have credentials, never what they are. So only their names are
+  // sent, and a re-score happens when that list changes, not on every key typed. The values travel once, with the run.
+  const credentialKey = useMemo(() => JSON.stringify(Object.keys(credentials)
+    .filter((name) => Object.values(credentials[name] ?? {}).some((v) => typeof v === "string" && v.trim() !== ""))
+    .sort()), [credentials]);
   const analyze = useCallback(async (record = false) => {
     if (!plan.length) { setAnalysis(null); setAnalysisError(null); return; }
     setAnalysisBusy(true);
     setAnalysisError(null);
     try {
-      setAnalysis(await api.analyzePlan([...plan].sort((a, b) => a.wave - b.wave), record, options, credentials));
+      setAnalysis(await api.analyzePlan([...plan].sort((a, b) => a.wave - b.wave), record, options, JSON.parse(credentialKey) as string[]));
     } catch (e) {
       setAnalysisError(messageOf(e));
     } finally {
       setAnalysisBusy(false);
     }
-  }, [api, plan, options, credentials]);
+  }, [api, plan, options, credentialKey]);
   // Re-analyse (debounced) whenever the plan or the Fabric target changes, once discovery has results.
   const discovered = discovery.state === "completed" || discovery.state === "completed_with_warnings";
   useEffect(() => {

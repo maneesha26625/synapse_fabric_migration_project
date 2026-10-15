@@ -967,9 +967,9 @@ export const mockApi: MigrationApi = {
     return { stages: DEMO_STAGES, defaults: { dataMode: "if_empty", dataRun: "run", collation: "match_synapse", syncOverlap: "1h" }, linkedServices: [pool, ...linked], dataTables };
   },
 
-  async analyzePlan(items: PlanItem[], record?: boolean, options?: RunOptions, credentials?: ConnectionCredentials) {
+  async analyzePlan(items: PlanItem[], record?: boolean, options?: RunOptions, credentialNames?: string[]) {
     await sleep(120);
-    void credentials;
+    void credentialNames;
     return demoAnalysis(items, !!record, options);
   },
 

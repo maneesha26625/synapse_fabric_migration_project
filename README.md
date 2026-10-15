@@ -68,7 +68,10 @@ before the next one opens.
   sign-in window, or the Fabric CLI, on the machine running the API. There is
   no password or token field for signing in. Credentials that Synapse will not
   give up (for linked services and the data-load connection) are typed into the
-  Plan step, sent once, held in memory, and never stored, logged or returned.
+  Plan step, sent once when the run starts, held in memory, and never stored,
+  logged or returned. Planning is told only which linked services have them, and
+  refuses a request that carries them. A secret in an environment's parameters
+  file never reaches the disk either.
 * **Deterministic by default.** The same workspace and the same plan give the same
   result. Parsers and rules do the work. A language model is used only when a person
   asks for a draft of one object ([LLM-assisted transformation](#llm-assisted-transformation)),
@@ -101,6 +104,10 @@ and opens the browser. **Run it once; you don't restart anything by hand after t
   restart sign in to Synapse again only to run discovery again, load table data, or count rows in Validate.
 * Running `start-ui.ps1` again is safe: what is already running is reused, and the API refuses to
   start a second copy on the same port.
+* An unexpected error never shows a traceback in the browser. It is written, redacted, to the API's
+  own output (its console, or `.accelerator\api.log` when it runs as the scheduled task), and the
+  message on screen quotes its reference, such as *reference 7f3a2c1b*, so you can find it there.
+  This covers a request, discovery, a run's object, validation, an LLM draft and the Fabric Git commit.
 
 **Keep the API running in the background (recommended).** `.\install-api-service.ps1` creates a
 Windows scheduled task, `MigrationAcceleratorAPI`, that runs the API hidden with auto-reload. It
@@ -213,7 +220,16 @@ Tables, views, procedures and data come from the dedicated SQL pool either way.
   `<linked service>_properties_typeProperties_<property>`. They are applied to
   a working copy under `input/environments/`; the repository and the upload
   are never changed. A parameter that matches no existing property is listed,
-  not guessed at.
+  not guessed at. A secret in the file never reaches that copy: the credential
+  part of a connection string or URL (`Password=`, `AccountKey=`, `sig=` …) is
+  masked, and a value that is only a secret (a password or key) is left out.
+  Nothing needs them, since Fabric connections get their credentials in Plan.
+  The connection check names each parameter this was done to.
+* **Uploads and working copies** hold a client's definitions, so they are kept
+  only while the API process that made them runs. Each is marked with that
+  process (`<folder>.owner`). The next start removes the ones whose process has
+  ended (a restart, or `--reload`), and leaves those of an API still running on
+  another port. A new ZIP replaces the earlier upload.
 * **Optional SQL pool:** the repository holds definitions only. To also
   migrate tables and data, the dedicated SQL pool is read from Azure (for Git,
   the one chosen in the pool list; for a ZIP, tick *Also read the dedicated SQL
@@ -372,8 +388,9 @@ All under `/api`, JSON in and out. Nothing returns a token or a secret.
 | Mapping and waves | `GET /mapping/components` · `GET /dependencies` |
 | Fabric connection | `GET /fabric/connection` · `POST /fabric/authenticate` · `POST /fabric/workspaces` · `POST /fabric/test` · `DELETE /fabric/connection` |
 | LLM transformation | `GET /transform/settings` · `GET /transform` · `GET /transform/objects/<id>` · `GET /transform/prompt/<id>` · `POST /transform/generate` (`ids`) · `POST /transform/accept` (`id`, optional edited `code`) · `POST /transform/discard` (`id`, `scope`: `draft` or `all`) · `GET /transform/candidates` · `GET`/`POST /transform/project` |
-| Migration | `GET /migration/capabilities` · `POST /migration/plan` · `POST /migration/start` · `GET /migration/run` (with `git`: the commit after the run) · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: forget the run's record, refused while it is working) · `POST /migration/validate` (starts it in the background) · `GET /migration/validation` |
-| Fabric Git | `GET /fabric/git` (the target workspace's branch, head, uncommitted / incoming / conflicting items, data-load pipelines kept out, the pull-request link, the last commit) · `POST /fabric/git/commit` (`{comment?}`; commits in the background, refused while a run or another commit is working) |
+| Migration | `GET /migration/capabilities` · `POST /migration/plan` (`credentialNames`: which linked services have credentials; a request carrying the credentials themselves is refused) · `POST /migration/start` (refused with `plan_blocked` while the planner finds a blocking risk) · `GET /migration/run` (with `git`: the commit after the run) · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: forget the run's record, refused while it is working) · `POST /migration/validate` (starts it in the background) · `GET /migration/validation` |
+| Fabric Git | `GET /fabric/git` (the target workspace's branch, head, uncommitted / incoming / conflicting items, data-load pipelines kept out, the pull-request link, the last commit) · `POST /fabric/git/commit` (`{comment?}`; commits what the current run created or updated, in the background; refused with no run, or while a run or another commit is working) |
+| Errors | Every error is `{"error": {"code", "message"}}`. An unexpected one is a 500 with `code: internal_error` and a `reference`; the traceback is in the API's log under that reference, redacted, and never in the response |
 
 ## What is automated, manual, or coming
 
@@ -994,7 +1011,13 @@ triggers).
   risks with a severity, effort, a readiness score, pre-run checks and a
   history of recorded runs. It reads the real definitions, so an unsupported
   column, an unreadable view, a pipeline activity with no Fabric equivalent or a
-  linked service missing credentials is a finding *before* the run.
+  linked service missing credentials is a finding *before* the run. It is told
+  which linked services have credentials by name only (`credentialNames`).
+* **A blocking risk stops the run before it starts.** Plan holds Start back
+  while a risk is blocking, and the backend enforces the same rule: when a run
+  starts, the planner runs again on exactly what that run was given, and a
+  blocking risk refuses it (409 `plan_blocked`, naming the risks) before
+  anything in Fabric is touched.
 * **Safe to re-run.** An object that already exists in Fabric is **Skipped**,
   never overwritten. Retry Failed runs only the failed objects again.
 * **Order.** Waves come from the dependency graph; within a wave: warehouse,
@@ -1010,7 +1033,10 @@ triggers).
   window (the Fabric CLI cannot issue a SQL token).
 * **Needs** ODBC Driver 18 on the machine running the server. Row counts after
   a data pipeline run, and shortcuts, read from the connected Synapse pool, so
-  keep that connection.
+  keep that connection. Plan checks for it only when the plan has table data to
+  load or external tables: a source connected without a dedicated SQL pool (a
+  workspace or repository with no pool chosen) needs none, even with the Table
+  data and External tables stages on.
 * **What is verified.** Every stage is tested offline against Synapse's
   documented formats and Fabric's documented request bodies; Fabric validates
   each create and each pipeline run, and its own error message is shown if it
@@ -1103,13 +1129,21 @@ Fabric's Git REST APIs):
 * When the run completes and **Commit to Fabric Git after the run** is on
   (Plan → *Stages & credentials*; on by default; run option
   `gitCommit: "auto" | "off"`), the accelerator reads the workspace's Git
-  connection and status and makes a **selective commit** of the items the
-  workspace added or changed, with the message *Synapse to Fabric migration
-  run 00N: X object(s) created in &lt;workspace&gt;*.
+  connection and status and makes a **selective commit** of the items **this
+  run created or updated**, with the message *Synapse to Fabric migration
+  run 00N: X object(s) created in &lt;workspace&gt;*. Those are its notebooks
+  (SQL-script notebooks included), pipelines, Spark job definitions and
+  Environments; the Warehouse when any of its schemas, tables, views,
+  procedures, functions or roles changed; and the run's Lakehouse when it made
+  shortcuts, routed storage, or gave a Spark job its default Lakehouse.
 * **Left out on purpose:** the per-wave data-load pipelines
   (`load_<warehouse>_wave_<n>`) and the sync pipeline (`sync_<warehouse>`).
   They are rebuilt per environment, so they never go through Git. Deletions
-  are not committed either.
+  are not committed either, and neither is **anything else waiting in the
+  workspace that this run did not make**: an edit made by hand in Fabric, or an
+  item from outside the migration. Those are named in the result, *Left out 2
+  other change(s) … (pl_load, pool01)*, to be committed from Fabric's Source
+  control panel if they belong in Git.
 * **Stops and says so** rather than forcing anything: when the branch has
   changes the workspace has not taken yet (*Update all* in Fabric first) or
   there are conflicts (resolve them in Fabric's Source control panel). A head
@@ -1121,8 +1155,9 @@ Fabric's Git REST APIs):
   workspace is not connected to Git*; or the error. Anything not committed has
   **Commit now** to try again. The commit runs on its own thread, so Retry
   failed and Reset are free the moment the run completes.
-* **Commit now** (`POST /api/fabric/git/commit`) commits by hand: after a run
-  with committing switched off, or to retry.
+* **Commit now** (`POST /api/fabric/git/commit`) commits by hand what the
+  current run created or updated: after a run with committing switched off, or
+  to retry. With no run for the workspace it is refused (`no_run`).
 * The pull-request link opens Azure DevOps' (or GitHub's) *create pull
   request* page from the workspace's branch into `main`; the review and the
   merge happen there.
@@ -1207,9 +1242,19 @@ connection string or table data is ever sent. If this client's code must not lea
 ## Tests
 
 ```
-pytest                                  # backend: 1,508 tests pass, 104 skipped (below)
-cd frontend && npm run typecheck && npm test   # UI: type check and 70 tests
+pytest                                  # backend: 1,526 tests pass, 104 skipped (below)
+cd frontend && npm run typecheck && npm test   # UI: type check and 71 tests
 ```
+
+**Safe to run beside a live session.** `tests/conftest.py` points everything a
+real session keeps on the machine into each test's own temporary folder:
+`MIGRATION_STATE_DIR` (the saved discovery and Fabric target),
+`MIGRATION_TRANSFORMS_DIR` (accepted LLM transforms), and the upload and
+working-copy folders under `input/`. A test API used to delete a running
+session's saved `discovery.pickle` and leave uploads behind; a test now checks
+that nothing points at the real folders. (`MIGRATION_STATE=off` alone was never
+enough: a reset or sign-out still deleted the saved file. Switched off, the
+folder is now never read, written or emptied.)
 
 The skipped backend tests are the two opt-in integration suites (39 tests,
 below), 63 that read a local snapshot of a sample repository
@@ -1218,7 +1263,8 @@ been cloned there, and 2 that need permission to create symbolic links.
 
 Tests run fully offline — no network access, no Azure subscription, no ODBC
 driver and no dependency on any real repository. Every credential, ARM call,
-SQL session and git invocation in the unit suite is a fake.
+SQL session and git invocation in the unit suite is a fake, and so is the ODBC
+driver the planner checks for (`MigrationService(driver=...)`).
 
 Two opt-in integration suites talk to real resources and are skipped unless
 their flag and configuration are both set:
@@ -1237,9 +1283,10 @@ followed), a selective commit that leaves out data-load pipelines and
 deletions, Azure DevOps single sign-on set when missing and GitHub refused with
 the way forward, conflicts and incoming changes refused, a moved head retried
 once, a commit too large split into batches, error messages without a token,
-the pull-request links, and the run: committed after it completes, free for
-Retry while the commit finishes, switched off, and a commit failure kept as a
-note that never fails the run.
+the pull-request links, and the run: committed after it completes (only what
+it created or updated, with the other waiting changes named and left), free for
+Retry while the commit finishes, switched off, a commit by hand refused without
+a run, and a commit failure kept as a note that never fails the run.
 
 The UI tests run against Demo data in a simulated browser: choosing the
 route (only Synapse and Fabric selectable), the two source options (the
@@ -1252,5 +1299,7 @@ and tested, the step lock and Next, resetting a step, results that disappear
 backend-unavailable bar, the dialogs that ask first, every step's panel, the
 workspace explorer, the release path (with its live Fabric Git chip), a run
 committed to Fabric Git with its pull-request link, *Commit now* after a run
-with committing off, the assistant, the old page addresses, and that a typed
-credential never reaches browser storage.
+with committing off, the assistant, the old page addresses, that a typed
+credential never reaches browser storage, and that planning is told only which
+linked services have credentials (never what they are, and not again on every
+key typed).

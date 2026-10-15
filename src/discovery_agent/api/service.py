@@ -37,6 +37,7 @@ from discovery_agent.api import mapping, repository_source
 from discovery_agent.api.repository_source import RepositoryError, RepositorySpec
 from discovery_agent.api.persist import StateStore
 from discovery_agent.config import DEFAULT_OUTPUT_DIR, DiscoveryConfig
+from discovery_agent.diagnostics import record_unexpected, unexpected_message
 from discovery_agent.connections.azure import (
     ARM_SCOPE,
     AzureConnection,
@@ -659,6 +660,8 @@ class Session:
             upload_id, folder = repository_source.extract_zip(data)
         except RepositoryError as exc:
             raise ApiError(400, "invalid_zip", str(exc)) from exc
+        # The new ZIP replaces the one the page held: an earlier upload is never connected again, so it is not kept.
+        repository_source.forget_uploads(keep=upload_id)
         name = _FILE_NAME.sub("_", file_name or "")[:120] or "workspace.zip"
         try:
             root, relative = repository_source.find_root(folder)
@@ -729,14 +732,14 @@ class Session:
 
         try:
             root, relative = repository_source.find_root(base, str(body.get("rootFolder") or ""))
-            path, applied, unmatched = repository_source.prepare(root, parameters)
+            path, applied, unmatched, secrets = repository_source.prepare(root, parameters)
         except RepositoryError as exc:
             checks.append({"name": "Synapse definitions", "status": "failed", "message": str(exc), "category": "configuration"})
             return self._repository_failure(checks, "No Synapse definitions found", str(exc),
                                             "Name the root folder the workspace uses (its Git configuration shows it).")
         spec = RepositorySpec(kind=kind, label=label, environment=environment, root_folder=relative, path=path, ref=ref,
                               commit=commit, parameters_name=(str(body.get("parametersName") or "")[:120] or None) if parameters else None,
-                              applied=applied, unmatched=unmatched, counts=repository_source.counts(path))
+                              applied=applied, unmatched=unmatched, counts=repository_source.counts(path), secrets=secrets)
         where = f"in {relative}/" if relative else "at the top"
         checks.append({"name": "Synapse definitions", "status": "ok" if spec.artifact_count else "failed", "category": None,
                        "message": f"{spec.artifact_count:,} definitions in {len(spec.counts)} folders, {where}"})
@@ -744,9 +747,12 @@ class Session:
             checks.append({"name": f"{environment} parameters", "status": "skipped", "category": None,
                            "message": "No parameters file: linked services keep the values committed in the repository"})
         else:
-            message = f"{len(applied)} of {len(applied) + len(unmatched)} values applied to linked services"
+            message = f"{len(applied)} of {len(applied) + len(unmatched) + len(set(secrets) - set(applied))} values applied to linked services"
             if unmatched:
                 message += f"; not matched: {', '.join(unmatched[:5])}{' and more' if len(unmatched) > 5 else ''}"
+            if secrets:
+                message += (f"; secrets kept off disk (Fabric gets credentials in Plan instead): "
+                            f"{', '.join(secrets[:5])}{' and more' if len(secrets) > 5 else ''}")
             checks.append({"name": f"{environment} parameters", "status": "ok", "message": message, "category": None})
 
         manager: Optional[ConnectionManager] = None
@@ -963,8 +969,9 @@ class Session:
                 self._save_discovery(job, conn)
         except DiscoveryError as exc:
             self._fail(job, redact(str(exc)))
-        except Exception as exc:  # noqa: BLE001 - never leak a traceback to the UI
-            self._fail(job, f"Discovery stopped unexpectedly ({type(exc).__name__}).")
+        except Exception as exc:  # noqa: BLE001 - never leak a traceback to the UI; the API's log gets it
+            reference = record_unexpected("discovery", exc)
+            self._fail(job, unexpected_message("Discovery stopped unexpectedly", exc, reference))
 
     @staticmethod
     def _build_graph(items: List[dict], records: list, extras: list, known: Dict[str, str]) -> dict:

@@ -28,8 +28,9 @@ import re
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from discovery_agent.diagnostics import record_unexpected, redacted
 from discovery_agent.migration import environments, notebooks, security, tsql_rules, warehouse_ddl
 from discovery_agent.migration.common import (  # noqa: F401 - re-exported: tests and the API import these from here
     COMPLETED, CONNECTION, DATA, DATASET, DEFERRED, DEFERRED_STATUS, ENVIRONMENT, FAILED, FUNCTION, IN_PROGRESS, MISSING,
@@ -216,6 +217,16 @@ class Migrator(StageMixin, FabricStageMixin):
         self._collation: Optional[str] = None
         #: A workspace-level failure; every later Fabric object fails with it at once.
         self._fatal: Optional[str] = None
+        #: Log references of the unexpected errors this pass has written down, by (type, message).
+        self._unexpected: Dict[Tuple[str, str], str] = {}
+
+    def _reference(self, source: Source, exc: Exception) -> str:
+        """The log reference for an unexpected error. Each distinct error is written once per pass, so a fault
+        that hits every object leaves one traceback in the log, not thousands."""
+        key = (type(exc).__name__, str(exc)[:300])
+        if key not in self._unexpected:
+            self._unexpected[key] = record_unexpected(f"migration run {self.run.run_id}: {source.name}", exc)
+        return self._unexpected[key]
 
     # -- the loop ----------------------------------------------------------
 
@@ -283,8 +294,8 @@ class Migrator(StageMixin, FabricStageMixin):
                 item.status, item.step, item.error, item.completed_at = FAILED, "Failed", message, _now()
             run.log("FAILED", source.name, message)
             return
-        except Exception as exc:  # noqa: BLE001 - one object never stops the run
-            message = f"Unexpected {type(exc).__name__}: {str(exc)[:300]}"
+        except Exception as exc:  # noqa: BLE001 - one object never stops the run; the API's log gets the traceback
+            message = f"Unexpected {type(exc).__name__}: {redacted(str(exc)[:300])} (reference {self._reference(source, exc)})"
             with run.lock:
                 item.status, item.step, item.error, item.completed_at = FAILED, "Failed", message, _now()
             run.log("FAILED", source.name, message)

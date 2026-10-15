@@ -15,10 +15,11 @@ from __future__ import annotations
 import re
 import threading
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from discovery_agent.api.fabric import FabricError, FabricTarget
 from discovery_agent.api.service import ApiError, Session
+from discovery_agent.diagnostics import record_unexpected, redacted, unexpected_message
 from discovery_agent.migration import planner as planning
 from discovery_agent.migration.fabric_rest import NO_CAPACITY, FabricApiError, FabricRestClient
 from discovery_agent.migration.preflight import code_text as preflight_code_text
@@ -27,7 +28,9 @@ from discovery_agent.migration import capabilities, datafilter, datapipeline, fa
 from discovery_agent.migration.onelake import OneLakeFiles
 from discovery_agent.migration.runtime_checks import RuntimeOptions
 from discovery_agent.migration.validation import Validator, summarize
+from discovery_agent.migration.common import lakehouse_name
 from discovery_agent.migration.runner import (
+    COMPLETED,
     CONNECTION,
     DATA,
     DATASET,
@@ -39,12 +42,15 @@ from discovery_agent.migration.runner import (
     NOTEBOOK,
     PIPELINE,
     POOL,
+    PROCEDURE,
     SCHEDULE,
     SCHEMA,
     SCRIPT,
     SECURITY,
+    SHORTCUT,
     SPARKJOB,
     TABLE,
+    VIEW,
     COLLATIONS,
     MigrationRun,
     Migrator,
@@ -172,6 +178,18 @@ def parse_credentials(raw: Any) -> Dict[str, Dict[str, str]]:
     return out
 
 
+def parse_credential_names(raw: Any) -> Set[str]:
+    """The linked services a person has entered credentials for, by name only.
+
+    Planning needs to know which have them, never what they are: the credentials themselves are sent once, when
+    a run starts."""
+    if raw in (None, []):
+        return set()
+    if not isinstance(raw, list) or len(raw) > MAX_CREDENTIALS or not all(isinstance(n, str) and 0 < len(n) <= 260 for n in raw):
+        raise ApiError(400, "invalid_request", "credentialNames must be a list of linked-service names.")
+    return set(raw)
+
+
 def apply_stages(sources: List[Source], options: dict) -> List[Source]:
     """Add the data loads, then keep only what the selected stages cover."""
     stages = set(options["stages"])
@@ -191,6 +209,12 @@ def apply_stages(sources: List[Source], options: dict) -> List[Source]:
             label = capabilities.stage(key).label if key else s.type
             kept.append(Source(s.id, s.name, s.type, s.wave, DEFERRED, reason=f"Its stage ({label}) is switched off for this run."))
     return kept
+
+
+def needs_synapse_source(sources: List[Source]) -> bool:
+    """Whether running these items reads the Synapse pool itself: a table's data load (its row count) or an
+    external table (its location). Nothing else does, so a plan without them needs no SQL pool sign-in."""
+    return any(s.kind in (DATA, SHORTCUT) for s in sources)
 
 
 def plan_objects(plan: List[dict], job: Any, sources: List[Source], stages: Optional[set] = None) -> List[planning.PlanObject]:
@@ -215,6 +239,34 @@ def plan_objects(plan: List[dict], job: Any, sources: List[Source], stages: Opti
             selected=stages is None or capabilities.stage_of_kind(kind or "") in stages,
         ))
     return out
+
+#: The Fabric item each kind of run object is created as: what its commit to Fabric Git is made of.
+_GIT_ITEM_TYPES = {NOTEBOOK: "Notebook", SCRIPT: "Notebook", PIPELINE: "DataPipeline", SPARKJOB: "SparkJobDefinition",
+                   ENVIRONMENT: "Environment"}
+#: Kinds whose objects live inside the run's Warehouse item.
+_WAREHOUSE_KINDS = frozenset({POOL, SCHEMA, TABLE, VIEW, PROCEDURE, FUNCTION, SECURITY})
+
+
+def git_items(run: MigrationRun) -> Set[Tuple[str, str]]:
+    """The Fabric items a run created or updated, as (item type, display name): all its Fabric Git commit may take.
+
+    Schemas, tables, views, procedures, functions and roles change the Warehouse item. External-table shortcuts,
+    storage routed through OneLake, and a Spark job's default Lakehouse change the run's Lakehouse. Connections,
+    data loads and schedules are not items Fabric keeps in Git."""
+    with run.lock:
+        done = [i.source for i in run.items if i.status == COMPLETED]
+    items: Set[Tuple[str, str]] = set()
+    lakehouse = False
+    for source in done:
+        if source.kind in _GIT_ITEM_TYPES:
+            items.add((_GIT_ITEM_TYPES[source.kind], source.name))
+        elif source.kind in _WAREHOUSE_KINDS:
+            items.add(("Warehouse", run.warehouse))
+        lakehouse = lakehouse or source.kind in (SHORTCUT, SPARKJOB)
+    if lakehouse or (items and run.settings.get("storageRoutes")):
+        items.add(("Lakehouse", lakehouse_name(run.warehouse)))
+    return items
+
 
 IDLE = {
     "runId": "", "state": "idle", "total": 0, "completed": 0, "inProgress": 0, "failed": 0,
@@ -458,9 +510,12 @@ class MigrationService:
         sql_factory: Optional[Callable[[str, str], Any]] = None,
         source_factory: Optional[Callable[[], Any]] = None,
         transforms: Any = None,
+        driver: Optional[Callable[[], str]] = None,
     ) -> None:
         self._session = session
         self._source_factory = source_factory
+        #: The ODBC driver the Warehouse sessions would use (``sql_driver``); the tests give one, so they need none installed.
+        self._driver = driver or sql_driver
         #: The TransformService, when LLM-assisted transforms are wired in: it attaches accepted ones to the plan items.
         self._transforms = transforms
         #: Connection credentials for the run's life. Memory only: never logged, returned or written.
@@ -495,32 +550,58 @@ class MigrationService:
         if not workspace.get("capacityId"):
             raise ApiError(409, "no_fabric_capacity", NO_CAPACITY + ".")
 
+    def _refuse_blocking(self, plan: List[dict], options: dict, credentials: Dict[str, Dict[str, str]], job: Any,
+                         pool: Optional[str]) -> None:
+        """Refuse a run the planner finds a blocking risk in: one that would fail or do the wrong thing.
+
+        The Plan step holds Start back for the same reason; this is the same rule where no page can skip it,
+        worked out again on what this run is given, so a plan scored earlier cannot slip one through."""
+        result, _ = self._assessment(plan, options, set(credentials), job, pool)
+        blocking = [r for r in result["risks"] if r["severity"] == planning.BLOCKING]
+        if blocking:
+            shown = " ".join(r["message"] for r in blocking[:3])
+            more = f" There {'is' if len(blocking) == 4 else 'are'} {len(blocking) - 3} more in Plan." if len(blocking) > 3 else ""
+            raise ApiError(409, "plan_blocked", f"The run was not started: the plan has {len(blocking)} blocking "
+                           f"risk{'s' if len(blocking) != 1 else ''}. {shown}{more} Resolve them in Plan, then start the run.")
+
     # -- routes ------------------------------------------------------------
 
     def state(self) -> dict:
         run = self._run
         return run.to_dict() if run is not None else dict(IDLE)
 
-    def analyze(self, body: dict) -> dict:
-        """The planner's strategy, risks, effort and checks for a plan. Reads, never writes."""
-        plan = body.get("items")
-        if not isinstance(plan, list) or not all(isinstance(p, dict) for p in plan) or len(plan) > MAX_ITEMS:
-            raise ApiError(400, "invalid_plan", "The migration plan is not in a valid format.")
-        options = parse_options(body)
-        credentials = parse_credentials(body.pop("credentials", None))
-        job, pool = self._session.migration_snapshot()
+    def _assessment(self, plan: List[dict], options: dict, credential_names: Set[str], job: Any,
+                    pool: Optional[str]) -> Tuple[dict, List[Source]]:
+        """The planner's analysis of a plan run with these options, and the sources it read. Reads, never writes.
+
+        ``analyze`` shows it on the Plan step; ``start`` refuses a run it finds a blocking risk in."""
         every = sources_for(plan, job, pool)
         stages = set(options["stages"])
         sources = apply_stages(every, {**options, "scope": "automated"})
         if self._transforms is not None:
             self._transforms.apply(sources)
         objects = plan_objects(plan, job, every, stages)
-        needs_source = bool(stages & {"data", "shortcuts"})
-        checks = environment_checks(self._fabric.state(), sql_driver(),
-                                    source_connected=self._source_available() if needs_source else None)
+        # Asked only when the plan has table data to load or external tables: the Table data and External tables
+        # stages are on by default, and a source connected without a SQL pool has nothing for them to read.
+        checks = environment_checks(self._fabric.state(), self._driver(),
+                                    source_connected=self._source_available() if needs_synapse_source(sources) else None)
         # A connection already in Fabric is reused by the run (skipped), so it needs no credentials either.
-        names = set(credentials) | set(self._credentials) | self._existing_connection_names()
-        result = planning.analyze(objects, content_findings(sources, names, pool or "", options["storageRoutes"]), checks)
+        names = set(credential_names) | set(self._credentials) | self._existing_connection_names()
+        return planning.analyze(objects, content_findings(sources, names, pool or "", options["storageRoutes"]), checks), sources
+
+    def analyze(self, body: dict) -> dict:
+        """The planner's strategy, risks, effort and checks for a plan. Reads, never writes."""
+        plan = body.get("items")
+        if not isinstance(plan, list) or not all(isinstance(p, dict) for p in plan) or len(plan) > MAX_ITEMS:
+            raise ApiError(400, "invalid_plan", "The migration plan is not in a valid format.")
+        if "credentials" in body:
+            # Refused, not dropped: credentials travel once, with the run. Planning needs only whose they are.
+            raise ApiError(400, "credentials_not_accepted", "Credentials are sent only when a run starts. To plan, send the "
+                           "names of the linked services that have them (credentialNames).")
+        options = parse_options(body)
+        names = parse_credential_names(body.get("credentialNames"))
+        job, pool = self._session.migration_snapshot()
+        result, sources = self._assessment(plan, options, names, job, pool)
         result["storage"] = self._storage_suggestions(sources, job)
         result["options"] = {**options, "dataFilters": {k: f.to_dict() for k, f in options["dataFilters"].items()}}
         if body.get("record"):
@@ -586,6 +667,7 @@ class MigrationService:
         if self._busy():
             raise ApiError(409, "run_in_progress", "A migration run is already in progress. Pause it or wait for it to finish.")
         self._check_capacity(workspace_id)
+        self._refuse_blocking(plan, options, credentials, job, pool)
         with self._lock:
             if self._busy():
                 raise ApiError(409, "run_in_progress", "A migration run is already in progress. Pause it or wait for it to finish.")
@@ -692,9 +774,12 @@ class MigrationService:
                                         "finishedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), **out}
                 except ApiError as exc:
                     self._validation = {"state": "failed", "startedAt": started, "error": {"code": exc.code, "message": exc.message}}
-                except Exception as exc:  # noqa: BLE001 - reported, never raised into the thread
-                    self._validation = {"state": "failed", "startedAt": started,
-                                        "error": {"code": "validation_failed", "message": f"Validation stopped: {type(exc).__name__}: {str(exc)[:300]}"}}
+                except Exception as exc:  # noqa: BLE001 - reported, never raised into the thread; the API's log gets the traceback
+                    reference = record_unexpected("validation", exc)
+                    self._validation = {"state": "failed", "startedAt": started, "error": {
+                        "code": "validation_failed", "reference": reference,
+                        "message": f"Validation stopped: {type(exc).__name__}: {redacted(str(exc)[:300])} (reference {reference}). "
+                                   "The details are in the API's log."}}
 
             snapshot = dict(self._validation)  # before the thread starts: a quick validation may finish first
             self._validation_thread = threading.Thread(target=work, name="validation", daemon=True)
@@ -812,32 +897,38 @@ class MigrationService:
         made = sum(1 for i in run.items if i.status == "COMPLETED")
         return f"Synapse to Fabric migration run {run.run_id}: {made} object(s) created in {run.workspace_name}"
 
-    def _commit(self, workspace_id: str, comment: str) -> dict:
-        """Commit the workspace's migrated items to its Fabric Git branch. Never raises: the answer says what happened."""
+    def _commit(self, workspace_id: str, comment: str, run: MigrationRun) -> dict:
+        """Commit what ``run`` created or updated to the workspace's Fabric Git branch, and nothing else waiting there.
+        Never raises: the answer says what happened."""
         started = datetime.now(timezone.utc).isoformat(timespec="seconds")
         try:
             client = self._rest_factory()
             conn = fabric_git.connection(client, workspace_id)
             if not conn.connected:
                 return {"state": "skipped", "message": fabric_git.KNOWN_NOT_CONNECTED, "at": started}
-            result = fabric_git.commit(client, workspace_id, comment)
-            out = {"state": result.state, "items": result.items, "skipped": result.skipped, "commit": result.commit,
-                   "branch": conn.branch, "commitUrl": fabric_git.commit_url(conn, result.commit),
+            result = fabric_git.commit(client, workspace_id, comment, only=git_items(run))
+            out = {"state": result.state, "items": result.items, "skipped": result.skipped, "others": result.others,
+                   "commit": result.commit, "branch": conn.branch, "commitUrl": fabric_git.commit_url(conn, result.commit),
                    "pullRequestUrl": fabric_git.pull_request_url(conn), "at": started}
             out["message"] = (f"Committed {result.items} item(s) to {conn.branch}." if result.state == "committed"
                               else "Nothing new to commit: the branch already has everything the run created.")
             if result.skipped:
                 out["message"] += f" Left out {len(result.skipped)} data-load pipeline(s): they are rebuilt per environment."
+            if result.others:
+                shown = ", ".join(result.others[:5]) + (f" and {len(result.others) - 5} more" if len(result.others) > 5 else "")
+                out["message"] += (f" Left out {len(result.others)} other change(s) waiting in the workspace that this run did not "
+                                   f"make ({shown}): commit them from Fabric's Source control panel if they belong in Git.")
             return out
         except fabric_git.GitNotReady as exc:
             return {"state": "blocked", "message": str(exc), "at": started}
         except FabricApiError as exc:
             return {"state": "failed", "message": exc.message, "code": exc.code, "at": started}
-        except Exception as exc:  # noqa: BLE001 - a commit problem is reported, never raised into the run
-            return {"state": "failed", "message": f"The commit could not be made: {type(exc).__name__}.", "at": started}
+        except Exception as exc:  # noqa: BLE001 - a commit problem is reported, never raised into the run; the API's log gets it
+            reference = record_unexpected("the Fabric Git commit", exc)
+            return {"state": "failed", "message": unexpected_message("The commit could not be made", exc, reference), "at": started}
 
     def _commit_after_run(self, run: MigrationRun) -> None:
-        result = self._commit(run.workspace_id, self._git_comment(run))
+        result = self._commit(run.workspace_id, self._git_comment(run), run)
         with run.lock:
             run.git = result
         run.log("GIT", "run", result.get("message") or result.get("state", ""))
@@ -858,20 +949,26 @@ class MigrationService:
             out = fabric_git.describe(self._rest_factory(), workspace_id)
         except FabricApiError as exc:
             out = {"state": "error", "message": exc.message, "code": exc.code}
-        except Exception as exc:  # noqa: BLE001 - the page shows a reason, never a traceback
-            out = {"state": "error", "message": f"The Git status could not be read: {type(exc).__name__}."}
+        except Exception as exc:  # noqa: BLE001 - the page shows a reason, never a traceback; the API's log gets it
+            reference = record_unexpected("reading the Fabric Git status", exc)
+            out = {"state": "error", "message": unexpected_message("The Git status could not be read", exc, reference)}
         out["workspace"] = workspace_name
         out["committing"] = committing
         out["lastCommit"] = last
         return out
 
     def git_commit(self, body: dict) -> dict:
-        """Commit the target workspace's migrated items to its Fabric Git branch, on a background thread."""
+        """Commit what the current run created or updated to the target workspace's Fabric Git branch, on a
+        background thread. Other changes waiting in the workspace are left for a person, and listed."""
         unknown = sorted(set(body) - {"comment"})
         if unknown:
             raise ApiError(400, "invalid_request", f"Unexpected field(s): {', '.join(unknown)}.")
         workspace_id, _, _ = self._fabric.migration_target()
-        comment = str(body.get("comment") or "").strip() or self._git_comment(self._run)
+        run = self._run
+        if run is None or run.workspace_id != workspace_id:
+            raise ApiError(409, "no_run", "There is no migration run for this workspace to commit. Changes made outside a run "
+                           "are committed from Fabric's Source control panel.")
+        comment = str(body.get("comment") or "").strip() or self._git_comment(run)
         with self._lock:
             if self._busy():
                 raise ApiError(409, "run_in_progress", "A migration run is working. It commits by itself when it completes.")
@@ -879,12 +976,12 @@ class MigrationService:
                 raise ApiError(409, "commit_in_progress", "A commit is already running.")
 
             def work() -> None:
-                result = self._commit(workspace_id, comment)
+                result = self._commit(workspace_id, comment, run)
                 with self._lock:
                     self._last_commit = result
-                    if self._run is not None and self._run.workspace_id == workspace_id:
-                        with self._run.lock:
-                            self._run.git = result
+                    if self._run is run:
+                        with run.lock:
+                            run.git = result
 
             self._git_thread = threading.Thread(target=work, name="fabric-git-commit", daemon=True)
             self._git_thread.start()

@@ -867,6 +867,34 @@ describe("plan step", () => {
     expect(screen.getByLabelText("Password for synapse-demo-synapse-ws-TransportDW")).toHaveValue("");
   }, 30000);
 
+  it("tells the planner which linked services have credentials, never the credentials, and does not re-score on every key", async () => {
+    await discovered();
+    unlockTo("plan");
+    const user = userEvent.setup();
+    const analyze = vi.spyOn(mockApi, "analyzePlan");
+    try {
+      go("/migration?step=plan");
+      await waitFor(() => expect(screen.getByRole("button", { name: /^Add all .* objects/ })).toBeEnabled(), { timeout: 8000 });
+      await user.click(screen.getByRole("button", { name: /^Add all .* objects/ }));
+      await user.click(await screen.findByRole("tab", { name: "Stages & credentials" }));
+      for (const section of screen.getAllByText(/Credentials/, { selector: "summary span" })) await user.click(section);
+      const name = "synapse-demo-synapse-ws-TransportDW";
+      // Choosing how it signs in is what gives it credentials: the planner is told its name, and only its name.
+      await user.selectOptions(screen.getByLabelText(`How to sign in to ${name}`), "basic");
+      await waitFor(() => expect(analyze.mock.calls.some((call) => call[3]?.includes(name))).toBe(true));
+      await user.type(await screen.findByLabelText(`Password for ${name}`), "S3CRET-NEVER-SENT");
+      await new Promise((resolve) => setTimeout(resolve, 700)); // past the re-score's 350 ms pause
+      const scored = analyze.mock.calls.length;
+      await user.type(screen.getByLabelText(`Password for ${name}`), "MORE");
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      // More keys typed, the same linked services with credentials: nothing to score again, and nothing secret sent.
+      expect(analyze.mock.calls.length).toBe(scored);
+      expect(JSON.stringify(analyze.mock.calls)).not.toContain("S3CRET-NEVER-SENT");
+    } finally {
+      analyze.mockRestore();
+    }
+  }, 30000);
+
   it("sets a date filter per table, keeps a table in sync with a guessed change column, and keeps filters across a reload", async () => {
     resetDemo();
     await discovered();

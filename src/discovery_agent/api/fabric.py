@@ -33,6 +33,8 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from discovery_agent.diagnostics import record_unexpected
+
 FABRIC_RESOURCE = "https://api.fabric.microsoft.com"
 FABRIC_API = FABRIC_RESOURCE + "/v1"
 LOGIN_TIMEOUT = 180  # seconds the operator has to finish a browser sign-in
@@ -151,11 +153,13 @@ class FabricTarget:
                 name = self.workspace_name or wid
                 self._reset()
                 self.message = f"Could not reconnect to {name} from the last session ({exc.message}) Log in again."
-        except Exception as exc:  # noqa: BLE001 - a restore never takes the API down
+        except Exception as exc:  # noqa: BLE001 - a restore never takes the API down; the API's log gets the traceback
+            reference = record_unexpected("restoring the Fabric target", exc)
             with self._lock:
                 if gen == self._gen:
                     self._reset()
-                    self.message = f"Could not reconnect to the Fabric workspace from the last session ({type(exc).__name__}). Log in again."
+                    self.message = (f"Could not reconnect to the Fabric workspace from the last session ({type(exc).__name__}, "
+                                    f"reference {reference}). Log in again.")
 
     def _reset(self) -> None:
         self.status = "disconnected"  # disconnected | signing_in | authenticated | connected | failed

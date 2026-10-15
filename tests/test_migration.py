@@ -10,19 +10,20 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import threading
 import time
 from types import SimpleNamespace
 
 import pytest
 
-from discovery_agent.api.migration import MigrationService, sources_for
+from discovery_agent.api.migration import MigrationService, needs_synapse_source, sources_for
 from discovery_agent.api.service import ApiError
 from discovery_agent.migration import notebooks, warehouse_ddl
 from discovery_agent.migration.fabric_rest import FabricApiError, FabricRestClient
 from discovery_agent.migration.runner import (
-    COMPLETED, DEFERRED, DEFERRED_STATUS, FAILED, MIGRATABLE_TYPES, NOTEBOOK, PENDING, POOL, PROCEDURE,
-    SCHEMA, SCHEMA_EXISTS_QUERY, SKIPPED, TABLE, VIEW, MigrationRun, Migrator, Source, warehouse_name_for,
+    COMPLETED, DATA, DEFERRED, DEFERRED_STATUS, FAILED, MIGRATABLE_TYPES, NOTEBOOK, PENDING, PIPELINE, POOL, PROCEDURE,
+    SCHEMA, SCHEMA_EXISTS_QUERY, SHORTCUT, SKIPPED, TABLE, VIEW, MigrationRun, Migrator, Source, warehouse_name_for,
 )
 from discovery_agent.source_strategy import P0Artifact
 from discovery_agent.sql.models import (
@@ -552,10 +553,12 @@ def wait_until(predicate, seconds=5.0):
     return False
 
 
-def service(job=None, ready=True, rest=None, db=None):
+def service(job=None, ready=True, rest=None, db=None, driver="ODBC Driver 18 for SQL Server"):
     rest = rest or FakeRest(warehouses=[{"id": "wh-1", "displayName": "pool01"}])
     db = db or FakeDb()
-    return MigrationService(FakeSession(job), FakeFabric(ready), rest_factory=lambda: rest, sql_factory=lambda h, d: db)
+    # The SQL sessions are fakes, so the ODBC driver they would need is given too: the tests need none installed.
+    return MigrationService(FakeSession(job), FakeFabric(ready), rest_factory=lambda: rest, sql_factory=lambda h, d: db,
+                            driver=lambda: driver)
 
 
 def test_a_run_needs_a_plan_a_discovery_and_a_connected_fabric_target():
@@ -593,7 +596,9 @@ def test_pause_stops_before_the_next_object_and_resume_continues():
 
     rest = SlowRest()
     svc = service(fake_job(), rest=rest)
-    svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}, {"id": "sql://ws/pool/sales/Orders", "wave": 2}],
+    # In dependency order (LoadSales reads Orders), so the planner lets it start. Orders goes first and waits in
+    # Fabric (its Warehouse is created) while the pause is asked for.
+    svc.start({"items": [{"id": "sql://ws/pool/sales/Orders", "wave": 1}, {"id": "synapse://notebook/LoadSales", "wave": 2}],
                "options": {"stages": ["warehouse", "notebooks"]}})
     svc.control({"action": "pause"})
     gate.set()
@@ -673,6 +678,54 @@ def test_a_workspace_without_a_fabric_capacity_is_refused_before_anything_runs()
         svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}]})
     assert exc.value.code == "no_fabric_capacity" and "License info" in exc.value.message
     assert svc.state()["state"] == "idle" and not rest.created
+
+
+def test_a_plan_with_a_blocking_risk_is_refused_at_start_and_nothing_is_touched():
+    rest = FakeRest(warehouses=[{"id": "wh-1", "displayName": "pool01"}])
+    svc = service(fake_job(), rest=rest)
+    # LoadSales reads sales.Orders but is planned a wave before it, which the planner calls blocking. The page
+    # holds Start back for it; the backend refuses it too, whatever page sends the request.
+    plan = {"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}, {"id": "sql://ws/pool/sales/Orders", "wave": 2}],
+            "options": {"stages": ["warehouse", "notebooks"]}}
+    assert svc.analyze(plan)["blocking"] == 1
+    with pytest.raises(ApiError) as refused:
+        svc.start(plan)
+    assert refused.value.status == 409 and refused.value.code == "plan_blocked"
+    assert "1 blocking risk." in refused.value.message and "LoadSales is in wave 1 but needs sales.Orders" in refused.value.message
+    assert svc.state()["state"] == "idle" and not rest.created
+    # A check on the machine blocks the same way: without an ODBC driver the Warehouse cannot be reached.
+    nodriver = service(fake_job(), driver="")
+    with pytest.raises(ApiError) as missing:
+        nodriver.start({"items": [{"id": "sql://ws/pool/sales/Orders", "wave": 1}], "options": {"stages": ["warehouse"]}})
+    assert missing.value.code == "plan_blocked" and "ODBC Driver 18" in missing.value.message
+
+
+def test_planning_is_told_which_linked_services_have_credentials_never_the_credentials():
+    svc = service(fake_job())
+    plan = {"items": [{"id": "synapse://notebook/LoadSales", "wave": 4}], "options": {"stages": ["notebooks"]}}
+    with pytest.raises(ApiError) as refused:
+        svc.analyze({**plan, "credentials": {"LS_Sql": {"authType": "Basic", "username": "u", "password": "s3cr3t-value"}}})
+    assert refused.value.status == 400 and refused.value.code == "credentials_not_accepted"
+    assert "s3cr3t-value" not in refused.value.message
+    assert svc.analyze({**plan, "credentialNames": ["LS_Sql"]})["objects"] == 1
+    for bad in ("LS_Sql", [""], [1], ["x" * 261]):
+        with pytest.raises(ApiError) as invalid:
+            svc.analyze({**plan, "credentialNames": bad})
+        assert invalid.value.code == "invalid_request"
+
+
+def test_an_unexpected_error_is_logged_once_under_the_reference_each_object_shows(capsys):
+    class Boom(FakeRest):
+        def list(self, path):
+            raise KeyError("password=hunter2")
+    run, _, _, _ = run_with([src("A", NOTEBOOK, payload=notebook_payload()), src("B", NOTEBOOK, payload=notebook_payload())], rest=Boom())
+    errors = {i.error for i in run.items}
+    assert all(i.status == FAILED for i in run.items) and len(errors) == 1
+    reference = re.search(r"\(reference ([0-9a-f]{8})\)$", errors.pop()).group(1)
+    log = capsys.readouterr().err
+    # One traceback for one fault, however many objects it hit; and no secret in it, or on any object.
+    assert log.count("ERROR [") == 1 and f"ERROR [{reference}] migration run 001: A: unexpected KeyError" in log
+    assert "Traceback" in log and "hunter2" not in log and all("hunter2" not in i.error for i in run.items)
 
 
 def test_schema_and_pool_items_become_warehouse_steps():
@@ -947,6 +1000,27 @@ def test_the_planner_endpoint_reports_strategy_checks_and_a_history_of_recorded_
     assert again["fingerprint"] == first["fingerprint"]
     assert len(again["history"]) == 1 and again["history"][0]["id"] == "P001"
     assert len(svc.analyze({"items": ALL_THREE, "record": True})["history"]) == 2
+
+
+SOURCE_CHECK = "Synapse source connected (row counts and shortcuts)"
+
+
+def test_the_source_check_follows_what_the_plan_reads_from_the_pool_not_which_stages_are_on():
+    # The fake session has no Synapse pool signed in, like a source connected without a SQL pool.
+    svc = service(fake_job())
+    no_tables = svc.analyze({"items": [i for i in ALL_THREE if not i["id"].startswith("sql://")]})
+    assert SOURCE_CHECK not in [c["label"] for c in no_tables["checks"]]  # stages on by default, nothing for them to read
+    assert not [r for r in no_tables["risks"] if SOURCE_CHECK in str(r)]
+    with_table = svc.analyze({"items": ALL_THREE})
+    assert next(c for c in with_table["checks"] if c["label"] == SOURCE_CHECK)["status"] == "fail"
+    data_off = svc.analyze({"items": ALL_THREE, "options": {"stages": ["warehouse", "notebooks", "pipelines"]}})
+    assert SOURCE_CHECK not in [c["label"] for c in data_off["checks"]]
+
+
+def test_only_data_loads_and_external_tables_read_the_synapse_pool():
+    assert not needs_synapse_source([src("A", NOTEBOOK), src("P", PIPELINE, type_="Pipeline"), src("sales.Orders", TABLE, payload=table())])
+    assert needs_synapse_source([src("A", NOTEBOOK), Source("t#data", "t (data)", "Table data", 2, DATA)])
+    assert needs_synapse_source([Source("x", "ext.Sales", "External Table", 2, SHORTCUT)])
 
 
 def test_the_planner_rejects_a_malformed_plan():

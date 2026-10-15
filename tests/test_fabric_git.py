@@ -156,6 +156,36 @@ def test_only_plumbing_changed_means_nothing_to_commit():
     assert result.skipped == ["load_pool01_wave_1", "sync_pool01"]
 
 
+def test_a_commit_told_what_the_run_made_takes_only_that_and_names_the_rest():
+    rest = GitRest()
+    result = fabric_git.commit(rest, WS, "run 002", only={("Notebook", "loadsales"), ("Warehouse", "POOL01")})
+    assert result.state == "committed" and result.items == 2
+    assert {i["objectId"] for i in rest.commits[0]["items"]} == {"id-pool01", "id-LoadSales"}
+    assert result.others == ["pl_load"] and result.skipped == ["load_pool01_wave_2", "sync_pool01"]
+    # Told of nothing that is waiting, it commits nothing, and still says what waits.
+    rest = GitRest()
+    nothing = fabric_git.commit(rest, WS, "run 003", only=set())
+    assert nothing.state == "nothing" and rest.commits == [] and nothing.others == ["LoadSales", "pl_load", "pool01"]
+
+
+def test_a_runs_git_items_are_the_fabric_items_it_created_or_updated():
+    from discovery_agent.api.migration import git_items
+    from discovery_agent.migration.common import (
+        COMPLETED, CONNECTION, DATA, FAILED, NOTEBOOK, PIPELINE, SCHEDULE, SHORTCUT, SKIPPED, TABLE, VIEW, Source,
+    )
+    from discovery_agent.migration.runner import MigrationRun
+
+    made = {"LoadSales": (NOTEBOOK, COMPLETED), "sales.Orders": (TABLE, COMPLETED), "sales.vOrders": (VIEW, COMPLETED),
+            "pl_copy": (PIPELINE, SKIPPED), "pl_broken": (PIPELINE, FAILED), "ext_events": (SHORTCUT, COMPLETED),
+            "ls_sql": (CONNECTION, COMPLETED), "sales.Orders (data)": (DATA, COMPLETED), "TR_Daily": (SCHEDULE, COMPLETED)}
+    run = MigrationRun("004", [Source(f"id-{n}", n, k, 1, k) for n, (k, _) in made.items()], WS, "Sales WS", "pool01")
+    for item in run.items:
+        item.status = made[item.source.name][1]
+    # Objects inside the Warehouse change the Warehouse; a shortcut changes the run's Lakehouse. A pipeline left as it
+    # was, or one that failed, is not the run's to commit; connections, rows and schedules are not kept in Git.
+    assert git_items(run) == {("Notebook", "LoadSales"), ("Warehouse", "pool01"), ("Lakehouse", "pool01_lakehouse")}
+
+
 def test_a_long_comment_is_cut_to_what_fabric_accepts():
     assert len(fabric_git.comment_for("x" * 500)) == fabric_git.MAX_COMMENT
     assert fabric_git.comment_for("two\nlines  here") == "two lines here"
@@ -238,13 +268,19 @@ def test_a_commit_that_outlasts_its_wait_says_what_it_was_waiting_for():
 NOTEBOOK_PLAN = {"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}], "options": {"stages": ["notebooks"]}}
 
 
-def test_a_completed_run_commits_to_fabric_git_and_offers_the_pull_request():
+def test_a_completed_run_commits_what_it_made_to_fabric_git_and_offers_the_pull_request():
     rest = GitRest()
     svc = service(fake_job(), rest=rest)
     svc.start(NOTEBOOK_PLAN)
     assert wait_until(lambda: svc.state()["state"] == "completed" and (svc.state()["git"] or {}).get("state") == "committed")
     git = svc.state()["git"]
-    assert git["items"] == 3 and git["branch"] == "dev" and git["commit"] == "1" * 40
+    # The run created the LoadSales notebook, so that is what it commits. The Warehouse and pl_load changed in the
+    # workspace too, but not in this run: they are left for a person, and named.
+    assert git["items"] == 1 and git["branch"] == "dev" and git["commit"] == "1" * 40
+    assert [i["objectId"] for i in rest.commits[0]["items"]] == ["id-LoadSales"]
+    assert git["others"] == ["pl_load", "pool01"]
+    assert "Left out 2 other change(s) waiting in the workspace that this run did not make (pl_load, pool01)" in git["message"]
+    assert {"pool01", "pl_load"} <= {c["itemMetadata"]["displayName"] for c in rest.changes}
     assert git["pullRequestUrl"].endswith("pullrequestcreate?sourceRef=dev&targetRef=main")
     assert git["commitUrl"].endswith("/commit/" + "1" * 40)
     assert "Left out 2 data-load pipeline(s)" in git["message"]
@@ -293,9 +329,17 @@ def test_the_git_state_and_a_commit_by_hand():
     state = svc.git_state()
     assert state["state"] == "connected" and state["workspace"] == "Sales WS" and state["uncommitted"] == 6
     assert not state["committing"] and state["lastCommit"] is None
+    # Without a run, nothing waiting in the workspace is the migration's to commit: that is a person's, in Fabric.
+    with pytest.raises(ApiError) as norun:
+        svc.git_commit({})
+    assert norun.value.code == "no_run" and rest.commits == []
+    svc.start({**NOTEBOOK_PLAN, "options": {"stages": ["notebooks"], "gitCommit": "off"}})
+    assert wait_until(lambda: svc.state()["state"] == "completed" and not svc._busy())  # noqa: SLF001
     svc.git_commit({"comment": "Reviewed fixes"})
     assert wait_until(lambda: (svc.git_state()["lastCommit"] or {}).get("state") == "committed")
     assert rest.commits[0]["comment"] == "Reviewed fixes"
+    assert [i["objectId"] for i in rest.commits[0]["items"]] == ["id-LoadSales"]
+    assert svc.state()["git"]["state"] == "committed"
     with pytest.raises(ApiError) as refused:
         svc.git_commit({"token": "s3cr3t-value"})
     assert refused.value.code == "invalid_request" and "s3cr3t-value" not in refused.value.message

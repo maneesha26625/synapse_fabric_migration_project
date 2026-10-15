@@ -18,20 +18,34 @@ Parameter names follow Synapse's default template-parameters definition:
 ``<linked service>_connectionString`` and
 ``<linked service>_properties_typeProperties_<property>``. A name that does
 not resolve to a property that exists is reported, not guessed at.
+
+A parameters file can hold secrets (a password in a connection string, an
+account key). They never reach the disk: the credential parts of a value are
+masked before it is written, and a value that is nothing but a secret is left
+out. Nothing here needs them: Fabric connections get their credentials in Plan.
+
+Uploads and working copies hold a client's definitions, so they are kept only
+while an API process can use them. Each is marked with the process that made
+it; when that process has ended (a restart, or ``--reload``), the next start
+removes them. A folder whose process still runs, such as a second API on
+another port, is never touched.
 """
 
 from __future__ import annotations
 
 import io
 import json
+import os
+import re
 import shutil
 import stat
 import uuid
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from discovery_agent.connections.validation import REDACTED
 from discovery_agent.source_strategy import P0Artifact
 
 #: The folders a Synapse repository keeps its definitions in.
@@ -49,6 +63,13 @@ MAX_PARAMETERS_BYTES = 1024 * 1024
 #: How deep under the repository or ZIP root the Synapse folders are looked for.
 _ROOT_SEARCH_DEPTH = 3
 _ENVIRONMENT_MAX = 40
+#: Beside each upload and working copy (``<folder>.owner``): the id of the API process that made it.
+_OWNER_SUFFIX = ".owner"
+#: The credential part of a connection string or a URL: its value, up to the next ``;`` or ``&``, is never written.
+_SECRET_PART = re.compile(r"(?i)\b(password|pwd|accountkey|sharedaccesskey|sharedaccesssignature|sig|client_?secret|"
+                          r"access_?token|refresh_?token)(\s*=\s*)[^;&]*")
+#: Linked-service properties that hold a secret, whatever form the committed value takes.
+_SECRET_PROPERTY = re.compile(r"(?i)(password|pwd|secret|accountkey|sastoken|sasuri|token|credential|serviceprincipalkey)")
 
 
 class RepositoryError(ValueError):
@@ -70,6 +91,8 @@ class RepositorySpec:
     applied: List[str] = field(default_factory=list)
     unmatched: List[str] = field(default_factory=list)
     counts: Dict[str, int] = field(default_factory=dict)
+    #: Parameters whose secret values were kept off the disk: masked in what was written, or left out.
+    secrets: List[str] = field(default_factory=list)
 
     @property
     def artifact_count(self) -> int:
@@ -79,9 +102,93 @@ class RepositorySpec:
         return {
             "kind": self.kind, "label": self.label, "environment": self.environment, "rootFolder": self.root_folder,
             "ref": self.ref, "commit": self.commit, "parametersName": self.parameters_name,
-            "applied": list(self.applied), "unmatched": list(self.unmatched), "counts": dict(self.counts),
-            "artifacts": self.artifact_count,
+            "applied": list(self.applied), "unmatched": list(self.unmatched), "secrets": list(self.secrets),
+            "counts": dict(self.counts), "artifacts": self.artifact_count,
         }
+
+
+# ---- which API process a folder belongs to --------------------------------------------------
+
+
+def _owner_file(folder: Path) -> Path:
+    return folder.with_name(folder.name + _OWNER_SUFFIX)
+
+
+def _claim(folder: Path) -> None:
+    """Mark ``folder`` as this process's. Without the mark a folder is never swept, so a failure here only leaves it."""
+    try:
+        _owner_file(folder).write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _owner(folder: Path) -> Optional[int]:
+    try:
+        return int(json.loads(_owner_file(folder).read_text(encoding="utf-8")).get("pid") or 0) or None
+    except (OSError, ValueError, AttributeError, TypeError):
+        return None
+
+
+def _remove(folder: Path) -> None:
+    shutil.rmtree(folder, ignore_errors=True)
+    try:
+        _owner_file(folder).unlink()
+    except OSError:
+        pass
+
+
+def _alive(pid: int) -> bool:
+    """Whether a process with this id still runs. In doubt, yes: a folder is kept rather than removed under a reader."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        import ctypes  # noqa: PLC0415 - Windows only
+        from ctypes import wintypes  # noqa: PLC0415
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: no process has this id
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)  # signal 0 only asks whether it exists (never sent on Windows, where it would end the process)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def sweep(roots: Optional[Sequence[Path]] = None) -> int:
+    """Remove the uploads and working copies of API processes that have ended. Returns how many were removed.
+
+    A connection lasts only as long as the process that made it, so once that process is gone nothing reads its
+    folders again, and they hold a client's definitions. A folder whose process still runs is left alone, and so
+    is one with no owner (made before folders had one): nothing says no running process reads it."""
+    removed = 0
+    for root in roots or (UPLOAD_ROOT, WORK_ROOT):
+        if not root.is_dir():
+            continue
+        for marker in sorted(root.glob("*" + _OWNER_SUFFIX)):
+            folder = marker.with_name(marker.name[: -len(_OWNER_SUFFIX)])
+            pid = _owner(folder)
+            if pid is None or _alive(pid):
+                continue
+            _remove(folder)
+            removed += 1
+    return removed
 
 
 # ---- ZIP ------------------------------------------------------------------------------------
@@ -118,18 +225,30 @@ def extract_zip(data: bytes, upload_id: Optional[str] = None, root: Optional[Pat
     upload_id = upload_id or uuid.uuid4().hex
     dest = (root or UPLOAD_ROOT) / upload_id
     dest.mkdir(parents=True, exist_ok=False)
+    _claim(dest)
     for member in members:
         if stat.S_ISLNK(member.external_attr >> 16):
             continue
         relative = _member_path(member.filename)
         if relative is None:
-            shutil.rmtree(dest, ignore_errors=True)
+            _remove(dest)
             raise RepositoryError(f"The ZIP has a file outside its own folder ({member.filename!r}), so it was refused.")
         target = dest.joinpath(*relative.parts)
         target.parent.mkdir(parents=True, exist_ok=True)
         with archive.open(member) as src, open(target, "wb") as out:
             shutil.copyfileobj(src, out)
     return upload_id, dest
+
+
+def forget_uploads(keep: str, root: Optional[Path] = None) -> None:
+    """Remove this process's other uploads. A new ZIP replaces the one the page held, and only it is connected next."""
+    base = root or UPLOAD_ROOT
+    if not base.is_dir():
+        return
+    for marker in base.glob("*" + _OWNER_SUFFIX):
+        folder = marker.with_name(marker.name[: -len(_OWNER_SUFFIX)])
+        if folder.name != keep and _owner(folder) == os.getpid():
+            _remove(folder)
 
 
 def upload_folder(upload_id: str, root: Optional[Path] = None) -> Path:
@@ -238,8 +357,22 @@ def _resolve(node: Any, tokens: List[str]) -> Optional[Tuple[Any, str]]:
     return None
 
 
-def apply_parameters(root: Path, values: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-    """Write the environment's values into the linked services under ``root``. Returns (applied, unmatched)."""
+def mask_secrets(value: str) -> str:
+    """``value`` with the credential parts of a connection string or URL masked: ``Password=``, ``AccountKey=``, ``sig=``..."""
+    return _SECRET_PART.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", value)
+
+
+def _structured(value: str) -> bool:
+    """A connection string or a URL: it has parts that are not secret, such as a server's or an account's name."""
+    return "://" in value or ("=" in value and ";" in value)
+
+
+def apply_parameters(root: Path, values: Dict[str, Any]) -> Tuple[List[str], List[str], List[str]]:
+    """Write the environment's values into the linked services under ``root``. Returns (applied, unmatched, secrets).
+
+    A secret never reaches the disk. The credential parts of a connection string or URL are masked before it is
+    written, and a value that is nothing but a secret (a password or a key in a secure property) is left out, the
+    committed placeholder kept. Both are listed in ``secrets``; nothing the run does needs them."""
     folder = root / "linkedService"
     services: Dict[str, Tuple[Path, dict]] = {}
     for path in sorted(folder.glob("*.json")) if folder.is_dir() else []:
@@ -252,6 +385,7 @@ def apply_parameters(root: Path, values: Dict[str, Any]) -> Tuple[List[str], Lis
     names = sorted(services, key=len, reverse=True)
     applied: List[str] = []
     unmatched: List[str] = []
+    secrets: List[str] = []
     changed: Dict[str, bool] = {}
     for param, value in sorted(values.items()):
         service = next((n for n in names if param.startswith(n + "_")), None)
@@ -270,19 +404,28 @@ def apply_parameters(root: Path, values: Dict[str, Any]) -> Tuple[List[str], Lis
             continue
         parent, key = found
         current = parent[key]
-        if isinstance(current, dict) and current.get("type") == "SecureString" and "value" in current:
-            current["value"] = value  # a secure string keeps its wrapper
-        elif isinstance(current, (str, int, float, bool)) or current is None:
-            parent[key] = value
-        else:
+        wrapped = isinstance(current, dict) and current.get("type") == "SecureString" and "value" in current
+        if not wrapped and not (isinstance(current, (str, int, float, bool)) or current is None):
             unmatched.append(param)  # an expression or a Key Vault reference: not a literal to replace
             continue
+        if isinstance(value, str):
+            masked = mask_secrets(value)
+            if (wrapped or _SECRET_PROPERTY.search(key)) and masked == value and not _structured(value):
+                secrets.append(param)  # nothing but a secret: it stays off the disk
+                continue
+            if masked != value:
+                secrets.append(param)
+            value = masked
+        if wrapped:
+            current["value"] = value  # a secure string keeps its wrapper
+        else:
+            parent[key] = value
         applied.append(param)
         changed[service] = True
     for service in changed:
         path, doc = services[service]
         path.write_text(json.dumps(doc, indent=4), encoding="utf-8")
-    return applied, unmatched
+    return applied, unmatched, secrets
 
 
 # ---- one environment's working copy ---------------------------------------------------------
@@ -297,12 +440,20 @@ def clean_environment(name: str) -> str:
     return text
 
 
-def prepare(spec_root: Path, parameters: Optional[Dict[str, Any]], work_root: Optional[Path] = None) -> Tuple[Path, List[str], List[str]]:
-    """Copy the Synapse folder for discovery and apply the environment's parameters to the copy."""
+def prepare(spec_root: Path, parameters: Optional[Dict[str, Any]],
+            work_root: Optional[Path] = None) -> Tuple[Path, List[str], List[str], List[str]]:
+    """Copy the Synapse folder for discovery and apply the environment's parameters to the copy.
+
+    Returns (the copy, the parameters applied, those that matched nothing, those whose secrets were kept off disk)."""
     dest = (work_root or WORK_ROOT) / uuid.uuid4().hex
     shutil.copytree(spec_root, dest, ignore=shutil.ignore_patterns(".git"))
-    applied, unmatched = apply_parameters(dest, parameters) if parameters else ([], [])
-    return dest, applied, unmatched
+    _claim(dest)
+    try:
+        applied, unmatched, secrets = apply_parameters(dest, parameters) if parameters else ([], [], [])
+    except Exception:
+        _remove(dest)  # a half-prepared copy is never left behind
+        raise
+    return dest, applied, unmatched, secrets
 
 
 def discard(path: Optional[Path], work_root: Optional[Path] = None) -> None:
@@ -311,7 +462,7 @@ def discard(path: Optional[Path], work_root: Optional[Path] = None) -> None:
         return
     try:
         if (work_root or WORK_ROOT).resolve() in path.resolve().parents:
-            shutil.rmtree(path, ignore_errors=True)
+            _remove(path)
     except OSError:
         pass
 

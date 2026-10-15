@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from discovery_agent.api.migration import rewritable, sources_for
 from discovery_agent.api.service import ApiError
+from discovery_agent.diagnostics import record_unexpected, unexpected_message
 from discovery_agent.llm import checks, context, templates
 from discovery_agent.llm.claude_cli import ClaudeCli, ModelError
 from discovery_agent.llm.store import TransformStore
@@ -303,9 +304,11 @@ class TransformService:
             with self._lock:
                 self._jobs[oid] = {**self._jobs.get(oid, {}), "state": FAILED_JOB, "error": str(exc)}
             return
-        except Exception as exc:  # noqa: BLE001 - one draft never takes the service down
+        except Exception as exc:  # noqa: BLE001 - one draft never takes the service down; the API's log gets the traceback
+            reference = record_unexpected(f"LLM draft for {source.name}", exc)
             with self._lock:
-                self._jobs[oid] = {**self._jobs.get(oid, {}), "state": FAILED_JOB, "error": f"Unexpected {type(exc).__name__}."}
+                self._jobs[oid] = {**self._jobs.get(oid, {}), "state": FAILED_JOB,
+                                   "error": unexpected_message("The draft could not be made", exc, reference)}
             return
         with self._lock:
             self._jobs.pop(oid, None)

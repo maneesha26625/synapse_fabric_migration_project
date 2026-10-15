@@ -162,7 +162,7 @@ export function StagesPanel() {
                       ? "The data pipelines read the Synapse pool through a Fabric connection that can read the pool: the workspace identity, a SQL login or a service principal. If Fabric already has a connection to this pool, it is reused and this can stay empty."
                       : "Synapse does not give up the secret behind a linked service, so Fabric needs a way to sign in."}
                     {" "}Workspace identity and Key Vault options pass no secret through this tool; prefer them.
-                    {" "}Anything typed is sent once to the backend, kept in memory for this run, and never saved in the browser.</p>
+                    {" "}Anything typed is sent to the backend once, when the run starts. It is kept in memory for that run and never saved in the browser.</p>
                   {services.length === 0 && <p className="muted">{s.key === "data" ? "Connect the Synapse source with its dedicated SQL pool to set up the pool connection." : "No linked services were discovered."}</p>}
                   {services.map((l) => <CredentialForm key={l.name} service={l} />)}
                   {Object.keys(credentials).length > 0 && <Button size="small" variant="ghost" onClick={clearCredentials}>Clear all credentials</Button>}

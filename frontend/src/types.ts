@@ -102,6 +102,8 @@ export interface RepositoryInfo {
   /** Parameters written into linked services, and those that matched no property. */
   applied: string[];
   unmatched: string[];
+  /** Parameters whose secret values were kept off the disk: masked in what was written, or left out. */
+  secrets?: string[];
   /** Definition files per Synapse folder. */
   counts: Record<string, number>;
   artifacts: number;
@@ -536,6 +538,8 @@ export interface GitCommitResult {
   items?: number;
   /** Data-load pipelines left out: they are rebuilt per environment. */
   skipped?: string[];
+  /** Other changes waiting in the workspace that the run did not make: left for a person, never committed by the run. */
+  others?: string[];
   commit?: string | null;
   branch?: string | null;
   commitUrl?: string | null;
@@ -866,7 +870,8 @@ export interface MigrationApi {
   /** Commit the migrated items to that branch (in the background; poll `getFabricGit`). */
   commitFabricGit(comment?: string): Promise<FabricGitState>;
   getCapabilities(): Promise<Capabilities>;
-  analyzePlan(items: PlanItem[], record?: boolean, options?: RunOptions, credentials?: ConnectionCredentials): Promise<PlanAnalysis>;
+  /** Planning is told which linked services have credentials (`credentialNames`), never what they are: those travel once, with the run. */
+  analyzePlan(items: PlanItem[], record?: boolean, options?: RunOptions, credentialNames?: string[]): Promise<PlanAnalysis>;
   startExecution(items: PlanItem[], options?: RunOptions, credentials?: ConnectionCredentials): Promise<ExecutionRun>;
   getExecution(): Promise<ExecutionRun>;
   /** `reset` forgets the run's record so the next run starts fresh; refused while the run is working. */
