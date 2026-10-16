@@ -5,6 +5,7 @@ import { StagesPanel } from "../../migrate/StagesPanel";
 import { PlanEditor, StrategyTable } from "../../migrate/StrategyPanel";
 import { StatStrip } from "../../shared/Metrics";
 import { Banner, Button, Collapsible, Tabs } from "../../shared/Shared";
+import { useConsult } from "../../../state/ConsultState";
 import { useMigration } from "../../../state/MigrationState";
 import type { RiskSeverity } from "../../../types";
 
@@ -54,12 +55,36 @@ function Risks() {
   );
 }
 
+/** How the plan stands against the approved brief: what differs, and whether a reason covers it. */
+function BriefStanding() {
+  const { analysis, plan, removeFromPlan } = useMigration();
+  const { approved, stale, required, excluded } = useConsult();
+  const check = analysis?.brief;
+  if (!approved) {
+    return required ? <Banner tone="info" title="No migration brief is approved yet">Plan can be built now, but a run is refused until a brief is approved in Consult. Its decisions are then pre-set here.</Banner> : null;
+  }
+  if (stale) return <Banner tone="warning" title={`Brief version ${approved} no longer fits the estate`}>Reconfirm it in Consult before a run: the estate changed since it was approved.</Banner>;
+  if (!check || !check.differences.length) return <p className="faint note-line">Pre-set from migration brief version {approved}. Nothing here differs from it.</p>;
+  const leftOut = plan.filter((p) => excluded[p.id]);
+  return (
+    <Banner tone={check.explained ? "info" : "warning"} title={check.explained ? `Differs from brief version ${check.version}, with a reason recorded` : `This plan differs from brief version ${check.version}`}
+      actions={leftOut.length ? <Button size="small" onClick={() => leftOut.forEach((p) => removeFromPlan(p.id))}>Remove the {leftOut.length} object{leftOut.length === 1 ? "" : "s"} the brief leaves out</Button> : undefined}>
+      <ul className="reset-list" style={{ margin: 0 }}>{check.differences.map((d) => <li key={`${d.option}-${d.message}`}>{d.message}</li>)}</ul>
+      {!check.explained && "Confirming Plan asks why, and keeps the reason with the run and in the audit trail."}
+    </Banner>
+  );
+}
+
 export function PlanPanel() {
-  const { graph, plan, analysis, analysisError, addAllToPlan } = useMigration();
+  const { graph, plan, analysis, analysisError, addToPlan } = useMigration();
+  const { excluded } = useConsult();
   const [tab, setTab] = useState<"risks" | "objects" | "strategy" | "stages">("risks");
   const [picking, setPicking] = useState(false);
 
   if (!graph) return <p className="muted">The plan is built from the discovered objects and their waves. Finish the earlier steps first.</p>;
+  // Add all: every discovered object but those the approved brief leaves out (each with why, in the brief).
+  const left = graph.nodes.filter((nd) => excluded[nd.id]);
+  const addAll = () => addToPlan(graph.nodes.filter((nd) => !excluded[nd.id]).map((nd) => nd.id));
 
   if (!plan.length && !picking) {
     return (
@@ -67,8 +92,9 @@ export function PlanPanel() {
         <span className="intro-icon" aria-hidden="true"><ListChecks size={26} /></span>
         <h3>Build the migration plan</h3>
         <p className="muted">Start with every discovered object in its suggested wave, then remove or move what you want. The plan is scored as you edit: strategy, risks, effort and readiness.</p>
+        {left.length > 0 && <p className="faint">Add all skips the {left.length.toLocaleString()} object{left.length === 1 ? "" : "s"} the approved brief leaves out. {[...new Set(left.map((nd) => excluded[nd.id]))].slice(0, 2).join(" ")}</p>}
         <div className="row" style={{ justifyContent: "center" }}>
-          <Button variant="primary" onClick={addAllToPlan}><ListPlus size={14} aria-hidden="true" />Add all {graph.nodes.length.toLocaleString()} objects</Button>
+          <Button variant="primary" onClick={addAll}><ListPlus size={14} aria-hidden="true" />Add all {(graph.nodes.length - left.length).toLocaleString()} objects</Button>
           <Button onClick={() => { setPicking(true); setTab("objects"); }}>Choose objects myself</Button>
         </div>
       </div>
@@ -89,6 +115,7 @@ export function PlanPanel() {
         ]} />
       ) : !analysisError && <p className="muted"><span className="spinner" aria-hidden="true" /> Scoring the plan…</p>}
       {analysisError && <Banner tone="error" title="The plan could not be scored">{analysisError}</Banner>}
+      <BriefStanding />
 
       <Tabs label="Plan sections" value={tab} onChange={setTab} tabs={[
         { id: "risks", label: "Readiness & risks", count: analysis?.risks.length },

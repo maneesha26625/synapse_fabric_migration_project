@@ -24,11 +24,28 @@ from discovery_agent.state.store import now
 
 NEVER, OVERWRITE, ALWAYS = "never", "overwrite", "always"
 POLICIES = (NEVER, OVERWRITE, ALWAYS)
+_STRICTNESS = {NEVER: 0, OVERWRITE: 1, ALWAYS: 2}
+
+
+def configured() -> Optional[str]:
+    """The rule this machine is set to (``MIGRATION_SIGNOFF``), or None when it is not set."""
+    value = str(os.environ.get("MIGRATION_SIGNOFF") or "").strip().lower()
+    return value if value in POLICIES else None
 
 
 def policy() -> str:
-    value = str(os.environ.get("MIGRATION_SIGNOFF") or OVERWRITE).strip().lower()
-    return value if value in POLICIES else OVERWRITE
+    return configured() or OVERWRITE
+
+
+def rule_for(brief: Optional[str]) -> str:
+    """The rule a run is signed off under. The approved brief's (G3) decides, but never loosens a rule this machine is
+    set to: the stricter of the two holds. With neither, a person signs off what overwrites."""
+    machine = configured()
+    if brief not in POLICIES:
+        return machine or OVERWRITE
+    if machine is None:
+        return brief
+    return brief if _STRICTNESS[brief] >= _STRICTNESS[machine] else machine
 
 
 def reasons(options: Dict[str, Any], stages: List[str]) -> List[str]:

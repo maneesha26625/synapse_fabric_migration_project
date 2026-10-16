@@ -70,8 +70,23 @@ def _strip_fences(code: str) -> str:
     return text.strip()
 
 
-def parse(stdout: str) -> Answer:
-    """The CLI's ``--output-format json`` result -> an Answer."""
+@dataclass
+class Reply:
+    """A structured answer to any question (``ClaudeCli.ask``): the JSON object asked for, and what it cost."""
+
+    data: Dict[str, Any]
+    model: str = ""
+    cost_usd: Optional[float] = None
+    duration_ms: int = 0
+
+
+def switched_on() -> bool:
+    """Whether this server may call the model at all (``MIGRATION_LLM``)."""
+    return (os.environ.get("MIGRATION_LLM") or "on").strip().lower() not in ("off", "0", "false", "no", "disabled")
+
+
+def parse_reply(stdout: str) -> Reply:
+    """The CLI's ``--output-format json`` result -> the JSON object it answered with, the model and the cost."""
     try:
         envelope = json.loads(stdout)
     except ValueError as exc:
@@ -87,17 +102,27 @@ def parse(stdout: str) -> Answer:
             data = json.loads(_strip_fences(str(envelope.get("result") or "")))
         except ValueError as exc:
             raise ModelError("Claude Code answered, but not with the JSON object that was asked for.") from exc
-    if not isinstance(data, dict) or not isinstance(data.get("code"), str) or not data["code"].strip():
-        raise ModelError("Claude Code's answer has no converted code.")
+    if not isinstance(data, dict):
+        raise ModelError("Claude Code answered, but not with the JSON object that was asked for.")
     usage = envelope.get("modelUsage") or {}
+    return Reply(data=data, model=next(iter(usage), "") if isinstance(usage, dict) else "",
+                 cost_usd=envelope.get("total_cost_usd") if isinstance(envelope.get("total_cost_usd"), (int, float)) else None)
+
+
+def parse(stdout: str) -> Answer:
+    """The CLI's ``--output-format json`` result -> an Answer."""
+    reply = parse_reply(stdout)
+    data = reply.data
+    if not isinstance(data.get("code"), str) or not data["code"].strip():
+        raise ModelError("Claude Code's answer has no converted code.")
     confidence = str(data.get("confidence") or "low").lower()
     return Answer(
         code=_strip_fences(data["code"]),
         notes=[str(n) for n in data.get("notes") or [] if str(n).strip()],
         unconverted=[str(n) for n in data.get("unconverted") or [] if str(n).strip()],
         confidence=confidence if confidence in CONFIDENCE else "low",
-        model=next(iter(usage), "") if isinstance(usage, dict) else "",
-        cost_usd=envelope.get("total_cost_usd") if isinstance(envelope.get("total_cost_usd"), (int, float)) else None,
+        model=reply.model,
+        cost_usd=reply.cost_usd,
     )
 
 
@@ -115,12 +140,45 @@ class ClaudeCli:
         return {"available": exe is not None, "model": self.model or "Claude Code default", "timeoutSeconds": self.timeout,
                 "message": None if exe else "The Claude Code CLI (`claude`) is not on this machine's PATH. Install it and sign in once, or set CLAUDE_CLI."}
 
-    def command(self, exe: str) -> List[str]:
+    def command(self, exe: str, schema: Optional[Dict[str, Any]] = None, system: Optional[str] = None) -> List[str]:
         args = [exe, "-p", "--output-format", "json", "--tools", "", "--strict-mcp-config", "--no-session-persistence",
-                "--system-prompt", SYSTEM_PROMPT, "--json-schema", json.dumps(RESULT_SCHEMA, separators=(",", ":"))]
+                "--system-prompt", system or SYSTEM_PROMPT,
+                "--json-schema", json.dumps(schema or RESULT_SCHEMA, separators=(",", ":"))]
         if self.model:
             args += ["--model", self.model]
         return args
+
+    def ask(self, prompt: str, schema: Dict[str, Any], system: str) -> Reply:
+        """One question answered in the JSON shape ``schema`` gives, for the consultation's help. Run like a draft
+        (no tools, an empty folder) and logged like one: by the prompt's hash, never the prompt or the answer."""
+        digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+        exe = executable()
+        if exe is None:
+            raise ModelError(self.available()["message"])
+        started = time.monotonic()
+        stdout = self._invoke(self.command(exe, schema, system), prompt)
+        reply = parse_reply(stdout)
+        reply.duration_ms = int((time.monotonic() - started) * 1000)
+        _log.info("LLM question answered by %s in %d ms", reply.model or self.model or "default", reply.duration_ms,
+                  extra={"promptHash": digest, "model": reply.model or self.model or "default", "costUsd": reply.cost_usd,
+                         "durationMs": reply.duration_ms})
+        return reply
+
+    def _invoke(self, args: List[str], prompt: str) -> str:
+        """Run the CLI once and return what it printed; ``ModelError`` when it could not answer."""
+        with tempfile.TemporaryDirectory(prefix="fabric-transform-") as workdir:
+            try:
+                done = self._run(args, input=prompt, capture_output=True, text=True, encoding="utf-8",
+                                 timeout=self.timeout, cwd=workdir, check=False)
+            except subprocess.TimeoutExpired as exc:
+                raise ModelError(f"Claude Code did not answer within {self.timeout} seconds. Try again, or raise MIGRATION_LLM_TIMEOUT.") from exc
+            except OSError as exc:
+                raise ModelError(f"Claude Code could not be started: {exc.strerror or exc}.") from exc
+        if done.returncode != 0 and not (done.stdout or "").strip():
+            detail = (done.stderr or "").strip().splitlines()
+            hint = detail[-1][:300] if detail else f"exit code {done.returncode}"
+            raise ModelError(f"Claude Code failed ({hint}). If it asks you to sign in, run `claude` once in a terminal.")
+        return done.stdout or ""
 
     def complete(self, prompt: str) -> Answer:
         """One draft. Logged by its prompt's hash, the model, the time and the cost: never the prompt or the answer."""
@@ -142,18 +200,6 @@ class ClaudeCli:
         if exe is None:
             raise ModelError(self.available()["message"])
         started = time.monotonic()
-        with tempfile.TemporaryDirectory(prefix="fabric-transform-") as workdir:
-            try:
-                done = self._run(self.command(exe), input=prompt, capture_output=True, text=True, encoding="utf-8",
-                                 timeout=self.timeout, cwd=workdir, check=False)
-            except subprocess.TimeoutExpired as exc:
-                raise ModelError(f"Claude Code did not answer within {self.timeout} seconds. Try again, or raise MIGRATION_LLM_TIMEOUT.") from exc
-            except OSError as exc:
-                raise ModelError(f"Claude Code could not be started: {exc.strerror or exc}.") from exc
-        if done.returncode != 0 and not (done.stdout or "").strip():
-            detail = (done.stderr or "").strip().splitlines()
-            hint = detail[-1][:300] if detail else f"exit code {done.returncode}"
-            raise ModelError(f"Claude Code failed ({hint}). If it asks you to sign in, run `claude` once in a terminal.")
-        answer = parse(done.stdout or "")
+        answer = parse(self._invoke(self.command(exe), prompt))
         answer.duration_ms = int((time.monotonic() - started) * 1000)
         return answer

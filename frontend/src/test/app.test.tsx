@@ -7,7 +7,7 @@ import { TransformQueue } from "../components/discovery/TransformQueue";
 import { AppStateProvider } from "../state/AppState";
 import { buildReport } from "../components/journey/report";
 import { buildTree } from "../components/journey/WorkspaceExplorer";
-import { mockApi, resetDemo } from "../mock/mockApi";
+import { mockApi, resetDemo, setDemoConsultation } from "../mock/mockApi";
 import type { ConnectionConfig, ExecutionRun, FabricConfig, ResultsQuery, RunOptions } from "../types";
 
 const CONFIG: ConnectionConfig = {
@@ -19,7 +19,7 @@ const Q: ResultsQuery = {
   search: "", categories: [], types: [], statuses: [], fabricTargets: [], paths: [], workstreams: [], mappingStatuses: [],
   classifications: [], assessment: "", sort: "name", dir: "asc", page: 1, pageSize: 200,
 };
-const STEP_ORDER = ["discover", "assess", "waves", "plan", "migrate", "validate"];
+const STEP_ORDER = ["discover", "assess", "consult", "waves", "plan", "migrate", "validate"];
 const JOURNEY = "ma.journey.mock.default";
 const PLAN = "ma.plan.mock.default";
 const stored = (key: string) => JSON.parse(localStorage.getItem(key) ?? "null");
@@ -57,6 +57,8 @@ beforeEach(async () => {
   localStorage.setItem("ma.apiMode", "mock");
   window.history.pushState({}, "", "/");
   resetDemo();
+  // Runs start without an approved brief unless a test asks for one: the consultation's own tests switch it back.
+  setDemoConsultation("advisory");
   await mockApi.disconnect();
   await mockApi.disconnectFabric();
 });
@@ -518,14 +520,14 @@ describe("migration journey", () => {
     expect(await screen.findByText("Connect both sides first")).toBeInTheDocument();
   });
 
-  it("shows the six steps left to right, locks the ones after the open step, and Next unlocks the following one", async () => {
+  it("shows the seven steps left to right, locks the ones after the open step, and Next unlocks the following one", async () => {
     resetDemo();
     const user = userEvent.setup();
     go("/migration");
     expect(await stepHeading("Discover")).toBeInTheDocument();
     const nav = screen.getByRole("navigation", { name: "Migration steps" });
     const boxes = within(nav).getAllByRole("button");
-    expect(boxes.map((b) => b.getAttribute("aria-label")?.match(/^Step \d: (\w+)/)?.[1])).toEqual(["Discover", "Assess", "Waves", "Plan", "Migrate", "Validate"]);
+    expect(boxes.map((b) => b.getAttribute("aria-label")?.match(/^Step \d: (\w+)/)?.[1])).toEqual(["Discover", "Assess", "Consult", "Waves", "Plan", "Migrate", "Validate"]);
     expect(boxes[0]).toHaveAttribute("aria-current", "step");
     for (const b of boxes.slice(1)) expect(b).toBeDisabled();
     expect(document.title).toBe("Discover · Migration · Migration Accelerator");
@@ -557,7 +559,7 @@ describe("migration journey", () => {
     expect(await stepHeading("Discover")).toBeInTheDocument();
     await user.click(stepBox(2));
     expect(await stepHeading("Assess")).toBeInTheDocument();
-    expect(stepBox(4)).toBeDisabled();
+    expect(stepBox(5)).toBeDisabled();
   }, 15000);
 
   it("marks a confirmed step whose results are gone as Run again, and keeps the steps after it locked", async () => {
@@ -566,8 +568,8 @@ describe("migration journey", () => {
     unlockTo("validate"); // Migrate is confirmed, but there is no run (as after a reload of Demo data)
     go("/migration");
     expect(await stepHeading("Migrate")).toBeInTheDocument();
-    await waitFor(() => expect(stepBox(5)).toHaveAccessibleName(/Run again/));
-    expect(stepBox(6)).toBeDisabled();
+    await waitFor(() => expect(stepBox(6)).toHaveAccessibleName(/Run again/));
+    expect(stepBox(7)).toBeDisabled();
     expect(screen.getByText("Migrate needs to run again")).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Migration complete" })).toBeNull();
     // The confirmation itself is kept: once the run exists again, the journey comes back.
@@ -582,7 +584,7 @@ describe("migration journey", () => {
     await user.click(await screen.findByRole("button", { name: "Run again" }, { timeout: 5000 }));
     const dialog = screen.getByRole("dialog", { name: "Run discovery again?" });
     await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
-    expect(stored(JOURNEY)).toEqual(["discover", "assess"]);
+    expect(stored(JOURNEY)).toEqual(["discover", "assess", "consult"]);
   }, 15000);
 
   it.each([
@@ -627,7 +629,7 @@ describe("resetting a step", () => {
     await user.click(within(dialog).getByRole("button", { name: "Reset Plan" }));
     expect(await screen.findByRole("button", { name: /^Add all .* objects/ }, { timeout: 5000 })).toBeInTheDocument();
     expect(stored(PLAN)).toEqual([]);
-    expect(stored(JOURNEY)).toEqual(["discover", "assess", "waves"]);
+    expect(stored(JOURNEY)).toEqual(["discover", "assess", "consult", "waves"]);
     expect(screen.getByText(/Plan was reset, with the steps after it/)).toBeInTheDocument();
   }, 20000);
 
@@ -665,7 +667,7 @@ describe("resetting a step", () => {
     expect(await screen.findByText("Nothing is running.", {}, { timeout: 5000 })).toBeInTheDocument();
     expect((await mockApi.getExecution()).state).toBe("idle");
     expect(await screen.findByRole("table", { name: "Earlier runs" })).toBeInTheDocument();
-    expect(stored(JOURNEY)).toEqual(["discover", "assess", "waves", "plan"]);
+    expect(stored(JOURNEY)).toEqual(["discover", "assess", "consult", "waves", "plan"]);
   }, 20000);
 });
 
@@ -1007,7 +1009,7 @@ describe("workspace explorer", () => {
 });
 
 describe("release path", () => {
-  it("shows where the migration sits on the way to Prod, below the six steps, with a checklist kept per project", async () => {
+  it("shows where the migration sits on the way to Prod, below the seven steps, with a checklist kept per project", async () => {
     await discovered();
     unlockTo("assess");
     const user = userEvent.setup();
@@ -1016,8 +1018,8 @@ describe("release path", () => {
     const stages = within(path).getByRole("list", { name: "From the source to production" });
     expect(within(stages).getAllByRole("listitem").map((li) => li.querySelector(".release-label")?.textContent))
       .toEqual(["Synapse workspace", "This migration", "Fabric Dev", "Fabric Git", "Fabric Test", "Fabric Prod"]);
-    // The six steps are unchanged.
-    expect(within(screen.getByRole("navigation", { name: "Migration steps" })).getAllByRole("listitem")).toHaveLength(6);
+    // The seven steps are unchanged.
+    expect(within(screen.getByRole("navigation", { name: "Migration steps" })).getAllByRole("listitem")).toHaveLength(7);
     await user.click(within(path).getByRole("button", { name: /What comes next · 0\/6/ }));
     expect(within(path).getByText(/Getting them to Test and Prod is not a second migration/)).toBeInTheDocument();
     await user.click(within(path).getByRole("checkbox", { name: /Connect the Fabric workspace to Git/ }));
@@ -1490,4 +1492,135 @@ describe("run records, sign-off, projects and activity", () => {
     expect(posted).toEqual([{ name: "Finance", id: "pabc", copyFrom: "default" }]);
     expect(stored("ma.projects.adopted")).toBe(true);
   }, 15000);
+});
+
+// ---- the consultation (demo): required, as the backend's default ------------------------------------------------
+
+/** Answer, accept the remaining recommendations, submit and approve: a brief in force (Demo data). */
+async function approveBrief(answers: [string, unknown][] = []) {
+  for (const [q, v] of answers) await mockApi.answerQuestion(q, v);
+  await mockApi.acceptRecommendations();
+  const view = await mockApi.submitBrief();
+  const version = view.versions[view.versions.length - 1].version;
+  await mockApi.decideBrief(version, "approve");
+  return (await mockApi.getConsultPolicy()).runOptions as RunOptions;
+}
+
+describe("consultation (demo)", () => {
+  beforeEach(() => { resetDemo(); setDemoConsultation("required"); });
+
+  it("refuses a run until a brief is approved, then starts it under that brief, and only as the brief says", async () => {
+    const graph = await mockApi.getDependencies();
+    const items = graph.nodes.filter((n) => n.type === "Notebook").slice(0, 1).map((n) => ({ id: n.id, wave: n.wave }));
+    await expect(mockApi.startExecution(items)).rejects.toMatchObject({ code: "brief_required" });
+    const before = await mockApi.getConsult();
+    expect(before.next).toBe("D1");
+    expect(before.submittable).toBe(false);
+    await expect(mockApi.submitBrief()).rejects.toMatchObject({ code: "brief_not_ready" });
+    const options = await approveBrief();
+    await expect(mockApi.startExecution(items, { ...options, stopOnFailure: !options.stopOnFailure })).rejects.toMatchObject({ code: "deviation_unexplained" });
+    const run = await mockApi.startExecution(items, options);
+    expect(run.brief?.version).toBe(1);
+    const trail = await mockApi.getAudit({ limit: 100 });
+    expect(trail.records.map((r) => r.action)).toEqual(expect.arrayContaining(["consult.accepted", "brief.submitted", "brief.approved", "run.requested"]));
+  });
+
+  it("asks what needs a person, takes every recommendation in one go, and has the brief approved before Waves opens", async () => {
+    unlockTo("consult");
+    const user = userEvent.setup();
+    go("/migration?step=consult");
+    expect(await stepHeading("Consult")).toBeInTheDocument();
+    const summary = await screen.findByLabelText("Consultation summary", {}, { timeout: 5000 });
+    expect(within(summary).getByText("Not approved")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Continue to Waves/ })).toBeDisabled();
+    const d1 = screen.getByRole("region", { name: /^D1\./ });
+    expect(within(d1).getByText("A person answers")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Accept all recommendations" }));
+    await waitFor(() => expect(within(screen.getByRole("region", { name: /^D1\./ })).getByText("Answered")).toBeInTheDocument());
+    await user.click(screen.getByRole("tab", { name: /^Brief/ }));
+    await user.click(await screen.findByRole("button", { name: "Submit the brief" }));
+    await user.click(await screen.findByRole("button", { name: "Approve version 1" }));
+    await waitFor(() => expect(within(screen.getByLabelText("Consultation summary")).getByText("v1")).toBeInTheDocument());
+    expect(await screen.findByRole("list", { name: "Brief versions" })).toHaveTextContent(/Version 1.*APPROVED/);
+    await user.click(await screen.findByRole("button", { name: /continue to Waves/ }));
+    expect(await stepHeading("Waves")).toBeInTheDocument();
+  }, 30000);
+
+  it("holds a contradiction until it is resolved: an answer kept with a reason, and what an answer would change said first", async () => {
+    unlockTo("consult");
+    const user = userEvent.setup();
+    go("/migration?step=consult");
+    const c4 = await screen.findByRole("region", { name: /^C4\./ }, { timeout: 5000 });
+    await user.click(within(c4).getByRole("radio", { name: /Replace their rows/ }));
+    expect(await within(c4).findByText(/This answer .*data\.mode: if_empty → replace/)).toBeInTheDocument();
+    await user.click(within(c4).getByRole("button", { name: "Save answer" }));
+    const g3 = screen.getByRole("region", { name: /^G3\./ });
+    await user.click(within(g3).getByRole("radio", { name: /^Never/ }));
+    await user.click(within(g3).getByRole("button", { name: "Save answer" }));
+    const conflict = await screen.findByRole("listitem", { name: "Contradiction K2" });
+    expect(conflict).toHaveTextContent(/Replacing rows empties tables/);
+    await user.click(within(conflict).getByRole("button", { name: "Keep my answers" }));
+    await user.type(within(conflict).getByRole("textbox", { name: /Why K2/ }), "Only the test copy is replaced");
+    await user.click(within(conflict).getByRole("button", { name: "Keep with this reason" }));
+    expect(await screen.findByRole("listitem", { name: "Contradiction K2, kept" })).toHaveTextContent("Only the test copy is replaced");
+  }, 30000);
+
+  it("pre-sets Plan from the brief, leaves out what the brief does, and asks why when the plan differs from it", async () => {
+    await approveBrief([["A1", ["structure", "orchestration"]]]);
+    unlockTo("plan");
+    const user = userEvent.setup();
+    go("/migration?step=plan");
+    expect(await screen.findByText(/Add all skips the .* objects? the approved brief leaves out\. Written for the serverless SQL pool/, {}, { timeout: 8000 })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^Add all .* objects/ }));
+    expect(await screen.findByText("Pre-set from migration brief version 1. Nothing here differs from it.", {}, { timeout: 8000 })).toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: "Stages & credentials" }));
+    const data = await screen.findByRole("checkbox", { name: "Include Table data" });
+    expect(data).not.toBeChecked();
+    await user.click(data);
+    expect(await screen.findByText(/This plan differs from brief version 1/, {}, { timeout: 8000 })).toBeInTheDocument();
+    const next = await screen.findByRole("button", { name: /Continue to Migrate anyway/ }, { timeout: 8000 });
+    await waitFor(() => expect(next).toBeEnabled());
+    await user.click(next);
+    const dialog = await screen.findByRole("dialog", { name: /The plan differs from the approved brief/ });
+    await user.type(within(dialog).getByRole("textbox", { name: "Why the plan differs from the brief" }), "The client wants the data in this pilot");
+    await user.click(within(dialog).getByRole("button", { name: "Confirm the plan with this reason" }));
+    expect(await stepHeading("Migrate")).toBeInTheDocument();
+    const trail = await mockApi.getAudit({ limit: 50 });
+    expect(trail.records.find((r) => r.action === "plan.deviation")?.details.reason).toBe("The client wants the data in this pilot");
+  }, 40000);
+
+  it("pauses a run before each later wave until a person signs that wave off", async () => {
+    const options = await approveBrief([["A4", "signoff_each_wave"]]);
+    expect(options.waveGate).toBe(true);
+    const graph = await mockApi.getDependencies();
+    const notebooks = graph.nodes.filter((n) => n.type === "Notebook").slice(0, 2);
+    const items = notebooks.map((n, i) => ({ id: n.id, wave: i + 1 }));
+    localStorage.setItem(PLAN, JSON.stringify(items));
+    await mockApi.startExecution(items, options);
+    await waitFor(async () => expect((await mockApi.getExecution()).pausedReason).toBe("awaiting_wave_signoff"), { timeout: 5000 });
+    unlockTo("migrate");
+    const user = userEvent.setup();
+    go("/migration?step=migrate");
+    expect(await screen.findByText("Wave 2 waits for a person to sign it off", {}, { timeout: 5000 })).toBeInTheDocument();
+    await user.type(screen.getByRole("textbox", { name: /Comment \(kept with the sign-off\)/ }), "Wave 1 checked");
+    await user.click(screen.getByRole("button", { name: "Sign off wave 2 and continue" }));
+    await waitFor(async () => expect((await mockApi.getExecution()).releasedWaves).toEqual([2]), { timeout: 5000 });
+    const signed = (await mockApi.getAudit({ limit: 50 })).records.find((r) => r.action === "run.wave_signed_off");
+    expect(signed?.details).toMatchObject({ wave: 2, comment: "Wave 1 checked" });
+  }, 30000);
+
+  it("reads answers from notes for a person to confirm, and a withdrawn consent stops LLM drafts at once", async () => {
+    unlockTo("consult");
+    const user = userEvent.setup();
+    go("/migration?step=consult");
+    await user.click(await screen.findByRole("tab", { name: "Help" }, { timeout: 5000 }));
+    await user.type(screen.getByRole("textbox", { name: "Meeting notes or an email" }), "Every run must be signed off. No AI please.");
+    await user.click(screen.getByRole("button", { name: "Read answers from the notes" }));
+    expect(await screen.findByText(/2 answers proposed\. Demo data reads notes with the built-in rules/)).toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: /^Questions/ }));
+    await user.click(await screen.findByRole("button", { name: "Confirm D1" }));
+    await waitFor(() => expect(within(screen.getByRole("region", { name: /^D1\./ })).getByText(/Read from notes, confirmed by/)).toBeInTheDocument());
+    expect(screen.getByRole("list", { name: "Proposed answers" })).toHaveTextContent(/G3/);
+    await expect(mockApi.generateTransforms(["anything"])).rejects.toMatchObject({ code: "llm_no_consent" });
+  }, 30000);
 });

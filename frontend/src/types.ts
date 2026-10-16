@@ -490,6 +490,8 @@ export interface PlanAnalysis {
   checks: PlanCheck[];
   objectStrategies: Record<string, { strategy: Strategy; label: string; effortHours: number }>;
   history: PlannerRun[];
+  /** How the plan stands against the approved migration brief; null when consultation is not served. */
+  brief?: BriefCheck | null;
 }
 /** How a run is carried out. `automated` runs only what this build creates; `all` also lists the deferred. */
 export interface RunOptions {
@@ -514,7 +516,229 @@ export interface RunOptions {
   dataFilters?: Record<string, DataFilterInput>;
   /** After the run completes, commit what it created to the workspace's Fabric Git branch (auto) or not (off). */
   gitCommit?: "auto" | "off";
+  /** What that commit takes: only what the run created or updated (run), or everything waiting in the workspace (all). */
+  commitScope?: "run" | "all";
+  /** A person signs off each wave before the next one starts (the brief's A4). */
+  waveGate?: boolean;
 }
+
+// ---- consultation: the questions, the migration brief, the policy in force -------------------
+
+export type ConsultQuestionType = "choice" | "multi" | "boolean" | "number" | "date" | "text" | "list" | "name" | "principalMap";
+/** answered: by a person; assumed: its recommendation stands, nobody confirmed it; stale: what it rests on changed;
+ *  parked: answered on a branch that no longer applies (kept, and back if it applies again). */
+export type ConsultStatus = "answered" | "assumed" | "open" | "skipped" | "stale" | "parked" | "not_applicable";
+/** Every source but an assumption is a person's action: their own answer, an accepted recommendation, a finding they
+ *  took, or a proposal they confirmed (read from notes by the model or the rules, or from an imported questionnaire). */
+export type AnswerSource = "person" | "recommendation" | "finding" | "ai" | "rules" | "import";
+export type SettingStatus = "enforced" | "recorded" | "note";
+export interface SettingDrive { setting: string; status: SettingStatus; applies: string }
+export interface ConsultQuestionDef {
+  id: string;
+  section: string;
+  type: ConsultQuestionType;
+  text: string;
+  help: string;
+  options: { value: string; label: string; description: string }[];
+  /** A multi question whose choices are a fact's list (the schemas and folders discovered). */
+  optionsFrom: string | null;
+  /** A principal map's rows: a fact's list (the SQL users discovered). */
+  rowsFrom: string | null;
+  required: boolean;
+  optional: boolean;
+  drives: SettingDrive[];
+  min: number | null;
+  max: number | null;
+  maxLength: number;
+  /** Why an answer to it can ask for an approver other than the submitter, or null. */
+  separateApprover: string | null;
+}
+export interface ConsultCatalog {
+  version: string;
+  sections: { id: string; title: string }[];
+  questions: ConsultQuestionDef[];
+  conflicts: { id: string; questions: string[]; resolutions: { kind: "take" | "keep" | "change"; label: string; question: string | null }[] }[];
+}
+export interface FactChange { fact: string; description: string; before: unknown; after: unknown }
+export interface ConsultQuestion {
+  id: string;
+  applies: boolean;
+  status: ConsultStatus;
+  value: unknown;
+  display: string | null;
+  source: AnswerSource | null;
+  by: Actor | null;
+  at: string | null;
+  note: string | null;
+  recommendation: { value: unknown; reason: string } | null;
+  /** For a stale answer: the facts it rests on that changed since. */
+  changed: FactChange[];
+  conflicts: string[];
+  choices: string[] | null;
+  rows: string[] | null;
+  evidence: { fact: string; description: string; value: unknown }[];
+}
+export interface ConsultConflict {
+  id: string;
+  status: "open" | "kept";
+  message: string;
+  questions: string[];
+  evidence: { fact: string; description: string; value: unknown }[];
+  reason: string | null;
+  by: Actor | null;
+  at: string | null;
+  resolutions: { kind: "take" | "keep" | "change"; label: string; question: string | null }[];
+}
+export interface ConsultProposal {
+  id: string;
+  question: string;
+  value: unknown;
+  reason: string | null;
+  source: "ai" | "rules" | "import";
+  model: string | null;
+  at: string;
+  display: string;
+  /** What the question holds now, for comparison. */
+  current: string | null;
+}
+/** Whether an LLM call may be made now: consent (D1) and the budget (D2), against what has been spent. */
+export interface LlmGate {
+  purpose: "transform" | "consult";
+  mode: "required" | "advisory";
+  consent: boolean | null;
+  liveConsent: boolean | null;
+  budgetUsd: number | null;
+  spentUsd: number;
+  allowed: boolean;
+  reason: string | null;
+  code: string | null;
+}
+export interface BriefChange { question: string; text: string; before: string | null; after: string | null; kind: "added" | "removed" | "changed" }
+export interface BriefSummary {
+  draftHash: string;
+  versions: number;
+  /** The version submitted and waiting for a decision, if any. */
+  pending: number | null;
+  approved: number | null;
+  approvedHash: string | null;
+  approvedBy: Actor | null;
+  approvedAt: string | null;
+  /** The estate changed since the approved version was made: a run under a required consultation is refused. */
+  stale: boolean;
+  factChanges: FactChange[];
+  /** The answers as they stand make the same brief as the approved one. */
+  sameAsApproved: boolean;
+  /** How the answers now differ from the approved version. */
+  changes: BriefChange[];
+}
+export interface ConsultState {
+  mode: "required" | "advisory";
+  catalogVersion: string;
+  snapshot: string | null;
+  factsFingerprint: string;
+  facts: { name: string; description: string; scope: "estate" | "environment"; value: unknown }[];
+  questions: ConsultQuestion[];
+  conflicts: ConsultConflict[];
+  next: string | null;
+  blockers: string[];
+  submittable: boolean;
+  progress: { applicable: number; answered: number; assumed: number; needsPerson: number; open: number; contradictions: number };
+  seq: number;
+  brief: BriefSummary;
+  proposals: ConsultProposal[];
+  llm: LlmGate;
+  /** After an action: the questions it answered, the proposals it made, what could not be used, and a note. */
+  accepted?: string[];
+  answered?: string[];
+  proposed?: string[];
+  rejected?: { question: string; value: unknown; reason?: string | null; message: string }[];
+  source?: string;
+  message?: string | null;
+}
+export interface BriefDecision {
+  question: string;
+  section: string;
+  sectionTitle: string;
+  text: string;
+  value: unknown;
+  display: string;
+  /** Nobody confirmed it: its recommendation stands. */
+  assumed: boolean;
+  source: AnswerSource | null;
+  by: Actor | null;
+  at: string | null;
+  reason: string | null;
+  drives: SettingDrive[];
+}
+export interface BriefContent {
+  catalogVersion: string;
+  factsFingerprint: string;
+  facts: Record<string, unknown>;
+  snapshot: string | null;
+  decisions: BriefDecision[];
+  settings: Record<string, unknown>;
+  enforced: Record<string, unknown>;
+  assumptions: string[];
+  recordedOnly: { setting: string; value: unknown; status: SettingStatus; applies: string }[];
+  keptContradictions: { conflict: string; message: string; reason: string; by: Actor | null; at: string | null }[];
+  separateApprover: { question: string; reason: string }[];
+}
+export type BriefStatus = "submitted" | "approved" | "rejected" | "superseded";
+export interface BriefVersion {
+  version: number;
+  hash: string;
+  status: BriefStatus;
+  submittedAt: string;
+  submittedBy: Actor;
+  note: string | null;
+  decidedBy: Actor | null;
+  decidedAt: string | null;
+  comment: string | null;
+  selfApproved: boolean | null;
+  catalogVersion: string;
+  factsFingerprint: string;
+  snapshot: string | null;
+  decisions: number;
+  assumptions: number;
+  separateApprover: string[];
+}
+export interface BriefView { draft: BriefContent; draftHash: string; submittable: boolean; blockers: string[]; versions: BriefVersion[]; summary: BriefSummary }
+export interface AnswerPreview {
+  question: string;
+  value: unknown;
+  preview: { opens: string[]; parks: string[]; revives: string[]; conflictsOpened: string[]; conflictsClosed: string[];
+    settings: { setting: string; before: unknown; after: unknown }[] };
+}
+/** Where a plan or a run differs from the approved brief. */
+export interface PlanDifference { option: string; setting: string | null; brief: unknown; plan: unknown; message: string }
+/** How a plan stands against the approved brief (from the planner). */
+export interface BriefCheck {
+  mode: "required" | "advisory";
+  version: number | null;
+  hash?: string;
+  stale: boolean;
+  changes?: FactChange[];
+  differences: PlanDifference[];
+  /** A reason recorded when Plan was confirmed covers every difference. */
+  explained: boolean;
+}
+/** The policy in force, as Plan pre-sets and Migrate enforces it. Null fields: the brief does not decide them. */
+export interface ConsultPolicy {
+  mode: "required" | "advisory";
+  inForce: { version: number; hash: string; approvedBy: Actor | null; approvedAt: string | null; stale: boolean; changes: FactChange[];
+    settings: Record<string, unknown> } | null;
+  llm: LlmGate;
+  runOptions?: Partial<RunOptions>;
+  dataFilters?: Record<string, DataFilterInput>;
+  storageRoutes?: "all" | "none" | null;
+  /** The objects the brief leaves out of Add all, with why. */
+  excluded?: Record<string, string>;
+  signoff?: "never" | "overwrite" | "always" | null;
+  names?: { warehouse: string | null; lakehouse: string | null };
+  validate?: { probe: boolean; run: RunnableKind[] } | null;
+  sqlUserMap?: Record<string, string>;
+}
+export interface ConsultExplanation { question: string; text: string; source: "ai" | "rules"; model: string | null; message?: string }
 
 // ---- Git: the Synapse workspace's repository, and the Fabric workspace's branch ---------------
 
@@ -649,8 +873,8 @@ export type ExecState = "idle" | "running" | "paused" | "completed";
 /** A run's own status, finer than `state`: how it was left, and so what may be done with it. */
 export type RunStatus = "queued" | "awaiting_approval" | "running" | "paused" | "completed" | "completed_with_failures"
   | "failed" | "cancelled" | "rejected";
-/** Why a run is paused: each has its own way on. */
-export type PausedReason = "by_person" | "halted_on_failures" | "needs_input" | "interrupted";
+/** Why a run is paused: each has its own way on. awaiting_wave_signoff: Resume, by a person, signs the next wave off. */
+export type PausedReason = "by_person" | "halted_on_failures" | "needs_input" | "interrupted" | "awaiting_wave_signoff";
 /** What kind of failure an object's error is (the backend classifies every one). */
 export type FailureCategory = "TRANSIENT" | "AUTH" | "CAPACITY" | "CONFIG" | "UNSUPPORTED" | "DEPENDENCY" | "CONFLICT"
   | "INTERRUPTED" | "UNKNOWN";
@@ -752,6 +976,12 @@ export interface ExecutionRun {
   resumable?: boolean;
   unresumableReason?: string | null;
   executions?: RunExecution[];
+  /** The waves a person has signed off, when each wave is signed off (the brief's A4). */
+  releasedWaves?: number[];
+  /** The wave a paused run waits to start until a person signs it off. */
+  waitingWave?: number | null;
+  /** The migration brief it started under (version and hash), and how it differs from it. */
+  brief?: { version: number | null; hash?: string; differences?: PlanDifference[] } | null;
 }
 
 /** One run in the project's run history. */
@@ -846,8 +1076,9 @@ export interface ValidationRuntimeOptions {
 
 /** The single seam between the UI and whatever supplies data. */
 export type RunControl = "pause" | "resume" | "retry" | "reset";
-/** What a control may carry: the run's version (a stale page is refused), and credentials a restart lost. */
-export interface RunControlExtra { version?: number; credentials?: ConnectionCredentials }
+/** What a control may carry: the run's version (a stale page is refused), credentials a restart lost, and the comment
+ *  a person signs the next wave off with. */
+export interface RunControlExtra { version?: number; credentials?: ConnectionCredentials; comment?: string }
 
 /* ---- LLM-assisted transformation ------------------------------------------- */
 
@@ -867,6 +1098,8 @@ export interface TransformSettings {
   kinds: TransformKind[];
   promptsDir: string;
   storeDir: string;
+  /** What the migration brief allows: consent to send definitions (D1), the budget (D2) and what is spent. */
+  consent?: Pick<LlmGate, "allowed" | "reason" | "code" | "consent" | "budgetUsd" | "spentUsd">;
 }
 
 export interface TransformCheck {
@@ -1000,7 +1233,8 @@ export interface MigrationApi {
   getCapabilities(): Promise<Capabilities>;
   /** Planning is told which linked services have credentials (`credentialNames`), never what they are: those travel once, with the run. */
   analyzePlan(items: PlanItem[], record?: boolean, options?: RunOptions, credentialNames?: string[]): Promise<PlanAnalysis>;
-  startExecution(items: PlanItem[], options?: RunOptions, credentials?: ConnectionCredentials): Promise<ExecutionRun>;
+  /** `deviationReason`: why the run differs from the approved brief, when it does and no reason was recorded in Plan. */
+  startExecution(items: PlanItem[], options?: RunOptions, credentials?: ConnectionCredentials, deviationReason?: string): Promise<ExecutionRun>;
   getExecution(): Promise<ExecutionRun>;
   /** `reset` closes the run (its record stays in the history) so the next run starts fresh; refused while it works. */
   controlExecution(action: RunControl, extra?: RunControlExtra): Promise<ExecutionRun>;
@@ -1042,6 +1276,33 @@ export interface MigrationApi {
   /** The project requirements every prompt carries (prompts/transform/project.md on the server). */
   getProjectRequirements(): Promise<ProjectRequirements>;
   saveProjectRequirements(text: string): Promise<ProjectRequirements>;
+  // The consultation: questions, answers, the migration brief and the policy in force.
+  getConsult(): Promise<ConsultState>;
+  getConsultCatalog(): Promise<ConsultCatalog>;
+  answerQuestion(question: string, value: unknown, extra?: { note?: string; seq?: number }): Promise<ConsultState>;
+  /** What an answer would open, park, revive and move, without recording it. */
+  previewAnswer(question: string, value: unknown): Promise<AnswerPreview>;
+  skipQuestion(question: string): Promise<ConsultState>;
+  withdrawAnswer(question: string): Promise<ConsultState>;
+  /** Accept the recommendations as answers: every section's, or one's. */
+  acceptRecommendations(section?: string): Promise<ConsultState>;
+  resolveConflict(conflict: string, resolution: "take" | "keep", reason?: string): Promise<ConsultState>;
+  getBrief(): Promise<BriefView>;
+  submitBrief(note?: string): Promise<BriefView>;
+  /** A person approves or rejects the version waiting for a decision. */
+  decideBrief(version: number, decision: "approve" | "reject", comment?: string, hash?: string): Promise<BriefView>;
+  /** Where a version downloads from (real), or its text (demo). Without a version: the one in force. */
+  exportBrief(version?: number, format?: "md" | "json"): Promise<{ url?: string; text?: string; fileName: string }>;
+  getConsultPolicy(): Promise<ConsultPolicy>;
+  /** Confirm a plan that differs from the approved brief, with the reason (kept in the audit trail). */
+  recordDeviation(items: PlanItem[], options: RunOptions, reason: string): Promise<{ differences: PlanDifference[]; recorded: boolean }>;
+  /** Answers read from notes (by the model with consent, else by the rules), for a person to confirm. */
+  proposeAnswers(text: string, useAi?: boolean): Promise<ConsultState>;
+  decideProposals(ids: string[], decision: "confirm" | "reject"): Promise<ConsultState>;
+  explainQuestion(question: string, useAi?: boolean): Promise<ConsultExplanation>;
+  exportQuestionnaire(format: "md" | "json"): Promise<{ url?: string; text?: string; fileName: string }>;
+  /** A questionnaire's answers, by question id: each proposed for a person to confirm. */
+  importQuestionnaire(answers: Record<string, unknown>): Promise<ConsultState>;
 }
 
 export class ApiRequestError extends Error {

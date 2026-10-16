@@ -2,7 +2,8 @@
 
 Moves an **Azure Synapse Analytics** workspace to **Microsoft Fabric**. It
 reads everything in the Synapse workspace, works out how each object maps to
-Fabric, orders the objects into dependency waves, builds and scores a
+Fabric, agrees a **migration brief** with the client (what moves, how, and who
+decides), orders the objects into dependency waves, builds and scores a
 migration plan, creates the objects in Fabric, and then compares the two sides
 object by object.
 
@@ -27,6 +28,7 @@ generated sample data, with no Azure, Synapse or Fabric needed.
 [What is automated, manual, or coming](#what-is-automated-manual-or-coming) ·
 [Discovery engine](#discovery-engine) ·
 [Connection architecture](#connection-architecture) ·
+[Consultation and the migration brief](#consultation-and-the-migration-brief) ·
 [Migration](#migration) ·
 [LLM-assisted transformation](#llm-assisted-transformation) ·
 [Fabric Git (Dev)](#fabric-git-dev) ·
@@ -35,17 +37,18 @@ generated sample data, with no Azure, Synapse or Fabric needed.
 
 ## What it does
 
-A migration is six steps, done in order. Each step is reviewed and confirmed
+A migration is seven steps, done in order. Each step is reviewed and confirmed
 before the next one opens.
 
 | # | Step | What happens | Writes to |
 |---|---|---|---|
 | 1 | **Discover** | Reads every object in the Synapse workspace (SQL pools, tables, views, procedures, scripts, pipelines, datasets, linked services, triggers, notebooks, Spark pools, Spark jobs, libraries, integration runtimes, storage) and maps each one to its Fabric component. | Nothing |
 | 2 | **Assess** | Classifies every object by how it moves: **Direct** (a matching Fabric component exists), **Reconfigure** (same idea, configured differently), **Transform** (code or settings change), **Manual** (needs a person), **Review** (no reliable one-to-one mapping). Also shows the Synapse → Fabric component mapping. | Nothing |
-| 3 | **Waves** | Builds the dependency graph and groups objects into waves, so nothing is created before what it depends on. | Nothing |
-| 4 | **Plan** | Chooses what moves. A deterministic planner gives each object a strategy, lists risks by severity, estimates effort and scores readiness (0–100). Stages, their options and any credentials are set here. | Nothing |
-| 5 | **Migrate** | Pre-run checks, then the run, wave by wave: Warehouse and schemas, empty tables, views, procedures, data pipelines that load the rows, notebooks, connections, pipelines, Spark, jobs, scripts, schedules and shortcuts. Safe to re-run; Retry failed re-runs only the failures. A run that changes what Fabric already has waits for a person to sign it off first. Every run is recorded as it happens: a restart brings it back paused, Resume carries it on without making anything twice, and closed runs stay in the run history. When the Fabric workspace is connected to Git, the run is then committed to its branch (`dev`), ready for a pull request. | **Fabric only** (and, through Fabric, its Git branch) |
-| 6 | **Validate** | Compares Synapse with Fabric, object by object: columns and types, row counts, definitions, notebook cells, pipeline activities. It also checks each object **runs in Fabric**: tables and views are queried, procedures compiled, and pipelines, notebooks and Spark jobs judged by their latest run (or run now, on request). | Nothing, unless you ask it to run items or procedures (procedures are rolled back) |
+| 3 | **Consult** | Asks the questions a consultant asks before a migration (what moves, history and sync, names and standards, SQL users, sign-off, Git, validation depth), each only when the estate makes it relevant and each with a recommendation that quotes the estate. The answers make the **migration brief**, which a person approves: Plan starts from it, and every run is checked against it. | Nothing (the brief is a record in the project) |
+| 4 | **Waves** | Builds the dependency graph and groups objects into waves, so nothing is created before what it depends on. | Nothing |
+| 5 | **Plan** | Chooses what moves, pre-set from the approved brief. A deterministic planner gives each object a strategy, lists risks by severity, estimates effort and scores readiness (0–100). Stages, their options and any credentials are set here; where the plan differs from the brief, confirming it asks why. | Nothing |
+| 6 | **Migrate** | Pre-run checks, then the run, wave by wave: Warehouse and schemas, empty tables, views, procedures, data pipelines that load the rows, notebooks, connections, pipelines, Spark, jobs, scripts, schedules and shortcuts. Safe to re-run; Retry failed re-runs only the failures. A run that changes what Fabric already has waits for a person to sign it off first. Every run is recorded as it happens: a restart brings it back paused, Resume carries it on without making anything twice, and closed runs stay in the run history. When the Fabric workspace is connected to Git, the run is then committed to its branch (`dev`), ready for a pull request. | **Fabric only** (and, through Fabric, its Git branch) |
+| 7 | **Validate** | Compares Synapse with Fabric, object by object: columns and types, row counts, definitions, notebook cells, pipeline activities. It also checks each object **runs in Fabric**: tables and views are queried, procedures compiled, and pipelines, notebooks and Spark jobs judged by their latest run (or run now, on request). | Nothing, unless you ask it to run items or procedures (procedures are rolled back) |
 
 ## Principles
 
@@ -80,6 +83,10 @@ before the next one opens.
   and a run uses the result only after that person has reviewed and accepted it.
 * **Honest about limits.** Anything that cannot be converted is reported, with
   the reason, as a risk before the run and as *left for a person* after it.
+* **Agreed before it moves.** By default no run starts until a person has
+  approved a migration brief that still fits the estate, and a plan that departs
+  from the brief says why. The brief says who decided each thing, and which
+  decisions nobody confirmed. See [Consultation and the migration brief](#consultation-and-the-migration-brief).
 * **Everything is on record.** Every run is written down as it happens: each
   change of status and each object's outcome, and exactly what was sent to
   Fabric. Every action goes into the project's hash-chained audit trail with
@@ -256,10 +263,10 @@ Triggers and integration runtimes are read from the repository's own
 folders. Spark pools and libraries are not in a repository, so they appear
 only when the SQL pool's workspace is signed in to.
 
-### Migration: the six steps
+### Migration: the seven steps
 
-The six steps sit side by side at the top, each a box with its key number
-(objects found, % direct, waves, readiness, objects migrated, matches) and its
+The seven steps sit side by side at the top, each a box with its key number
+(objects found, % direct, the brief's version, waves, readiness, objects migrated, matches) and its
 state: *To do*, *Running*, *Paused*, *Needs attention*, *Ready to confirm*,
 *Done*, *Run again* or *Locked*. Clicking a box opens that step's details
 below the flow, and the address and the browser tab follow the step you are
@@ -272,8 +279,9 @@ so the page stays readable:
 |---|---|---|
 | Discover | Objects, object types, with a Fabric mapping, manual or review, warnings | Overview (a tile per object type; click one to filter), Inventory (searchable table; click a row for the object's details, Fabric target and steps) |
 | Assess | A tile and percentage per class, and a bar across all of them | By workstream, Objects, Component mapping |
+| Consult | The brief (its version, or *not approved*), answered, assumed, needing a person, contradictions | Questions (by section, with **Accept all recommendations**, proposed answers to confirm, and the contradictions first), Brief (the draft, **Submit the brief**, approve or reject the version waiting, each version as Markdown or JSON), Changes since approval, Help (read answers from notes, the questionnaire) |
 | Waves | Objects, dependencies, waves | Waves (one row per wave with its object types), Dependency graph |
-| Plan | Readiness, objects, automated, needs a person, effort, blocking | Readiness & risks, Objects in plan, Strategy by type, Stages & credentials (configuration only: nothing runs from Plan) |
+| Plan | Readiness, objects, automated, needs a person, effort, blocking; how the plan stands against the approved brief | Readiness & risks, Objects in plan, Strategy by type, Stages & credentials (configuration only: nothing runs from Plan; an option that differs from the brief is marked) |
 | Migrate | Pre-run checks, then the run: every stage that is on or a single stage, progress by wave, every object's result, pause, resume, Retry failed; the **sign-off** card when the run waits for one; why a run is paused (by you, at a wave with failures, or cut short by a restart) and the credentials to enter again; objects **blocked** by a failure they depend on; the data-pipeline runs it started in Fabric; once it completes, the commit to Fabric Git with **Open pull request dev → main**, or **Commit now**; and the **run history** | — |
 | Validate | Checks, match, review, mismatch (each one filters) | One tab per category |
 
@@ -281,7 +289,9 @@ The bar at the foot of every step says where it stands and how to move on:
 *Looks good, continue to …* once the step is finished, *Continue to … anyway*
 when it finished with something worth a look (warnings, failures, blocking
 risks), and a disabled button with the reason while it is not finished. Plan
-cannot be confirmed while a risk is blocking. Confirming the last step shows
+cannot be confirmed while a risk is blocking, and confirming a plan that differs
+from the approved brief asks why. Under a required consultation, Consult is
+finished only once a brief that fits the estate is approved. Confirming the last step shows
 *Migration complete*: the final numbers, said plainly when objects failed or
 checks did not match, and **Download report (CSV)** with every object's result
 and every validation check.
@@ -395,8 +405,9 @@ Live mode that is `realApi.ts` and the local API; in Demo mode it is
 | `src/discovery_agent/discovery.py`, `records.py`, `extractors/`, `sql/`, `synapse/`, `acquisition/`, `artifacts/` | The discovery engine: what the workspace, the SQL pool and the Git repository say, merged into one record per object. |
 | `src/discovery_agent/mapping/` | `synapse_fabric_mapping.py` (Fabric target, classification and workstream for each object type and pipeline activity) and `waves.py` (dependency waves). |
 | `src/discovery_agent/migration/` | The planner, the eleven stages, the T-SQL rules, Fabric REST calls, data pipelines, validation, `fabric_git.py` (the target workspace's Fabric Git: status, commit, pull-request link), `run_state.py` (the statuses of a run and its objects, and the moves between them) and `failures.py` (what kind of failure an object's error is). See [Migration](#migration) and [Fabric Git (Dev)](#fabric-git-dev). |
+| `src/discovery_agent/consult/` | The consultation: `catalog.json` (the questions, as data) and `catalog.py` (checks it at load), `conditions.py` (when a question applies), `facts.py` (what the estate facts are), `settings.py` (the settings a brief can set, and who acts on each), `engine.py` (where every question stands), `brief.py` (versions, hashes, Markdown) and `policy.py` (what every consumer reads). See [Consultation and the migration brief](#consultation-and-the-migration-brief). |
 | `src/discovery_agent/state/` | What the backend keeps and records: `store.py` (a project's files: versioned documents, append-only streams, blobs, leases), `projects.py`, `runs.py` (run records), `approvals.py` (sign-off), `audit.py` (the hash-chained trail), `context.py` (correlation id and actor), `logs.py` (JSON logs), `processes.py`. See [Projects, run records and the audit trail](#projects-run-records-and-the-audit-trail). |
-| `src/discovery_agent/api/` | The local HTTP API: `service.py` (connections, discovery, results), `fabric.py` (Fabric sign-in), `migration.py` (plan, run, sign-off, run history, validate), `projects.py` (projects, the audit trail), `mapping.py`, `server.py`. |
+| `src/discovery_agent/api/` | The local HTTP API: `service.py` (connections, discovery, results), `fabric.py` (Fabric sign-in), `consult.py` (the consultation, the brief, the LLM gate), `migration.py` (plan, run, sign-off, run history, validate), `projects.py` (projects, the audit trail), `mapping.py`, `server.py`. |
 | `prompts/transform/` | The prompt templates for LLM-assisted transformation: `base.md`, one file per object type, and `project.md` for your project's own rules. |
 | `transforms/` | Drafts and accepted LLM-assisted transforms, one JSON file per object (created on first use; git-ignored, because it holds the client's code). |
 | `tests/` | The backend test suite; runs offline. |
@@ -417,7 +428,8 @@ All under `/api`, JSON in and out. Nothing returns a token or a secret.
 | Mapping and waves | `GET /mapping/components` · `GET /dependencies` |
 | Fabric connection | `GET /fabric/connection` · `POST /fabric/authenticate` · `POST /fabric/workspaces` · `POST /fabric/test` · `DELETE /fabric/connection` |
 | LLM transformation | `GET /transform/settings` · `GET /transform` · `GET /transform/objects/<id>` · `GET /transform/prompt/<id>` · `POST /transform/generate` (`ids`) · `POST /transform/accept` (`id`, optional edited `code`) · `POST /transform/discard` (`id`, `scope`: `draft` or `all`) · `GET /transform/candidates` · `GET`/`POST /transform/project` |
-| Migration | `GET /migration/capabilities` · `POST /migration/plan` (`credentialNames`: which linked services have credentials; a request carrying the credentials themselves is refused; `record` keeps it as a plan version) · `POST /migration/start` (refused with `plan_blocked` while the planner finds a blocking risk; a run that changes what Fabric has answers `awaiting_approval`) · `POST /migration/approve` (`decision`: `approve` or `reject`, `comment`, `subjectHash`; a person only) · `GET /migration/run` (with `status`, `pausedReason`, `needsInput`, `passes`, `approval`, `executions`, and `git`: the commit after the run) · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: close the run, keeping its record; `version` refuses a page that read an older run; `credentials` for the connections a restart lost) · `GET /migration/runs` · `GET /migration/runs/<id>` · `GET /migration/runs/<id>/events?after=&limit=` · `GET /migration/runs/<id>/artifacts/<sha256>` (what the run sent to Fabric for an object) · `GET /migration/plans/<P001>` · `GET /migration/policy` · `POST /migration/validate` (starts it in the background) · `GET /migration/validation` (also the last one, after a restart) |
+| Consultation | `GET /consult` (every question as it stands, the contradictions, what is next, the brief, proposals, the LLM gate) · `GET /consult/catalog` · `POST /consult/answer` (`question`, `value`, `note?`; `preview: true` says what it would change without recording it) · `POST /consult/skip` · `POST /consult/withdraw` · `POST /consult/accept` (`section?`) · `POST /consult/resolve` (`conflict`, `resolution`: `take` or `keep`, `reason`) · `GET /consult/brief` · `POST /consult/brief/submit` (`note?`) · `POST /consult/brief/approve` (`version`, `decision`: `approve` or `reject`, `comment?`, `hash?`; a person only) · `GET /consult/brief/export?version=&format=md|json` · `GET /consult/policy` (what Plan pre-sets: run options, date filters, objects left out, names, sign-off, Validate's depth) · `POST /consult/deviation` (`items`, `options`, `reason`) · `POST /consult/propose` (`text`) · `POST /consult/proposals` (`ids`, `decision`: `confirm` or `reject`) · `POST /consult/explain` (`question`) · `GET /consult/questionnaire?format=md|json` · `POST /consult/questionnaire` (`answers`) |
+| Migration | `GET /migration/capabilities` · `POST /migration/plan` (`credentialNames`: which linked services have credentials; a request carrying the credentials themselves is refused; `record` keeps it as a plan version) · `POST /migration/start` (refused with `plan_blocked` while the planner finds a blocking risk, and under a required consultation with `brief_required`, `brief_stale` or `deviation_unexplained`; `deviationReason` explains a difference from the brief; a run that changes what Fabric has answers `awaiting_approval`) · `POST /migration/approve` (`decision`: `approve` or `reject`, `comment`, `subjectHash`; a person only) · `GET /migration/run` (with `status`, `pausedReason`, `needsInput`, `passes`, `approval`, `executions`, and `git`: the commit after the run) · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: close the run, keeping its record; `version` refuses a page that read an older run; `credentials` for the connections a restart lost) · `GET /migration/runs` · `GET /migration/runs/<id>` · `GET /migration/runs/<id>/events?after=&limit=` · `GET /migration/runs/<id>/artifacts/<sha256>` (what the run sent to Fabric for an object) · `GET /migration/plans/<P001>` · `GET /migration/policy` · `POST /migration/validate` (starts it in the background) · `GET /migration/validation` (also the last one, after a restart) |
 | Projects | `GET /projects` · `POST /projects` (`name`, `id?`, `version?`, `activate?`, `copyFrom?`) · `POST /projects/<id>/rename` · `POST /projects/<id>/activate` (refused with `project_busy` while something of the current project works) · `DELETE /projects/<id>?version=` (archives the folder) |
 | Audit trail | `GET /audit` (newest first; `action` (a family such as `run`), `actor` (`person`, `system`, `agent` or `kind:id`), `outcome`, `run`, `since`, `until`, `correlationId`, `limit`, `before` to page back, `project` for another project's trail) · `GET /audit/verify` · `GET /audit/export?format=jsonl|csv` · `POST /journey/confirm` (`step`, `note?`) |
 | Fabric Git | `GET /fabric/git` (the target workspace's branch, head, uncommitted / incoming / conflicting items, data-load pipelines kept out, the pull-request link, the last commit) · `POST /fabric/git/commit` (`{comment?}`; commits what the current run created or updated, in the background; refused with no run, or while a run or another commit is working) |
@@ -940,6 +952,152 @@ The two Synapse permissions are independent, and the tool validates them
 separately: Reader on the resource group satisfies ARM and grants nothing on
 the data plane.
 
+## Consultation and the migration brief
+
+Before anything is planned, the **Consult** step asks the questions a consultant
+asks a client before a migration, and turns the answers into a **migration
+brief**: every decision, who made it and why, the settings it implies, and the
+estate it rests on. A person approves the brief. Plan then starts from it, and
+every run is checked against it.
+
+### The questions
+
+The questions are data, not code: `src/discovery_agent/consult/catalog.json`
+(39 questions in nine sections: scope and approach, target and standards, data,
+code, security, release, validation, the assistant, context). Each says when it
+applies (a condition over what discovery found and the answers before it), what
+it recommends and why (ordered rules whose reasons quote the estate, such as
+*4 objects use the serverless pool*), which settings it drives, and whether a
+person must answer it. The catalog is checked when the API starts and refused
+whole if anything is wrong: every setting and fact it names exists, a condition
+reads only earlier questions, every contradiction can be resolved, and accepting
+every recommendation gives a brief that can be submitted.
+
+A question appears only when the estate makes it relevant: the data questions
+when there are tables, the SQL-user question when SQL users were discovered, the
+Git questions when the Fabric workspace is connected to Git. What a question
+rests on is a **fact**, worked out once per discovery from metadata only (counts,
+names and short lists, never a definition, a row or a credential):
+`consult/facts.py` names them, `api/consult.py` (`estate_facts`) works them out.
+
+| Status | Meaning |
+|---|---|
+| Answered | A person answered it, accepted its recommendation, took a contradiction's finding, or confirmed a proposed answer. The brief says which. |
+| Assumed | Nobody answered: its recommendation stands, and the brief lists it as an assumption. |
+| Open | It has no recommendation and needs an answer. |
+| Skipped | A person moved past it: the recommendation stands, as an assumption. |
+| Confirm again | What the answer rests on changed since it was given (a new discovery): a person confirms it, or changes it. |
+| Parked | Answered on a branch that no longer applies. The answer is kept, and comes back if the branch applies again. |
+
+**Accept all recommendations** answers every assumed question with its
+recommendation in one go, the two a person must answer included (D1, whether
+definitions may be sent to Claude, and G3, which runs need a sign-off); each
+section has its own button. A choice says what it would change before it is saved
+(*This answer opens A2I; plan.scopeMode: all → include*), and **Explain** says
+what a question decides for this estate.
+
+**Contradictions.** Some answers contradict the estate or each other: replacing
+rows while no run needs a sign-off, a case-sensitive Warehouse for a
+case-insensitive pool, keeping tables in sync when some have no key. A
+contradiction comes first and holds the brief back until a person **takes the
+finding** (the safe answer, recorded as theirs), **keeps the answers with a
+reason** (kept in the brief and the audit trail), or changes an answer. One kept
+opens again if its answers or what it rests on change.
+
+Every answer is an append-only record (`consult/answers`) with who, when, its
+source, the catalog version and the evidence it was made against. Withdrawing an
+answer is a new record; nothing is deleted.
+
+### The brief
+
+**Submit the brief** makes a new numbered version that never changes, with a
+content hash over its decisions. A version is *submitted*, then *approved* or
+*rejected*; approving one supersedes the one in force, and submitting supersedes
+one still waiting. Only a person approves, and a version whose estate changed
+since it was submitted cannot be: submit again. A decision that loosens a
+safeguard (sending definitions to Claude, updating objects in place, replacing
+rows, no sign-off) asks for an approver other than the submitter. Whether the
+approver was the submitter is recorded either way, and
+`MIGRATION_BRIEF_APPROVAL=separate` refuses such a version's self-approval. Each
+version downloads as Markdown (for the client, and the final report) or JSON.
+
+A version lists each decision with who made it and why, the settings the
+accelerator acts on and who acts on each, the assumptions, what is recorded but
+not acted on (the assistant's autonomy, owners, the cutover window), the
+contradictions kept with their reasons, and the facts it rests on with their
+fingerprint.
+
+**Freshness.** A new discovery whose facts differ makes the approved brief
+**stale**: *Changes since approval* lists exactly what moved (*SQL Script 12 →
+11*), answers whose own evidence changed are to be confirmed again, and the brief
+is submitted and approved again. Only facts about the estate count: a target
+that is briefly disconnected never stales a brief.
+
+### What the brief changes
+
+One policy object (`consult/policy.py`), built from the approved brief, is what
+every consumer reads; no code outside the consultation reads a question or an
+answer.
+
+| The brief decides | Where it takes effect |
+|---|---|
+| What moves (structure, data, orchestration), and whether roles and permissions do | Plan's stages are pre-set |
+| What is in scope (schemas and folders, or name patterns left out), and leaving out serverless-pool code, multi-statement functions and what must be rebuilt | Plan's **Add all** leaves those objects out, each with why |
+| How a run goes through the waves | Stop at a wave with failures, or a person **signs off each wave** before the next one starts (the run pauses, `awaiting_wave_signoff`; Resume, by a person, releases that wave and is recorded as `run.wave_signed_off`) |
+| Objects already in Fabric, the Warehouse collation, tables that already have rows, whether load pipelines run, the sync re-read window | Plan's stage options are pre-set |
+| How much history loads, and whether tables stay in sync | Each table's date filter is pre-set |
+| Storage the code reads directly | Routed through OneLake shortcuts, or left |
+| The Warehouse's and the Lakehouse's names | The run creates them under those names; Validate compares against them |
+| The Microsoft Entra user or group that replaces each SQL user | The SQL user is migrated as that principal: its role memberships and its grants go to it |
+| Commit each run to Fabric Git, and what the commit takes | Only what the run made (the default), or everything waiting in the workspace |
+| Which runs a person signs off | The sign-off rule, which never loosens one this machine is set to (`MIGRATION_SIGNOFF`): the stricter holds |
+| Whether definitions may be sent to Claude, and the budget | Every LLM call is refused without consent, and once the budget is spent |
+| Naming and coding standards | Added to every draft's prompt |
+| How deep Validate checks | Validate's checks are pre-set |
+
+Plan is pre-set **once for each set of decisions**, so a person's later changes
+are never overwritten, not even by a brief approved again only because the
+estate moved. Where the plan differs from the brief, Plan says how (*Stop at a
+wave with failures: the brief says yes, the plan has no*) and marks each option
+that differs, and confirming Plan asks **why**. The reason is kept in the audit
+trail (`plan.deviation`) and with the run, and covers the same differences until
+the decisions change.
+
+**Consultation mode** (`MIGRATION_CONSULTATION`). `required`, the default,
+refuses a run without an approved brief (`brief_required`), under one that no
+longer fits the estate (`brief_stale`), and one that differs from it with no
+reason given (`deviation_unexplained`; the reason can also be given at Start).
+`advisory` refuses none of these; an approved brief is still pre-set and recorded
+with each run. Every run keeps the brief it started under (`pins.brief`: its
+version and hash, the differences, and the reason).
+
+### Help: notes, explanations, a questionnaire
+
+* **Read answers from notes.** Paste meeting notes or an email (*the last 3
+  years, and every run must be signed off*): the answers the text gives plainly
+  are proposed, each with the words it was read from, and nothing is answered
+  until a person confirms each one. With consent (D1) Claude reads the notes;
+  what is sent is the text pasted, the questions, and counts and yes/no facts
+  about the estate, never a name or a definition. Otherwise built-in rules read them.
+* **Explain** says what a question decides for this estate: Claude, with
+  consent, or the catalog's own words.
+* **Questionnaire.** Download the questions (Markdown to read, JSON to fill in)
+  for someone without access; importing the filled JSON proposes each answer for
+  a person to confirm.
+
+**The LLM gate.** Consent (D1) and the budget (D2) are what the approved brief
+says, with two exceptions that only make the gate stricter and so take effect at
+once: a person withdrawing consent, or lowering the budget. What every call cost
+is kept in the project's `llm/spend` ledger. The consultation's own help follows
+a person's latest answer to D1, so it works before any brief is approved.
+
+**Demo data** runs the same consultation in the browser:
+`frontend/src/mock/consultCatalog.json` is a copy of the catalog (a backend test
+keeps the two the same) and `frontend/src/mock/mockConsult.ts` a TypeScript copy
+of the engine, checked against the server's on the cases `tests/test_consult.py`
+writes to `frontend/src/test/consultParity.json`. Demo data reads notes with the
+rules only: nothing is sent anywhere.
+
 ## Migration
 
 The **Plan** step scores the plan and is where you choose which **stages** run
@@ -970,6 +1128,10 @@ in one place, `migration/capabilities.py`, and the UI reads it from
 | External tables | External table | A OneLake shortcut in a Lakehouse | The storage location is read from the pool's external data source; needs a Fabric connection to that storage. |
 
 Integration runtimes are always set up by hand.
+
+A SQL user that the approved brief replaces with a Microsoft Entra user or group
+(question E2) is migrated as that principal: the roles it was a member of get the
+principal as a member, and its grants are made to it.
 
 ### Date filters and keeping tables in sync
 
@@ -1239,6 +1401,13 @@ Accepted SQL still goes through the T-SQL rules, which are safe to repeat. An ac
 *Synapse-shaped* pipeline, and the usual converter embeds its datasets and resolves the Fabric ids. The
 run log marks every object created this way.
 
+**Consent and budget.** Drafts follow the migration brief: none is generated without
+consent to send definitions to Claude (D1), and none once the project has spent its
+budget (D2; every draft's cost is kept in the project's `llm/spend` ledger). Under a
+required consultation, consent comes from the approved brief; a person withdrawing it
+in Consult stops drafts at once. The brief's naming and coding standards (B3) are
+added to every prompt. See [Consultation and the migration brief](#consultation-and-the-migration-brief).
+
 **Changing the prompt for a project.** The prompt is put together on the server from Markdown files in
 `prompts/transform/`:
 
@@ -1286,7 +1455,10 @@ active at a time. Each keeps its own folder, `.accelerator/state/projects/<id>/`
 | `snapshots.jsonl` | One record per discovery: what it saw, a fingerprint over every object and definition, whether all of the source could be read |
 | `plans.jsonl` | Plan versions (`P001`, …): the objects and waves, the options, the planner's score, the discovery it was made from, who recorded it |
 | `migration.json`, `runs/<id>/` | Which run is current, and each run's record (below) |
-| `approvals.jsonl` | Every sign-off decision |
+| `approvals.jsonl` | Every sign-off decision, a wave's included |
+| `consult/answers.jsonl`, `consult/proposals.jsonl` | Every answer, skip, withdrawal and resolution, and the answers proposed from notes or a questionnaire with what a person decided |
+| `consult/briefs/<n>.json`, `consult/brief_events.jsonl`, `consult/deviations.jsonl` | Each brief version, never changed; each version's lifecycle; the plans confirmed although they differ from the brief, with the reason |
+| `llm/spend.jsonl` | What each LLM call cost, against the brief's budget |
 | `validation.json`, `git.json` | The last validation, and the last Fabric Git commit |
 | `audit.jsonl` | The audit trail (below) |
 | `blobs/` | What the runs sent to Fabric, by hash |
@@ -1329,7 +1501,7 @@ whatever stopped it.
 |---|---|---|
 | `awaiting_approval` | A person must sign it off before it writes anything | **Sign off and run**, or **Decline** (`rejected`, final) |
 | `queued`, `running` | A pass is working | It ends by itself, or **Pause** |
-| `paused` | Stopped between objects: by you, at a wave with failures (*stop on failure*), or cut short by a restart (`interrupted`) | **Resume** (a new pass) |
+| `paused` | Stopped between objects: by you, at a wave with failures (*stop on failure*), before a wave a person signs off (`awaiting_wave_signoff`, when the brief has each wave signed off), or cut short by a restart (`interrupted`) | **Resume** (a new pass); before a wave, **Sign off wave N**, which releases that wave only |
 | `completed_with_failures`, `failed` | The pass ended with objects failed or blocked, or the workspace refused it | **Retry failed** (a new pass) |
 | `completed` | Done | Final |
 | `cancelled` | Closed by **Reset step** or replaced by a new run | Final; its record stays in the **run history** |
@@ -1369,8 +1541,9 @@ kept: it carries credentials.
 
 ### Sign-off
 
-`MIGRATION_SIGNOFF` decides which runs a person signs off before they write to
-Fabric:
+The approved brief's G3 decides which runs a person signs off before they write
+to Fabric. `MIGRATION_SIGNOFF` is this machine's own rule: with no brief it
+decides, and with one the stricter of the two holds:
 
 | Value | A person signs off |
 |---|---|
@@ -1386,8 +1559,9 @@ and stages, which a run never changes once made.
 ### Audit trail
 
 `audit.jsonl` holds one record per action: what it was (a closed catalog:
-`project.*`, `source.*`, `discovery.*`, `fabric.*`, `plan.recorded`, `run.*`,
-`validation.*`, `git.*`, `transform.*`, `journey.step_confirmed`, `system.*`,
+`project.*`, `source.*`, `discovery.*`, `fabric.*`, `consult.*`, `brief.*`,
+`plan.recorded`, `plan.deviation`, `run.*`, `validation.*`, `git.*`,
+`transform.*`, `llm.refused`, `journey.step_confirmed`, `system.*`,
 `audit.exported`), who did it (`person`: `MIGRATION_OPERATOR`, else the account
 the API runs as; `agent`: the LLM, for a draft it wrote; `system`: the accelerator
 itself), the target, the outcome (`done`, `failed`, `refused`) with a code and a
@@ -1406,14 +1580,16 @@ Writing a record never fails the action it records.
 | `MIGRATION_LOG_DIR` | `.accelerator/logs` | Where `api.jsonl` is written. |
 | `MIGRATION_LOG` | `on` | `off` writes no log file: the console only. |
 | `MIGRATION_LOG_LEVEL` | `INFO` | `DEBUG` adds every Fabric read and every Warehouse statement (by kind and hash, never its text). |
-| `MIGRATION_SIGNOFF` | `overwrite` | Which runs a person signs off: `never`, `overwrite` or `always`. |
+| `MIGRATION_SIGNOFF` | `overwrite` | Which runs a person signs off: `never`, `overwrite` or `always`. With an approved brief, the stricter of this and the brief's rule holds. |
+| `MIGRATION_CONSULTATION` | `required` | `required`: no run without an approved brief that fits the estate, and differences from it explained. `advisory`: neither is refused. |
+| `MIGRATION_BRIEF_APPROVAL` | (unset) | `separate`: a brief with a decision that loosens a safeguard cannot be approved by the person who submitted it. |
 | `MIGRATION_OPERATOR` | the account the API runs as | The person the log and the audit trail name. |
 
 ## Tests
 
 ```
-pytest                                  # backend: 1,620 tests pass, 104 skipped (below)
-cd frontend && npm run typecheck && npm test   # UI: type check and 76 tests
+pytest                                  # backend: 1,673 tests pass, 104 skipped (below)
+cd frontend && npm run typecheck && npm test   # UI: type check and 87 tests
 ```
 
 **Safe to run beside a live session.** `tests/conftest.py` points everything a
@@ -1421,12 +1597,24 @@ real session keeps on the machine into each test's own temporary folder:
 `MIGRATION_STATE_DIR` (the projects, their discoveries, runs and audit trails),
 `MIGRATION_TRANSFORMS_DIR` (accepted LLM transforms), `MIGRATION_LOG_DIR`, and
 the upload and working-copy folders under `input/`. It also fixes the operator's
-name and sets `MIGRATION_SIGNOFF=never`, so a test asks for a sign-off only when
-it means to. A test API used to delete a running
+name, sets `MIGRATION_SIGNOFF=never` and `MIGRATION_CONSULTATION=advisory`, so a
+test asks for a sign-off or an approved brief only when it means to, and makes
+sure no test finds a real `claude` on the machine. A test API used to delete a running
 session's saved `discovery.pickle` and leave uploads behind; a test now checks
 that nothing points at the real folders. (`MIGRATION_STATE=off` alone was never
 enough: a reset or sign-out still deleted the saved file. Switched off, the
 folder is now never read, written or emptied.)
+
+**Changing the consultation.** The Demo page keeps its own copy of the catalog
+and of the engine. After a change to `consult/catalog.json`, copy it to
+`frontend/src/mock/consultCatalog.json` (a test fails until the two match); after
+a change to the catalog or the engine, write the cases the Demo engine is checked
+against again, then run the UI tests:
+
+```
+UPDATE_CONSULT_PARITY=1 pytest tests/test_consult.py -k demo_engine
+cd frontend && npx vitest run src/test/consult.test.ts
+```
 
 The skipped backend tests are the two opt-in integration suites (39 tests,
 below), 63 that read a local snapshot of a sample repository

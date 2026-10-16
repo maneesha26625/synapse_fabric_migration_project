@@ -70,10 +70,32 @@ CATALOG: Dict[str, Tuple[str, FrozenSet[str]]] = {
     "fabric.connected": ("The Fabric target workspace was chosen and verified, or reconnected at start", _fields(
         "workspace", "method", "capacity", "checks", "restored")),
     "fabric.disconnected": ("The Fabric target was disconnected", _fields("workspace")),
+    "consult.answered": ("A consultation question was answered", _fields("question", "value", "source", "note", "catalogVersion")),
+    "consult.skipped": ("A consultation question was skipped; its recommendation stands as an assumption", _fields("question")),
+    "consult.withdrawn": ("A consultation answer was withdrawn; the record keeps it", _fields("question")),
+    "consult.accepted": ("Recommendations were accepted as answers", _fields("questions", "section", "count")),
+    "consult.resolved": ("A contradiction between the answers and the estate was resolved", _fields(
+        "conflict", "resolution", "reason", "question", "value")),
+    "consult.proposed": ("Answers were proposed from notes or an imported questionnaire, for a person to confirm", _fields(
+        "source", "model", "count", "questions", "textHash", "message")),
+    "consult.proposal_confirmed": ("A person confirmed a proposed answer", _fields("proposal", "question", "value", "source")),
+    "consult.proposal_rejected": ("A person rejected a proposed answer", _fields("proposal", "question", "value", "source")),
+    "consult.explained": ("A consultation question was explained", _fields("question", "source", "model")),
+    "consult.exported": ("The questionnaire was exported, to answer offline", _fields("format", "questions")),
+    "brief.submitted": ("A migration brief version was submitted for approval", _fields(
+        "version", "hash", "decisions", "assumptions", "kept", "catalogVersion", "factsFingerprint", "snapshot", "superseded")),
+    "brief.approved": ("A migration brief version was approved: it is the policy in force", _fields(
+        "version", "hash", "comment", "selfApproved", "separateApprover", "superseded")),
+    "brief.rejected": ("A migration brief version was rejected", _fields("version", "hash", "comment")),
+    "brief.exported": ("A migration brief version was exported", _fields("version", "format")),
+    "plan.deviation": ("A plan that differs from the approved brief was confirmed, with a reason", _fields(
+        "briefVersion", "differences", "reason")),
+    "llm.refused": ("An LLM call was refused: no consent, or the budget is spent", _fields("purpose", "reason", "spent", "budget")),
     "plan.recorded": ("A plan version was recorded", _fields("fingerprint", "objects", "readiness", "blocking", "snapshot")),
     "run.requested": ("A migration run was asked for", _fields(
         "objects", "stages", "existing", "dataMode", "dataRun", "credentialNames", "workspace", "warehouse",
-        "plannerFingerprint", "snapshot")),
+        "plannerFingerprint", "snapshot", "brief", "briefHash", "differences", "signoffRule")),
+    "run.wave_signed_off": ("A person signed off the next wave of a run", _fields("wave", "comment")),
     "run.refused": ("A migration run was refused before it started", _fields("message")),
     "run.signoff_requested": ("A run waits for a person to sign it off", _fields("reason", "policy")),
     "run.approved": ("A run was signed off", _fields("automatic", "policy", "comment", "subjectHash")),

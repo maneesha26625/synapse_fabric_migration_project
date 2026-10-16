@@ -87,7 +87,7 @@ def _module(source: Source) -> List[Finding]:
 
 def _security(source: Source) -> List[Finding]:
     try:
-        plan = security_sql.plan_principal(source.payload, source.name)
+        plan = security_sql.plan_principal(source.payload, source.object_name or source.name)
     except Exception:  # noqa: BLE001 - a principal discovery did not keep is a finding, not a crash
         return [Finding(source.id, "DEFINITION_UNREADABLE", HIGH, f"{source.name}: the role or user was not kept by discovery. Run discovery again.")]
     found = []

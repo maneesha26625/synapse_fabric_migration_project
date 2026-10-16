@@ -20,6 +20,7 @@ export function useResetPlan(step: StepKey) {
   if (step === "discover" && discovered) clears.push(`The discovered inventory: ${n(discovery.summary?.total ?? 0)} objects${discovery.workspace ? ` from ${discovery.workspace}` : ""}.`);
   if (step === "discover" && discovery.state === "failed") clears.push("The failed discovery attempt.");
   if (step === "assess" && discovered) clears.push("Nothing of its own: the assessment is read again from the discovery.");
+  if (step === "consult" && discovered) clears.push("Nothing of its own: every answer and brief version stays in the project's record, as the audit trail needs. Change the answers in Consult instead.");
   if (step === "waves" && discovered) clears.push("The dependency graph, which is built again from the discovery.");
   if (covers("plan") && plan.length) {
     const typed = Object.keys(credentials).length;

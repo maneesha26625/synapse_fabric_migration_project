@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from discovery_agent.migration import fabric_connections, jobs, onelake, pipelines, storage_remap
 from discovery_agent.migration.common import (
-    COMPLETED, DEFERRED_STATUS, SKIPPED, MigrationError, Source, lakehouse_name, override_note,
+    COMPLETED, DEFERRED_STATUS, SKIPPED, MigrationError, Source, lakehouse_of, override_note,
 )
 from discovery_agent.migration.fabric_rest import FabricApiError
 
@@ -40,7 +40,7 @@ class FabricStageMixin:
     def _lakehouse(self) -> Tuple[str, str]:
         """(name, id) of the run's Lakehouse, created on first use. It holds the OneLake shortcuts."""
         wid, client = self.run.workspace_id, self._client()  # type: ignore[attr-defined]
-        name = lakehouse_name(self.run.warehouse)
+        name = lakehouse_of(self.run.warehouse, self.run.settings)
         lakehouse = self._find(self._ids("lakehouses"), name)
         if not lakehouse:
             created = client.create(f"/workspaces/{wid}/lakehouses",

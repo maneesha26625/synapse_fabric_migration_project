@@ -57,7 +57,11 @@ import {
   type ProgressStep,
   type ResultsPage,
   type ResultsQuery,
+  type AnswerPreview,
+  type ConsultState,
+  type FilterableTable,
 } from "../types";
+import { DemoConsult, type DemoEstate } from "./mockConsult";
 import { generateObjects } from "./mockData";
 import { RUN_KIND, applyDemoRuntime } from "./mockRuntime";
 import { DEMO_PROJECT, KIND_OF_TYPE, demoNeedsWork, demoPrompt, demoSource, demoTransformSettings } from "./mockTransform";
@@ -156,6 +160,9 @@ interface ExecSim {
   per: number; dur: number; failing: Set<string>;
   // The run's record, as the backend keeps it: its sign-off, its passes, when it was made.
   approval: RunApproval; rejected: boolean; createdAt: string; passes: RunPass[]; version: number;
+  // What the brief decided for it: the Warehouse's name, and whether a person signs off each wave (and those signed off).
+  warehouse: string; waveGate: boolean; released: number[]; waitingWave: number | null;
+  brief: { version: number | null; hash?: string; differences: import("../types").PlanDifference[] };
 }
 let execSim: ExecSim | null = null;
 let runCounter = 0;
@@ -184,6 +191,16 @@ const DEMO_CATALOG: Record<string, string> = {
   "run.resumed": "A run was resumed", "run.retried": "A run's failed objects were retried", "run.closed": "A run was closed; its record stays in the run history",
   "validation.started": "Validation started", "journey.step_confirmed": "A person confirmed a step of the journey",
   "audit.exported": "The audit trail was exported",
+  "consult.answered": "A consultation question was answered", "consult.skipped": "A consultation question was skipped; its recommendation stands as an assumption",
+  "consult.withdrawn": "A consultation answer was withdrawn; the record keeps it", "consult.accepted": "Recommendations were accepted as answers",
+  "consult.resolved": "A contradiction between the answers and the estate was resolved",
+  "consult.proposed": "Answers were proposed from notes or an imported questionnaire, for a person to confirm",
+  "consult.proposal_confirmed": "A person confirmed a proposed answer", "consult.proposal_rejected": "A person rejected a proposed answer",
+  "consult.explained": "A consultation question was explained", "consult.exported": "The questionnaire was exported, to answer offline",
+  "brief.submitted": "A migration brief version was submitted for approval", "brief.approved": "A migration brief version was approved: it is the policy in force",
+  "brief.rejected": "A migration brief version was rejected", "brief.exported": "A migration brief version was exported",
+  "plan.deviation": "A plan that differs from the approved brief was confirmed, with a reason",
+  "run.wave_signed_off": "A person signed off the next wave of a run",
 };
 
 // ---- demo projects: kept in this browser, as projects always were in Demo data ---------------------
@@ -209,15 +226,17 @@ function checkVersion(version?: number) {
   }
 }
 
-/** What Demo data asks a person to sign off: like the backend's default rule, a run that changes what Fabric has. */
-function demoApproval(options?: RunOptions): RunApproval {
+/** What Demo data asks a person to sign off, under the approved brief's rule (G3), else the backend's default: a run that
+ *  changes what Fabric has. */
+function demoApproval(options?: RunOptions, rule: RunApproval["policy"] = "overwrite"): RunApproval {
   const reasons = [
     ...(options?.existing === "update" ? ["it updates objects that are already in Fabric in place"] : []),
     ...(options?.dataMode === "replace" && (!options?.stages?.length || options.stages.includes("data")) ? ["it empties tables that already have rows and loads them again"] : []),
   ];
   const now = new Date().toISOString();
-  const reason = reasons.length ? `This run changes what Fabric already has: ${reasons.join("; ")}.` : null;
-  return { policy: "overwrite", required: !!reason, reason, subjectHash: demoSha(JSON.stringify(options ?? {})).padEnd(64, "0"), requestedAt: now,
+  const reason = rule === "always" ? `Every run is signed off before it writes to Fabric${reasons.length ? `: ${reasons.join("; ")}` : "."}`
+    : rule === "overwrite" && reasons.length ? `This run changes what Fabric already has: ${reasons.join("; ")}.` : null;
+  return { policy: rule, required: !!reason, reason, subjectHash: demoSha(JSON.stringify(options ?? {})).padEnd(64, "0"), requestedAt: now,
     requestedBy: DEMO_PERSON, decision: reason ? null : "approved", by: reason ? null : DEMO_SYSTEM, at: reason ? null : now, comment: null,
     automatic: !reason };
 }
@@ -438,7 +457,7 @@ function demoDateColumns(name: string): { dateColumns: { name: string; type: str
   return { dateColumns: dates, keyColumns: h % 4 === 0 ? [] : [`${table.replace(/^(Dim|Fact)/, "")}Id`] };
 }
 
-function outcome(i: SimItem, h: number): { step: string; target: string | null; notes: string[] } {
+function outcome(i: SimItem, h: number, WAREHOUSE: string): { step: string; target: string | null; notes: string[] } {
   const ws = fabric.workspaceName ?? "Fabric_demo";
   const wave = `load_${WAREHOUSE}_wave_${i.wave}`;
   switch (i.type) {
@@ -492,6 +511,7 @@ function runNow(): ExecutionRun {
   const line = (ms: number, level: string, name: string, text: string) => `${at(ms)}  ${level.padEnd(11)}${name}: ${text}`;
   const logs: string[] = [line(0, "RUN", "run", `${sim.items.length} objects, workspace ${fabric.workspaceName ?? "Fabric_demo"}, warehouse ${WAREHOUSE} (demo)`)];
   let slot = 0;
+  const begins = new Map<string, number>();
   const items: ExecItem[] = sim.items.map((si) => {
     const accepted = transforms.get(si.id)?.accepted;
     const base: ExecItem = { id: si.id, name: si.name, type: si.type, wave: si.wave, step: "Waiting", status: "PENDING", startedAt: null, completedAt: null, error: null,
@@ -512,6 +532,7 @@ function runNow(): ExecutionRun {
     }
     const begin = slot * sim.per, end = begin + sim.dur;
     slot += 1;
+    begins.set(si.id, begin);
     if (elapsed < begin) return base;
     if (elapsed < end) {
       logs.push(line(begin, "START", si.name, si.type));
@@ -525,11 +546,24 @@ function runNow(): ExecutionRun {
       logs.push(line(begin, "START", si.name, si.type), line(end, "FAILED", si.name, error));
       return { ...base, step: "Failed", status: "FAILED", startedAt: at(begin), completedAt: at(end), error };
     }
-    const done = outcome(si, h);
+    const done = outcome(si, h, sim.warehouse);
     logs.push(line(begin, "START", si.name, si.type), line(end, "COMPLETED", si.name, done.step + (done.target ? ` -> ${done.target}` : "")));
     for (const n of done.notes) logs.push(line(end, "NOTE", si.name, n));
     return { ...base, step: done.step, status: "COMPLETED", startedAt: at(begin), completedAt: at(end), target: done.target, notes: done.notes };
   });
+  // The brief signs each wave off (A4): the run stops before the first object of a later wave nobody has released yet.
+  if (sim.waveGate && sim.waitingWave === null && sim.resumedAt !== null) {
+    const first = Math.min(...sim.items.map((i) => i.wave));
+    const gate = sim.items.find((si) => si.wave > first && !sim.released.includes(si.wave) && begins.has(si.id) && elapsed >= (begins.get(si.id) as number));
+    if (gate) {
+      sim.base = Math.max(0, (begins.get(gate.id) as number) - 1);
+      sim.resumedAt = null;
+      sim.waitingWave = gate.wave;
+      const last = sim.passes[sim.passes.length - 1];
+      if (last && last.status === "running") Object.assign(last, { status: "awaiting wave sign-off", finishedAt: new Date().toISOString() });
+      return runNow();
+    }
+  }
   const n = (st: ExecItem["status"]) => items.filter((i) => i.status === st).length;
   const allDone = items.every((i) => i.status !== "PENDING" && i.status !== "IN PROGRESS");
   if (allDone) logs.push(line(elapsed, "DONE", "run", "every pending object was processed"));
@@ -538,14 +572,16 @@ function runNow(): ExecutionRun {
   const waiting = sim.approval.required && sim.approval.decision === null;
   const status: ExecutionRun["status"] = sim.rejected ? "rejected" : waiting ? "awaiting_approval"
     : allDone ? (n("FAILED") ? "completed_with_failures" : "completed") : sim.resumedAt === null ? "paused" : "running";
+  if (sim.waitingWave !== null) logs.push(line(elapsed, "SIGN-OFF", "run", `Wave ${sim.waitingWave} waits for a person to sign it off.`));
   return {
     runId: sim.runId,
     state: sim.rejected || allDone ? "completed" : waiting || sim.resumedAt === null ? "paused" : "running",
     total: items.length, completed: n("COMPLETED"), inProgress: n("IN PROGRESS"), failed: n("FAILED"), pending: n("PENDING"),
-    skipped: n("SKIPPED"), deferred: n("DEFERRED"), workspace: fabric.workspaceName ?? null, warehouse: WAREHOUSE,
+    skipped: n("SKIPPED"), deferred: n("DEFERRED"), workspace: fabric.workspaceName ?? null, warehouse: sim.warehouse,
     options: sim.options, git: sim.rejected || waiting ? null : git, items: sim.rejected || waiting ? items.map((i) => i.status === "DEFERRED" ? i : { ...i, status: "PENDING", step: "Waiting" }) : items,
     logs: waiting ? [logs[0], line(0, "SIGN-OFF", "run", `Waiting for a person to sign it off. ${sim.approval.reason ?? ""}`)] : logs,
-    status, pausedReason: status === "paused" ? "by_person" : null, needsInput: [], blocked: 0, passes: sim.passes, version: sim.version,
+    status, pausedReason: status === "paused" ? (sim.waitingWave !== null ? "awaiting_wave_signoff" : "by_person") : null, needsInput: [], blocked: 0,
+    passes: sim.passes, version: sim.version, releasedWaves: [...sim.released], waitingWave: status === "paused" ? sim.waitingWave : null, brief: sim.brief,
     createdAt: sim.createdAt, startedAt: sim.passes[0]?.startedAt ?? null, finishedAt: allDone && !waiting ? new Date(started + elapsed).toISOString() : null,
     closedAt: null, requestedBy: DEMO_PERSON, approval: sim.approval, resumable: true, unresumableReason: null, executions: [],
   };
@@ -626,6 +662,7 @@ export function resetDemo(): void {
   lastValidation = null;
   trail = [];
   projectsVersion = 1;
+  consult = new DemoConsult(DEMO_PERSON, consultAudit);
 }
 
 /** A small stand-in for the backend planner so the demo page is fully populated. */
@@ -690,6 +727,89 @@ function demoAnalysis(items: PlanItem[], record: boolean, options?: RunOptions):
       { label: "Synapse source connected (row counts and shortcuts)", status: s.connection.status === "connected" ? "ok" : "fail", detail: s.connection.status === "connected" ? `${s.connection.workspace} (demo)` : "Connect the Synapse source again." },
     ],
     objectStrategies, history: plannerHistory,
+  };
+}
+
+// ---- the demo consultation: its facts come from the demo estate, as the backend's come from the discovery ---------------
+
+/** Demo consultation is required, as the backend's default: a run starts only under an approved brief. */
+let CONSULT_MODE: "required" | "advisory" = "required";
+/** For tests that are about something else: runs start without a brief, as with MIGRATION_CONSULTATION=advisory. */
+export function setDemoConsultation(mode: "required" | "advisory"): void {
+  CONSULT_MODE = mode;
+}
+const consultAudit = (action: string, details: Record<string, unknown>, target?: { type: string; id: string | null }) => record(action, { details, target });
+let consult = new DemoConsult(DEMO_PERSON, consultAudit);
+const warehouseNameFor = (pool: string) => { const name = pool.replace(/[^A-Za-z0-9_]/g, "_") || "SynapseMigration"; return /^[A-Za-z]/.test(name) ? name : `wh_${name}`; };
+/** Demo: the SQL scripts written for the serverless pool, the same ones every time. */
+const isServerless = (o: { type: string; id: string }) => o.type === "SQL Script" && hash(o.id) % 5 === 0;
+const config = (o: ObjectDetail) => (o.configuration ?? {}) as Record<string, unknown>;
+
+/** The demo's tables a date filter can apply to (as the backend's filterable_tables). */
+function demoTables(): FilterableTable[] {
+  return (s.objects ?? []).filter((o) => o.type === "Table").map((o) => {
+    const [schema, name] = o.name.includes(".") ? o.name.split(".", 2) : ["dbo", o.name];
+    return { id: o.id, schema, name, key: o.name.toLowerCase(), ...demoDateColumns(o.name) };
+  });
+}
+
+function demoEstate(): DemoEstate {
+  const objects = completedObjects();
+  const groupOf: Record<string, string[]> = {};
+  const flags: Record<string, string[]> = {};
+  for (const o of objects) {
+    if (["Table", "View", "Stored Procedure", "Function", "External Table"].includes(o.type) && o.schema) groupOf[o.id] = [`schema:${o.schema}`];
+    else if (o.type === "Schema") groupOf[o.id] = [`schema:${o.name.split(".").pop()}`];
+    else if (["Notebook", "Pipeline", "SQL Script", "Spark Job Definition", "Dataset"].includes(o.type)) groupOf[o.id] = ["folder:(top level)"];
+    if (isServerless(o)) flags[o.id] = ["serverless"];
+    if (isMultiStatement(o.type, o.name)) flags[o.id] = [...(flags[o.id] ?? []), "multiStatement"];
+  }
+  return { items: objects.map((o) => ({ id: o.id, name: o.name })), groupOf, flags, filterable: demoTables() };
+}
+
+/** Every fact the consultation reads, from the demo estate: counts, names and short lists, as the backend's. */
+function demoFacts(): Record<string, unknown> {
+  const objects = completedObjects();
+  const of = (type: string) => objects.filter((o) => o.type === type);
+  const tables = demoTables();
+  const pool = of("Dedicated SQL Pool")[0];
+  const collation = pool ? String(config(pool).collation ?? "") || null : null;
+  const security = of("Security Object");
+  const sqlUsers = security.map((o) => o.name).filter((n) => SQL_USERS.has(n)).sort();
+  const services = of("Linked Service");
+  const byType: Record<string, number> = {};
+  for (const o of services) { const t = String(config(o).type ?? "Unknown"); byType[t] = (byType[t] ?? 0) + 1; }
+  const triggers = of("Trigger");
+  const schedules = triggers.filter((o) => config(o).triggerType === "ScheduleTrigger").length;
+  const runtimes = of("Integration Runtime").filter((o) => o.name !== "AutoResolveIntegrationRuntime");
+  const changing = tables.filter((t) => t.dateColumns.some((c) => /(modif|updat|chang|last_?mod|_ts$|^ts$|timestamp)/i.test(c.name)));
+  const groups = [...new Set(Object.values(demoEstate().groupOf).flat())]
+    .sort((a, b) => Number(!a.startsWith("schema:")) - Number(!b.startsWith("schema:")) || a.toLowerCase().localeCompare(b.toLowerCase()));
+  const repo = s.connection.repository;
+  const failed = s.summary?.failedCategories ?? [];
+  return {
+    "objects.total": objects.length, "objects.byType": { ...(s.summary?.byType ?? {}) }, "objects.byClass": { ...(s.summary?.byClassification ?? {}) },
+    "waves.count": new Set(objects.map((o) => o.wave).filter((w) => w > 0)).size,
+    "pool.present": !!pool, "pool.name": pool?.name ?? null, "pool.warehouseName": pool ? warehouseNameFor(pool.name) : null,
+    "pool.collation": collation, "pool.caseInsensitive": collation ? collation.toUpperCase().includes("_CI") : null,
+    "tables.count": of("Table").length, "tables.external": of("External Table").length,
+    "tables.withDateColumn": tables.filter((t) => t.dateColumns.length).length, "tables.withChangeColumn": changing.length,
+    "tables.withKeys": tables.filter((t) => t.keyColumns.length).length, "tables.withoutKeys": tables.filter((t) => !t.keyColumns.length).length,
+    "tables.changeWithoutKeys": changing.filter((t) => !t.keyColumns.length).length, "storage.locations": of("Storage Reference").length,
+    "security.principals": security.length, "security.roles": security.filter((o) => /role/i.test(String(config(o).principalKind ?? ""))).length,
+    "security.sqlUsers": sqlUsers.length, "security.sqlUserNames": sqlUsers, "security.masks": of("Table").filter((o) => hash(o.id) % 11 === 0).length,
+    "code.multiStatementFunctions": of("Function").filter((o) => isMultiStatement(o.type, o.name)).length, "code.dotnetNotebooks": 0,
+    "code.unsupportedPipelines": 0, "code.needsRewrite": 0, "code.serverlessObjects": objects.filter(isServerless).length,
+    "linkedServices.count": services.length, "linkedServices.byType": byType,
+    "linkedServices.keyVault": services.filter((o) => /key ?vault/i.test(String(config(o).authentication ?? ""))).length,
+    "triggers.count": triggers.length, "triggers.schedule": schedules, "triggers.event": triggers.length - schedules,
+    "integrationRuntimes.count": runtimes.length, "manual.setupCount": triggers.length + runtimes.length, "scope.groups": groups,
+    "source.kind": repo?.kind ?? "workspace", "source.workspace": s.connection.workspace ?? null, "source.ref": repo?.ref ?? null,
+    "source.commit": repo?.commit ?? null, "source.environment": repo?.environment ?? null,
+    "discovery.complete": failed.length === 0, "discovery.failedCategories": failed.map((f) => f.name), "discovery.snapshot": "S001",
+    "target.connected": fabric.status === "connected", "target.workspace": fabric.status === "connected" ? fabric.workspaceName ?? null : null,
+    "target.capacity": fabric.status === "connected" ? !!fabric.capacityAssigned : null, "target.gitConnected": fabric.status === "connected" ? gitConnected() : null,
+    "llm.available": true,
   };
 }
 
@@ -1065,23 +1185,22 @@ export const mockApi: MigrationApi = {
       name: o.name, type: "AzureSqlDW", fabricType: "SQL", needsPath: false, unsupported: null, authTypes: sqlAuth, stage: "connections",
     }));
     const pool = { name: `synapse-${s.connection.workspace ?? DEMO_SOURCE.workspace}-${s.connection.sqlPool ?? DEMO_SOURCE.sqlPool}`, type: "Synapse dedicated SQL pool", fabricType: "SQL", needsPath: false, unsupported: null, authTypes: sqlAuth, stage: "data" };
-    const dataTables = (s.objects ?? []).filter((o) => o.type === "Table").map((o) => {
-      const [schema, name] = o.name.includes(".") ? o.name.split(".", 2) : ["dbo", o.name];
-      return { id: o.id, schema, name, key: o.name.toLowerCase(), ...demoDateColumns(o.name) };
-    });
+    const dataTables = demoTables();
     return { stages: DEMO_STAGES, defaults: { dataMode: "if_empty", dataRun: "run", collation: "match_synapse", syncOverlap: "1h" }, linkedServices: [pool, ...linked], dataTables };
   },
 
   async analyzePlan(items: PlanItem[], record?: boolean, options?: RunOptions, credentialNames?: string[]) {
     await sleep(120);
     void credentialNames;
-    return demoAnalysis(items, !!record, options);
+    return { ...demoAnalysis(items, !!record, options), brief: consult.checkPlan(demoFacts(), demoEstate(), items, options ?? {}, CONSULT_MODE) };
   },
 
-  async startExecution(items: PlanItem[], options?: RunOptions, credentials?: ConnectionCredentials) {
+  async startExecution(items: PlanItem[], options?: RunOptions, credentials?: ConnectionCredentials, deviationReason?: string) {
     await sleep(200);
     if (fabric.status !== "connected") throw new ApiRequestError("target_not_connected", "Connect the Fabric target first. In Demo data, reload the page to restore the demo target.", 409);
     if (!items.length) throw new ApiRequestError("empty_plan", "The migration plan is empty.", 400);
+    // As the backend: the approved brief it starts under, refused without one (Demo consultation is required).
+    const gate = consult.runGate(demoFacts(), demoEstate(), items, options ?? {}, CONSULT_MODE, deviationReason);
     const objects = new Map((s.objects ?? []).map((o) => [o.id, o]));
     const stages = options?.stages ?? [];
     const on = (key: string | undefined) => !stages.length || (!!key && stages.includes(key));
@@ -1110,15 +1229,19 @@ export const mockApi: MigrationApi = {
     const failing = new Set([...(rejected && kept.length >= 5 ? [rejected.id] : []), ...others.map((i) => i.id)]);
     closeRun("replaced by a new run");
     runCounter += 1;
-    const approval = demoApproval(options);
+    const rule = (gate.signoff ?? "overwrite") as RunApproval["policy"];
+    const approval = demoApproval(options, rule);
     const runId = String(runCounter).padStart(3, "0");
     const now = new Date().toISOString();
     execSim = { runId, items: kept, base: 0, resumedAt: approval.required ? null : Date.now(), retried: false,
       credentials: Object.entries(credentials ?? {}).filter(([, f]) => Object.values(f).some((v) => v.trim())).map(([n]) => n), options, per, dur: Math.min(600, per * 2), failing,
-      approval, rejected: false, createdAt: now, passes: approval.required ? [] : [{ n: 1, trigger: "start", status: "running", startedAt: now, finishedAt: null, by: DEMO_PERSON }], version: 1 };
-    record("run.requested", { target: { type: "run", id: runId }, run: runId, details: { objects: kept.length, stages: options?.stages ?? [] } });
-    if (approval.required) record("run.signoff_requested", { actor: DEMO_PERSON, target: { type: "run", id: runId }, run: runId, details: { reason: approval.reason, policy: "overwrite" } });
-    else record("run.approved", { actor: DEMO_SYSTEM, target: { type: "run", id: runId }, run: runId, details: { automatic: true, policy: "overwrite" } });
+      approval, rejected: false, createdAt: now, passes: approval.required ? [] : [{ n: 1, trigger: "start", status: "running", startedAt: now, finishedAt: null, by: DEMO_PERSON }], version: 1,
+      warehouse: gate.names.warehouse ?? WAREHOUSE, waveGate: !!options?.waveGate, released: [], waitingWave: null, brief: gate.brief };
+    record("run.requested", { target: { type: "run", id: runId }, run: runId, details: { objects: kept.length, stages: options?.stages ?? [],
+      brief: gate.brief.version, differences: gate.brief.differences.length, signoffRule: rule } });
+    if (gate.brief.deviation) record("plan.deviation", { target: { type: "brief", id: String(gate.brief.version) }, details: { reason: gate.brief.deviation } });
+    if (approval.required) record("run.signoff_requested", { actor: DEMO_PERSON, target: { type: "run", id: runId }, run: runId, details: { reason: approval.reason, policy: rule } });
+    else record("run.approved", { actor: DEMO_SYSTEM, target: { type: "run", id: runId }, run: runId, details: { automatic: true, policy: rule } });
     return runNow();
   },
 
@@ -1126,7 +1249,7 @@ export const mockApi: MigrationApi = {
     return runNow();
   },
 
-  async controlExecution(action: RunControl) {
+  async controlExecution(action: RunControl, extra?: { comment?: string }) {
     if (action === "reset") {
       if (runNow().state === "running") throw new ApiRequestError("run_in_progress", "The run is still working. Pause it, then reset.", 409);
       closeRun("closed by Reset");
@@ -1150,6 +1273,13 @@ export const mockApi: MigrationApi = {
       sim.resumedAt = null;
       record("run.pause_requested", { target: { type: "run", id: sim.runId }, run: sim.runId });
     } else if (action === "resume" && sim.resumedAt === null) {
+      if (sim.waitingWave !== null) {
+        // This Resume, by a person, signs the waiting wave off, and that wave only.
+        record("run.wave_signed_off", { target: { type: "run", id: sim.runId }, run: sim.runId, reason: extra?.comment ?? null,
+          details: { wave: sim.waitingWave, comment: extra?.comment ?? null } });
+        sim.released = [...sim.released, sim.waitingWave];
+        sim.waitingWave = null;
+      }
       sim.resumedAt = now;
       pass("resume");
       record("run.resumed", { target: { type: "run", id: sim.runId }, run: sim.runId });
@@ -1357,7 +1487,8 @@ export const mockApi: MigrationApi = {
   // -- LLM-assisted transformation (demo: canned drafts, no model is called) --
   async getTransformSettings() {
     await sleep(60);
-    return demoTransformSettings;
+    const gate = consult.llmGate("transform", CONSULT_MODE);
+    return { ...demoTransformSettings, consent: { allowed: gate.allowed, reason: gate.reason, code: gate.code, consent: gate.consent, budgetUsd: gate.budgetUsd, spentUsd: gate.spentUsd } };
   },
   async listTransforms() {
     return [...transforms.values()].map((t) => ({ ...t }));
@@ -1374,6 +1505,8 @@ export const mockApi: MigrationApi = {
   },
   async generateTransforms(ids) {
     await sleep(120);
+    const gate = consult.llmGate("transform", CONSULT_MODE);
+    if (!gate.allowed) throw new ApiRequestError(gate.code ?? "llm_refused", gate.reason ?? "Drafts may not be generated now.", 403);
     return ids.map((id) => {
       const o = completedObjects().find((x) => x.id === id);
       if (!o || !KIND_OF_TYPE[o.type]) return { objectId: id, state: "rejected" as const, error: "Drafts are not available for this type of object yet." };
@@ -1429,6 +1562,79 @@ export const mockApi: MigrationApi = {
       throw new ApiRequestError("invalid_template", "An {{#if}} block is not closed, or an {{/if}} has no {{#if}}.", 400);
     projectText = text.split("\r\n").join("\n");
     return this.getProjectRequirements();
+  },
+  // -- the consultation (demo: the same catalog and rules as the backend, in this browser) --
+  async getConsult() {
+    await sleep(60);
+    return consult.state(demoFacts(), CONSULT_MODE);
+  },
+  async getConsultCatalog() {
+    return consult.catalog();
+  },
+  async answerQuestion(question, value, extra) {
+    await sleep(60);
+    return consult.answer(demoFacts(), CONSULT_MODE, question, value, extra?.note) as ConsultState;
+  },
+  async previewAnswer(question, value) {
+    return consult.answer(demoFacts(), CONSULT_MODE, question, value, undefined, true) as AnswerPreview;
+  },
+  async skipQuestion(question) {
+    await sleep(60);
+    return consult.skip(demoFacts(), CONSULT_MODE, question);
+  },
+  async withdrawAnswer(question) {
+    await sleep(60);
+    return consult.withdraw(demoFacts(), CONSULT_MODE, question);
+  },
+  async acceptRecommendations(section) {
+    await sleep(80);
+    return consult.accept(demoFacts(), CONSULT_MODE, section);
+  },
+  async resolveConflict(conflict, resolution, reason) {
+    await sleep(60);
+    return consult.resolve(demoFacts(), CONSULT_MODE, conflict, resolution, reason);
+  },
+  async getBrief() {
+    await sleep(60);
+    return consult.brief(demoFacts());
+  },
+  async submitBrief(note) {
+    await sleep(120);
+    return consult.submit(demoFacts(), note);
+  },
+  async decideBrief(version, decision, comment) {
+    await sleep(120);
+    return consult.decide(demoFacts(), version, decision, comment);
+  },
+  async exportBrief(version, format = "md") {
+    return consult.exportBrief(version, format);
+  },
+  async getConsultPolicy() {
+    await sleep(60);
+    return consult.policy(demoFacts(), demoEstate(), CONSULT_MODE);
+  },
+  async recordDeviation(items, options, reason) {
+    await sleep(80);
+    return consult.recordDeviation(demoFacts(), demoEstate(), items, options, reason);
+  },
+  async proposeAnswers(text) {
+    await sleep(150);
+    return consult.propose(demoFacts(), CONSULT_MODE, text);
+  },
+  async decideProposals(ids, decision) {
+    await sleep(80);
+    return consult.decideProposals(demoFacts(), CONSULT_MODE, ids, decision);
+  },
+  async explainQuestion(question) {
+    await sleep(80);
+    return consult.explain(demoFacts(), question);
+  },
+  async exportQuestionnaire(format) {
+    return consult.questionnaire(demoFacts(), format);
+  },
+  async importQuestionnaire(answers) {
+    await sleep(100);
+    return consult.importAnswers(demoFacts(), CONSULT_MODE, answers);
   },
   async discardTransform(id, scope) {
     await sleep(100);

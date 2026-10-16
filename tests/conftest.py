@@ -54,6 +54,13 @@ def _isolated_local_state(tmp_path, monkeypatch):
     # and the operator a test sees is a fixed name, never this machine's account.
     monkeypatch.setenv("MIGRATION_SIGNOFF", "never")
     monkeypatch.setenv("MIGRATION_OPERATOR", "Test Operator")
+    # Runs start without an approved migration brief unless a test asks for one (``MIGRATION_CONSULTATION``, ``api.consult``),
+    # and the consultation's help never asks the model: no test sends anything to Claude.
+    monkeypatch.setenv("MIGRATION_CONSULTATION", "advisory")
+    monkeypatch.delenv("MIGRATION_BRIEF_APPROVAL", raising=False)
+    from discovery_agent.llm import claude_cli
+
+    monkeypatch.setattr(claude_cli, "executable", lambda: None)  # a test that needs one gives a fake
     monkeypatch.setattr(repository_source, "UPLOAD_ROOT", tmp_path / "uploads")
     monkeypatch.setattr(repository_source, "WORK_ROOT", tmp_path / "environments")
 

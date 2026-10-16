@@ -1,4 +1,5 @@
 import { useAppState } from "../../state/AppState";
+import { useConsult } from "../../state/ConsultState";
 import { useMigration, type StepKey } from "../../state/MigrationState";
 import { STEPS, type StepMeta } from "./steps";
 
@@ -42,10 +43,14 @@ const plural = (count: number, one: string, many = `${one}s`) => `${n(count)} ${
 export function useJourney(): { steps: StepStatus[]; current: StepKey; finished: boolean } {
   const { discovery, ready, mode } = useAppState();
   const { graph, graphLoading, graphError, plan, analysis, analysisBusy, execution: run, executionReady, validation, validationBusy, confirmed } = useMigration();
+  const { consult, approved, stale: briefStale, required, brief } = useConsult();
   const discovered = discovery.state === "completed" || discovery.state === "completed_with_warnings";
   const summary = discovery.summary;
   const total = summary?.total ?? 0;
   const cls = summary?.byClassification ?? {};
+  const pending = consult?.brief.pending ?? null;
+  const decided = brief?.versions.find((v) => v.version === approved);
+  const unexplained = !!analysis?.brief && analysis.brief.differences.length > 0 && !analysis.brief.explained;
 
   const facts: Record<StepKey, Facts> = {
     discover: {
@@ -66,6 +71,23 @@ export function useJourney(): { steps: StepStatus[]; current: StepKey; finished:
       outcome: discovered ? `${n(cls.DIRECT ?? 0)} move directly, ${n((cls.RECONFIGURE ?? 0) + (cls.TRANSFORM ?? 0))} need changes, ${n((cls.MANUAL ?? 0) + (cls.REVIEW ?? 0))} need a person.` : "",
       waiting: "Waiting for discovery.",
     },
+    consult: {
+      // Required: a run is refused until a brief that fits the estate is approved. Advisory: the brief is a record.
+      complete: discovered && (required ? approved !== null && !briefStale : !!consult),
+      running: false,
+      paused: false,
+      attention: briefStale ? "The estate changed since the brief was approved"
+        : discovered && consult && !approved && !required ? "No approved brief" : null,
+      metric: !discovered ? "—" : !consult ? "Reading…" : approved ? `Brief v${approved}${briefStale ? " · reconfirm" : " approved"}`
+        : pending ? `v${pending} to approve` : `${n(consult.progress.answered)}/${n(consult.progress.applicable)} answered`,
+      outcome: approved && decided ? `Brief version ${approved} approved by ${decided.decidedBy?.id ?? "a person"}: ${plural(decided.decisions, "decision")}, ${plural(decided.assumptions, "assumption")}.`
+        : !required && consult ? `No brief approved yet: ${n(consult.progress.answered)} of ${plural(consult.progress.applicable, "question")} answered. Runs start without one (advisory).` : "",
+      waiting: !discovered ? "Waiting for discovery."
+        : briefStale ? "The estate changed since it was approved: confirm what changed, submit the brief again and have it approved."
+        : pending ? `Version ${pending} of the brief waits for a person to approve it.`
+        : consult && !consult.submittable ? `${plural(consult.progress.needsPerson, "item")} need${consult.progress.needsPerson === 1 ? "s" : ""} a person before the brief can be submitted.`
+        : "Submit the brief, then have it approved.",
+    },
     waves: {
       complete: !!graph,
       running: graphLoading && !graph,
@@ -80,7 +102,7 @@ export function useJourney(): { steps: StepStatus[]; current: StepKey; finished:
       // Scoring again in the background (after an edit) keeps the last score on show: not "running".
       running: analysisBusy && !analysis,
       paused: false,
-      attention: analysis?.blocking ? plural(analysis.blocking, "blocking risk") : null,
+      attention: analysis?.blocking ? plural(analysis.blocking, "blocking risk") : unexplained ? "Differs from the brief" : null,
       metric: !plan.length ? "No plan yet" : analysis ? `Readiness ${analysis.readiness}` : plural(plan.length, "object"),
       outcome: analysis ? `${plural(analysis.objects, "object")} in ${plural(analysis.waves.length, "wave")}, readiness ${analysis.readiness}/100, about ${n(Math.round(analysis.effortDays * 10) / 10)} working days.` : "",
       waiting: !plan.length ? "Build the plan: add the objects to migrate." : !analysis ? "Scoring the plan…" : `Resolve the ${plural(analysis.blocking, "blocking risk")} first.`,
@@ -89,13 +111,14 @@ export function useJourney(): { steps: StepStatus[]; current: StepKey; finished:
       complete: run.state === "completed",
       running: run.state === "running",
       paused: run.state === "paused",
-      pausedTitle: run.status === "awaiting_approval" ? "waits for sign-off" : undefined,
+      pausedTitle: run.status === "awaiting_approval" ? "waits for sign-off" : run.pausedReason === "awaiting_wave_signoff" ? "waits for a wave's sign-off" : undefined,
       attention: run.failed || run.blocked ? [run.failed ? plural(run.failed, "object") + " failed" : "", run.blocked ? `${n(run.blocked)} blocked` : ""].filter(Boolean).join(", ") : null,
       metric: run.state === "idle" ? "Not started" : run.state === "running" ? `${run.total ? Math.round(((run.completed + run.failed + (run.skipped ?? 0) + (run.deferred ?? 0)) / run.total) * 100) : 0}%` : run.status === "awaiting_approval" ? "Sign-off" : run.state === "paused" ? "Paused" : `${n(run.completed)} migrated`,
       outcome: run.state === "completed" ? `${n(run.completed)} migrated, ${n(run.skipped ?? 0)} already there, ${n(run.deferred ?? 0)} left for a person${run.failed ? `, ${n(run.failed)} failed` : ""}.` : "",
       waiting: run.state === "running" ? "The migration is running…"
         : run.status === "awaiting_approval" ? "The run waits for a person to sign it off; nothing has been written to Fabric yet."
         : run.pausedReason === "interrupted" ? "The accelerator stopped under the run. Resume it to carry on from where it stopped."
+        : run.pausedReason === "awaiting_wave_signoff" ? `Wave ${run.waitingWave ?? ""} waits for a person to sign it off. Check what the waves before it made, then sign it off.`
         : run.state === "paused" ? "The run is paused. Resume it to finish." : "Start the migration run.",
     },
     validate: {
@@ -116,6 +139,10 @@ export function useJourney(): { steps: StepStatus[]; current: StepKey; finished:
       ? "The discovery result is no longer here: the source was signed out or reconnected, discovery was reset, or the server restarted."
       : null,
     assess: null,
+    // Read once, so a page still loading never looks lost: a required brief that went stale, or is no longer approved.
+    consult: consult && required && (approved === null || briefStale)
+      ? briefStale ? "The approved brief no longer fits the estate." : "The brief is no longer approved."
+      : null,
     waves: null,
     plan: plan.length === 0 ? "The plan is empty now." : null,
     migrate: executionReady && run.state === "idle"

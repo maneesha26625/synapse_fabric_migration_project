@@ -1,6 +1,8 @@
 import { AlertTriangle, ArrowLeft, ArrowRight, Check, CheckCircle2, Circle, Download, Lock, PanelLeftClose, PanelLeftOpen, Pause, PartyPopper, PlugZap, ServerCrash, Settings2 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { ConsultPanel } from "../components/consult/ConsultPanel";
+import { DeviationDialog } from "../components/consult/DeviationDialog";
 import { AssessPanel } from "../components/journey/panels/AssessPanel";
 import { DiscoverPanel } from "../components/journey/panels/DiscoverPanel";
 import { MigratePanel } from "../components/journey/panels/MigratePanel";
@@ -22,6 +24,7 @@ import { useMigration, type StepKey } from "../state/MigrationState";
 const PANELS: Record<StepKey, () => ReactNode> = {
   discover: () => <DiscoverPanel />,
   assess: () => <AssessPanel />,
+  consult: () => <ConsultPanel />,
   waves: () => <WavesPanel />,
   plan: () => <PlanPanel />,
   migrate: () => <MigratePanel />,
@@ -39,7 +42,7 @@ function stateOf(s: StepStatus): { cls: string; label: string } {
   return { cls: s.attention ? "current attention" : "current", label: s.attention ? "Needs attention" : "To do" };
 }
 
-/** The six steps, left to right. Each box opens its step below; locked boxes open once the step before is confirmed. */
+/** The steps, left to right. Each box opens its step below; locked boxes open once the step before is confirmed. */
 function JourneyFlow({ steps, selected, onSelect }: { steps: StepStatus[]; selected: StepKey; onSelect: (k: StepKey) => void }) {
   // On a narrow screen the strip scrolls sideways; keep the selected step in view.
   const list = useRef<HTMLOListElement>(null);
@@ -82,10 +85,21 @@ function JourneyFlow({ steps, selected, onSelect }: { steps: StepStatus[]; selec
 
 /** Below every step: where it stands, and the way forward once it is good. */
 function NextBar({ step, steps, onGo }: { step: StepStatus; steps: StepStatus[]; onGo: (k: StepKey) => void }) {
-  const { confirmStep } = useMigration();
+  const { api } = useAppState();
+  const { confirmStep, analysis, analyze, plan, options } = useMigration();
   const next = steps[step.index + 1];
   const prev = steps[step.index - 1];
-  const confirm = () => { confirmStep(step.key); if (next) onGo(next.key); };
+  const [asking, setAsking] = useState(false);
+  // A plan that differs from the approved brief is confirmed with a reason, which the audit trail and the run keep.
+  const differences = step.key === "plan" && analysis?.brief && !analysis.brief.explained ? analysis.brief.differences : [];
+  const advance = () => { confirmStep(step.key); if (next) onGo(next.key); };
+  const confirm = () => { if (differences.length) setAsking(true); else advance(); };
+  const explainPlan = async (reason: string) => {
+    await api.recordDeviation([...plan].sort((a, b) => a.wave - b.wave), options, reason);
+    setAsking(false);
+    void analyze(false);
+    advance();
+  };
 
   let icon: ReactNode, title: string, detail: string, action: ReactNode;
   // Work under way comes first: a confirmed step being run again is not "confirmed" until it finishes.
@@ -123,6 +137,8 @@ function NextBar({ step, steps, onGo }: { step: StepStatus; steps: StepStatus[];
 
   return (
     <footer className="next-bar" aria-label="Step status">
+      {asking && <DeviationDialog differences={differences} version={analysis?.brief?.version ?? null} confirmLabel="Confirm the plan with this reason"
+        onConfirm={explainPlan} onCancel={() => setAsking(false)} />}
       <div className="next-status" role="status">
         {icon}
         <div><strong>{title}</strong><span className="muted">{detail}</span></div>

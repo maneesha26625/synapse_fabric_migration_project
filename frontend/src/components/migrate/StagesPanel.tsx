@@ -72,12 +72,20 @@ function CredentialForm({ service }: { service: LinkedServiceInput }) {
   );
 }
 
+/** Marks an option that differs from the approved brief: the brief says one thing, the plan another. */
+function Differs({ option }: { option: string }) {
+  const { analysis } = useMigration();
+  const found = analysis?.brief?.differences.find((d) => d.option === option);
+  return found ? <span className="badge warning consult-differs" title={found.message}>Differs from the brief</span> : null;
+}
+
 /**
  * Which stages run, and how. Configuration only: nothing is written from the
  * Plan step. The Migrate step runs every stage that is on, or one on its own.
  */
 export function StagesPanel() {
   const { capabilities, options, setOptions, graph, plan, execution: run, credentials, clearCredentials, fabricGit } = useMigration();
+  const waves = useMemo(() => new Set(plan.map((p) => p.wave)).size, [plan]);
 
   const nodes = useMemo(() => new Map((graph?.nodes ?? []).map((n) => [n.id, n])), [graph]);
   const typesInPlan = useMemo(() => {
@@ -104,6 +112,7 @@ export function StagesPanel() {
     <Card eyebrow="Migration stages" title="Choose what to migrate"
       subtitle="Switch stages on or off and choose how each one works. The Migrate step runs every stage that is on, in dependency order, or a single stage on its own."
       actions={<div className="row" style={{ gap: 6 }}>
+        <Differs option="stages" />
         <Button size="small" variant="ghost" onClick={() => setOptions({ stages: stages.map((s) => s.key) })}>All on</Button>
         <Button size="small" variant="ghost" onClick={() => setOptions({ stages: [] })}>All off</Button>
       </div>}>
@@ -135,7 +144,7 @@ export function StagesPanel() {
                 const value = optionValue(o.key, o.default);
                 return (
                   <div key={o.key} className="stage-option">
-                    <label htmlFor={`opt-${s.key}-${o.key}`}>{o.label}</label>
+                    <label htmlFor={`opt-${s.key}-${o.key}`}>{o.label} <Differs option={o.key} /></label>
                     <select id={`opt-${s.key}-${o.key}`} className="select" disabled={!on} value={value}
                       onChange={(e) => setOptions({ [o.key]: e.target.value } as Partial<RunOptions>)}>
                       {o.choices.map((c) => <option key={c.value} value={c.value}>{c.label ?? c.value}</option>)}
@@ -190,11 +199,16 @@ export function StagesPanel() {
         </div>
         <label className="check-row">
           <input type="checkbox" checked={options.stopOnFailure} onChange={(e) => setOptions({ stopOnFailure: e.target.checked })} />
-          <span><strong>Stop at the end of a wave that has failures</strong><span className="muted"> — so a failed table never lets the views that read it start. Off: every object is attempted and failures are reported.</span></span>
+          <span><strong>Stop at the end of a wave that has failures</strong> <Differs option="stopOnFailure" /><span className="muted"> — so a failed table never lets the views that read it start. Off: every object is attempted and failures are reported.</span></span>
+        </label>
+        <label className="check-row">
+          <input type="checkbox" checked={!!options.waveGate} onChange={(e) => setOptions({ waveGate: e.target.checked })} />
+          <span><strong>A person signs off each wave before the next one starts</strong> <Differs option="waveGate" /><span className="muted"> — the run pauses
+            before wave 2, 3…; Resume, by a person, signs that wave off and is recorded in the audit trail.{waves < 2 ? " This plan has one wave, so it never pauses." : ""}</span></span>
         </label>
         <label className="check-row">
           <input type="checkbox" checked={options.existing === "update"} onChange={(e) => setOptions({ existing: e.target.checked ? "update" : "skip" })} />
-          <span><strong>Update objects that are already in Fabric</strong><span className="muted"> — to redeploy fixes or accepted LLM transforms. Views and
+          <span><strong>Update objects that are already in Fabric</strong> <Differs option="existing" /><span className="muted"> — to redeploy fixes or accepted LLM transforms. Views and
             procedures are updated with CREATE OR ALTER (the old one stays if the new one is rejected); notebooks, pipelines, SQL scripts and Spark
             jobs get the new definition and keep their id, so whatever calls them still works. Tables are never replaced: they hold data.
             Off: anything already there is left unchanged.</span></span>
@@ -206,11 +220,21 @@ export function StagesPanel() {
         )}
         <label className="check-row">
           <input type="checkbox" checked={options.gitCommit !== "off"} onChange={(e) => setOptions({ gitCommit: e.target.checked ? "auto" : "off" })} />
-          <span><strong>Commit to Fabric Git after the run</strong><span className="muted"> — what the run created is committed to the target workspace's Git branch, ready for a pull request. Data-load pipelines are left out: they are rebuilt per environment. Off: commit by hand from the Migrate step.</span>
+          <span><strong>Commit to Fabric Git after the run</strong> <Differs option="gitCommit" /><span className="muted"> — what the run created is committed to the target workspace's Git branch, ready for a pull request. Data-load pipelines are left out: they are rebuilt per environment. Off: commit by hand from the Migrate step.</span>
             {fabricGit?.state === "connected" && <span className="faint git-where"> {fabricGit.workspace ?? "The workspace"} commits to <strong>{fabricGit.branch}</strong> in {fabricGit.repository}.</span>}
             {fabricGit?.state === "not_connected" && <span className="faint git-where"> {fabricGit.workspace ?? "The target workspace"} is not connected to Git yet, so the commit is skipped; the run says so.</span>}
           </span>
         </label>
+        {options.gitCommit !== "off" && (
+          <div className="stage-option" style={{ marginTop: 8 }}>
+            <label htmlFor="opt-commit-scope">What the commit takes <Differs option="commitScope" /></label>
+            <select id="opt-commit-scope" className="select" value={options.commitScope ?? "run"} onChange={(e) => setOptions({ commitScope: e.target.value as "run" | "all" })}>
+              <option value="run">Only what the run created or updated</option>
+              <option value="all">Everything waiting in the workspace</option>
+            </select>
+            <span className="faint">{(options.commitScope ?? "run") === "run" ? "Other changes waiting in the workspace are left for a person, and listed." : "Every change waiting in the workspace is committed with the run's, including ones the run did not make."}</span>
+          </div>
+        )}
       </div>
     </Card>
   );

@@ -22,12 +22,15 @@ carried: in Fabric, workspace roles and item permissions decide who can connect.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Mapping, Optional, Sequence, Tuple
 
 from discovery_agent.migration.warehouse_ddl import qualified, quote
 from discovery_agent.sql.security import (
+    ENTRA_GROUP,
+    ENTRA_USER,
     RESOURCE_CLASS_ROLES,
     CLASS_DATABASE,
     CLASS_OBJECT,
@@ -123,6 +126,38 @@ def plan_principal(security: SqlSecurity, name: str) -> SecurityPlan:
     if resource:
         plan.notes.append(f"Resource class {', '.join(sorted(resource))} dropped: Fabric sizes each query itself.")
     return plan
+
+
+def replace_sql_users(security: SqlSecurity, replacements: Mapping[str, str]) -> SqlSecurity:
+    """The catalog as Fabric will have it once each SQL user in ``replacements`` (its name, any case -> a Microsoft
+    Entra user or group) is replaced: that principal instead, with the user's role memberships and permissions.
+
+    A name with an ``@`` is taken for a user, any other for a group; Fabric grants to either by name. Everything
+    that plans, runs or validates security reads this catalog, so a replaced user is planned like any Entra one."""
+    wanted = {str(k).lower(): " ".join(str(v).split()) for k, v in (replacements or {}).items() if str(v or "").strip()}
+    sql_users = {p.name.lower() for p in security.principals if p.is_sql_user}
+    wanted = {k: v for k, v in wanted.items() if k in sql_users}
+    if not wanted:
+        return security
+
+    def kind(name: str) -> str:
+        return ENTRA_USER if "@" in name else ENTRA_GROUP
+
+    principals: List[SqlPrincipal] = []
+    seen = set()
+    for p in security.principals:
+        new = wanted.get(p.name.lower())
+        name = new or p.name
+        if name.lower() in seen:
+            continue  # two SQL users replaced by one principal, or by one already there: it is listed once
+        seen.add(name.lower())
+        principals.append(p if new is None else SqlPrincipal(new, kind(new), "EXTERNAL_USER" if kind(new) == ENTRA_USER
+                                                              else "EXTERNAL_GROUP", p.principal_id))
+    members = tuple(dataclasses.replace(m, member=wanted[m.member.lower()], member_type=kind(wanted[m.member.lower()]))
+                    if m.member.lower() in wanted else m for m in security.members)
+    permissions = tuple(dataclasses.replace(p, grantee=wanted[p.grantee.lower()], grantee_type=kind(wanted[p.grantee.lower()]))
+                        if p.grantee.lower() in wanted else p for p in security.permissions)
+    return dataclasses.replace(security, principals=tuple(principals), members=members, permissions=permissions)
 
 
 def manual_statements(plan: SecurityPlan, replacement: str = "<Microsoft Entra user or group>") -> List[str]:

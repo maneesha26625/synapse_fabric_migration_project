@@ -42,6 +42,24 @@ web framework would be the first. The surface is small and fixed.
     GET    /api/migration/runs/{id}/artifacts/{hash}  what it sent to Fabric for an object (a definition, a statement)
     GET    /api/migration/plans/{id}      one recorded plan version
     GET    /api/migration/policy          run and object statuses, their moves, the sign-off rule
+    GET    /api/consult                   the consultation: every question as it stands, what is next, the brief
+    GET    /api/consult/catalog           the questions, as the page shows them
+    POST   /api/consult/answer            answer a question (or preview what the answer would change)
+    POST   /api/consult/skip              skip a question: its recommendation stands, as an assumption
+    POST   /api/consult/withdraw          withdraw an answer (the record keeps it)
+    POST   /api/consult/accept            accept the recommendations, all or one section's
+    POST   /api/consult/resolve           resolve a contradiction: take the finding, or keep the answers with a reason
+    GET    /api/consult/brief             the brief's draft, versions and status
+    POST   /api/consult/brief/submit      submit the brief: a new, immutable version
+    POST   /api/consult/brief/approve     a person approves or rejects the version waiting
+    GET    /api/consult/brief/export      one version as Markdown or JSON
+    GET    /api/consult/policy            the policy in force: what Plan pre-sets and Migrate enforces
+    POST   /api/consult/deviation         confirm a plan that differs from the brief, with the reason
+    POST   /api/consult/propose           answers read from notes (AI, or rules), for a person to confirm
+    POST   /api/consult/proposals         confirm or reject proposed answers
+    POST   /api/consult/explain           what a question means for this estate
+    GET    /api/consult/questionnaire     the questions, to answer offline (Markdown or JSON)
+    POST   /api/consult/questionnaire     import a questionnaire's answers, proposed for a person to confirm
     GET    /api/projects                  the projects, and which is active
     POST   /api/projects                  create one (optionally carrying on another's saved discovery)
     POST   /api/projects/{id}/rename      rename one
@@ -97,6 +115,7 @@ from discovery_agent.state import context, logs
 
 _log = logs.get("api")
 
+from discovery_agent.api.consult import ConsultService
 from discovery_agent.api.fabric import FabricError, FabricTarget
 from discovery_agent.api.migration import MigrationService
 from discovery_agent.api.projects import ProjectsService, describe_start
@@ -132,10 +151,12 @@ def make_handler(
     transforms: Optional[TransformService] = None,
     project_of: Optional[Callable[[], Optional[str]]] = None,
     projects: Optional[ProjectsService] = None,
+    consult: Optional[ConsultService] = None,
 ):
     fabric = fabric or FabricTarget()
-    transforms = transforms or TransformService(session, fabric)
-    migration = migration or MigrationService(session, fabric, transforms=transforms)
+    consult = consult or ConsultService(session, fabric)
+    transforms = transforms or TransformService(session, fabric, consult=consult)
+    migration = migration or MigrationService(session, fabric, transforms=transforms, consult=consult)
     if projects is not None and project_of is None:
         project_of = projects.active_id
     # Every request passes the projects' gate, so a switch of project runs alone (``ProjectsService.activate``).
@@ -306,6 +327,18 @@ def make_handler(
                 self._dispatch(migration.runs)
             elif path == "/api/migration/policy":
                 self._dispatch(migration.policy)
+            elif path == "/api/consult":
+                self._dispatch(consult.state)
+            elif path == "/api/consult/catalog":
+                self._dispatch(consult.catalog_view)
+            elif path == "/api/consult/brief":
+                self._dispatch(consult.brief)
+            elif path == "/api/consult/brief/export":
+                self._dispatch(lambda: RawResponse(*consult.export(query)))
+            elif path == "/api/consult/policy":
+                self._dispatch(consult.policy_view)
+            elif path == "/api/consult/questionnaire":
+                self._dispatch(lambda: RawResponse(*consult.questionnaire(query)))
             elif _RUN_PATH.match(path):
                 run_id, events = _RUN_PATH.match(path).groups()
                 if events:
@@ -375,6 +408,18 @@ def make_handler(
                 "/api/migration/start": lambda: migration.start(self._json_body()),
                 "/api/migration/control": lambda: migration.control(self._json_body()),
                 "/api/migration/approve": lambda: migration.approve(self._json_body()),
+                "/api/consult/answer": lambda: consult.answer(self._json_body()),
+                "/api/consult/skip": lambda: consult.skip(self._json_body()),
+                "/api/consult/withdraw": lambda: consult.withdraw(self._json_body()),
+                "/api/consult/accept": lambda: consult.accept(self._json_body()),
+                "/api/consult/resolve": lambda: consult.resolve(self._json_body()),
+                "/api/consult/brief/submit": lambda: consult.submit(self._json_body()),
+                "/api/consult/brief/approve": lambda: consult.approve(self._json_body()),
+                "/api/consult/deviation": lambda: consult.deviation(self._json_body()),
+                "/api/consult/propose": lambda: consult.propose(self._json_body()),
+                "/api/consult/proposals": lambda: consult.decide(self._json_body()),
+                "/api/consult/explain": lambda: consult.explain(self._json_body()),
+                "/api/consult/questionnaire": lambda: consult.import_answers(self._json_body()),
                 "/api/projects": lambda: need_projects().create(self._json_body()),
                 "/api/journey/confirm": lambda: need_projects().confirm_step(self._json_body()),
                 "/api/transform/generate": lambda: transforms.generate(self._json_body()),
@@ -446,11 +491,13 @@ def create_server(host: str, port: int, static_root: Optional[Path] = None, proj
     with context.bound(actor=context.system(), project=active):
         session = Session(projects.pickle_store(active), records=projects.store(active), audit=hub.audit)
         fabric = FabricTarget(projects.pickle_store(active), audit=hub.audit)
-        transforms = TransformService(session, fabric, audit=hub.audit)
-        migration = MigrationService(session, fabric, transforms=transforms, records=projects.store(active), audit=hub.audit)
-        hub.attach(session, fabric, migration, transforms)
+        consult = ConsultService(session, fabric, records=projects.store(active), audit=hub.audit)
+        transforms = TransformService(session, fabric, audit=hub.audit, consult=consult)
+        migration = MigrationService(session, fabric, transforms=transforms, records=projects.store(active), audit=hub.audit,
+                                     consult=consult)
+        hub.attach(session, fabric, migration, transforms, consult)
         hub.audit("system.started", details=describe_start(projects))
     server = ThreadingHTTPServer((host, port), make_handler(session, static_root, fabric=fabric, migration=migration,
-                                                            transforms=transforms, projects=hub))
+                                                            transforms=transforms, projects=hub, consult=consult))
     server.projects = hub  # type: ignore[attr-defined] - for the entry point, which records the stop
     return server

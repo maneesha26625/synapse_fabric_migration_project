@@ -34,7 +34,7 @@ from discovery_agent.state.audit import Auditor
 from discovery_agent.state.projects import LEGACY_FILES, ProjectError, Projects
 
 #: The steps of the journey a person confirms, as the page names them.
-JOURNEY_STEPS = ("discover", "assess", "waves", "plan", "migrate", "validate")
+JOURNEY_STEPS = ("discover", "assess", "consult", "waves", "plan", "migrate", "validate")
 #: How long a switch waits for the requests already being answered before it gives up (and says so).
 SWITCH_WAIT_SECONDS = 15.0
 _log = logging.getLogger("discovery_agent.projects")
@@ -128,13 +128,15 @@ class ProjectsService:
         self._fabric: Any = None
         self._migration: Any = None
         self._transforms: Any = None
+        self._consult: Any = None
         #: Every request the API answers passes through it, so a switch can run alone.
         self.gate = RequestGate()
         self.switch_wait = SWITCH_WAIT_SECONDS
 
-    def attach(self, session: Any, fabric: Any, migration: Any, transforms: Any = None) -> None:
+    def attach(self, session: Any, fabric: Any, migration: Any, transforms: Any = None, consult: Any = None) -> None:
         """The services that hold the active project's state, and are switched with it."""
         self._session, self._fabric, self._migration, self._transforms = session, fabric, migration, transforms
+        self._consult = consult
 
     @property
     def projects(self) -> Projects:
@@ -354,11 +356,14 @@ class ProjectsService:
         return self.listing()
 
     def _steps(self, project_id: str) -> Tuple[Tuple[str, Callable[[], None]], ...]:
-        return (
+        steps: Tuple[Tuple[str, Callable[[], None]], ...] = (
             ("session", lambda: self._session.switch(self._projects.pickle_store(project_id), self._projects.store(project_id))),
             ("fabric", lambda: self._fabric.switch(self._projects.pickle_store(project_id))),
             ("migration", lambda: self._migration.switch(self._projects.store(project_id))),
         )
+        if self._consult is not None:
+            steps += (("consult", lambda: self._consult.switch(self._projects.store(project_id))),)
+        return steps
 
     def _switch(self, project_id: str, done: List[str]) -> None:
         for name, step in self._steps(project_id):

@@ -8,9 +8,12 @@ no sidebar:
   **Synapse workspace** (sign in and choose it; when it is connected to Git its
   definitions are read from its **Git repository**, recommended and chosen for
   you, or from the **live workspace** if you choose) or a **ZIP export**.
-* **Migration** (`/migration?step=…`): the six steps (Discover, Assess, Waves,
-  Plan, Migrate, Validate) side by side. Click a step to see its details below;
-  each step is confirmed with Next before the following one opens. Beside the
+* **Migration** (`/migration?step=…`): the seven steps (Discover, Assess,
+  Consult, Waves, Plan, Migrate, Validate) side by side. Click a step to see its
+  details below; each step is confirmed with Next before the following one opens.
+  **Consult** asks the questions before a migration and has the migration brief
+  approved; Plan is pre-set from it, and confirming a plan that differs from it
+  asks why. Beside the
   steps, the **workspace explorer** shows the discovered workspace as a
   repository tree; under them, the **release path** shows the way from Dev to
   Prod, with a live **Fabric Git** chip (branch, last commit, what waits to be
@@ -197,14 +200,15 @@ src/
     connections/  SourceConnection (Synapse), TargetConnection (Fabric), MethodTiles
     journey/      steps, useJourney (each step's state), ResetStep, report (CSV), WorkspaceExplorer, ReleasePath, panels/ (one per step)
     discovery/    Inventory, object details, summaries, mapping, dependency graph
+    consult/      ConsultPanel (questions, brief, changes since approval, help), QuestionCard, DeviationDialog, format
     migrate/      planner runs, stages and credentials (and the Fabric Git option), strategy, run panel (and its Git banner)
     layout/       Layout (top bar, project menu, backend bar), Assistant (launcher and panel)
     shared/       buttons, fields, banners, tabs, metrics, dialogs, notify (toasts)
-  state/        AppState (connection, discovery), MigrationState (projects, plan, run, journey)
+  state/        AppState (connection, discovery), MigrationState (projects, plan, run, journey), ConsultState (the consultation, and Plan pre-set from the approved brief)
   services/     realApi, mode selection            (the only code that calls fetch)
-  mock/         mockApi, mockData                  (demo only)
+  mock/         mockApi, mockData, mockConsult and consultCatalog.json (the server's catalog and engine, in TypeScript)   (demo only)
   styles/       global.css (tokens and every style)
-  test/         app.test.tsx
+  test/         app.test.tsx, consult.test.ts (the Demo engine against the server's, on consultParity.json)
 ```
 
 The earlier one-page-per-step addresses (`/discovery`, `/assessment`,

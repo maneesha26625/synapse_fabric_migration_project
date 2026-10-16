@@ -189,6 +189,8 @@ class MigrationRun:
         self.scope = "all"
         self.stop_on_failure = False
         self.halt_waived = False  # set when the operator resumes past a halt
+        #: The waves a person has signed off, when the run has each wave signed off (setting ``waveGate``).
+        self.released_waves: List[int] = []
         #: Strategy settings for the stages (data mode, data run, collation, sync re-read window). Never credentials.
         self.settings: Dict[str, Any] = {"dataMode": "if_empty", "dataRun": "run", "collation": "match_synapse", "syncOverlap": "1h",
                                          "gitCommit": "auto"}
@@ -237,6 +239,13 @@ class MigrationRun:
 
     def item(self, object_id: str) -> Optional[Item]:
         return self._by_id.get(object_id)
+
+    def waiting_wave(self) -> Optional[int]:
+        """The wave a run paused for a wave's sign-off waits to start, or None."""
+        if self.status != run_state.PAUSED or self.paused_reason != run_state.WAVE_SIGNOFF:
+            return None
+        pending = [i.source.wave for i in self.items if i.status == PENDING]
+        return min(pending) if pending else None
 
     # -- the only ways a status changes -------------------------------------------------------------
 
@@ -407,6 +416,7 @@ class MigrationRun:
                 "runId": self.run_id, "status": self.status, "pausedReason": self.paused_reason, "needsInput": list(self.needs_input),
                 "workspaceId": self.workspace_id, "workspace": self.workspace_name, "warehouse": self.warehouse,
                 "scope": self.scope, "stopOnFailure": self.stop_on_failure, "haltWaived": self.halt_waived,
+                "releasedWaves": list(self.released_waves),
                 "settings": dict(self.settings), "stages": list(self.stages), "poolName": self.pool_name,
                 "sourceServer": self.source_server, "sourceDatabase": self.source_database,
                 "sourceConnectionName": self.source_connection_name, "sourceCollation": self.source_collation,
@@ -433,6 +443,7 @@ class MigrationRun:
         run.needs_input = list(document.get("needsInput") or [])
         run.scope, run.stop_on_failure = str(document.get("scope") or "all"), bool(document.get("stopOnFailure"))
         run.halt_waived = bool(document.get("haltWaived"))
+        run.released_waves = [int(w) for w in document.get("releasedWaves") or []]
         run.settings = {**run.settings, **(document.get("settings") or {})}
         run.stages = list(document.get("stages") or [])
         run.pool_name = str(document.get("poolName") or "")
@@ -477,7 +488,10 @@ class MigrationRun:
                 "blocked": counts[run_state.BLOCKED],
                 "workspace": self.workspace_name, "warehouse": self.warehouse,
                 "options": {"scope": self.scope, "stopOnFailure": self.stop_on_failure, "stages": list(self.stages), **self.settings},
-                "haltedReason": self.halted_reason,
+                "haltedReason": self.halted_reason, "releasedWaves": list(self.released_waves),
+                "waitingWave": self.waiting_wave(),
+                # The migration brief it started under, and how it differs from it (``pins.brief``).
+                "brief": dict(self.pins["brief"]) if isinstance(self.pins.get("brief"), dict) else None,
                 "git": dict(self.git) if self.git else None,
                 "passes": [dict(p) for p in self.passes], "version": self.version,
                 "createdAt": self.created_at, "startedAt": self.started_at, "finishedAt": self.finished_at,
@@ -626,6 +640,11 @@ class Migrator(StageMixin, FabricStageMixin):
                 self._end(run_state.PAUSED, "halted", reason, run_state.HALTED)
                 run.log("HALTED", "run", reason)
                 return
+            gate = self._wave_gate(item)
+            if gate:
+                self._end(run_state.PAUSED, "awaiting wave sign-off", gate, run_state.WAVE_SIGNOFF)
+                run.log("SIGN-OFF", "run", gate)
+                return
             blocker = self._blocker(item)
             if blocker:
                 run.update(item, status=run_state.BLOCKED, step="Not started: something it needs failed", error=blocker,
@@ -659,6 +678,18 @@ class Migrator(StageMixin, FabricStageMixin):
         if not failed:
             return None
         return f"Stopped before wave {wave}: wave {failed[0]} has failed objects. Fix them and Retry Failed, or Resume to continue anyway."
+
+    def _wave_gate(self, item: Item) -> Optional[str]:
+        """A wave after the run's first waits for a person to sign it off, when the brief says so (``waveGate``)."""
+        run = self.run
+        if not run.settings.get("waveGate"):
+            return None
+        wave = item.source.wave
+        first = min((i.source.wave for i in run.items), default=wave)
+        if wave <= first or wave in run.released_waves:
+            return None
+        return (f"Wave {wave} waits for a person to sign it off: check what the waves before it made in Fabric, then "
+                f"Resume to start wave {wave}.")
 
     def _blocker(self, item: Item) -> Optional[str]:
         """Why ``item`` cannot start in this pass: something in this run it needs failed or was blocked itself."""
@@ -1009,9 +1040,12 @@ class Migrator(StageMixin, FabricStageMixin):
     # -- roles, members and permissions ---------------------------------------
 
     def _security(self, source: Source):
-        plan = security.plan_principal(source.payload, source.name)
+        # A SQL user a Microsoft Entra principal replaces is planned as that principal (``object_name``).
+        plan = security.plan_principal(source.payload, source.object_name or source.name)
         principal = plan.principal
         target = f"{self.run.warehouse} / {principal.kind_label.lower()} {principal.name}"
+        if source.object_name and source.object_name != source.name:
+            target += f" (replaces SQL user {source.name})"
         if principal.is_sql_user:
             # A plan never sends one (sources_for defers SQL users), but a hand-built run must not grant to it.
             raise MigrationError("A SQL user cannot be recreated in Fabric. Replace it with a Microsoft Entra principal.")

@@ -1,0 +1,2089 @@
+[
+ {
+  "name": "nothing known",
+  "facts": {},
+  "records": [],
+  "expected": {
+   "questions": {
+    "A1": {
+     "applies": true,
+     "status": "assumed",
+     "value": [
+      "structure",
+      "data",
+      "orchestration"
+     ],
+     "recommendation": {
+      "value": [
+       "structure",
+       "data",
+       "orchestration"
+      ],
+      "reason": "unknown objects were discovered, and everything can move in this migration."
+     }
+    },
+    "A2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "Nothing discovered is marked as out of scope."
+     }
+    },
+    "A2I": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A2X": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A3": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A4": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "skip",
+     "recommendation": {
+      "value": "skip",
+      "reason": "Leaving what is there makes every run safe to repeat."
+     }
+    },
+    "B1": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "B2": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "B2L": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "B3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "",
+     "recommendation": {
+      "value": "",
+      "reason": "None beyond the project requirements already set."
+     }
+    },
+    "C1": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C1D": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C2": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C3": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C4": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C5": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C6": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "D1": {
+     "applies": true,
+     "status": "assumed",
+     "value": false,
+     "recommendation": {
+      "value": false,
+      "reason": "Nothing leaves this machine unless a person says so."
+     }
+    },
+    "D2": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "D3": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "D4": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "D4O": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "E1": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "E2": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "E3": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "E4": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "G1": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "G2": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "G3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "overwrite",
+     "recommendation": {
+      "value": "overwrite",
+      "reason": "A run that changes what Fabric already has waits for a person; any other is approved by the accelerator, and recorded as such."
+     }
+    },
+    "G4": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "G5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "Deploying from Git to Test and Prod is not built yet."
+     }
+    },
+    "H1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "probe",
+     "recommendation": {
+      "value": "probe",
+      "reason": "Querying and compiling proves objects work without changing anything."
+     }
+    },
+    "H2": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "I1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "suggest",
+     "recommendation": {
+      "value": "suggest",
+      "reason": "It proposes; a person decides."
+     }
+    },
+    "X1": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X2": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X3": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X4": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    }
+   },
+   "next": "D1",
+   "blockers": [
+    "D1: May object definitions be sent to Claude for drafts? Code only: never rows or credentials. A person answers this one.",
+    "G3: When must a person sign a run off before it writes to Fabric? A person answers this one."
+   ],
+   "conflicts": [],
+   "settings": {
+    "assistant.autonomy": "suggest",
+    "llm.consent": false,
+    "llm.standards": "",
+    "plan.scopeMode": "all",
+    "release.path": "dev",
+    "release.signoff": "overwrite",
+    "run.existing": "skip",
+    "run.parts": [
+     "structure",
+     "data",
+     "orchestration"
+    ],
+    "validate.depth": "probe"
+   }
+  }
+ },
+ {
+  "name": "a rich estate, nothing answered",
+  "facts": {
+   "objects.total": 40,
+   "waves.count": 3,
+   "pool.present": true,
+   "pool.name": "sqlpool1",
+   "pool.warehouseName": "sqlpool1",
+   "pool.collation": "SQL_Latin1_General_CP1_CI_AS",
+   "pool.caseInsensitive": true,
+   "tables.count": 10,
+   "tables.withDateColumn": 5,
+   "tables.withChangeColumn": 3,
+   "tables.changeWithoutKeys": 0,
+   "storage.locations": 2,
+   "security.principals": 4,
+   "security.sqlUsers": 1,
+   "security.sqlUserNames": [
+    "app_user"
+   ],
+   "code.multiStatementFunctions": 1,
+   "code.needsRewrite": 2,
+   "code.serverlessObjects": 1,
+   "linkedServices.count": 3,
+   "linkedServices.keyVault": 1,
+   "manual.setupCount": 2,
+   "scope.groups": [
+    "schema:dbo"
+   ],
+   "discovery.complete": true,
+   "target.gitConnected": true,
+   "llm.available": true
+  },
+  "records": [],
+  "expected": {
+   "questions": {
+    "A1": {
+     "applies": true,
+     "status": "assumed",
+     "value": [
+      "structure",
+      "data",
+      "orchestration"
+     ],
+     "recommendation": {
+      "value": [
+       "structure",
+       "data",
+       "orchestration"
+      ],
+      "reason": "40 objects were discovered, and everything can move in this migration."
+     }
+    },
+    "A2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "Nothing discovered is marked as out of scope."
+     }
+    },
+    "A2I": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A2X": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "leave_out",
+     "recommendation": {
+      "value": "leave_out",
+      "reason": "1 objects use the serverless pool, which the Lakehouse's SQL endpoint replaces in Fabric."
+     }
+    },
+    "A4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "stop_on_failures",
+     "recommendation": {
+      "value": "stop_on_failures",
+      "reason": "3 waves. Stopping after a wave with failures keeps a failed table from letting the views that read it start."
+     }
+    },
+    "A5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "skip",
+     "recommendation": {
+      "value": "skip",
+      "reason": "Leaving what is there makes every run safe to repeat."
+     }
+    },
+    "B1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "match_synapse",
+     "recommendation": {
+      "value": "match_synapse",
+      "reason": "The Synapse pool's collation is SQL_Latin1_General_CP1_CI_AS."
+     }
+    },
+    "B2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "sqlpool1",
+     "recommendation": {
+      "value": "sqlpool1",
+      "reason": "Named after the pool, sqlpool1."
+     }
+    },
+    "B2L": {
+     "applies": true,
+     "status": "assumed",
+     "value": "sqlpool1_lakehouse",
+     "recommendation": {
+      "value": "sqlpool1_lakehouse",
+      "reason": "Named after the Warehouse."
+     }
+    },
+    "B3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "",
+     "recommendation": {
+      "value": "",
+      "reason": "None beyond the project requirements already set."
+     }
+    },
+    "C1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "5 tables have a date column. Loading every row keeps both sides identical, which Validate's row counts then show."
+     }
+    },
+    "C1D": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C2": {
+     "applies": true,
+     "status": "assumed",
+     "value": false,
+     "recommendation": {
+      "value": false,
+      "reason": "3 tables have a column like ModifiedAt that could drive a sync. A one-off migration needs none."
+     }
+    },
+    "C3": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "if_empty",
+     "recommendation": {
+      "value": "if_empty",
+      "reason": "Skipping never touches data already there, so a re-run is safe."
+     }
+    },
+    "C5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "run",
+     "recommendation": {
+      "value": "run",
+      "reason": "Running them lets the run compare row counts table by table."
+     }
+    },
+    "C6": {
+     "applies": true,
+     "status": "assumed",
+     "value": "workspaceIdentity",
+     "recommendation": {
+      "value": "workspaceIdentity",
+      "reason": "No secret passes through the accelerator."
+     }
+    },
+    "D1": {
+     "applies": true,
+     "status": "assumed",
+     "value": false,
+     "recommendation": {
+      "value": false,
+      "reason": "Nothing leaves this machine unless a person says so."
+     }
+    },
+    "D2": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "D3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "manual",
+     "recommendation": {
+      "value": "manual",
+      "reason": "1 functions, and no AI drafts (D1)."
+     }
+    },
+    "D4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "by_hand",
+     "recommendation": {
+      "value": "by_hand",
+      "reason": "unknown pipelines and unknown notebooks have no Fabric equivalent as they are."
+     }
+    },
+    "D4O": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "E1": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "unknown roles and the permissions of 4 roles and users can be recreated in the Warehouse."
+     }
+    },
+    "E2": {
+     "applies": true,
+     "status": "assumed",
+     "value": {},
+     "recommendation": {
+      "value": {},
+      "reason": "None mapped: 1 SQL users stay listed for a person."
+     }
+    },
+    "E3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "keyVault",
+     "recommendation": {
+      "value": "keyVault",
+      "reason": "1 linked services already read their secrets from Azure Key Vault."
+     }
+    },
+    "E4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "2 storage locations are read by the code."
+     }
+    },
+    "G1": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "The target workspace is connected to Git: each run's items are committed, ready for a pull request."
+     }
+    },
+    "G2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "run",
+     "recommendation": {
+      "value": "run",
+      "reason": "Other changes in the workspace are someone else's work, left for Fabric's Source control panel."
+     }
+    },
+    "G3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "overwrite",
+     "recommendation": {
+      "value": "overwrite",
+      "reason": "A run that changes what Fabric already has waits for a person; any other is approved by the accelerator, and recorded as such."
+     }
+    },
+    "G4": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "G5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "Deploying from Git to Test and Prod is not built yet."
+     }
+    },
+    "H1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "probe",
+     "recommendation": {
+      "value": "probe",
+      "reason": "Querying and compiling proves objects work without changing anything."
+     }
+    },
+    "H2": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "I1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "suggest",
+     "recommendation": {
+      "value": "suggest",
+      "reason": "It proposes; a person decides."
+     }
+    },
+    "X1": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X2": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X3": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X4": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    }
+   },
+   "next": "D1",
+   "blockers": [
+    "D1: May object definitions be sent to Claude for drafts? Code only: never rows or credentials. A person answers this one.",
+    "E2: Which Microsoft Entra user or group replaces each SQL user? A person answers this one.",
+    "G3: When must a person sign a run off before it writes to Fabric? A person answers this one."
+   ],
+   "conflicts": [],
+   "settings": {
+    "assistant.autonomy": "suggest",
+    "code.multiStatement": "manual",
+    "code.rebuild": "by_hand",
+    "connections.defaultSignIn": "keyVault",
+    "data.historyMode": "all",
+    "data.mode": "if_empty",
+    "data.poolSignIn": "workspaceIdentity",
+    "data.run": "run",
+    "data.sync": false,
+    "llm.consent": false,
+    "llm.standards": "",
+    "names.lakehouse": "sqlpool1_lakehouse",
+    "names.warehouse": "sqlpool1",
+    "plan.scopeMode": "all",
+    "plan.serverless": "leave_out",
+    "release.commitScope": "run",
+    "release.gitCommit": true,
+    "release.path": "dev",
+    "release.signoff": "overwrite",
+    "run.existing": "skip",
+    "run.parts": [
+     "structure",
+     "data",
+     "orchestration"
+    ],
+    "run.stopOnFailure": true,
+    "run.waveGate": false,
+    "security.migrate": true,
+    "security.sqlUserMap": {},
+    "storage.routes": "all",
+    "validate.depth": "probe",
+    "warehouse.collation": "match_synapse"
+   }
+  }
+ },
+ {
+  "name": "answers that open, park and contradict",
+  "facts": {
+   "objects.total": 40,
+   "waves.count": 3,
+   "pool.present": true,
+   "pool.name": "sqlpool1",
+   "pool.warehouseName": "sqlpool1",
+   "pool.collation": "SQL_Latin1_General_CP1_CI_AS",
+   "pool.caseInsensitive": true,
+   "tables.count": 10,
+   "tables.withDateColumn": 5,
+   "tables.withChangeColumn": 3,
+   "tables.changeWithoutKeys": 0,
+   "storage.locations": 2,
+   "security.principals": 4,
+   "security.sqlUsers": 1,
+   "security.sqlUserNames": [
+    "app_user"
+   ],
+   "code.multiStatementFunctions": 1,
+   "code.needsRewrite": 2,
+   "code.serverlessObjects": 1,
+   "linkedServices.count": 3,
+   "linkedServices.keyVault": 1,
+   "manual.setupCount": 2,
+   "scope.groups": [
+    "schema:dbo"
+   ],
+   "discovery.complete": true,
+   "target.gitConnected": true,
+   "llm.available": true
+  },
+  "records": [
+   {
+    "type": "answer",
+    "question": "A2",
+    "value": "include",
+    "source": "person",
+    "seq": 1
+   },
+   {
+    "type": "answer",
+    "question": "A2I",
+    "value": [
+     "schema:dbo"
+    ],
+    "source": "person",
+    "seq": 2
+   },
+   {
+    "type": "answer",
+    "question": "C4",
+    "value": "replace",
+    "source": "person",
+    "seq": 3
+   },
+   {
+    "type": "answer",
+    "question": "G3",
+    "value": "never",
+    "source": "person",
+    "seq": 4
+   },
+   {
+    "type": "answer",
+    "question": "A4",
+    "value": "signoff_each_wave",
+    "source": "person",
+    "seq": 5
+   },
+   {
+    "type": "answer",
+    "question": "D1",
+    "value": true,
+    "source": "person",
+    "seq": 6
+   },
+   {
+    "type": "answer",
+    "question": "C1",
+    "value": "since",
+    "source": "person",
+    "seq": 7
+   },
+   {
+    "type": "answer",
+    "question": "C1D",
+    "value": "2024-01-01",
+    "source": "person",
+    "seq": 8
+   },
+   {
+    "type": "answer",
+    "question": "C1",
+    "value": "all",
+    "source": "person",
+    "seq": 9
+   },
+   {
+    "type": "skip",
+    "question": "A5",
+    "seq": 10
+   }
+  ],
+  "expected": {
+   "questions": {
+    "A1": {
+     "applies": true,
+     "status": "assumed",
+     "value": [
+      "structure",
+      "data",
+      "orchestration"
+     ],
+     "recommendation": {
+      "value": [
+       "structure",
+       "data",
+       "orchestration"
+      ],
+      "reason": "40 objects were discovered, and everything can move in this migration."
+     }
+    },
+    "A2": {
+     "applies": true,
+     "status": "answered",
+     "value": "include",
+     "recommendation": {
+      "value": "all",
+      "reason": "Nothing discovered is marked as out of scope."
+     }
+    },
+    "A2I": {
+     "applies": true,
+     "status": "answered",
+     "value": [
+      "schema:dbo"
+     ],
+     "recommendation": null
+    },
+    "A2X": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "leave_out",
+     "recommendation": {
+      "value": "leave_out",
+      "reason": "1 objects use the serverless pool, which the Lakehouse's SQL endpoint replaces in Fabric."
+     }
+    },
+    "A4": {
+     "applies": true,
+     "status": "answered",
+     "value": "signoff_each_wave",
+     "recommendation": {
+      "value": "stop_on_failures",
+      "reason": "3 waves. Stopping after a wave with failures keeps a failed table from letting the views that read it start."
+     }
+    },
+    "A5": {
+     "applies": true,
+     "status": "skipped",
+     "value": "skip",
+     "recommendation": {
+      "value": "skip",
+      "reason": "Leaving what is there makes every run safe to repeat."
+     }
+    },
+    "B1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "match_synapse",
+     "recommendation": {
+      "value": "match_synapse",
+      "reason": "The Synapse pool's collation is SQL_Latin1_General_CP1_CI_AS."
+     }
+    },
+    "B2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "sqlpool1",
+     "recommendation": {
+      "value": "sqlpool1",
+      "reason": "Named after the pool, sqlpool1."
+     }
+    },
+    "B2L": {
+     "applies": true,
+     "status": "assumed",
+     "value": "sqlpool1_lakehouse",
+     "recommendation": {
+      "value": "sqlpool1_lakehouse",
+      "reason": "Named after the Warehouse."
+     }
+    },
+    "B3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "",
+     "recommendation": {
+      "value": "",
+      "reason": "None beyond the project requirements already set."
+     }
+    },
+    "C1": {
+     "applies": true,
+     "status": "answered",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "5 tables have a date column. Loading every row keeps both sides identical, which Validate's row counts then show."
+     }
+    },
+    "C1D": {
+     "applies": false,
+     "status": "parked",
+     "value": "2024-01-01",
+     "recommendation": null
+    },
+    "C2": {
+     "applies": true,
+     "status": "assumed",
+     "value": false,
+     "recommendation": {
+      "value": false,
+      "reason": "3 tables have a column like ModifiedAt that could drive a sync. A one-off migration needs none."
+     }
+    },
+    "C3": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C4": {
+     "applies": true,
+     "status": "answered",
+     "value": "replace",
+     "recommendation": {
+      "value": "if_empty",
+      "reason": "Skipping never touches data already there, so a re-run is safe."
+     }
+    },
+    "C5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "run",
+     "recommendation": {
+      "value": "run",
+      "reason": "Running them lets the run compare row counts table by table."
+     }
+    },
+    "C6": {
+     "applies": true,
+     "status": "assumed",
+     "value": "workspaceIdentity",
+     "recommendation": {
+      "value": "workspaceIdentity",
+      "reason": "No secret passes through the accelerator."
+     }
+    },
+    "D1": {
+     "applies": true,
+     "status": "answered",
+     "value": true,
+     "recommendation": {
+      "value": false,
+      "reason": "Nothing leaves this machine unless a person says so."
+     }
+    },
+    "D2": {
+     "applies": true,
+     "status": "assumed",
+     "value": 25,
+     "recommendation": {
+      "value": 25,
+      "reason": "Enough for a few hundred drafts at typical prices."
+     }
+    },
+    "D3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "llm",
+     "recommendation": {
+      "value": "llm",
+      "reason": "1 functions, and AI drafts are allowed (D1)."
+     }
+    },
+    "D4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "by_hand",
+     "recommendation": {
+      "value": "by_hand",
+      "reason": "unknown pipelines and unknown notebooks have no Fabric equivalent as they are."
+     }
+    },
+    "D4O": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "E1": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "unknown roles and the permissions of 4 roles and users can be recreated in the Warehouse."
+     }
+    },
+    "E2": {
+     "applies": true,
+     "status": "assumed",
+     "value": {},
+     "recommendation": {
+      "value": {},
+      "reason": "None mapped: 1 SQL users stay listed for a person."
+     }
+    },
+    "E3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "keyVault",
+     "recommendation": {
+      "value": "keyVault",
+      "reason": "1 linked services already read their secrets from Azure Key Vault."
+     }
+    },
+    "E4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "2 storage locations are read by the code."
+     }
+    },
+    "G1": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "The target workspace is connected to Git: each run's items are committed, ready for a pull request."
+     }
+    },
+    "G2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "run",
+     "recommendation": {
+      "value": "run",
+      "reason": "Other changes in the workspace are someone else's work, left for Fabric's Source control panel."
+     }
+    },
+    "G3": {
+     "applies": true,
+     "status": "answered",
+     "value": "never",
+     "recommendation": {
+      "value": "overwrite",
+      "reason": "A run that changes what Fabric already has waits for a person; any other is approved by the accelerator, and recorded as such."
+     }
+    },
+    "G4": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "G5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "Deploying from Git to Test and Prod is not built yet."
+     }
+    },
+    "H1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "probe",
+     "recommendation": {
+      "value": "probe",
+      "reason": "Querying and compiling proves objects work without changing anything."
+     }
+    },
+    "H2": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "I1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "suggest",
+     "recommendation": {
+      "value": "suggest",
+      "reason": "It proposes; a person decides."
+     }
+    },
+    "X1": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X2": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X3": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X4": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    }
+   },
+   "next": "C4",
+   "blockers": [
+    "Contradiction: Replacing rows empties tables that already have data, and no person would sign such a run off first.",
+    "E2: Which Microsoft Entra user or group replaces each SQL user? A person answers this one."
+   ],
+   "conflicts": [
+    {
+     "id": "K2",
+     "status": "open",
+     "message": "Replacing rows empties tables that already have data, and no person would sign such a run off first."
+    }
+   ],
+   "settings": {
+    "assistant.autonomy": "suggest",
+    "code.multiStatement": "llm",
+    "code.rebuild": "by_hand",
+    "connections.defaultSignIn": "keyVault",
+    "data.historyMode": "all",
+    "data.mode": "replace",
+    "data.poolSignIn": "workspaceIdentity",
+    "data.run": "run",
+    "data.sync": false,
+    "llm.budgetUsd": 25,
+    "llm.consent": true,
+    "llm.standards": "",
+    "names.lakehouse": "sqlpool1_lakehouse",
+    "names.warehouse": "sqlpool1",
+    "plan.scopeInclude": [
+     "schema:dbo"
+    ],
+    "plan.scopeMode": "include",
+    "plan.serverless": "leave_out",
+    "release.commitScope": "run",
+    "release.gitCommit": true,
+    "release.path": "dev",
+    "release.signoff": "never",
+    "run.existing": "skip",
+    "run.parts": [
+     "structure",
+     "data",
+     "orchestration"
+    ],
+    "run.stopOnFailure": true,
+    "run.waveGate": true,
+    "security.migrate": true,
+    "security.sqlUserMap": {},
+    "storage.routes": "all",
+    "validate.depth": "probe",
+    "warehouse.collation": "match_synapse"
+   }
+  }
+ },
+ {
+  "name": "a contradiction kept, and an answer whose evidence moved",
+  "facts": {
+   "objects.total": 40,
+   "waves.count": 3,
+   "pool.present": true,
+   "pool.name": "sqlpool1",
+   "pool.warehouseName": "sqlpool1",
+   "pool.collation": "SQL_Latin1_General_CP1_CI_AS",
+   "pool.caseInsensitive": true,
+   "tables.count": 10,
+   "tables.withDateColumn": 5,
+   "tables.withChangeColumn": 3,
+   "tables.changeWithoutKeys": 0,
+   "storage.locations": 2,
+   "security.principals": 4,
+   "security.sqlUsers": 1,
+   "security.sqlUserNames": [
+    "app_user"
+   ],
+   "code.multiStatementFunctions": 1,
+   "code.needsRewrite": 2,
+   "code.serverlessObjects": 2,
+   "linkedServices.count": 3,
+   "linkedServices.keyVault": 1,
+   "manual.setupCount": 2,
+   "scope.groups": [
+    "schema:dbo"
+   ],
+   "discovery.complete": true,
+   "target.gitConnected": true,
+   "llm.available": true
+  },
+  "records": [
+   {
+    "type": "answer",
+    "question": "C4",
+    "value": "replace",
+    "source": "person",
+    "seq": 1
+   },
+   {
+    "type": "answer",
+    "question": "G3",
+    "value": "never",
+    "source": "person",
+    "seq": 2
+   },
+   {
+    "type": "resolve",
+    "conflict": "K2",
+    "resolution": "keep",
+    "reason": "Test data only",
+    "seq": 3,
+    "facts": {},
+    "answers": {
+     "C4": "replace",
+     "G3": "never"
+    }
+   },
+   {
+    "type": "answer",
+    "question": "A3",
+    "value": "keep",
+    "source": "person",
+    "seq": 4,
+    "facts": {
+     "code.serverlessObjects": 1
+    }
+   }
+  ],
+  "expected": {
+   "questions": {
+    "A1": {
+     "applies": true,
+     "status": "assumed",
+     "value": [
+      "structure",
+      "data",
+      "orchestration"
+     ],
+     "recommendation": {
+      "value": [
+       "structure",
+       "data",
+       "orchestration"
+      ],
+      "reason": "40 objects were discovered, and everything can move in this migration."
+     }
+    },
+    "A2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "Nothing discovered is marked as out of scope."
+     }
+    },
+    "A2I": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A2X": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A3": {
+     "applies": true,
+     "status": "stale",
+     "value": "keep",
+     "recommendation": {
+      "value": "leave_out",
+      "reason": "2 objects use the serverless pool, which the Lakehouse's SQL endpoint replaces in Fabric."
+     }
+    },
+    "A4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "stop_on_failures",
+     "recommendation": {
+      "value": "stop_on_failures",
+      "reason": "3 waves. Stopping after a wave with failures keeps a failed table from letting the views that read it start."
+     }
+    },
+    "A5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "skip",
+     "recommendation": {
+      "value": "skip",
+      "reason": "Leaving what is there makes every run safe to repeat."
+     }
+    },
+    "B1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "match_synapse",
+     "recommendation": {
+      "value": "match_synapse",
+      "reason": "The Synapse pool's collation is SQL_Latin1_General_CP1_CI_AS."
+     }
+    },
+    "B2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "sqlpool1",
+     "recommendation": {
+      "value": "sqlpool1",
+      "reason": "Named after the pool, sqlpool1."
+     }
+    },
+    "B2L": {
+     "applies": true,
+     "status": "assumed",
+     "value": "sqlpool1_lakehouse",
+     "recommendation": {
+      "value": "sqlpool1_lakehouse",
+      "reason": "Named after the Warehouse."
+     }
+    },
+    "B3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "",
+     "recommendation": {
+      "value": "",
+      "reason": "None beyond the project requirements already set."
+     }
+    },
+    "C1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "5 tables have a date column. Loading every row keeps both sides identical, which Validate's row counts then show."
+     }
+    },
+    "C1D": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C2": {
+     "applies": true,
+     "status": "assumed",
+     "value": false,
+     "recommendation": {
+      "value": false,
+      "reason": "3 tables have a column like ModifiedAt that could drive a sync. A one-off migration needs none."
+     }
+    },
+    "C3": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C4": {
+     "applies": true,
+     "status": "answered",
+     "value": "replace",
+     "recommendation": {
+      "value": "if_empty",
+      "reason": "Skipping never touches data already there, so a re-run is safe."
+     }
+    },
+    "C5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "run",
+     "recommendation": {
+      "value": "run",
+      "reason": "Running them lets the run compare row counts table by table."
+     }
+    },
+    "C6": {
+     "applies": true,
+     "status": "assumed",
+     "value": "workspaceIdentity",
+     "recommendation": {
+      "value": "workspaceIdentity",
+      "reason": "No secret passes through the accelerator."
+     }
+    },
+    "D1": {
+     "applies": true,
+     "status": "assumed",
+     "value": false,
+     "recommendation": {
+      "value": false,
+      "reason": "Nothing leaves this machine unless a person says so."
+     }
+    },
+    "D2": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "D3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "manual",
+     "recommendation": {
+      "value": "manual",
+      "reason": "1 functions, and no AI drafts (D1)."
+     }
+    },
+    "D4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "by_hand",
+     "recommendation": {
+      "value": "by_hand",
+      "reason": "unknown pipelines and unknown notebooks have no Fabric equivalent as they are."
+     }
+    },
+    "D4O": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "E1": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "unknown roles and the permissions of 4 roles and users can be recreated in the Warehouse."
+     }
+    },
+    "E2": {
+     "applies": true,
+     "status": "assumed",
+     "value": {},
+     "recommendation": {
+      "value": {},
+      "reason": "None mapped: 1 SQL users stay listed for a person."
+     }
+    },
+    "E3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "keyVault",
+     "recommendation": {
+      "value": "keyVault",
+      "reason": "1 linked services already read their secrets from Azure Key Vault."
+     }
+    },
+    "E4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "2 storage locations are read by the code."
+     }
+    },
+    "G1": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "The target workspace is connected to Git: each run's items are committed, ready for a pull request."
+     }
+    },
+    "G2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "run",
+     "recommendation": {
+      "value": "run",
+      "reason": "Other changes in the workspace are someone else's work, left for Fabric's Source control panel."
+     }
+    },
+    "G3": {
+     "applies": true,
+     "status": "answered",
+     "value": "never",
+     "recommendation": {
+      "value": "overwrite",
+      "reason": "A run that changes what Fabric already has waits for a person; any other is approved by the accelerator, and recorded as such."
+     }
+    },
+    "G4": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "G5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "Deploying from Git to Test and Prod is not built yet."
+     }
+    },
+    "H1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "probe",
+     "recommendation": {
+      "value": "probe",
+      "reason": "Querying and compiling proves objects work without changing anything."
+     }
+    },
+    "H2": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "I1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "suggest",
+     "recommendation": {
+      "value": "suggest",
+      "reason": "It proposes; a person decides."
+     }
+    },
+    "X1": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X2": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X3": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X4": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    }
+   },
+   "next": "D1",
+   "blockers": [
+    "A3: what it rests on changed since it was answered; confirm it again.",
+    "D1: May object definitions be sent to Claude for drafts? Code only: never rows or credentials. A person answers this one.",
+    "E2: Which Microsoft Entra user or group replaces each SQL user? A person answers this one."
+   ],
+   "conflicts": [
+    {
+     "id": "K2",
+     "status": "kept",
+     "message": "Replacing rows empties tables that already have data, and no person would sign such a run off first."
+    }
+   ],
+   "settings": {
+    "assistant.autonomy": "suggest",
+    "code.multiStatement": "manual",
+    "code.rebuild": "by_hand",
+    "connections.defaultSignIn": "keyVault",
+    "data.historyMode": "all",
+    "data.mode": "replace",
+    "data.poolSignIn": "workspaceIdentity",
+    "data.run": "run",
+    "data.sync": false,
+    "llm.consent": false,
+    "llm.standards": "",
+    "names.lakehouse": "sqlpool1_lakehouse",
+    "names.warehouse": "sqlpool1",
+    "plan.scopeMode": "all",
+    "plan.serverless": "keep",
+    "release.commitScope": "run",
+    "release.gitCommit": true,
+    "release.path": "dev",
+    "release.signoff": "never",
+    "run.existing": "skip",
+    "run.parts": [
+     "structure",
+     "data",
+     "orchestration"
+    ],
+    "run.stopOnFailure": true,
+    "run.waveGate": false,
+    "security.migrate": true,
+    "security.sqlUserMap": {},
+    "storage.routes": "all",
+    "validate.depth": "probe",
+    "warehouse.collation": "match_synapse"
+   }
+  }
+ },
+ {
+  "name": "a case-insensitive pool and a case-sensitive Warehouse",
+  "facts": {
+   "objects.total": 40,
+   "waves.count": 3,
+   "pool.present": true,
+   "pool.name": "sqlpool1",
+   "pool.warehouseName": "sqlpool1",
+   "pool.collation": "SQL_Latin1_General_CP1_CI_AS",
+   "pool.caseInsensitive": true,
+   "tables.count": 10,
+   "tables.withDateColumn": 5,
+   "tables.withChangeColumn": 3,
+   "tables.changeWithoutKeys": 0,
+   "storage.locations": 2,
+   "security.principals": 4,
+   "security.sqlUsers": 1,
+   "security.sqlUserNames": [
+    "app_user"
+   ],
+   "code.multiStatementFunctions": 1,
+   "code.needsRewrite": 2,
+   "code.serverlessObjects": 1,
+   "linkedServices.count": 3,
+   "linkedServices.keyVault": 1,
+   "manual.setupCount": 2,
+   "scope.groups": [
+    "schema:dbo"
+   ],
+   "discovery.complete": false,
+   "target.gitConnected": true,
+   "llm.available": true,
+   "discovery.failedCategories": [
+    "Triggers",
+    "Pools"
+   ]
+  },
+  "records": [
+   {
+    "type": "answer",
+    "question": "B1",
+    "value": "case_sensitive",
+    "source": "person",
+    "seq": 1
+   },
+   {
+    "type": "answer",
+    "question": "A1",
+    "value": [
+     "data"
+    ],
+    "source": "person",
+    "seq": 2
+   },
+   {
+    "type": "withdraw",
+    "question": "B1",
+    "seq": 3
+   },
+   {
+    "type": "answer",
+    "question": "B1",
+    "value": "case_sensitive",
+    "source": "person",
+    "seq": 4
+   }
+  ],
+  "expected": {
+   "questions": {
+    "A1": {
+     "applies": true,
+     "status": "answered",
+     "value": [
+      "data"
+     ],
+     "recommendation": {
+      "value": [
+       "structure",
+       "data",
+       "orchestration"
+      ],
+      "reason": "40 objects were discovered, and everything can move in this migration."
+     }
+    },
+    "A2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "Nothing discovered is marked as out of scope."
+     }
+    },
+    "A2I": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A2X": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "leave_out",
+     "recommendation": {
+      "value": "leave_out",
+      "reason": "1 objects use the serverless pool, which the Lakehouse's SQL endpoint replaces in Fabric."
+     }
+    },
+    "A4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "stop_on_failures",
+     "recommendation": {
+      "value": "stop_on_failures",
+      "reason": "3 waves. Stopping after a wave with failures keeps a failed table from letting the views that read it start."
+     }
+    },
+    "A5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "skip",
+     "recommendation": {
+      "value": "skip",
+      "reason": "Leaving what is there makes every run safe to repeat."
+     }
+    },
+    "B1": {
+     "applies": true,
+     "status": "answered",
+     "value": "case_sensitive",
+     "recommendation": {
+      "value": "match_synapse",
+      "reason": "The Synapse pool's collation is SQL_Latin1_General_CP1_CI_AS."
+     }
+    },
+    "B2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "sqlpool1",
+     "recommendation": {
+      "value": "sqlpool1",
+      "reason": "Named after the pool, sqlpool1."
+     }
+    },
+    "B2L": {
+     "applies": true,
+     "status": "assumed",
+     "value": "sqlpool1_lakehouse",
+     "recommendation": {
+      "value": "sqlpool1_lakehouse",
+      "reason": "Named after the Warehouse."
+     }
+    },
+    "B3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "",
+     "recommendation": {
+      "value": "",
+      "reason": "None beyond the project requirements already set."
+     }
+    },
+    "C1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "5 tables have a date column. Loading every row keeps both sides identical, which Validate's row counts then show."
+     }
+    },
+    "C1D": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C2": {
+     "applies": true,
+     "status": "assumed",
+     "value": false,
+     "recommendation": {
+      "value": false,
+      "reason": "3 tables have a column like ModifiedAt that could drive a sync. A one-off migration needs none."
+     }
+    },
+    "C3": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "if_empty",
+     "recommendation": {
+      "value": "if_empty",
+      "reason": "Skipping never touches data already there, so a re-run is safe."
+     }
+    },
+    "C5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "run",
+     "recommendation": {
+      "value": "run",
+      "reason": "Running them lets the run compare row counts table by table."
+     }
+    },
+    "C6": {
+     "applies": true,
+     "status": "assumed",
+     "value": "workspaceIdentity",
+     "recommendation": {
+      "value": "workspaceIdentity",
+      "reason": "No secret passes through the accelerator."
+     }
+    },
+    "D1": {
+     "applies": true,
+     "status": "assumed",
+     "value": false,
+     "recommendation": {
+      "value": false,
+      "reason": "Nothing leaves this machine unless a person says so."
+     }
+    },
+    "D2": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "D3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "manual",
+     "recommendation": {
+      "value": "manual",
+      "reason": "1 functions, and no AI drafts (D1)."
+     }
+    },
+    "D4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "by_hand",
+     "recommendation": {
+      "value": "by_hand",
+      "reason": "unknown pipelines and unknown notebooks have no Fabric equivalent as they are."
+     }
+    },
+    "D4O": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "E1": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "unknown roles and the permissions of 4 roles and users can be recreated in the Warehouse."
+     }
+    },
+    "E2": {
+     "applies": true,
+     "status": "assumed",
+     "value": {},
+     "recommendation": {
+      "value": {},
+      "reason": "None mapped: 1 SQL users stay listed for a person."
+     }
+    },
+    "E3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "keyVault",
+     "recommendation": {
+      "value": "keyVault",
+      "reason": "1 linked services already read their secrets from Azure Key Vault."
+     }
+    },
+    "E4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "2 storage locations are read by the code."
+     }
+    },
+    "G1": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "The target workspace is connected to Git: each run's items are committed, ready for a pull request."
+     }
+    },
+    "G2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "run",
+     "recommendation": {
+      "value": "run",
+      "reason": "Other changes in the workspace are someone else's work, left for Fabric's Source control panel."
+     }
+    },
+    "G3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "overwrite",
+     "recommendation": {
+      "value": "overwrite",
+      "reason": "A run that changes what Fabric already has waits for a person; any other is approved by the accelerator, and recorded as such."
+     }
+    },
+    "G4": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "G5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "Deploying from Git to Test and Prod is not built yet."
+     }
+    },
+    "H1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "probe",
+     "recommendation": {
+      "value": "probe",
+      "reason": "Querying and compiling proves objects work without changing anything."
+     }
+    },
+    "H2": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "I1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "suggest",
+     "recommendation": {
+      "value": "suggest",
+      "reason": "It proposes; a person decides."
+     }
+    },
+    "X1": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X2": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X3": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "X4": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    }
+   },
+   "next": "A1",
+   "blockers": [
+    "Contradiction: Data loads into the Warehouse's tables, which Structure creates. Without it the loads fail, unless the tables are already in Fabric.",
+    "Contradiction: The pool (SQL_Latin1_General_CP1_CI_AS) compares names and text case-insensitively. Code that relies on that, such as a join of 'ABC' with 'abc', behaves differently in a case-sensitive Warehouse.",
+    "Contradiction: This brief rests on a discovery that could not read: Triggers, Pools. Run discovery again, or go on knowing it.",
+    "D1: May object definitions be sent to Claude for drafts? Code only: never rows or credentials. A person answers this one.",
+    "E2: Which Microsoft Entra user or group replaces each SQL user? A person answers this one.",
+    "G3: When must a person sign a run off before it writes to Fabric? A person answers this one."
+   ],
+   "conflicts": [
+    {
+     "id": "K1",
+     "status": "open",
+     "message": "Data loads into the Warehouse's tables, which Structure creates. Without it the loads fail, unless the tables are already in Fabric."
+    },
+    {
+     "id": "K4",
+     "status": "open",
+     "message": "The pool (SQL_Latin1_General_CP1_CI_AS) compares names and text case-insensitively. Code that relies on that, such as a join of 'ABC' with 'abc', behaves differently in a case-sensitive Warehouse."
+    },
+    {
+     "id": "K5",
+     "status": "open",
+     "message": "This brief rests on a discovery that could not read: Triggers, Pools. Run discovery again, or go on knowing it."
+    }
+   ],
+   "settings": {
+    "assistant.autonomy": "suggest",
+    "code.multiStatement": "manual",
+    "code.rebuild": "by_hand",
+    "connections.defaultSignIn": "keyVault",
+    "data.historyMode": "all",
+    "data.mode": "if_empty",
+    "data.poolSignIn": "workspaceIdentity",
+    "data.run": "run",
+    "data.sync": false,
+    "llm.consent": false,
+    "llm.standards": "",
+    "names.lakehouse": "sqlpool1_lakehouse",
+    "names.warehouse": "sqlpool1",
+    "plan.scopeMode": "all",
+    "plan.serverless": "leave_out",
+    "release.commitScope": "run",
+    "release.gitCommit": true,
+    "release.path": "dev",
+    "release.signoff": "overwrite",
+    "run.existing": "skip",
+    "run.parts": [
+     "data"
+    ],
+    "run.stopOnFailure": true,
+    "run.waveGate": false,
+    "security.migrate": true,
+    "security.sqlUserMap": {},
+    "storage.routes": "all",
+    "validate.depth": "probe",
+    "warehouse.collation": "case_sensitive"
+   }
+  }
+ }
+]

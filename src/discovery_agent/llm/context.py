@@ -220,8 +220,9 @@ def _dependencies(detail: Mapping[str, Any], records: Mapping[str, Any]) -> List
 
 
 def build(subject: Subject, source: Source, detail: Mapping[str, Any], target: Mapping[str, Any],
-          records: Mapping[str, Any], prompts_dir: Path) -> str:
-    """The full prompt for one object, from the templates in ``prompts_dir``."""
+          records: Mapping[str, Any], prompts_dir: Path, standards: str = "") -> str:
+    """The full prompt for one object, from the templates in ``prompts_dir``. ``standards``: the approved migration
+    brief's naming and coding standards (B3), added to the project requirements as they were written."""
     context: Dict[str, Any] = {
         "object": {"id": source.id, "name": source.object_name or source.name, "type": source.type, "kind": subject.kind,
                    "schema": source.schema if subject.kind in (TABLE, VIEW, PROCEDURE, FUNCTION) else ""},
@@ -242,4 +243,6 @@ def build(subject: Subject, source: Source, detail: Mapping[str, Any], target: M
         raise templates.TemplateError(f"The prompt template base.md is missing from {prompts_dir}.")
     context["type_instructions"] = templates.render(templates.read(prompts_dir / TEMPLATES[subject.kind]), context).strip()
     context["project"] = templates.render(templates.read(prompts_dir / "project.md"), context).strip()
+    if standards.strip():
+        context["project"] = (context["project"] + "\n\nStandards from the approved migration brief:\n" + standards.strip()).strip()
     return templates.render(base, context)

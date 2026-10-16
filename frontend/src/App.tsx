@@ -4,6 +4,7 @@ import { Layout } from "./components/layout/Layout";
 import { Setup } from "./pages/Setup";
 import { Workspace } from "./pages/Workspace";
 import { AppStateProvider } from "./state/AppState";
+import { ConsultProvider } from "./state/ConsultState";
 import { MigrationStateProvider } from "./state/MigrationState";
 
 /** The earlier one-page-per-step addresses open the same step in the migration journey. */
@@ -17,6 +18,7 @@ export function App() {
   return (
     <AppStateProvider>
       <MigrationStateProvider>
+        <ConsultProvider>
         <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
           <a href="#main" className="sr-only">Skip to content</a>
           <Routes>
@@ -32,6 +34,7 @@ export function App() {
             </Route>
           </Routes>
         </BrowserRouter>
+        </ConsultProvider>
       </MigrationStateProvider>
     </AppStateProvider>
   );

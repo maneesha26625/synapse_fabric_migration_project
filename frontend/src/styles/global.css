@@ -611,7 +611,7 @@ html, body, #root { height: auto; min-height: 100%; }
 .ws-meter { width: 140px; height: 8px; border-radius: 999px; background: var(--surface-3); overflow: hidden; }
 .ws-meter span { display: block; height: 100%; border-radius: inherit; background: var(--accent-grad); transition: width .4s ease; }
 
-.journey ol { position: relative; list-style: none; margin: 0; padding: 2px 2px 12px; display: grid; grid-template-columns: repeat(6, minmax(158px, 1fr)); gap: 16px; overflow-x: auto; }
+.journey ol { position: relative; list-style: none; margin: 0; padding: 2px 2px 12px; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(140px, 1fr); gap: 16px; overflow-x: auto; }
 .jstep { position: relative; }
 .jstep:not(:last-child)::after { content: ""; position: absolute; top: 50%; right: -16px; width: 16px; height: 2px; background: var(--border-strong); }
 .jstep.done:not(:last-child)::after { background: color-mix(in srgb, var(--success) 70%, transparent); }
@@ -843,7 +843,7 @@ a.release-toggle:hover { text-decoration: underline; }
   .btn.launch-btn { width: 100%; justify-content: center; }
   .journey-anchor { scroll-margin-top: 12px; }
   .journey-preview li > svg { display: none; }
-  .journey ol { grid-template-columns: repeat(6, minmax(132px, 1fr)); gap: 10px; scroll-snap-type: x proximity; }
+  .journey ol { grid-auto-columns: minmax(132px, 1fr); gap: 10px; scroll-snap-type: x proximity; }
   .jstep { scroll-snap-align: start; }
   .jstep:not(:last-child)::after { right: -10px; width: 10px; }
   .setup-hero h1 { font-size: 26px; }
@@ -918,3 +918,32 @@ a.release-toggle:hover { text-decoration: underline; }
 
 /* An object created from an accepted LLM-assisted transform. */
 .llm-badge { display: inline-flex; align-items: center; gap: 3px; margin-left: 6px; padding: 0 7px; border-radius: 999px; font-size: 11.5px; font-weight: 600; letter-spacing: .02em; color: var(--info); background: var(--info-soft); vertical-align: middle; cursor: help; }
+
+/* ---- consultation: questions, the brief, its versions ---------------------------------------------------------- */
+.consult-section { gap: 10px; }
+.consult-q { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
+.consult-q.attention { border-color: rgba(214, 162, 50, .45); }
+.consult-q.focused { box-shadow: 0 0 0 2px var(--accent); }
+.consult-q h3 { font-size: 15px; line-height: 1.4; }
+.consult-id { font-family: var(--mono); font-size: 12.5px; color: var(--accent); background: var(--accent-soft); border-radius: 6px; padding: 1px 6px; margin-right: 4px; }
+.consult-help { margin: 0; font-size: 14.5px; }
+.consult-options { display: flex; flex-direction: column; gap: 6px; }
+.consult-option { display: flex; gap: 10px; align-items: flex-start; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); cursor: pointer; font-size: 14.5px; }
+.consult-option input { margin-top: 4px; flex: none; }
+.consult-option.chosen { border-color: var(--accent); background: var(--accent-soft); }
+.consult-map { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 8px 14px; }
+.consult-text { height: auto; min-height: 64px; padding: 8px 10px; resize: vertical; font: inherit; line-height: 1.45; }
+.consult-input { max-width: 360px; }
+.consult-note { flex: 1; min-width: 200px; height: 32px; }
+.consult-rec, .consult-preview { margin: 0; }
+.consult-rec svg { color: var(--warning); vertical-align: -2px; margin-right: 2px; }
+.consult-explain { margin: 0; padding: 8px 10px; border-radius: var(--radius-sm); background: var(--surface-2); border: 1px solid var(--border); font-size: 14.5px; color: var(--text-muted); }
+.consult-explain svg { color: var(--accent-2); }
+.consult-actions { gap: 6px; flex-wrap: wrap; align-items: center; }
+.consult-proposals, .consult-versions { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.consult-proposals li, .consult-versions li { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); }
+.consult-differs { margin-left: 6px; font-size: 11.5px; vertical-align: middle; }
+@media (max-width: 640px) {
+  .consult-q { padding: 12px; }
+  .consult-input { max-width: none; }
+}

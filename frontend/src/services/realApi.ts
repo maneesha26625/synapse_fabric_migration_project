@@ -1,7 +1,14 @@
 import {
   ApiRequestError,
+  type AnswerPreview,
   type AuditPage,
   type AuditVerification,
+  type BriefView,
+  type ConsultCatalog,
+  type ConsultExplanation,
+  type ConsultPolicy,
+  type ConsultState,
+  type PlanDifference,
   type ProjectListing,
   type RunHistory,
   type AzureSubscription,
@@ -169,11 +176,12 @@ export const realApi: MigrationApi = {
       method: "POST",
       body: JSON.stringify({ items, record: !!record, ...(options ? { options } : {}), ...(credentialNames?.length ? { credentialNames } : {}) }),
     }),
-  startExecution: (items, options, credentials) =>
+  startExecution: (items, options, credentials, deviationReason) =>
     request<ExecutionRun>("/api/migration/start", {
       method: "POST",
       // Credentials travel once, over localhost, into the backend's memory. Never stored by the UI.
-      body: JSON.stringify({ items, ...(options ? { options } : {}), ...(credentials ? { credentials } : {}) }),
+      body: JSON.stringify({ items, ...(options ? { options } : {}), ...(credentials ? { credentials } : {}),
+        ...(deviationReason ? { deviationReason } : {}) }),
     }),
   getExecution: () => request<ExecutionRun>("/api/migration/run"),
   controlExecution: (action, extra) =>
@@ -181,6 +189,7 @@ export const realApi: MigrationApi = {
       method: "POST",
       // Credentials a restart lost travel once more, the same way: into the backend's memory, never stored here.
       body: JSON.stringify({ action, ...(extra?.version !== undefined ? { version: extra.version } : {}),
+        ...(extra?.comment ? { comment: extra.comment } : {}),
         ...(extra?.credentials && Object.keys(extra.credentials).length ? { credentials: extra.credentials } : {}) }),
     }),
   approveExecution: (decision, comment, extra) =>
@@ -248,6 +257,40 @@ export const realApi: MigrationApi = {
     (await request<{ items: string[] }>(
       `/api/azure/sql-pools?subscriptionId=${encodeURIComponent(sub)}&resourceGroup=${encodeURIComponent(rg)}&workspace=${encodeURIComponent(ws)}`,
     )).items,
+  getConsult: () => request<ConsultState>("/api/consult"),
+  getConsultCatalog: () => request<ConsultCatalog>("/api/consult/catalog"),
+  answerQuestion: (question, value, extra) =>
+    request<ConsultState>("/api/consult/answer", { method: "POST", body: JSON.stringify({ question, value, ...(extra?.note ? { note: extra.note } : {}),
+      ...(extra?.seq !== undefined ? { seq: extra.seq } : {}) }) }),
+  previewAnswer: (question, value) =>
+    request<AnswerPreview>("/api/consult/answer", { method: "POST", body: JSON.stringify({ question, value, preview: true }) }),
+  skipQuestion: (question) => request<ConsultState>("/api/consult/skip", { method: "POST", body: JSON.stringify({ question }) }),
+  withdrawAnswer: (question) => request<ConsultState>("/api/consult/withdraw", { method: "POST", body: JSON.stringify({ question }) }),
+  acceptRecommendations: (section) =>
+    request<ConsultState>("/api/consult/accept", { method: "POST", body: JSON.stringify(section ? { section } : {}) }),
+  resolveConflict: (conflict, resolution, reason) =>
+    request<ConsultState>("/api/consult/resolve", { method: "POST", body: JSON.stringify({ conflict, resolution, ...(reason ? { reason } : {}) }) }),
+  getBrief: () => request<BriefView>("/api/consult/brief"),
+  submitBrief: (note) => request<BriefView>("/api/consult/brief/submit", { method: "POST", body: JSON.stringify(note ? { note } : {}) }),
+  decideBrief: (version, decision, comment, hash) =>
+    request<BriefView>("/api/consult/brief/approve", { method: "POST", body: JSON.stringify({ version, decision, ...(comment ? { comment } : {}),
+      ...(hash ? { hash } : {}) }) }),
+  exportBrief: async (version, format = "md") => ({
+    url: `/api/consult/brief/export?format=${format}${version !== undefined ? `&version=${version}` : ""}`,
+    fileName: `migration-brief${version !== undefined ? `-v${version}` : ""}.${format}`,
+  }),
+  getConsultPolicy: () => request<ConsultPolicy>("/api/consult/policy"),
+  recordDeviation: (items, options, reason) =>
+    request<{ differences: PlanDifference[]; recorded: boolean }>("/api/consult/deviation", { method: "POST", body: JSON.stringify({ items, options, reason }) }),
+  proposeAnswers: (text, useAi = true) =>
+    request<ConsultState>("/api/consult/propose", { method: "POST", body: JSON.stringify({ text, useAi }) }),
+  decideProposals: (ids, decision) =>
+    request<ConsultState>("/api/consult/proposals", { method: "POST", body: JSON.stringify({ ids, decision }) }),
+  explainQuestion: (question, useAi = true) =>
+    request<ConsultExplanation>("/api/consult/explain", { method: "POST", body: JSON.stringify({ question, useAi }) }),
+  exportQuestionnaire: async (format) => ({ url: `/api/consult/questionnaire?format=${format}`, fileName: `migration-questionnaire.${format}` }),
+  importQuestionnaire: (answers) =>
+    request<ConsultState>("/api/consult/questionnaire", { method: "POST", body: JSON.stringify({ answers }) }),
   getWorkspaceGit: (sub, rg, ws) =>
     request<WorkspaceGit>(
       `/api/azure/workspace-git?subscriptionId=${encodeURIComponent(sub)}&resourceGroup=${encodeURIComponent(rg)}&workspace=${encodeURIComponent(ws)}`,

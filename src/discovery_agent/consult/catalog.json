@@ -1,0 +1,1575 @@
+{
+  "version": "1.0.0",
+  "sections": [
+    {
+      "id": "scope",
+      "title": "Scope and approach"
+    },
+    {
+      "id": "target",
+      "title": "Target and standards"
+    },
+    {
+      "id": "data",
+      "title": "Data"
+    },
+    {
+      "id": "code",
+      "title": "Code and AI"
+    },
+    {
+      "id": "security",
+      "title": "Security and connections"
+    },
+    {
+      "id": "release",
+      "title": "Release and governance"
+    },
+    {
+      "id": "validation",
+      "title": "Validation and cutover"
+    },
+    {
+      "id": "assistant",
+      "title": "The assistant"
+    },
+    {
+      "id": "context",
+      "title": "Context"
+    }
+  ],
+  "questions": [
+    {
+      "id": "A1",
+      "section": "scope",
+      "type": "multi",
+      "text": "What should this migration move?",
+      "help": "Structure is the Warehouse with its schemas, empty tables, functions, views, procedures and roles. Data is each table's rows, loaded inside Fabric by data pipelines. Orchestration is the notebooks, pipelines, connections, Spark, jobs, scripts, schedules and shortcuts. Leave out what moves later.",
+      "options": [
+        {
+          "value": "structure",
+          "label": "Structure",
+          "description": "The Warehouse, its schemas, empty tables, functions, views, procedures and roles"
+        },
+        {
+          "value": "data",
+          "label": "Data",
+          "description": "Each table's rows, loaded by Fabric data pipelines"
+        },
+        {
+          "value": "orchestration",
+          "label": "Orchestration",
+          "description": "Notebooks, pipelines, connections, Spark, jobs, scripts, schedules and shortcuts"
+        }
+      ],
+      "defaults": [
+        {
+          "value": [
+            "structure",
+            "data",
+            "orchestration"
+          ],
+          "reason": "{fact:objects.total} objects were discovered, and everything can move in this migration."
+        }
+      ],
+      "drives": [
+        "run.parts"
+      ]
+    },
+    {
+      "id": "A2",
+      "section": "scope",
+      "type": "choice",
+      "text": "Which objects are in scope?",
+      "help": "Everything is the usual answer. Narrow it to some schemas and folders, or leave out objects by their names (backups, temporary copies). Plan's Add all follows this; an object can still be added by hand, and Plan says it differs from the brief.",
+      "options": [
+        {
+          "value": "all",
+          "label": "Everything",
+          "description": "Every object discovered"
+        },
+        {
+          "value": "include",
+          "label": "These schemas and folders only",
+          "description": "Only the objects in the schemas and folders you choose"
+        },
+        {
+          "value": "exclude",
+          "label": "Everything except some names",
+          "description": "Leave out objects whose names match patterns"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "all",
+          "reason": "Nothing discovered is marked as out of scope."
+        }
+      ],
+      "drives": [
+        "plan.scopeMode"
+      ]
+    },
+    {
+      "id": "A2I",
+      "section": "scope",
+      "type": "multi",
+      "optionsFrom": "scope.groups",
+      "required": true,
+      "text": "Which schemas and folders are in scope?",
+      "help": "SQL objects are in scope by their schema; pipelines, notebooks, scripts and the rest by the Synapse folder they are in (and folders under it).",
+      "appliesWhen": {
+        "==": [
+          {
+            "answer": "A2"
+          },
+          "include"
+        ]
+      },
+      "drives": [
+        "plan.scopeInclude"
+      ],
+      "evidence": [
+        "scope.groups"
+      ]
+    },
+    {
+      "id": "A2X",
+      "section": "scope",
+      "type": "list",
+      "text": "Which names are left out?",
+      "help": "Patterns matched against each object's name, ignoring case: * for any text, ? for one character.",
+      "appliesWhen": {
+        "==": [
+          {
+            "answer": "A2"
+          },
+          "exclude"
+        ]
+      },
+      "defaults": [
+        {
+          "value": [
+            "*_bak",
+            "*_old",
+            "tmp_*"
+          ],
+          "reason": "Backup and temporary copies are the usual candidates."
+        }
+      ],
+      "drives": [
+        "plan.scopeExclude"
+      ]
+    },
+    {
+      "id": "A3",
+      "section": "scope",
+      "type": "choice",
+      "text": "Scripts and pipelines written for the serverless SQL pool: leave them out, or keep them for a person?",
+      "help": "Fabric has no serverless SQL pool. The Lakehouse's SQL endpoint takes its place, over the shortcuts the External tables stage makes.",
+      "appliesWhen": {
+        ">": [
+          {
+            "fact": "code.serverlessObjects"
+          },
+          0
+        ]
+      },
+      "options": [
+        {
+          "value": "leave_out",
+          "label": "Leave them out",
+          "description": "Plan's Add all leaves them out of the plan"
+        },
+        {
+          "value": "keep",
+          "label": "Keep them for a person",
+          "description": "They stay in the plan, reported for a person to rework"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "leave_out",
+          "reason": "{fact:code.serverlessObjects} objects use the serverless pool, which the Lakehouse's SQL endpoint replaces in Fabric."
+        }
+      ],
+      "drives": [
+        "plan.serverless"
+      ],
+      "evidence": [
+        "code.serverlessObjects"
+      ]
+    },
+    {
+      "id": "A4",
+      "section": "scope",
+      "type": "choice",
+      "text": "How should a run go through the waves?",
+      "help": "A run creates objects wave by wave, in dependency order. It can go straight through, stop at the end of a wave that has failures, or wait for a person to sign each wave off before the next one starts.",
+      "appliesWhen": {
+        ">": [
+          {
+            "fact": "waves.count"
+          },
+          1
+        ]
+      },
+      "options": [
+        {
+          "value": "one_run",
+          "label": "Straight through",
+          "description": "Every object is attempted; failures are reported",
+          "sets": {
+            "run.stopOnFailure": false,
+            "run.waveGate": false
+          }
+        },
+        {
+          "value": "stop_on_failures",
+          "label": "Stop at a wave with failures",
+          "description": "A failed table never lets the views that read it start",
+          "sets": {
+            "run.stopOnFailure": true,
+            "run.waveGate": false
+          }
+        },
+        {
+          "value": "signoff_each_wave",
+          "label": "A person signs off each wave",
+          "description": "The run pauses after each wave; Resume signs it off and starts the next",
+          "sets": {
+            "run.stopOnFailure": true,
+            "run.waveGate": true
+          }
+        }
+      ],
+      "defaults": [
+        {
+          "value": "stop_on_failures",
+          "reason": "{fact:waves.count} waves. Stopping after a wave with failures keeps a failed table from letting the views that read it start."
+        }
+      ],
+      "drives": [
+        "run.stopOnFailure",
+        "run.waveGate"
+      ]
+    },
+    {
+      "id": "A5",
+      "section": "scope",
+      "type": "choice",
+      "text": "Objects already in Fabric: leave them, or update them in place?",
+      "help": "Updating redeploys fixes and accepted LLM drafts: views and procedures by CREATE OR ALTER, notebooks, pipelines, scripts and Spark jobs by a new definition. Tables are never replaced.",
+      "options": [
+        {
+          "value": "skip",
+          "label": "Leave them",
+          "description": "Anything already in Fabric stays as it is"
+        },
+        {
+          "value": "update",
+          "label": "Update them in place",
+          "description": "Overwrites changes someone made in Fabric"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "skip",
+          "reason": "Leaving what is there makes every run safe to repeat."
+        }
+      ],
+      "drives": [
+        "run.existing"
+      ],
+      "separateApprover": {
+        "when": {
+          "==": [
+            {
+              "answer": "A5"
+            },
+            "update"
+          ]
+        },
+        "reason": "It lets runs overwrite objects that are already in Fabric."
+      }
+    },
+    {
+      "id": "B1",
+      "section": "target",
+      "type": "choice",
+      "text": "Which collation should the Warehouse have?",
+      "help": "A Warehouse's collation is set when it is created and cannot change afterwards.",
+      "appliesWhen": {
+        "==": [
+          {
+            "fact": "pool.present"
+          },
+          true
+        ]
+      },
+      "options": [
+        {
+          "value": "match_synapse",
+          "label": "Same as the Synapse pool",
+          "description": "Case-sensitive only if the pool was"
+        },
+        {
+          "value": "case_insensitive",
+          "label": "Case-insensitive",
+          "description": "'ABC' equals 'abc', as in most Synapse pools"
+        },
+        {
+          "value": "case_sensitive",
+          "label": "Case-sensitive",
+          "description": "Fabric's own default"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "match_synapse",
+          "reason": "The Synapse pool's collation is {fact:pool.collation}."
+        }
+      ],
+      "drives": [
+        "warehouse.collation"
+      ],
+      "evidence": [
+        "pool.collation"
+      ]
+    },
+    {
+      "id": "B2",
+      "section": "target",
+      "type": "name",
+      "text": "What should the Warehouse be called?",
+      "help": "Letters, digits and underscores, starting with a letter. A different name later creates another Warehouse.",
+      "appliesWhen": {
+        "==": [
+          {
+            "fact": "pool.present"
+          },
+          true
+        ]
+      },
+      "defaults": [
+        {
+          "value": "{fact:pool.warehouseName}",
+          "reason": "Named after the pool, {fact:pool.name}."
+        }
+      ],
+      "drives": [
+        "names.warehouse"
+      ],
+      "evidence": [
+        "pool.name"
+      ]
+    },
+    {
+      "id": "B2L",
+      "section": "target",
+      "type": "name",
+      "text": "What should the Lakehouse be called?",
+      "help": "The Lakehouse holds the OneLake shortcuts, storage routed through them, and the Spark jobs' default lakehouse.",
+      "appliesWhen": {
+        "==": [
+          {
+            "fact": "pool.present"
+          },
+          true
+        ]
+      },
+      "defaults": [
+        {
+          "value": "{answer:B2}_lakehouse",
+          "reason": "Named after the Warehouse."
+        }
+      ],
+      "drives": [
+        "names.lakehouse"
+      ]
+    },
+    {
+      "id": "B3",
+      "section": "target",
+      "type": "text",
+      "maxLength": 4000,
+      "text": "Naming and coding standards for converted code",
+      "help": "Rules every LLM draft follows, added to the project requirements in each prompt: naming, formatting, comments, patterns to avoid. The rule-based conversion keeps the code as close to the original as Fabric allows.",
+      "defaults": [
+        {
+          "value": "",
+          "reason": "None beyond the project requirements already set."
+        }
+      ],
+      "drives": [
+        "llm.standards"
+      ]
+    },
+    {
+      "id": "C1",
+      "section": "data",
+      "type": "choice",
+      "text": "How much of each table's history should load?",
+      "help": "A date filter loads only the newer rows of each table with a date column, on its first date column. Validate counts Synapse with the same filter.",
+      "appliesWhen": {
+        "and": [
+          {
+            ">": [
+              {
+                "fact": "tables.withDateColumn"
+              },
+              0
+            ]
+          },
+          {
+            "in": [
+              "data",
+              {
+                "answer": "A1"
+              }
+            ]
+          }
+        ]
+      },
+      "options": [
+        {
+          "value": "all",
+          "label": "Every row",
+          "description": "Synapse and Fabric hold the same rows"
+        },
+        {
+          "value": "since",
+          "label": "Rows since a date",
+          "description": "Older rows stay in Synapse"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "all",
+          "reason": "{fact:tables.withDateColumn} tables have a date column. Loading every row keeps both sides identical, which Validate's row counts then show."
+        }
+      ],
+      "drives": [
+        "data.historyMode"
+      ]
+    },
+    {
+      "id": "C1D",
+      "section": "data",
+      "type": "date",
+      "required": true,
+      "text": "Load rows since which date?",
+      "help": "The date is fixed in the brief, never 'two years ago', so every run loads the same rows.",
+      "appliesWhen": {
+        "==": [
+          {
+            "answer": "C1"
+          },
+          "since"
+        ]
+      },
+      "drives": [
+        "data.historyFrom"
+      ]
+    },
+    {
+      "id": "C2",
+      "section": "data",
+      "type": "boolean",
+      "text": "Keep tables in sync after the first load?",
+      "help": "A sync pipeline then loads new and changed rows on a schedule, created switched off, using each table's change column and key.",
+      "appliesWhen": {
+        "and": [
+          {
+            ">": [
+              {
+                "fact": "tables.withChangeColumn"
+              },
+              0
+            ]
+          },
+          {
+            "in": [
+              "data",
+              {
+                "answer": "A1"
+              }
+            ]
+          }
+        ]
+      },
+      "defaults": [
+        {
+          "value": false,
+          "reason": "{fact:tables.withChangeColumn} tables have a column like ModifiedAt that could drive a sync. A one-off migration needs none."
+        }
+      ],
+      "drives": [
+        "data.sync"
+      ]
+    },
+    {
+      "id": "C3",
+      "section": "data",
+      "type": "choice",
+      "text": "How far back should each sync re-read?",
+      "appliesWhen": {
+        "==": [
+          {
+            "answer": "C2"
+          },
+          true
+        ]
+      },
+      "options": [
+        {
+          "value": "1h",
+          "label": "One hour",
+          "description": "Catches rows committed late; re-read rows replace themselves"
+        },
+        {
+          "value": "1d",
+          "label": "One day",
+          "description": "For sources that write older timestamps, or a date-only change column"
+        },
+        {
+          "value": "none",
+          "label": "None",
+          "description": "Reads only from the last sync onwards"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "1h",
+          "reason": "An hour catches rows committed late, and nothing doubles."
+        }
+      ],
+      "drives": [
+        "data.syncOverlap"
+      ]
+    },
+    {
+      "id": "C4",
+      "section": "data",
+      "type": "choice",
+      "text": "Tables that already have rows in Fabric: skip them, or replace their rows?",
+      "appliesWhen": {
+        "and": [
+          {
+            ">": [
+              {
+                "fact": "tables.count"
+              },
+              0
+            ]
+          },
+          {
+            "in": [
+              "data",
+              {
+                "answer": "A1"
+              }
+            ]
+          }
+        ]
+      },
+      "options": [
+        {
+          "value": "if_empty",
+          "label": "Skip them",
+          "description": "Data already there is never touched"
+        },
+        {
+          "value": "replace",
+          "label": "Replace their rows",
+          "description": "Each table is emptied, then loaded again"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "if_empty",
+          "reason": "Skipping never touches data already there, so a re-run is safe."
+        }
+      ],
+      "drives": [
+        "data.mode"
+      ],
+      "separateApprover": {
+        "when": {
+          "==": [
+            {
+              "answer": "C4"
+            },
+            "replace"
+          ]
+        },
+        "reason": "It lets runs empty tables that already have rows in Fabric."
+      }
+    },
+    {
+      "id": "C5",
+      "section": "data",
+      "type": "choice",
+      "text": "Create and run the load pipelines, or only create them?",
+      "appliesWhen": {
+        "and": [
+          {
+            ">": [
+              {
+                "fact": "tables.count"
+              },
+              0
+            ]
+          },
+          {
+            "in": [
+              "data",
+              {
+                "answer": "A1"
+              }
+            ]
+          }
+        ]
+      },
+      "options": [
+        {
+          "value": "run",
+          "label": "Create and run",
+          "description": "The run waits for each load and compares row counts"
+        },
+        {
+          "value": "create",
+          "label": "Only create them",
+          "description": "You run them from Fabric when you choose"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "run",
+          "reason": "Running them lets the run compare row counts table by table."
+        }
+      ],
+      "drives": [
+        "data.run"
+      ]
+    },
+    {
+      "id": "C6",
+      "section": "data",
+      "type": "choice",
+      "text": "How should Fabric sign in to the Synapse pool to load data?",
+      "help": "Plan preselects it; any secret is still typed there, sent once with the run and never kept.",
+      "appliesWhen": {
+        "and": [
+          {
+            "==": [
+              {
+                "fact": "pool.present"
+              },
+              true
+            ]
+          },
+          {
+            "in": [
+              "data",
+              {
+                "answer": "A1"
+              }
+            ]
+          }
+        ]
+      },
+      "options": [
+        {
+          "value": "workspaceIdentity",
+          "label": "Workspace identity",
+          "description": "No secret: a database admin grants the workspace's identity read access in the pool"
+        },
+        {
+          "value": "basicKeyVault",
+          "label": "SQL login, password in Key Vault",
+          "description": "The secret stays in Azure Key Vault"
+        },
+        {
+          "value": "servicePrincipalKeyVault",
+          "label": "Service principal, secret in Key Vault",
+          "description": "The secret stays in Azure Key Vault"
+        },
+        {
+          "value": "basic",
+          "label": "SQL login",
+          "description": "The password is typed in Plan, once"
+        },
+        {
+          "value": "servicePrincipal",
+          "label": "Service principal",
+          "description": "The secret is typed in Plan, once"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "workspaceIdentity",
+          "reason": "No secret passes through the accelerator."
+        }
+      ],
+      "drives": [
+        "data.poolSignIn"
+      ]
+    },
+    {
+      "id": "D1",
+      "section": "code",
+      "type": "boolean",
+      "required": true,
+      "text": "May object definitions be sent to Claude for drafts? Code only: never rows or credentials.",
+      "help": "Drafts are made only for the objects a person asks for, and used only once that person accepts them. No keeps every model call off for this project, including help with these questions.",
+      "defaults": [
+        {
+          "value": false,
+          "reason": "Nothing leaves this machine unless a person says so."
+        }
+      ],
+      "drives": [
+        "llm.consent"
+      ],
+      "separateApprover": {
+        "when": {
+          "==": [
+            {
+              "answer": "D1"
+            },
+            true
+          ]
+        },
+        "reason": "It allows object definitions to be sent to Claude, a service outside this machine."
+      }
+    },
+    {
+      "id": "D2",
+      "section": "code",
+      "type": "number",
+      "min": 0,
+      "max": 10000,
+      "text": "How much may this project spend on AI, in US dollars?",
+      "help": "Every model call is counted against it; one that would go over is refused.",
+      "appliesWhen": {
+        "==": [
+          {
+            "answer": "D1"
+          },
+          true
+        ]
+      },
+      "defaults": [
+        {
+          "value": 25,
+          "reason": "Enough for a few hundred drafts at typical prices."
+        }
+      ],
+      "drives": [
+        "llm.budgetUsd"
+      ]
+    },
+    {
+      "id": "D3",
+      "section": "code",
+      "type": "choice",
+      "text": "Multi-statement table-valued functions: draft them with AI, rewrite them by hand, or leave them out?",
+      "help": "Fabric Warehouse has no multi-statement table-valued functions. Each becomes an inline function or a view.",
+      "appliesWhen": {
+        ">": [
+          {
+            "fact": "code.multiStatementFunctions"
+          },
+          0
+        ]
+      },
+      "options": [
+        {
+          "value": "llm",
+          "label": "AI draft",
+          "description": "Draft each with Claude, for a person to review and accept"
+        },
+        {
+          "value": "manual",
+          "label": "By hand",
+          "description": "Left for a person, with the reason"
+        },
+        {
+          "value": "leave_out",
+          "label": "Leave them out",
+          "description": "Plan's Add all leaves them out"
+        }
+      ],
+      "defaults": [
+        {
+          "when": {
+            "==": [
+              {
+                "answer": "D1"
+              },
+              true
+            ]
+          },
+          "value": "llm",
+          "reason": "{fact:code.multiStatementFunctions} functions, and AI drafts are allowed (D1)."
+        },
+        {
+          "value": "manual",
+          "reason": "{fact:code.multiStatementFunctions} functions, and no AI drafts (D1)."
+        }
+      ],
+      "drives": [
+        "code.multiStatement"
+      ],
+      "evidence": [
+        "code.multiStatementFunctions"
+      ]
+    },
+    {
+      "id": "D4",
+      "section": "code",
+      "type": "choice",
+      "text": "Pipelines with activities Fabric lacks, and .NET notebooks: rebuild them by hand, or leave them out?",
+      "appliesWhen": {
+        ">": [
+          {
+            "fact": "code.needsRewrite"
+          },
+          0
+        ]
+      },
+      "options": [
+        {
+          "value": "by_hand",
+          "label": "Rebuild them by hand",
+          "description": "They stay in the plan, reported for a person"
+        },
+        {
+          "value": "leave_out",
+          "label": "Leave them out",
+          "description": "Plan's Add all leaves them out"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "by_hand",
+          "reason": "{fact:code.unsupportedPipelines} pipelines and {fact:code.dotnetNotebooks} notebooks have no Fabric equivalent as they are."
+        }
+      ],
+      "drives": [
+        "code.rebuild"
+      ],
+      "evidence": [
+        "code.unsupportedPipelines",
+        "code.dotnetNotebooks"
+      ]
+    },
+    {
+      "id": "D4O",
+      "section": "code",
+      "type": "text",
+      "optional": true,
+      "text": "Who rebuilds them, and how?",
+      "appliesWhen": {
+        "==": [
+          {
+            "answer": "D4"
+          },
+          "by_hand"
+        ]
+      },
+      "drives": [
+        "owners.rebuild"
+      ]
+    },
+    {
+      "id": "E1",
+      "section": "security",
+      "type": "boolean",
+      "text": "Migrate roles and permissions?",
+      "help": "Roles, their members and GRANT / DENY permissions are recreated in the Warehouse. Masks travel with their tables either way.",
+      "appliesWhen": {
+        ">": [
+          {
+            "fact": "security.principals"
+          },
+          0
+        ]
+      },
+      "defaults": [
+        {
+          "value": true,
+          "reason": "{fact:security.roles} roles and the permissions of {fact:security.principals} roles and users can be recreated in the Warehouse."
+        }
+      ],
+      "drives": [
+        "security.migrate"
+      ]
+    },
+    {
+      "id": "E2",
+      "section": "security",
+      "type": "principalMap",
+      "required": true,
+      "rowsFrom": "security.sqlUserNames",
+      "text": "Which Microsoft Entra user or group replaces each SQL user?",
+      "help": "Fabric has no SQL authentication. A mapped SQL user's permissions and role memberships go to the Microsoft Entra principal instead. One left blank stays listed for a person, with the statements to run.",
+      "appliesWhen": {
+        "and": [
+          {
+            ">": [
+              {
+                "fact": "security.sqlUsers"
+              },
+              0
+            ]
+          },
+          {
+            "==": [
+              {
+                "answer": "E1"
+              },
+              true
+            ]
+          }
+        ]
+      },
+      "defaults": [
+        {
+          "value": {},
+          "reason": "None mapped: {fact:security.sqlUsers} SQL users stay listed for a person."
+        }
+      ],
+      "drives": [
+        "security.sqlUserMap"
+      ],
+      "evidence": [
+        "security.sqlUserNames"
+      ]
+    },
+    {
+      "id": "E3",
+      "section": "security",
+      "type": "choice",
+      "text": "How should linked services' connections sign in by default?",
+      "help": "Plan preselects it for each linked service. Neither option passes a secret through the accelerator.",
+      "appliesWhen": {
+        ">": [
+          {
+            "fact": "linkedServices.count"
+          },
+          0
+        ]
+      },
+      "options": [
+        {
+          "value": "workspaceIdentity",
+          "label": "Workspace identity",
+          "description": "The Fabric workspace's own identity, granted access to each service"
+        },
+        {
+          "value": "keyVault",
+          "label": "A secret in Azure Key Vault",
+          "description": "Through a Fabric Azure Key Vault reference"
+        }
+      ],
+      "defaults": [
+        {
+          "when": {
+            ">": [
+              {
+                "fact": "linkedServices.keyVault"
+              },
+              0
+            ]
+          },
+          "value": "keyVault",
+          "reason": "{fact:linkedServices.keyVault} linked services already read their secrets from Azure Key Vault."
+        },
+        {
+          "value": "workspaceIdentity",
+          "reason": "No secret passes through the accelerator."
+        }
+      ],
+      "drives": [
+        "connections.defaultSignIn"
+      ]
+    },
+    {
+      "id": "E4",
+      "section": "security",
+      "type": "choice",
+      "text": "Storage the code reads directly: route it through OneLake shortcuts?",
+      "help": "In Synapse the code read storage as the workspace's managed identity; in Fabric it runs as the signed-in user. A shortcut keeps the access working, and the paths are rewritten to go through it.",
+      "appliesWhen": {
+        ">": [
+          {
+            "fact": "storage.locations"
+          },
+          0
+        ]
+      },
+      "options": [
+        {
+          "value": "all",
+          "label": "Route all of it",
+          "description": "Every location found gets a shortcut"
+        },
+        {
+          "value": "none",
+          "label": "Leave the paths as they are",
+          "description": "The code reads storage directly"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "all",
+          "reason": "{fact:storage.locations} storage locations are read by the code."
+        }
+      ],
+      "drives": [
+        "storage.routes"
+      ],
+      "evidence": [
+        "storage.locations"
+      ]
+    },
+    {
+      "id": "G1",
+      "section": "release",
+      "type": "boolean",
+      "text": "Commit each run to the target workspace's Fabric Git branch?",
+      "appliesWhen": {
+        "==": [
+          {
+            "fact": "target.gitConnected"
+          },
+          true
+        ]
+      },
+      "defaults": [
+        {
+          "value": true,
+          "reason": "The target workspace is connected to Git: each run's items are committed, ready for a pull request."
+        }
+      ],
+      "drives": [
+        "release.gitCommit"
+      ]
+    },
+    {
+      "id": "G2",
+      "section": "release",
+      "type": "choice",
+      "text": "What should that commit take?",
+      "appliesWhen": {
+        "==": [
+          {
+            "answer": "G1"
+          },
+          true
+        ]
+      },
+      "options": [
+        {
+          "value": "run",
+          "label": "Only what the run made",
+          "description": "Other changes waiting in the workspace are listed and left"
+        },
+        {
+          "value": "all",
+          "label": "Every change waiting in the workspace",
+          "description": "Including changes someone else made in Fabric"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "run",
+          "reason": "Other changes in the workspace are someone else's work, left for Fabric's Source control panel."
+        }
+      ],
+      "drives": [
+        "release.commitScope"
+      ]
+    },
+    {
+      "id": "G3",
+      "section": "release",
+      "type": "choice",
+      "required": true,
+      "text": "When must a person sign a run off before it writes to Fabric?",
+      "options": [
+        {
+          "value": "never",
+          "label": "Never",
+          "description": "The accelerator approves every run, and records it as its own"
+        },
+        {
+          "value": "overwrite",
+          "label": "When it changes what Fabric already has",
+          "description": "Updates in place, or rows replaced"
+        },
+        {
+          "value": "always",
+          "label": "Always",
+          "description": "Every run waits for a person"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "overwrite",
+          "reason": "A run that changes what Fabric already has waits for a person; any other is approved by the accelerator, and recorded as such."
+        }
+      ],
+      "drives": [
+        "release.signoff"
+      ],
+      "separateApprover": {
+        "when": {
+          "==": [
+            {
+              "answer": "G3"
+            },
+            "never"
+          ]
+        },
+        "reason": "It lets every run write to Fabric without a person signing it off."
+      }
+    },
+    {
+      "id": "G4",
+      "section": "release",
+      "type": "text",
+      "optional": true,
+      "text": "Who sets up schedules (created switched off), integration runtimes, and event and tumbling-window triggers?",
+      "appliesWhen": {
+        ">": [
+          {
+            "fact": "manual.setupCount"
+          },
+          0
+        ]
+      },
+      "drives": [
+        "owners.setup"
+      ]
+    },
+    {
+      "id": "G5",
+      "section": "release",
+      "type": "choice",
+      "text": "What is the path to Test and Prod?",
+      "options": [
+        {
+          "value": "dev",
+          "label": "Dev only, for now",
+          "description": "This migration targets the Dev workspace"
+        },
+        {
+          "value": "dev_test",
+          "label": "Dev, then Test",
+          "description": "Promoted from Git to Test"
+        },
+        {
+          "value": "dev_test_prod",
+          "label": "Dev, Test, then Prod",
+          "description": "Promoted from Git through every environment"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "dev",
+          "reason": "Deploying from Git to Test and Prod is not built yet."
+        }
+      ],
+      "drives": [
+        "release.path"
+      ]
+    },
+    {
+      "id": "H1",
+      "section": "validation",
+      "type": "choice",
+      "text": "How deep should Validate check by default?",
+      "options": [
+        {
+          "value": "compare",
+          "label": "Compare only",
+          "description": "Definitions, columns and row counts"
+        },
+        {
+          "value": "probe",
+          "label": "Also query and compile",
+          "description": "Tables and views are queried, procedures compiled; nothing changes"
+        },
+        {
+          "value": "run",
+          "label": "Also run them",
+          "description": "Pipelines, notebooks and Spark jobs really run in Fabric"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "probe",
+          "reason": "Querying and compiling proves objects work without changing anything."
+        }
+      ],
+      "drives": [
+        "validate.depth"
+      ]
+    },
+    {
+      "id": "H2",
+      "section": "validation",
+      "type": "text",
+      "optional": true,
+      "text": "What is the cutover window, and what does a rollback mean?",
+      "drives": [
+        "release.cutover"
+      ]
+    },
+    {
+      "id": "I1",
+      "section": "assistant",
+      "type": "choice",
+      "text": "What may the assistant do on its own?",
+      "help": "Recorded now; the assistant follows it once it is built.",
+      "options": [
+        {
+          "value": "observe",
+          "label": "Observe",
+          "description": "It explains; it proposes nothing"
+        },
+        {
+          "value": "suggest",
+          "label": "Suggest",
+          "description": "It proposes; a person decides"
+        },
+        {
+          "value": "act_dev",
+          "label": "Act on Dev",
+          "description": "It may act on the Dev workspace on its own"
+        }
+      ],
+      "defaults": [
+        {
+          "value": "suggest",
+          "reason": "It proposes; a person decides."
+        }
+      ],
+      "drives": [
+        "assistant.autonomy"
+      ]
+    },
+    {
+      "id": "X1",
+      "section": "context",
+      "type": "text",
+      "optional": true,
+      "text": "What is the timeline?",
+      "drives": [
+        "context.timeline"
+      ]
+    },
+    {
+      "id": "X2",
+      "section": "context",
+      "type": "text",
+      "optional": true,
+      "text": "Who approves the migration?",
+      "drives": [
+        "context.approver"
+      ]
+    },
+    {
+      "id": "X3",
+      "section": "context",
+      "type": "text",
+      "optional": true,
+      "text": "What reads the data downstream (Power BI reports, applications)?",
+      "drives": [
+        "context.consumers"
+      ]
+    },
+    {
+      "id": "X4",
+      "section": "context",
+      "type": "text",
+      "optional": true,
+      "text": "What hurts today?",
+      "drives": [
+        "context.painPoints"
+      ]
+    }
+  ],
+  "conflicts": [
+    {
+      "id": "K1",
+      "questions": [
+        "A1"
+      ],
+      "when": {
+        "and": [
+          {
+            "in": [
+              "data",
+              {
+                "answer": "A1"
+              }
+            ]
+          },
+          {
+            "not": {
+              "in": [
+                "structure",
+                {
+                  "answer": "A1"
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "message": "Data loads into the Warehouse's tables, which Structure creates. Without it the loads fail, unless the tables are already in Fabric.",
+      "resolutions": [
+        {
+          "kind": "take",
+          "label": "Add Structure",
+          "question": "A1",
+          "add": "structure"
+        },
+        {
+          "kind": "keep",
+          "label": "Keep my answer: the tables are already in Fabric"
+        }
+      ]
+    },
+    {
+      "id": "K2",
+      "questions": [
+        "C4",
+        "G3"
+      ],
+      "when": {
+        "and": [
+          {
+            "==": [
+              {
+                "answer": "C4"
+              },
+              "replace"
+            ]
+          },
+          {
+            "==": [
+              {
+                "answer": "G3"
+              },
+              "never"
+            ]
+          }
+        ]
+      },
+      "message": "Replacing rows empties tables that already have data, and no person would sign such a run off first.",
+      "resolutions": [
+        {
+          "kind": "take",
+          "label": "Sign off runs that change what Fabric has",
+          "question": "G3",
+          "value": "overwrite"
+        },
+        {
+          "kind": "keep",
+          "label": "Keep both answers"
+        }
+      ]
+    },
+    {
+      "id": "K3",
+      "questions": [
+        "D3",
+        "D1"
+      ],
+      "when": {
+        "and": [
+          {
+            "==": [
+              {
+                "answer": "D3"
+              },
+              "llm"
+            ]
+          },
+          {
+            "==": [
+              {
+                "answer": "D1"
+              },
+              false
+            ]
+          }
+        ]
+      },
+      "message": "AI drafts need consent to send definitions to Claude (D1).",
+      "resolutions": [
+        {
+          "kind": "take",
+          "label": "Rewrite them by hand",
+          "question": "D3",
+          "value": "manual"
+        },
+        {
+          "kind": "change",
+          "label": "Allow AI drafts (D1)",
+          "question": "D1"
+        }
+      ]
+    },
+    {
+      "id": "K4",
+      "questions": [
+        "B1"
+      ],
+      "when": {
+        "and": [
+          {
+            "==": [
+              {
+                "answer": "B1"
+              },
+              "case_sensitive"
+            ]
+          },
+          {
+            "==": [
+              {
+                "fact": "pool.caseInsensitive"
+              },
+              true
+            ]
+          }
+        ]
+      },
+      "message": "The pool ({fact:pool.collation}) compares names and text case-insensitively. Code that relies on that, such as a join of 'ABC' with 'abc', behaves differently in a case-sensitive Warehouse.",
+      "evidence": [
+        "pool.collation"
+      ],
+      "resolutions": [
+        {
+          "kind": "take",
+          "label": "Same collation as the pool",
+          "question": "B1",
+          "value": "match_synapse"
+        },
+        {
+          "kind": "keep",
+          "label": "Keep case-sensitive: the code was checked"
+        }
+      ]
+    },
+    {
+      "id": "K5",
+      "questions": [],
+      "when": {
+        "==": [
+          {
+            "fact": "discovery.complete"
+          },
+          false
+        ]
+      },
+      "message": "This brief rests on a discovery that could not read: {fact:discovery.failedCategories}. Run discovery again, or go on knowing it.",
+      "evidence": [
+        "discovery.failedCategories"
+      ],
+      "resolutions": [
+        {
+          "kind": "keep",
+          "label": "Go on with this discovery"
+        }
+      ]
+    },
+    {
+      "id": "K6",
+      "questions": [
+        "A5",
+        "G3"
+      ],
+      "when": {
+        "and": [
+          {
+            "==": [
+              {
+                "answer": "A5"
+              },
+              "update"
+            ]
+          },
+          {
+            "==": [
+              {
+                "answer": "G3"
+              },
+              "never"
+            ]
+          }
+        ]
+      },
+      "message": "Updating objects in place overwrites changes someone made in Fabric, and no person would sign such a run off first.",
+      "resolutions": [
+        {
+          "kind": "take",
+          "label": "Sign off runs that change what Fabric has",
+          "question": "G3",
+          "value": "overwrite"
+        },
+        {
+          "kind": "keep",
+          "label": "Keep both answers"
+        }
+      ]
+    },
+    {
+      "id": "K7",
+      "questions": [
+        "C2"
+      ],
+      "when": {
+        "and": [
+          {
+            "==": [
+              {
+                "answer": "C2"
+              },
+              true
+            ]
+          },
+          {
+            ">": [
+              {
+                "fact": "tables.changeWithoutKeys"
+              },
+              0
+            ]
+          }
+        ]
+      },
+      "message": "{fact:tables.changeWithoutKeys} tables with a change column have no key: a sync can only append their changed rows, so a row changed in Synapse appears twice in Fabric.",
+      "evidence": [
+        "tables.changeWithoutKeys"
+      ],
+      "resolutions": [
+        {
+          "kind": "take",
+          "label": "Do not keep tables in sync",
+          "question": "C2",
+          "value": false
+        },
+        {
+          "kind": "keep",
+          "label": "Keep syncing: duplicates are handled downstream"
+        }
+      ]
+    }
+  ]
+}

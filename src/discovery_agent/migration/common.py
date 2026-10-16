@@ -66,6 +66,11 @@ def lakehouse_name(warehouse: str) -> str:
     return f"{warehouse}_lakehouse"
 
 
+def lakehouse_of(warehouse: str, settings: Dict[str, Any]) -> str:
+    """The Lakehouse a run uses: the one the migration brief names (run setting ``lakehouse``), else its Warehouse's."""
+    return str((settings or {}).get("lakehouse") or "") or lakehouse_name(warehouse)
+
+
 def override_note(source: Source) -> str:
     """The run-log note that says an object was created from reviewed, LLM-assisted code."""
     edited = " and edited" if (source.override or {}).get("edited") else ""

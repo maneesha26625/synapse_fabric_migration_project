@@ -47,9 +47,11 @@ TERMINAL = frozenset(s for s, moves in TRANSITIONS.items() if not moves)
 #: A pass is working on objects (or about to): the run cannot be changed under it.
 WORKING = frozenset({QUEUED, RUNNING})
 
-#: Why a run is paused. Each has its own way on.
-BY_PERSON, HALTED, NEEDS_INPUT, INTERRUPTED = "by_person", "halted_on_failures", "needs_input", "interrupted"
-PAUSE_REASONS = (BY_PERSON, HALTED, NEEDS_INPUT, INTERRUPTED)
+#: Why a run is paused. Each has its own way on. ``awaiting_wave_signoff``: the brief has a person sign off each wave
+#: before the next one starts (Resume, by a person, is that sign-off).
+BY_PERSON, HALTED, NEEDS_INPUT, INTERRUPTED, WAVE_SIGNOFF = (
+    "by_person", "halted_on_failures", "needs_input", "interrupted", "awaiting_wave_signoff")
+PAUSE_REASONS = (BY_PERSON, HALTED, NEEDS_INPUT, INTERRUPTED, WAVE_SIGNOFF)
 
 #: How each run status reads in the page's coarser vocabulary (idle | running | paused | completed).
 _LEGACY = {QUEUED: "running", RUNNING: "running", AWAITING_APPROVAL: "paused", PAUSED: "paused",

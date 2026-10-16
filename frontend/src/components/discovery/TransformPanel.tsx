@@ -137,7 +137,7 @@ export function TransformPanel({ object }: { object: ObjectDetail }) {
   if (!t || !t.source) return <div className="stack"><Skeleton width="50%" height={18} /><Skeleton /><Skeleton width="80%" /></div>;
 
   const source = t.source;
-  const canGenerate = !!settings?.enabled && !!settings?.available;
+  const canGenerate = !!settings?.enabled && !!settings?.available && settings?.consent?.allowed !== false;
   const badge = STATE_BADGE[t.state];
   const draft = t.draft;
   const code = edited ?? draft?.code ?? "";
@@ -151,6 +151,7 @@ export function TransformPanel({ object }: { object: ObjectDetail }) {
         A draft is never deployed as it is: you review it here, and only what you accept is used by the next migration run.
       </Banner>
       {settings && !settings.enabled && <Banner tone="warning" title="Generation is switched off">{settings.disabledReason}</Banner>}
+      {settings?.enabled && settings.consent && !settings.consent.allowed && <Banner tone="warning" title="The migration brief does not allow AI drafts now">{settings.consent.reason}</Banner>}
       {settings && settings.enabled && !settings.available && <Banner tone="warning" title="Claude Code is not available">{settings.message}</Banner>}
 
       <div className="row" style={{ justifyContent: "space-between" }}>

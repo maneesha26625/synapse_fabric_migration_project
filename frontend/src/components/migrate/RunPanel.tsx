@@ -1,6 +1,7 @@
 import { CheckCircle2, CircleAlert, GitPullRequest, Pause, Play, RotateCcw, ScrollText, ShieldCheck, XCircle } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { DeviationDialog } from "../consult/DeviationDialog";
 import { MetricCard } from "../shared/Metrics";
 import { Banner, Button, Card, EmptyState, Modal, StatusBadge, TextField, type Tone } from "../shared/Shared";
 import { useAppState } from "../../state/AppState";
@@ -179,10 +180,50 @@ function SignOffCard() {
   );
 }
 
+/** The brief has a person sign off each wave: the run waits before the next one, and Resume is that sign-off. */
+function WaveSignOffCard() {
+  const { execution: run, controlExecution } = useMigration();
+  const [comment, setComment] = useState("");
+  const [busy, setBusy] = useState(false);
+  if (run.state !== "paused" || run.pausedReason !== "awaiting_wave_signoff") return null;
+  const wave = run.waitingWave ?? "next";
+  const go = async () => {
+    setBusy(true);
+    await controlExecution("resume", comment.trim() || undefined);
+    setBusy(false);
+  };
+  return (
+    <Banner tone="warning" title={`Wave ${wave} waits for a person to sign it off`}
+      actions={<Button variant="primary" onClick={() => void go()} loading={busy}><ShieldCheck size={14} aria-hidden="true" />Sign off wave {wave} and continue</Button>}>
+      <p style={{ margin: "0 0 6px" }}>The migration brief has each wave signed off before the next one starts. Check what the waves before it made in Fabric, then sign wave {wave} off.</p>
+      <TextField label="Comment (kept with the sign-off)" optional value={comment} onChange={(e) => setComment(e.target.value)} maxLength={500} />
+    </Banner>
+  );
+}
+
+/** A start the approved brief refuses: no brief, a stale one, or a plan that differs from it with no reason. */
+function BriefRefusal({ only }: { only: string }) {
+  const navigate = useNavigate();
+  const { executionError, executionErrorCode, startExecution, analysis } = useMigration();
+  const [asking, setAsking] = useState(false);
+  if (!executionErrorCode || !["brief_required", "brief_stale", "deviation_unexplained"].includes(executionErrorCode)) return null;
+  const openConsult = <Button size="small" onClick={() => navigate("/migration?step=consult")}>Open Consult</Button>;
+  if (executionErrorCode !== "deviation_unexplained") {
+    return <Banner tone="warning" title={executionErrorCode === "brief_stale" ? "The brief no longer fits the estate" : "No approved migration brief"} actions={openConsult}>{executionError}</Banner>;
+  }
+  return (
+    <>
+      <Banner tone="warning" title="The run differs from the approved brief" actions={<Button size="small" variant="primary" onClick={() => setAsking(true)}>Give the reason and start</Button>}>{executionError}</Banner>
+      {asking && <DeviationDialog differences={analysis?.brief?.differences ?? []} version={analysis?.brief?.version ?? null} confirmLabel="Start with this reason"
+        onConfirm={async (reason) => { const ok = await startExecution(only || undefined, reason); if (ok) setAsking(false); return ok; }} onCancel={() => setAsking(false)} />}
+    </>
+  );
+}
+
 /** Why the run is not working right now, and what carries it on. */
 function PausedBanner() {
   const { execution: run } = useMigration();
-  if (run.state !== "paused" || run.status === "awaiting_approval") return null;
+  if (run.state !== "paused" || run.status === "awaiting_approval" || run.pausedReason === "awaiting_wave_signoff") return null;
   const needs = run.needsInput ?? [];
   if (run.resumable === false) {
     return <Banner tone="warning" title="This run cannot carry on">{run.unresumableReason} Use Start over (top right) to close it; its record stays in the run history.</Banner>;
@@ -226,7 +267,7 @@ function ExecutionsList() {
 export function RunPanel() {
   const { mode } = useAppState();
   const navigate = useNavigate();
-  const { execution: run, executionError, startExecution, controlExecution, plan, fabric, analysis, analysisError, options, capabilities } = useMigration();
+  const { execution: run, executionError, executionErrorCode, startExecution, controlExecution, plan, fabric, analysis, analysisError, options, capabilities } = useMigration();
   const [logs, setLogs] = useState(false);
   const [view, setView] = useState<View>("all");
   const accepted = useAcceptedTransforms();
@@ -272,8 +313,10 @@ export function RunPanel() {
         actions={started ? <StatusBadge tone={badge.tone} running={running}>{badge.label}</StatusBadge> : undefined}>
         {mode === "mock" && <Banner tone="info" title="Demo run">Results are simulated the way a real run reports them. A run takes about a minute, and a few objects fail on purpose so you can try Retry failed.</Banner>}
         {mode === "real" && <Banner tone="info" title="What a run does">Each stage you switched on is carried out in dependency order: Warehouse and schema, table data, Spark, notebooks, connections, pipelines, jobs, scripts, schedules and shortcuts. Nothing already in Fabric is overwritten, so a run can be repeated safely.{fabric.method === "fabric_cli" && " With the Fabric CLI the first SQL object opens one Microsoft sign-in window on the machine running the server."}</Banner>}
-        {executionError && <Banner tone="error" title="Execution">{executionError}</Banner>}
+        {executionError && !["brief_required", "brief_stale", "deviation_unexplained"].includes(executionErrorCode ?? "") && <Banner tone="error" title="Execution">{executionError}</Banner>}
+        <BriefRefusal only={only} />
         <SignOffCard />
+        <WaveSignOffCard />
         <PausedBanner />
         {run.status === "failed" && <Banner tone="error" title="The run stopped">The workspace refused it, or the accelerator hit a problem of its own: the log says which. Fix the cause, then Retry failed carries it on.</Banner>}
         {run.haltedReason && run.state === "paused" && <Banner tone="warning" title="Run stopped at a wave boundary">{run.haltedReason}</Banner>}
@@ -302,14 +345,15 @@ export function RunPanel() {
             <Play size={14} aria-hidden="true" />{onlyLabel ? `Run ${onlyLabel} only` : run.state === "completed" ? "Start new run" : "Start migration"}
           </Button>
           {run.state === "paused" && !waiting ? (
-            <Button onClick={() => void controlExecution("resume")} disabled={run.resumable === false}><Play size={14} aria-hidden="true" />Resume</Button>
+            <Button onClick={() => void controlExecution("resume")} disabled={run.resumable === false}><Play size={14} aria-hidden="true" />
+              {run.pausedReason === "awaiting_wave_signoff" ? `Sign off wave ${run.waitingWave ?? ""}` : "Resume"}</Button>
           ) : (
             <Button onClick={() => void controlExecution("pause")} disabled={!running}><Pause size={14} aria-hidden="true" />Pause</Button>
           )}
           <Button onClick={() => void controlExecution("retry")} disabled={!(needsAttention || run.status === "failed") || running || waiting || run.resumable === false}><RotateCcw size={14} aria-hidden="true" />Retry failed</Button>
           <Button onClick={() => setLogs(true)} disabled={!started}><ScrollText size={14} aria-hidden="true" />View logs</Button>
           <span className="spacer" />
-          <span className="muted">{options.stages.length} stage{options.stages.length === 1 ? "" : "s"} on · {options.scope === "automated" ? "automated objects only" : "everything in the plan"}{options.stopOnFailure ? " · stop on failure" : ""}{options.gitCommit === "off" ? " · no Git commit" : ""} · change in Plan</span>
+          <span className="muted">{options.stages.length} stage{options.stages.length === 1 ? "" : "s"} on · {options.scope === "automated" ? "automated objects only" : "everything in the plan"}{options.stopOnFailure ? " · stop on failure" : ""}{options.waveGate ? " · each wave signed off" : ""}{options.gitCommit === "off" ? " · no Git commit" : ""}{run.brief?.version ? ` · under brief v${run.brief.version}` : ""} · change in Plan</span>
         </div>
       </Card>
 

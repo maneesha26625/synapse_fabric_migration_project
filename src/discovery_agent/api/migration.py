@@ -44,7 +44,7 @@ from discovery_agent.migration import capabilities, datafilter, datapipeline, fa
 from discovery_agent.migration.onelake import OneLakeFiles
 from discovery_agent.migration.runtime_checks import RuntimeOptions
 from discovery_agent.migration.validation import Validator, summarize
-from discovery_agent.migration.common import lakehouse_name
+from discovery_agent.migration.common import lakehouse_of
 from discovery_agent.migration.runner import (
     COMPLETED,
     CONNECTION,
@@ -91,6 +91,8 @@ DATA_MODES = ("if_empty", "replace")
 DATA_RUNS = ("run", "create")
 #: After a run completes: commit what it created to the workspace's Fabric Git branch, or leave it.
 GIT_COMMITS = ("auto", "off")
+#: What that commit takes: only the items the run created or updated, or everything waiting in the workspace.
+COMMIT_SCOPES = ("run", "all")
 MAX_CREDENTIALS = 100
 MAX_CREDENTIAL_FIELD = 2048
 MAX_HISTORY = 20
@@ -142,10 +144,13 @@ def parse_options(body: dict) -> dict:
     git_commit = str(options.get("gitCommit") or "auto")
     if git_commit not in GIT_COMMITS:
         raise ApiError(400, "invalid_options", "Choose to commit to Fabric Git after the run (auto) or not (off).")
-    return {"scope": scope, "stopOnFailure": bool(options.get("stopOnFailure")), "stages": list(dict.fromkeys(stages)),
-            "dataMode": mode, "dataRun": data_run, "collation": collation, "syncOverlap": overlap, "existing": existing,
-            "storageRoutes": routes, "gitCommit": git_commit,
-            "dataFilters": parse_data_filters(options.get("dataFilters"))}
+    commit_scope = str(options.get("commitScope") or "run")
+    if commit_scope not in COMMIT_SCOPES:
+        raise ApiError(400, "invalid_options", "Choose what the Fabric Git commit takes: the run's items (run) or everything (all).")
+    return {"scope": scope, "stopOnFailure": bool(options.get("stopOnFailure")), "waveGate": bool(options.get("waveGate")),
+            "stages": list(dict.fromkeys(stages)), "dataMode": mode, "dataRun": data_run, "collation": collation,
+            "syncOverlap": overlap, "existing": existing, "storageRoutes": routes, "gitCommit": git_commit,
+            "commitScope": commit_scope, "dataFilters": parse_data_filters(options.get("dataFilters"))}
 
 
 _ACCOUNT_NAME = re.compile(r"^[a-z0-9]{3,24}$")
@@ -284,7 +289,7 @@ def git_items(run: MigrationRun) -> Set[Tuple[str, str]]:
             items.add(("Warehouse", run.warehouse))
         lakehouse = lakehouse or source.kind in (SHORTCUT, SPARKJOB)
     if lakehouse or (items and run.settings.get("storageRoutes")):
-        items.add(("Lakehouse", lakehouse_name(run.warehouse)))
+        items.add(("Lakehouse", lakehouse_of(run.warehouse, run.settings)))
     return items
 
 
@@ -395,7 +400,10 @@ def _function_source(oid: str, name: str, object_type: str, wave: int, catalog: 
     return Source(oid, name, object_type, wave, FUNCTION, payload=found, schema=schema, object_name=short)
 
 
-def _security_source(oid: str, name: str, object_type: str, wave: int, catalog: Any) -> Source:
+def _security_source(oid: str, name: str, object_type: str, wave: int, catalog: Any, mapped: Any = None,
+                     replacements: Optional[Dict[str, str]] = None) -> Source:
+    """A role or user. ``mapped``: the catalog with the SQL users the migration brief replaces (``replacements``,
+    by lowercase name) already replaced by their Microsoft Entra principals (``security.replace_sql_users``)."""
     from discovery_agent.migration import security as security_sql
 
     sec = getattr(catalog, "security", None) if catalog is not None else None
@@ -403,22 +411,31 @@ def _security_source(oid: str, name: str, object_type: str, wave: int, catalog: 
     if principal is None:
         return Source(oid, name, object_type, wave, DEFERRED, reason="The role or user was not kept by discovery. Run discovery again.")
     if principal.is_sql_user:
+        replacement = (replacements or {}).get(name.lower())
+        if replacement and mapped is not None:
+            # Planned, run and validated as the Entra principal that replaces it, with its roles and permissions.
+            return Source(oid, name, object_type, wave, SECURITY, payload=mapped, object_name=replacement)
         plan = security_sql.plan_principal(sec, name)
         todo = security_sql.manual_statements(plan)
         roles = [r for r in sec.roles_of(name) if not (sec.principal(r) and sec.principal(r).is_resource_class)]
         steps = (["add it to role(s) " + ", ".join(roles)] if roles else []) + (["run: " + " ".join(todo[:5])] if todo else [])
         return Source(oid, name, object_type, wave, DEFERRED, reason=(
-            "SQL user: Fabric has no SQL authentication. Choose the Microsoft Entra user or group that replaces it"
-            + ("; then " + "; ".join(steps) if steps else "") + "."))
-    return Source(oid, name, object_type, wave, SECURITY, payload=sec)
+            "SQL user: Fabric has no SQL authentication. Choose the Microsoft Entra user or group that replaces it (in Consult, "
+            "or by hand)" + ("; then " + "; ".join(steps) if steps else "") + "."))
+    return Source(oid, name, object_type, wave, SECURITY, payload=mapped if mapped is not None else sec)
 
 
-def sources_for(plan: List[dict], job: Any, pool: Optional[str]) -> List[Source]:
-    """Turn plan entries into what the runner needs, from the finished discovery."""
+def sources_for(plan: List[dict], job: Any, pool: Optional[str], principals: Optional[Dict[str, str]] = None) -> List[Source]:
+    """Turn plan entries into what the runner needs, from the finished discovery. ``principals``: the Microsoft Entra
+    user or group that replaces each SQL user, by its name (the migration brief's ``security.sqlUserMap``)."""
+    from discovery_agent.migration import security as security_sql
+
     rows = {item["id"]: item for item in job.items}
     artifacts = _artifacts(job)
     catalog = _catalog(job)
     catalog_security = getattr(catalog, "security", None) if catalog is not None else None
+    replacements = {str(k).lower(): str(v) for k, v in (principals or {}).items() if v}
+    mapped = security_sql.replace_sql_users(catalog_security, replacements) if catalog_security is not None and replacements else None
     by_kind = {
         NOTEBOOK: artifacts.get(P0Artifact.NOTEBOOK, {}), PIPELINE: artifacts.get(P0Artifact.PIPELINE, {}),
         CONNECTION: artifacts.get(P0Artifact.LINKED_SERVICE, {}), DATASET: artifacts.get(P0Artifact.DATASET, {}),
@@ -461,7 +478,7 @@ def sources_for(plan: List[dict], job: Any, pool: Optional[str]) -> List[Source]
             sources.append(_function_source(oid, name, object_type, wave, catalog, extra))
             continue
         if kind == SECURITY:
-            sources.append(_security_source(oid, name, object_type, wave, catalog))
+            sources.append(_security_source(oid, name, object_type, wave, catalog, mapped, replacements))
             continue
         if kind == SCHEDULE:
             raw = dict(getattr(extra, "raw", None) or {}) if extra is not None else {}
@@ -579,8 +596,12 @@ class MigrationService:
         driver: Optional[Callable[[], str]] = None,
         records: Optional[Store] = None,
         audit: Optional[Callable[..., Any]] = None,
+        consult: Any = None,
     ) -> None:
         self._session = session
+        #: The consultation (``api.consult.ConsultService``): the approved brief a run starts under, and what Plan,
+        #: Migrate and Validate take from it. None: no brief is read, and runs start as they did before briefs.
+        self._consult = consult
         self._source_factory = source_factory
         #: The ODBC driver the Warehouse sessions would use (``sql_driver``); the tests give one, so they need none installed.
         self._driver = driver or sql_driver
@@ -672,7 +693,8 @@ class MigrationService:
         if same:
             options = {"stages": document.get("stages") or list(capabilities.STAGE_KEYS), "scope": document.get("scope") or "all",
                        "dataFilters": parse_data_filters(pins.get("dataFilters"))}
-            sources = apply_stages(sources_for(pins.get("plan") or [], job, pool), options)
+            principals = (document.get("settings") or {}).get("sqlUserMap") or {}
+            sources = apply_stages(sources_for(pins.get("plan") or [], job, pool, principals), options)
             if self._transforms is not None:
                 self._transforms.apply(sources)
         run = MigrationRun.restore(document, items, sources, self._runs)
@@ -759,6 +781,21 @@ class MigrationService:
         if generation != self._generation:
             raise ApiError(409, "project_switched", "The project was switched while this was being prepared. Try again.")
 
+    def _brief(self) -> Any:
+        """The approved migration brief's policy (``consult.policy.Policy``), or None. Never raises."""
+        if self._consult is None:
+            return None
+        try:
+            return self._consult.in_force()
+        except Exception as exc:  # noqa: BLE001 - a brief that cannot be read is said by Consult; here it is no brief
+            _log.warning("Could not read the migration brief: %s: %s", type(exc).__name__, exc)
+            return None
+
+    def _principals(self, policy: Any = None) -> Dict[str, str]:
+        """The Microsoft Entra principal that replaces each SQL user, as the approved brief says."""
+        policy = policy if policy is not None else self._brief()
+        return policy.sql_user_map() if policy is not None else {}
+
     # -- capacity and blocking risks ----------------------------------------------------------------
 
     def _check_capacity(self, workspace_id: str) -> None:
@@ -792,10 +829,11 @@ class MigrationService:
         run = self._run
         return run.to_dict() if run is not None else dict(IDLE)
 
-    @staticmethod
-    def policy() -> dict:
+    def policy(self) -> dict:
         """How runs and their objects move, and the sign-off rule in force: what the page reads instead of a copy."""
-        return {**run_state.describe(), "signoff": approvals.policy(), "signoffPolicies": list(approvals.POLICIES),
+        brief = self._brief()
+        return {**run_state.describe(), "signoff": approvals.rule_for(brief.signoff() if brief else None),
+                "signoffPolicies": list(approvals.POLICIES), "signoffConfigured": approvals.configured(),
                 "failureCategories": {c: failures.MEANING[c] for c in failures.CATEGORIES}}
 
     def _assessment(self, plan: List[dict], options: dict, credential_names: Set[str], job: Any,
@@ -803,7 +841,7 @@ class MigrationService:
         """The planner's analysis of a plan run with these options, and the sources it read. Reads, never writes.
 
         ``analyze`` shows it on the Plan step; ``start`` refuses a run it finds a blocking risk in."""
-        every = sources_for(plan, job, pool)
+        every = sources_for(plan, job, pool, self._principals())
         stages = set(options["stages"])
         sources = apply_stages(every, {**options, "scope": "automated"})
         if self._transforms is not None:
@@ -834,6 +872,8 @@ class MigrationService:
         result, sources = self._assessment(plan, options, names, job, pool)
         result["storage"] = self._storage_suggestions(sources, job)
         result["options"] = {**options, "dataFilters": {k: f.to_dict() for k, f in options["dataFilters"].items()}}
+        entries = [{"id": str(p.get("id") or ""), "wave": _int(p.get("wave"), 1, "wave")} for p in plan]
+        result["brief"] = self._consult.check_plan(entries, options, job, pool) if self._consult is not None else None
         if body.get("record"):
             self._record_plan(plan, result, job, generation)
         with self._lock:
@@ -942,33 +982,45 @@ class MigrationService:
         workspace_id, workspace_name, method = self._fabric.migration_target()
         if self._busy():
             raise ApiError(409, "run_in_progress", "A migration run is already in progress. Pause it or wait for it to finish.")
+        # The brief the run starts under: refused here, under a required consultation, without an approved one that fits
+        # the estate, or with differences from it that nobody explained.
+        gate, brief = (self._consult.run_gate(entries, options, job, pool, body.get("deviationReason"))
+                       if self._consult is not None else ({"mode": None, "version": None, "differences": []}, None))
         self._check_capacity(workspace_id)
         analysis = self._refuse_blocking(plan, options, credentials, job, pool)
         with self._lock:
             self._same_project(generation)
             if self._busy():
                 raise ApiError(409, "run_in_progress", "A migration run is already in progress. Pause it or wait for it to finish.")
-            sources = apply_stages(sources_for(plan, job, pool), options)
+            principals = self._principals(brief)
+            sources = apply_stages(sources_for(plan, job, pool, principals), options)
             if not [s for s in sources if s.kind not in (DEFERRED, MISSING)]:
                 raise ApiError(400, "nothing_to_migrate", "No object in the plan can be created by this build. Choose scope All to see them listed as deferred.")
             transform_log = self._transforms.apply(sources) if self._transforms is not None else []
-            run = MigrationRun(f"{self._counter + 1:03d}", sources, workspace_id, workspace_name, warehouse_name_for(pool),
+            named_warehouse, named_lakehouse = brief.names() if brief is not None else (None, None)
+            warehouse = named_warehouse or warehouse_name_for(pool)
+            run = MigrationRun(f"{self._counter + 1:03d}", sources, workspace_id, workspace_name, warehouse,
                                recorder=self._runs, needs=run_needs(sources, job))
             via = "Azure CLI" if method == "azure_cli" else "Fabric CLI"
             run.scope, run.stop_on_failure = scope, stop_on_failure
             run.stages, run.pool_name = list(options["stages"]), pool or ""
             run.settings = {"dataMode": options["dataMode"], "dataRun": options["dataRun"], "collation": options["collation"],
                             "existing": options["existing"], "storageRoutes": options["storageRoutes"],
-                            "syncOverlap": options["syncOverlap"], "gitCommit": options["gitCommit"]}
+                            "syncOverlap": options["syncOverlap"], "gitCommit": options["gitCommit"],
+                            "commitScope": options["commitScope"], "waveGate": options["waveGate"],
+                            "lakehouse": lakehouse_of(warehouse, {"lakehouse": named_lakehouse}), "sqlUserMap": principals}
             self._describe_source(run, job, pool)
             snapshot = getattr(job, "snapshot", None) or {}
             # What the run was made from, so its record can say, and a later reader can check, exactly that.
             run.pins = {"plan": entries, "plannerFingerprint": analysis.get("fingerprint"), "readiness": analysis.get("readiness"),
                         "snapshot": {"id": snapshot.get("id"), "fingerprint": snapshot.get("fingerprint")} if snapshot else None,
                         "credentialNames": sorted(credentials), "signedInWith": via,
-                        "dataFilters": {k: f.to_dict() for k, f in options["dataFilters"].items()}}
-            reason = approvals.required(run.settings, run.stages)
-            run.approval = approvals.request(reason, approvals.subject_hash(entries, run.settings, run.stages))
+                        "dataFilters": {k: f.to_dict() for k, f in options["dataFilters"].items()},
+                        # The migration brief it starts under, by version and hash, and how the run differs from it.
+                        "brief": gate}
+            rule = approvals.rule_for(brief.signoff() if brief is not None else None)
+            reason = approvals.required(run.settings, run.stages, rule=rule)
+            run.approval = approvals.request(reason, approvals.subject_hash(entries, run.settings, run.stages), rule=rule)
             # Nothing is left to refuse: the new run replaces the current one, which is closed and kept in the history.
             if self._run is not None:
                 self._close_run(self._run, "replaced by a new run")
@@ -979,6 +1031,11 @@ class MigrationService:
             run.save()
             self._save_pointer(run.run_id)
             run.log("RUN", "run", f"{len(sources)} objects, workspace {workspace_name}, warehouse {run.warehouse}, signed in with {via}")
+            if gate.get("version") is not None:
+                differs = gate.get("differences") or []
+                run.log("BRIEF", "run", f"Under migration brief version {gate['version']}" + (
+                    f"; it differs in {len(differs)} way(s), explained: {(gate.get('deviation') or {}).get('reason') or 'not required'}"
+                    if differs else ", with nothing changed from it"))
             reviewed = sum(1 for s in sources if s.override)
             if reviewed:
                 run.log("NOTE", "run", f"{reviewed} object{'s' if reviewed != 1 else ''} use{'s' if reviewed == 1 else ''} an accepted LLM-assisted transform")
@@ -988,7 +1045,8 @@ class MigrationService:
                 "objects": len(sources), "stages": list(run.stages), "existing": options["existing"],
                 "dataMode": options["dataMode"], "dataRun": options["dataRun"], "credentialNames": sorted(credentials),
                 "workspace": workspace_name, "warehouse": run.warehouse, "plannerFingerprint": analysis.get("fingerprint"),
-                "snapshot": (run.pins.get("snapshot") or {}).get("id")})
+                "snapshot": (run.pins.get("snapshot") or {}).get("id"), "brief": gate.get("version"),
+                "briefHash": gate.get("hash"), "differences": len(gate.get("differences") or []), "signoffRule": rule})
             if reason:
                 run.transition(run_state.AWAITING_APPROVAL, reason)
                 run.log("SIGN-OFF", "run", f"Waiting for a person to sign it off. {reason}")
@@ -1070,11 +1128,19 @@ class MigrationService:
             elif action == "resume":
                 if run.status == run_state.PAUSED and not self._busy():
                     self._ready_to_carry_on(run, body)
+                    # A run waiting for a wave's sign-off: this Resume, by a person, is that sign-off, for that wave only.
+                    wave = run.waiting_wave()
                     run.pause.clear()
                     with run.lock:
-                        run.halt_waived, run.halted_reason, run.needs_input = True, None, []
-                    run.transition(run_state.QUEUED, "resume requested")
-                    run.log("RESUME", "run", "resumed")
+                        if wave is not None:
+                            run.released_waves.append(wave)
+                        else:
+                            run.halt_waived = True
+                        run.halted_reason, run.needs_input = None, []
+                    run.transition(run_state.QUEUED, "wave signed off" if wave is not None else "resume requested")
+                    if wave is not None:
+                        self._sign_off_wave(run, wave, str(body.get("comment") or ""))
+                    run.log("RESUME", "run", "resumed" if wave is None else f"resumed: wave {wave} signed off")
                     self._audit("run.resumed", target={"type": "run", "id": run.run_id}, run_id=run.run_id)
                     self._spawn(run, "resume")
             elif action == "retry":
@@ -1099,6 +1165,19 @@ class MigrationService:
             else:
                 raise ApiError(400, "invalid_action", "Choose pause, resume, retry or reset.")
             return run.to_dict()
+
+    def _sign_off_wave(self, run: MigrationRun, wave: int, comment: str) -> None:
+        """Record that a person let the next wave of a run start: in the approvals, and the trail."""
+        said = " ".join(comment.split())[:500] or None
+        who = context.actor().to_dict()
+        if self._records is not None:
+            try:
+                self._records.append("approvals", {"subject": {"type": "wave", "id": f"{run.run_id}/{wave}"}, "decision": "approved",
+                                                   "by": who, "at": _now(), "comment": said})
+            except OSError as exc:
+                _log.warning("Could not record the wave's sign-off: %s", exc)
+        self._audit("run.wave_signed_off", target={"type": "run", "id": run.run_id}, run_id=run.run_id, reason=said,
+                    details={"wave": wave, "comment": said})
 
     def _settle(self, run: MigrationRun) -> None:
         """A run whose pass has no thread left is never shown as working: what it was doing goes back in the queue."""
@@ -1270,10 +1349,14 @@ class MigrationService:
         plan = plan or [{"id": i["id"], "wave": 1} for i in job.items]
         given = body.get("options") if isinstance(body.get("options"), dict) else {}
         filters = parse_data_filters(given.get("dataFilters"))
-        sources = apply_stages(sources_for(plan, job, pool),
+        # Compared with what the run made: its Warehouse and its principals, else what the approved brief names.
+        run, brief = self._run, self._brief()
+        made = run if run is not None and run.workspace_id == workspace_id else None
+        principals = (made.settings.get("sqlUserMap") if made is not None else None) or self._principals(brief)
+        sources = apply_stages(sources_for(plan, job, pool, principals),
                                {"stages": list(capabilities.STAGE_KEYS), "scope": "all", "dataFilters": filters})
         factory = self._source_factory or getattr(self._session, "source_sql_factory", lambda: None)()
-        warehouse = warehouse_name_for(pool)
+        warehouse = made.warehouse if made is not None else ((brief.names()[0] if brief is not None else None) or warehouse_name_for(pool))
         validator = Validator(
             self._rest_factory(), workspace_id, workspace_name, warehouse, self._sql_factory, factory,
             artifacts={"pipelines": _artifacts(job).get(P0Artifact.PIPELINE, {})},
@@ -1401,7 +1484,9 @@ class MigrationService:
             if not conn.connected:
                 out = {"state": "skipped", "message": fabric_git.KNOWN_NOT_CONNECTED, "at": started}
             else:
-                result = fabric_git.commit(client, workspace_id, comment, only=git_items(run))
+                # The brief decides what the commit takes (G2): only what the run made (the default), or all that waits.
+                whole = run.settings.get("commitScope") == "all"
+                result = fabric_git.commit(client, workspace_id, comment, only=None if whole else git_items(run))
                 out = {"state": result.state, "items": result.items, "skipped": result.skipped, "others": result.others,
                        "commit": result.commit, "branch": conn.branch, "commitUrl": fabric_git.commit_url(conn, result.commit),
                        "pullRequestUrl": fabric_git.pull_request_url(conn), "at": started}

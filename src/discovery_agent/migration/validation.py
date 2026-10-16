@@ -427,7 +427,7 @@ class Validator:
     def _check_security(self, s: Source) -> List[Dict[str, str]]:
         if (gate := self._sql_gate(s)):
             return gate
-        plan = security_sql.plan_principal(s.payload, s.name)
+        plan = security_sql.plan_principal(s.payload, s.object_name or s.name)
         state = self._security_state()
         wanted_p = security_sql.expected_keys(plan, s.payload)
         label_s = f"{len(plan.members)} members, {len(wanted_p)} permissions" if plan.principal.is_role else f"{len(wanted_p)} permissions"

@@ -47,8 +47,9 @@ const JOURNEY_KEY = "ma.journey";
 /** Everything kept per project in this browser, by mode. Credentials are never among them. */
 const PROJECT_KEYS = [PLAN_KEY, OPTIONS_KEY, JOURNEY_KEY];
 
-/** The migration journey, in order. Each step unlocks once the one before it is confirmed. */
-export const STEP_KEYS = ["discover", "assess", "waves", "plan", "migrate", "validate"] as const;
+/** The migration journey, in order. Each step unlocks once the one before it is confirmed. Consult sits after Assess:
+ *  the brief its answers make is what Plan starts from and what a run is checked against. */
+export const STEP_KEYS = ["discover", "assess", "consult", "waves", "plan", "migrate", "validate"] as const;
 export type StepKey = (typeof STEP_KEYS)[number];
 
 function load<T>(key: string, fallback: T): T {
@@ -135,9 +136,13 @@ interface MigrationStateValue {
   /** False until the run's state has been read once, so an empty run is never mistaken for a lost one. */
   executionReady: boolean;
   executionError: string | null;
-  /** Starts a run. `only` runs a single stage, leaving the others off for that run. */
-  startExecution: (only?: string) => Promise<boolean>;
-  controlExecution: (action: "pause" | "resume" | "retry") => Promise<void>;
+  /** The backend's code for that error (``brief_required``, ``deviation_unexplained``...), so the page can offer the way on. */
+  executionErrorCode: string | null;
+  /** Starts a run. `only` runs a single stage, leaving the others off for that run. `deviationReason`: why it differs
+   *  from the approved brief, when it does and no reason was given in Plan. */
+  startExecution: (only?: string, deviationReason?: string) => Promise<boolean>;
+  /** `comment`: what a person says signing off the next wave (Resume on a run waiting for a wave's sign-off). */
+  controlExecution: (action: "pause" | "resume" | "retry", comment?: string) => Promise<void>;
   /** A person signs the waiting run off, and it starts; or declines it. */
   approveExecution: (decision: "approve" | "reject", comment?: string) => Promise<boolean>;
 
@@ -499,7 +504,12 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   // ---- execution (polls only while running)
   const [execution, setExecution] = useState<ExecutionRun>(EMPTY_RUN);
   const [executionReady, setExecutionReady] = useState(false);
-  const [executionError, setExecutionError] = useState<string | null>(null);
+  const [executionError, setExecutionErrorText] = useState<string | null>(null);
+  const [executionErrorCode, setExecutionErrorCode] = useState<string | null>(null);
+  const setExecutionError = useCallback((e: unknown) => {
+    setExecutionErrorText(e === null ? null : messageOf(e));
+    setExecutionErrorCode(e instanceof ApiRequestError ? e.code : null);
+  }, []);
   useEffect(() => {
     let live = true;
     setExecutionReady(false);
@@ -532,42 +542,42 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     wasCommitting.current = gitCommitting;
   }, [api, gitCommitting]);
 
-  const startExecution = useCallback(async (only?: string) => {
+  const startExecution = useCallback(async (only?: string, deviationReason?: string) => {
     setExecutionError(null);
     try {
       const ordered = [...plan].sort((a, b) => a.wave - b.wave);
       const run = only ? { ...options, stages: [only] } : options;
-      setExecution(await api.startExecution(ordered, run, credentials));
+      setExecution(await api.startExecution(ordered, run, credentials, deviationReason));
       return true;
     } catch (e) {
-      setExecutionError(messageOf(e));
+      setExecutionError(e);
       return false;
     }
-  }, [api, plan, options, credentials]);
+  }, [api, plan, options, credentials, setExecutionError]);
   // The credentials a run asks for again (a restart lost them: they are never kept), from what was typed on this page.
   const neededCredentials = useCallback((): ConnectionCredentials => Object.fromEntries(
     (execution.needsInput ?? []).filter((name) => credentials[name]).map((name) => [name, credentials[name]])), [execution.needsInput, credentials]);
-  const controlExecution = useCallback(async (action: "pause" | "resume" | "retry") => {
+  const controlExecution = useCallback(async (action: "pause" | "resume" | "retry", comment?: string) => {
     setExecutionError(null);
     try {
-      setExecution(await api.controlExecution(action, { version: execution.version, credentials: neededCredentials() }));
+      setExecution(await api.controlExecution(action, { version: execution.version, credentials: neededCredentials(), ...(comment ? { comment } : {}) }));
     } catch (e) {
-      setExecutionError(messageOf(e));
+      setExecutionError(e);
       // Refused because the run moved on since it was read, or for input it needs: show it as it is now.
       api.getExecution().then(setExecution, () => undefined);
     }
-  }, [api, execution.version, neededCredentials]);
+  }, [api, execution.version, neededCredentials, setExecutionError]);
   const approveExecution = useCallback(async (decision: "approve" | "reject", comment?: string) => {
     setExecutionError(null);
     try {
       setExecution(await api.approveExecution(decision, comment, { subjectHash: execution.approval?.subjectHash, credentials: neededCredentials() }));
       return true;
     } catch (e) {
-      setExecutionError(messageOf(e));
+      setExecutionError(e);
       api.getExecution().then(setExecution, () => undefined);
       return false;
     }
-  }, [api, execution.approval?.subjectHash, neededCredentials]);
+  }, [api, execution.approval?.subjectHash, neededCredentials, setExecutionError]);
 
   // ---- validation
   const [validation, setValidation] = useState<ValidationRow[] | null>(null);
@@ -656,7 +666,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     setValidationError(null);
     resetJourney(step);
     setResetNonce((n) => n + 1);
-  }, [api, execution.state, discovery.state, resetDiscovery, refreshDiscovery, capabilities, resetJourney]);
+  }, [api, execution.state, discovery.state, resetDiscovery, refreshDiscovery, capabilities, resetJourney, setExecutionError]);
 
   const value: MigrationStateValue = {
     projects, project, backendProjects, projectEpoch, addProject, selectProject, renameProject, deleteProject,
@@ -665,7 +675,7 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     fabric, fabricReady, fabricBusy, fabricError, authenticateFabric, testFabric, disconnectFabric,
     fabricGit, fabricGitError, refreshFabricGit, commitFabricGit,
     analysis, analysisBusy, analysisError, analyze, options, setOptions, capabilities, credentials, setCredential, clearCredentials,
-    execution, executionReady, executionError, startExecution, controlExecution, approveExecution,
+    execution, executionReady, executionError, executionErrorCode, startExecution, controlExecution, approveExecution,
     validation, validationError, validationBusy, validationProgress, validationRuntime, setValidationRuntime, runValidation,
     confirmed, confirmStep, resetJourney, resetStep, resetNonce,
   };

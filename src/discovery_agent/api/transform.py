@@ -35,7 +35,7 @@ from discovery_agent.api.service import ApiError
 from discovery_agent.diagnostics import record_unexpected, unexpected_message
 from discovery_agent.state import context as work_context  # not ``context``: that name is the LLM's subject builder
 from discovery_agent.llm import checks, context, templates
-from discovery_agent.llm.claude_cli import ClaudeCli, ModelError
+from discovery_agent.llm.claude_cli import ClaudeCli, ModelError, switched_on
 from discovery_agent.llm.store import TransformStore
 from discovery_agent.llm.templates import TemplateError
 from discovery_agent.migration.common import DEFERRED, FUNCTION, MISSING, NOTEBOOK, Source
@@ -48,7 +48,6 @@ MAX_PROJECT_CHARS = 32 * 1024
 #: The placeholders a template can use, for the requirements editor's help text.
 PLACEHOLDERS = ("object.name", "object.type", "object.kind", "object.schema", "target.warehouse", "target.workspace",
                 "target.component", "notebook.language")
-_OFF = {"off", "0", "false", "no", "disabled"}
 QUEUED, RUNNING, FAILED_JOB = "queued", "running", "failed"
 
 
@@ -77,8 +76,11 @@ def _hash(text: str) -> str:
 class TransformService:
     def __init__(self, session: Any, fabric: Any = None, model: Any = None, store: Optional[TransformStore] = None,
                  prompts: Optional[Path] = None, workers: Optional[int] = None, synchronous: bool = False,
-                 audit: Any = None) -> None:
+                 audit: Any = None, consult: Any = None) -> None:
         self._session = session
+        #: The consultation (``api.consult.ConsultService``): whether a definition may be sent to the model (D1), what
+        #: may be spent (D2), the standards every draft follows (B3), and the ledger of what was spent. None: no gate.
+        self._consult = consult
         #: Records what was asked of the model, what it wrote, and what a person accepted (``state.audit``); never raises.
         self._audit = audit or (lambda *args, **kwargs: None)
         self._fabric = fabric
@@ -94,7 +96,7 @@ class TransformService:
 
     @staticmethod
     def enabled() -> bool:
-        return (os.environ.get("MIGRATION_LLM") or "on").strip().lower() not in _OFF
+        return switched_on()
 
     def busy(self) -> Optional[str]:
         """Why the project cannot be switched now (drafts are being written for its objects), or None."""
@@ -122,24 +124,45 @@ class TransformService:
         except context.NotTransformable as exc:
             raise ApiError(400, "not_transformable", str(exc)) from exc
 
-    def _target(self, pool: Optional[str]) -> Dict[str, str]:
+    def _brief(self) -> Any:
+        if self._consult is None:
+            return None
+        try:
+            return self._consult.in_force()
+        except Exception:  # noqa: BLE001 - no brief that can be read is no brief: the prompt has no standards
+            return None
+
+    def _target(self, pool: Optional[str], brief: Any = None) -> Dict[str, str]:
         workspace = ""
         if self._fabric is not None:
             try:
                 workspace = str(self._fabric.state().get("workspaceName") or "")
             except Exception:  # noqa: BLE001 - the target is optional context
                 workspace = ""
-        return {"workspace": workspace, "warehouse": warehouse_name_for(pool)}
+        named = brief.names()[0] if brief is not None else None
+        return {"workspace": workspace, "warehouse": named or warehouse_name_for(pool)}
 
     def _prompt(self, source: Source, subject: context.Subject, job: Any, pool: Optional[str]) -> str:
         try:
             detail = self._session.result(source.id)
         except ApiError:
             detail = {}
+        brief = self._brief()
         try:
-            return context.build(subject, source, detail, self._target(pool), getattr(job, "records_by_id", {}), self._prompts)
+            return context.build(subject, source, detail, self._target(pool, brief), getattr(job, "records_by_id", {}),
+                                 self._prompts, standards=brief.standards() if brief is not None else "")
         except TemplateError as exc:
             raise ApiError(500, "prompt_template_error", str(exc)) from exc
+
+    def _gate(self) -> Dict[str, Any]:
+        """Whether a definition may be sent to the model now (``ConsultService.llm_gate``); allowed with no consultation."""
+        if self._consult is None:
+            return {"allowed": True}
+        return self._consult.llm_gate("transform")
+
+    def _refused(self, gate: Dict[str, Any]) -> None:
+        if self._consult is not None:
+            self._consult.refuse_llm(gate)
 
     # -- the view of one object -----------------------------------------------------
 
@@ -175,11 +198,14 @@ class TransformService:
     # -- routes -------------------------------------------------------------------------
 
     def settings(self) -> dict:
+        gate = self._gate()
         return {
             "enabled": self.enabled(), **self._model.available(),
             "kinds": sorted(context.TRANSFORMABLE_KINDS),
             "promptsDir": str(self._prompts), "storeDir": str(self._store.directory),
             "disabledReason": None if self.enabled() else "Generation is switched off on this server (MIGRATION_LLM=off).",
+            # What the migration brief allows: consent to send definitions (D1), the budget (D2) and what is spent.
+            "consent": {k: gate.get(k) for k in ("allowed", "reason", "code", "consent", "budgetUsd", "spentUsd")},
         }
 
     def list(self) -> dict:
@@ -276,6 +302,11 @@ class TransformService:
         available = self._model.available()
         if not available.get("available"):
             raise ApiError(409, "llm_unavailable", available.get("message") or "Claude Code is not available on this machine.")
+        gate = self._gate()
+        if not gate.get("allowed"):
+            self._refused(gate)
+            raise ApiError(403 if gate.get("code") == "llm_no_consent" else 409, str(gate.get("code") or "llm_refused"),
+                           str(gate.get("reason") or "Drafts may not be generated now."))
         ids = body.get("ids")
         if not isinstance(ids, list) or not ids or len(ids) > MAX_IDS or not all(isinstance(i, str) and i for i in ids):
             raise ApiError(400, "invalid_request", f"Send between 1 and {MAX_IDS} object ids.")
@@ -312,6 +343,12 @@ class TransformService:
         with self._lock:
             self._jobs[oid] = {**self._jobs.get(oid, {}), "state": RUNNING}
         target = {"type": "object", "id": oid}
+        gate = self._gate()  # again: the drafts before it in a batch may have spent the budget
+        if not gate.get("allowed"):
+            with self._lock:
+                self._jobs[oid] = {**self._jobs.get(oid, {}), "state": FAILED_JOB, "error": gate.get("reason")}
+            self._refused(gate)
+            return
         try:
             answer = self._model.complete(prompt)
             found = checks.run(subject.kind, answer.code, answer.unconverted, _original(source))
@@ -323,6 +360,8 @@ class TransformService:
                 "costUsd": answer.cost_usd, "durationMs": answer.duration_ms,
             }
             self._store.put(record)
+            if self._consult is not None:
+                self._consult.record_spend("transform", answer.model, answer.cost_usd, _hash(prompt), oid)
         except ModelError as exc:
             with self._lock:
                 self._jobs[oid] = {**self._jobs.get(oid, {}), "state": FAILED_JOB, "error": str(exc)}

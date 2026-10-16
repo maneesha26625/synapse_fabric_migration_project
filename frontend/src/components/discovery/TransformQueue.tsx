@@ -129,7 +129,7 @@ export function TransformQueue() {
     for (const c of visible.filter(selectable)) { if (allVisibleSelected) n.delete(c.objectId); else n.add(c.objectId); }
     return n;
   });
-  const canGenerate = !!settings?.enabled && !!settings?.available;
+  const canGenerate = !!settings?.enabled && !!settings?.available && settings?.consent?.allowed !== false;
 
   const generate = async () => {
     setBusy(true); setNotice(null);
@@ -162,6 +162,7 @@ export function TransformQueue() {
         in Fabric, in <strong>step 5, Migrate</strong>. Plan and Migrate mark those objects <LlmBadge />.
       </Banner>
       {settings && !settings.enabled && <Banner tone="warning" title="Generation is switched off">{settings.disabledReason}</Banner>}
+      {settings?.enabled && settings.consent && !settings.consent.allowed && <Banner tone="warning" title="The migration brief does not allow AI drafts now">{settings.consent.reason}</Banner>}
       {settings && settings.enabled && !settings.available && <Banner tone="warning" title="Claude Code is not available">{settings.message}</Banner>}
 
       <dl className="kv compact" aria-label="Transformation summary">
