@@ -189,6 +189,7 @@ class FabricTarget:
         self.status = "disconnected"  # disconnected | signing_in | authenticated | connected | failed
         self.method: Optional[str] = None
         self.account: Optional[str] = None
+        self.account_type: Optional[str] = None
         self.tenant: Optional[str] = None
         self.workspaces: List[dict] = []
         self.workspace_id: Optional[str] = None
@@ -202,7 +203,7 @@ class FabricTarget:
     def state(self) -> dict:
         with self._lock:
             return {
-                "status": self.status, "method": self.method, "account": self.account,
+                "status": self.status, "method": self.method, "account": self.account, "accountType": self.account_type,
                 "tenantId": self.tenant, "workspaces": list(self.workspaces),
                 "workspaceId": self.workspace_id, "workspaceName": self.workspace_name,
                 "checks": list(self.checks), "message": self.message,
@@ -454,6 +455,8 @@ class FabricTarget:
         except ValueError:
             return False
         self.account = (data.get("user") or {}).get("name")
+        #: user | servicePrincipal: the kind of identity Fabric items are created by (and owned by).
+        self.account_type = (data.get("user") or {}).get("type")
         self.tenant = data.get("tenantId")
         return True
 

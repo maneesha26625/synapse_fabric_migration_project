@@ -37,15 +37,29 @@ def policy() -> str:
     return configured() or OVERWRITE
 
 
-def rule_for(brief: Optional[str]) -> str:
-    """The rule a run is signed off under. The approved brief's (G3) decides, but never loosens a rule this machine is
-    set to: the stricter of the two holds. With neither, a person signs off what overwrites."""
+def rule_for(brief: Optional[str], role: Optional[str] = None) -> str:
+    """The rule a run is signed off under. The approved brief's (E4) decides, but never loosens a rule this machine is
+    set to: the stricter of the two holds. With neither, a person signs off what overwrites. A production target
+    (the brief's E1) signs off every run, whatever either says."""
+    if role == "prod":
+        return ALWAYS
     machine = configured()
     if brief not in POLICIES:
         return machine or OVERWRITE
     if machine is None:
         return brief
     return brief if _STRICTNESS[brief] >= _STRICTNESS[machine] else machine
+
+
+def rule_for_policy(policy: Any) -> str:
+    """The rule under the migration policy in force (``consult.policy.Policy``), or None. A brief approved for another
+    Fabric workspace than the one connected says nothing about this one: every run is signed off there until the
+    brief is reconfirmed."""
+    if policy is None:
+        return rule_for(None)
+    if getattr(policy, "target_moved", False):
+        return ALWAYS
+    return rule_for(policy.signoff(), policy.target_role())
 
 
 def reasons(options: Dict[str, Any], stages: List[str]) -> List[str]:

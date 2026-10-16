@@ -126,11 +126,13 @@ def _times(schedule: Mapping[str, Any], start: datetime) -> List[str]:
     return sorted({f"{h:02d}:{m:02d}" for h in hours for m in minutes})
 
 
-def schedule_bodies(payload: Mapping[str, Any], now: Optional[datetime] = None) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[str]]:
+def schedule_bodies(payload: Mapping[str, Any], now: Optional[datetime] = None,
+                    as_in_synapse: bool = False) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[str]]:
     """([(pipeline name, Fabric schedule body)], notes) for one Synapse trigger.
 
-    Schedules are always created switched off: a trigger that fires before the
-    data and pipelines it feeds are ready does harm, and enabling is one click.
+    Schedules are created switched off: a trigger that fires before the data and pipelines it feeds are ready does
+    harm, and enabling is one click. ``as_in_synapse`` (the migration brief's E5) switches on the schedules of a
+    trigger Synapse says was started; one whose state is not known stays off.
     """
     props = payload.get("properties") or {}
     kind = str(props.get("type") or "")
@@ -143,7 +145,9 @@ def schedule_bodies(payload: Mapping[str, Any], now: Optional[datetime] = None) 
     sched = rec.get("schedule") or {}
     start = _stamp(rec.get("startTime"), (now or datetime.now(timezone.utc)).replace(tzinfo=None, microsecond=0))
     end = _stamp(rec.get("endTime"), start + timedelta(days=365 * FAR_FUTURE_YEARS))
-    notes: List[str] = ["Created switched off. Enable it in Fabric when the pipeline and its data are ready."]
+    started = as_in_synapse and str(props.get("runtimeState") or "") == "Started"
+    notes: List[str] = (["Switched on, as the trigger was in Synapse (the migration brief, E5)."] if started else
+                        ["Created switched off. Enable it in Fabric when the pipeline and its data are ready."])
     config: Dict[str, Any] = {
         "startDateTime": start.strftime("%Y-%m-%dT%H:%M:%S"), "endDateTime": end.strftime("%Y-%m-%dT%H:%M:%S"),
         "localTimeZoneId": str(rec.get("timeZone") or "UTC"),
@@ -172,7 +176,7 @@ def schedule_bodies(payload: Mapping[str, Any], now: Optional[datetime] = None) 
         raise NotConvertible("The trigger does not run any pipeline.")
     if any(p.get("parameters") for p in props.get("pipelines") or []):
         notes.append("Parameter values passed by the trigger were not carried over: set them as the pipeline's defaults.")
-    return [(n, {"enabled": False, "configuration": dict(config)}) for n in names], notes
+    return [(n, {"enabled": started, "configuration": dict(config)}) for n in names], notes
 
 
 # ---- external tables -> shortcuts --------------------------------------------------------

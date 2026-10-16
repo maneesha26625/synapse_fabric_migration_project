@@ -8,6 +8,10 @@ import {
   type ConsultExplanation,
   type ConsultPolicy,
   type ConsultState,
+  type MigrationContextView,
+  type AgentAction,
+  type AssistantTask,
+  type ExecutionPlanView,
   type PlanDifference,
   type ProjectListing,
   type RunHistory,
@@ -266,8 +270,9 @@ export const realApi: MigrationApi = {
     request<AnswerPreview>("/api/consult/answer", { method: "POST", body: JSON.stringify({ question, value, preview: true }) }),
   skipQuestion: (question) => request<ConsultState>("/api/consult/skip", { method: "POST", body: JSON.stringify({ question }) }),
   withdrawAnswer: (question) => request<ConsultState>("/api/consult/withdraw", { method: "POST", body: JSON.stringify({ question }) }),
-  acceptRecommendations: (section) =>
-    request<ConsultState>("/api/consult/accept", { method: "POST", body: JSON.stringify(section ? { section } : {}) }),
+  acceptRecommendations: (section, questions) =>
+    request<ConsultState>("/api/consult/accept", { method: "POST", body: JSON.stringify({ ...(section ? { section } : {}),
+      ...(questions ? { questions } : {}) }) }),
   resolveConflict: (conflict, resolution, reason) =>
     request<ConsultState>("/api/consult/resolve", { method: "POST", body: JSON.stringify({ conflict, resolution, ...(reason ? { reason } : {}) }) }),
   getBrief: () => request<BriefView>("/api/consult/brief"),
@@ -291,6 +296,21 @@ export const realApi: MigrationApi = {
   exportQuestionnaire: async (format) => ({ url: `/api/consult/questionnaire?format=${format}`, fileName: `migration-questionnaire.${format}` }),
   importQuestionnaire: (answers) =>
     request<ConsultState>("/api/consult/questionnaire", { method: "POST", body: JSON.stringify({ answers }) }),
+  getMigrationContext: () => request<MigrationContextView>("/api/consult/context"),
+  getExecutionPlan: () => request<ExecutionPlanView>("/api/orchestrator/plan"),
+  markStep: (step, done, note) =>
+    request<ExecutionPlanView>("/api/orchestrator/steps/mark", { method: "POST", body: JSON.stringify({ step, done, ...(note ? { note } : {}) }) }),
+  decideAction: (id, decision, text) =>
+    request<{ action: AgentAction; plan: ExecutionPlanView }>("/api/orchestrator/actions/decide", { method: "POST",
+      body: JSON.stringify({ id, decision, ...(text ? (decision === "reject" ? { reason: text } : { note: text }) : {}) }) }),
+  controlAgent: (action) => request<ExecutionPlanView>("/api/orchestrator/supervisor", { method: "POST", body: JSON.stringify({ action }) }),
+  exportSignoffReport: async (format) => ({ url: `/api/orchestrator/report?format=${format}`, fileName: `migration-signoff-report.${format}` }),
+  askAssistant: (text, taskId) => request<AssistantTask>("/api/assistant/ask", { method: "POST", body: JSON.stringify({ text, ...(taskId ? { taskId } : {}) }) }),
+  getAssistantTasks: () => request<{ tasks: AssistantTask[] }>("/api/assistant/tasks"),
+  getAssistantTask: (id) => request<AssistantTask>(`/api/assistant/tasks/${encodeURIComponent(id)}`),
+  cancelAssistantTask: (id) => request<AssistantTask>(`/api/assistant/tasks/${encodeURIComponent(id)}/cancel`, { method: "POST", body: "{}" }),
+  continueAssistantTask: (id) => request<AssistantTask>(`/api/assistant/tasks/${encodeURIComponent(id)}/continue`, { method: "POST", body: "{}" }),
+  exportMigrationContext: async (hash) => ({ url: `/api/consult/context/${encodeURIComponent(hash)}`, fileName: `MIGRATION_CONTEXT-${hash.slice(0, 12)}.md` }),
   getWorkspaceGit: (sub, rg, ws) =>
     request<WorkspaceGit>(
       `/api/azure/workspace-git?subscriptionId=${encodeURIComponent(sub)}&resourceGroup=${encodeURIComponent(rg)}&workspace=${encodeURIComponent(ws)}`,

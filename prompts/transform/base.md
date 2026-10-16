@@ -76,6 +76,18 @@ wherever the two disagree.
 {{project}}
 
 {{/if}}
+{{#if migration.text}}
+## The migration context (MIGRATION_CONTEXT.md)
+
+This is the migration brief the client approved, written for you. Follow it
+wherever it applies to this object. It wins over the general guidance and the
+project requirements wherever they disagree.
+
+{{migration.fence}}markdown
+{{migration.text}}
+{{migration.fence}}
+
+{{/if}}
 ## Rules for every object
 
 1. **Keep the behaviour.** Same inputs, same outputs, same side effects. Never
@@ -95,3 +107,5 @@ Answer with **one JSON object** and nothing else:
 - `notes`: one short sentence per change you made, written for the reviewer.
 - `unconverted`: anything you could not convert and a person must handle. Empty if there is none.
 - `confidence`: `high`, `medium` or `low`. Your honest view of whether it will deploy and behave the same.
+- `context`: each instruction of the migration context that this draft applies, in a few words. Empty if
+  there is no migration context, or none of it applies.

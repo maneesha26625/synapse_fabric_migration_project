@@ -24,7 +24,7 @@ from discovery_agent.migration import datacopy, datafilter, environments, jobs, 
 from discovery_agent.migration import security as security_sql
 from discovery_agent.migration.common import (
     CONNECTION, DATA, DATASET, DEFERRED, ENVIRONMENT, FUNCTION, MISSING, NOTEBOOK, PIPELINE, POOL, PROCEDURE, SCHEDULE, SCHEMA,
-    SCRIPT, SECURITY, SHORTCUT, SPARKJOB, TABLE, VIEW, Source,
+    SCRIPT, SECURITY, SHORTCUT, SPARKJOB, TABLE, VIEW, Source, lakehouse_of,
 )
 from discovery_agent.migration.fabric_rest import FabricApiError, FabricRestClient
 
@@ -108,9 +108,12 @@ class Validator:
         progress: Callable[[str], None] = lambda text: None,
         sleep: Optional[Callable[[float], None]] = None,
         clock: Optional[Callable[[], float]] = None,
+        lakehouse_name: Optional[str] = None,
     ) -> None:
         self.rest, self.wid, self.workspace_name = rest, workspace_id, workspace_name
         self.warehouse_name = warehouse_name
+        #: The Lakehouse the run made its shortcuts in: the one the migration brief names, else the Warehouse's.
+        self.lakehouse_name = lakehouse_name or lakehouse_of(warehouse_name, {})
         self._sql_factory, self._source_factory = sql_factory, source_factory
         self.artifacts = artifacts or {}
         self._ids: Dict[str, Dict[str, str]] = {}
@@ -539,10 +542,10 @@ class Validator:
             if not has:
                 results.append(f"{pipeline_name}: no schedule")
         ok = not results
-        return [row(s, MATCH if ok else MISMATCH, f"{len(bodies)} schedule(s)", f"{len(bodies)} schedule(s)" if ok else "missing", "Schedules exist (created switched off)." if ok else "; ".join(results))]
+        return [row(s, MATCH if ok else MISMATCH, f"{len(bodies)} schedule(s)", f"{len(bodies)} schedule(s)" if ok else "missing", "Schedules exist." if ok else "; ".join(results))]
 
     def _check_shortcut(self, s: Source) -> List[Dict[str, str]]:
-        lake = self.find("lakehouses", f"{self.warehouse_name}_lakehouse")
+        lake = self.find("lakehouses", self.lakehouse_name)
         if not lake:
             return [row(s, MISMATCH, "1 external table", "no Lakehouse", "The Lakehouse for shortcuts does not exist.")]
         name = (s.object_name or s.name).lower()

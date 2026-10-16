@@ -59,6 +59,8 @@ web framework would be the first. The surface is small and fixed.
     POST   /api/consult/proposals         confirm or reject proposed answers
     POST   /api/consult/explain           what a question means for this estate
     GET    /api/consult/questionnaire     the questions, to answer offline (Markdown or JSON)
+    GET    /api/consult/context           MIGRATION_CONTEXT.md: the approved brief, as every LLM draft is sent it
+    GET    /api/consult/context/{hash}    one that a draft was made with, by its hash (Markdown)
     POST   /api/consult/questionnaire     import a questionnaire's answers, proposed for a person to confirm
     GET    /api/projects                  the projects, and which is active
     POST   /api/projects                  create one (optionally carrying on another's saved discovery)
@@ -79,6 +81,19 @@ web framework would be the first. The surface is small and fixed.
     POST   /api/transform/generate        queue drafts for objects (background)
     POST   /api/transform/accept          accept a draft, optionally edited
     POST   /api/transform/discard         drop a draft, or go back to the rule-based conversion
+    GET    /api/orchestrator/plan         the execution plan: every step, its status, what the agent proposes
+    POST   /api/orchestrator/steps/mark   a person marks a task of the plan done (or not)
+    GET    /api/orchestrator/actions      the agent's requests (?status=open | all)
+    POST   /api/orchestrator/actions/decide  a person confirms (it runs as them) or rejects a request
+    POST   /api/orchestrator/supervisor   pause | resume the agent (the kill switch), or wake it now
+    GET    /api/orchestrator/tools        the tool registry: every tool, its tier and arguments
+    GET    /api/orchestrator/diagnosis/{id}  why an object of the current run failed, and what may be done
+    GET    /api/orchestrator/report       the sign-off report (?format=md | json)
+    GET    /api/assistant/tasks           the assistant's questions, newest first
+    GET    /api/assistant/tasks/{id}      one question, with its conversation and action cards
+    POST   /api/assistant/ask             ask a question, or reply to one waiting ({text, taskId?})
+    POST   /api/assistant/tasks/{id}/cancel    stop a question
+    POST   /api/assistant/tasks/{id}/continue  carry on a question a restart paused
 
 Security posture, in order of importance:
 
@@ -118,6 +133,7 @@ _log = logs.get("api")
 from discovery_agent.api.consult import ConsultService
 from discovery_agent.api.fabric import FabricError, FabricTarget
 from discovery_agent.api.migration import MigrationService
+from discovery_agent.api.orchestrator import OrchestratorService, switched_on as agent_switched_on
 from discovery_agent.api.projects import ProjectsService, describe_start
 from discovery_agent.api.service import ApiError, Session
 from discovery_agent.api.transform import MAX_ACCEPT_BYTES, TransformService
@@ -133,6 +149,9 @@ TRANSFORM_PROMPT_PREFIX = "/api/transform/prompt/"
 _RUN_PATH = re.compile(r"^/api/migration/runs/([0-9]{1,9})(/events)?$")
 _ARTIFACT_PATH = re.compile(r"^/api/migration/runs/([0-9]{1,9})/artifacts/([0-9a-f]{64})$")
 _PLAN_PATH = re.compile(r"^/api/migration/plans/(P[0-9]{1,9})$")
+_CONTEXT_PATH = re.compile(r"^/api/consult/context/([0-9a-f]{64})$")
+_TASK_PATH = re.compile(r"^/api/assistant/tasks/([0-9a-f]{12})(?:/(cancel|continue))?$")
+DIAGNOSIS_PREFIX = "/api/orchestrator/diagnosis/"
 _PROJECT_PATH = re.compile(r"^/api/projects/([A-Za-z0-9][A-Za-z0-9_-]{0,63})(?:/(rename|activate))?$")
 
 
@@ -152,11 +171,13 @@ def make_handler(
     project_of: Optional[Callable[[], Optional[str]]] = None,
     projects: Optional[ProjectsService] = None,
     consult: Optional[ConsultService] = None,
+    orchestrator: Optional[OrchestratorService] = None,
 ):
     fabric = fabric or FabricTarget()
     consult = consult or ConsultService(session, fabric)
     transforms = transforms or TransformService(session, fabric, consult=consult)
     migration = migration or MigrationService(session, fabric, transforms=transforms, consult=consult)
+    orchestrator = orchestrator or OrchestratorService(session, migration, consult=consult, transforms=transforms, fabric=fabric)
     if projects is not None and project_of is None:
         project_of = projects.active_id
     # Every request passes the projects' gate, so a switch of project runs alone (``ProjectsService.activate``).
@@ -339,6 +360,27 @@ def make_handler(
                 self._dispatch(consult.policy_view)
             elif path == "/api/consult/questionnaire":
                 self._dispatch(lambda: RawResponse(*consult.questionnaire(query)))
+            elif path == "/api/consult/context":
+                self._dispatch(consult.context_view)
+            elif path == "/api/orchestrator/plan":
+                self._dispatch(orchestrator.plan_view)
+            elif path == "/api/orchestrator/actions":
+                self._dispatch(lambda: orchestrator.actions_view(query))
+            elif path == "/api/orchestrator/tools":
+                self._dispatch(orchestrator.tools_view)
+            elif path == "/api/orchestrator/report":
+                self._dispatch(lambda: RawResponse(*orchestrator.report(query)))
+            elif path.startswith(DIAGNOSIS_PREFIX):
+                object_id = unquote(path[len(DIAGNOSIS_PREFIX):])
+                self._dispatch(lambda: orchestrator.diagnosis(object_id))
+            elif path == "/api/assistant/tasks":
+                self._dispatch(orchestrator.tasks_view)
+            elif _TASK_PATH.match(path) and not _TASK_PATH.match(path).group(2):
+                task_id = _TASK_PATH.match(path).group(1)
+                self._dispatch(lambda: orchestrator.task_view(task_id))
+            elif _CONTEXT_PATH.match(path):
+                digest = _CONTEXT_PATH.match(path).group(1)
+                self._dispatch(lambda: RawResponse(*consult.context_export(digest)))
             elif _RUN_PATH.match(path):
                 run_id, events = _RUN_PATH.match(path).groups()
                 if events:
@@ -427,8 +469,16 @@ def make_handler(
                 "/api/transform/discard": lambda: transforms.discard(self._json_body()),
                 "/api/transform/project": lambda: transforms.save_project(self._json_body()),
                 "/api/discovery/start": session.start_discovery,
+                "/api/orchestrator/steps/mark": lambda: orchestrator.mark(self._json_body()),
+                "/api/orchestrator/actions/decide": lambda: orchestrator.decide(self._json_body()),
+                "/api/orchestrator/supervisor": lambda: orchestrator.control(self._json_body()),
+                "/api/assistant/ask": lambda: orchestrator.ask(self._json_body()),
             }
             handler = routes.get(path)
+            task = _TASK_PATH.match(path)
+            if handler is None and task and task.group(2):
+                task_id, verb = task.groups()
+                handler = (lambda: orchestrator.cancel(task_id)) if verb == "cancel" else (lambda: orchestrator.resume_task(task_id))
             found = _PROJECT_PATH.match(path)
             if handler is None and found and found.group(2):
                 project_id, verb = found.groups()
@@ -495,9 +545,18 @@ def create_server(host: str, port: int, static_root: Optional[Path] = None, proj
         transforms = TransformService(session, fabric, audit=hub.audit, consult=consult)
         migration = MigrationService(session, fabric, transforms=transforms, records=projects.store(active), audit=hub.audit,
                                      consult=consult)
-        hub.attach(session, fabric, migration, transforms, consult)
+        orchestrator = OrchestratorService(session, migration, consult=consult, transforms=transforms, fabric=fabric,
+                                           records=projects.store(active), audit=hub.audit,
+                                           trail=lambda: hub.audit_verify({}), project_of=hub.active_id)
+        hub.attach(session, fabric, migration, transforms, consult, orchestrator)
+        # The supervisor wakes on what the trail records: runs, sign-offs, briefs, validations. Nothing calls it directly.
+        hub.listen(orchestrator.notify)
         hub.audit("system.started", details=describe_start(projects))
+    if agent_switched_on():
+        orchestrator.start()
     server = ThreadingHTTPServer((host, port), make_handler(session, static_root, fabric=fabric, migration=migration,
-                                                            transforms=transforms, projects=hub, consult=consult))
+                                                            transforms=transforms, projects=hub, consult=consult,
+                                                            orchestrator=orchestrator))
     server.projects = hub  # type: ignore[attr-defined] - for the entry point, which records the stop
+    server.orchestrator = orchestrator  # type: ignore[attr-defined] - stopped with the server
     return server

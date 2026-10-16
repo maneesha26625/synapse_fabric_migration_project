@@ -58,6 +58,9 @@ def _isolated_local_state(tmp_path, monkeypatch):
     # and the consultation's help never asks the model: no test sends anything to Claude.
     monkeypatch.setenv("MIGRATION_CONSULTATION", "advisory")
     monkeypatch.delenv("MIGRATION_BRIEF_APPROVAL", raising=False)
+    # No supervisor wakes in the background of a test (``MIGRATION_AGENT``, ``api.orchestrator``): one that is about the
+    # agent switches it on, and runs it in the test's own thread.
+    monkeypatch.setenv("MIGRATION_AGENT", "off")
     from discovery_agent.llm import claude_cli
 
     monkeypatch.setattr(claude_cli, "executable", lambda: None)  # a test that needs one gives a fake

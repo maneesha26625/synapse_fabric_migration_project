@@ -63,7 +63,7 @@ function BriefStanding() {
   if (!approved) {
     return required ? <Banner tone="info" title="No migration brief is approved yet">Plan can be built now, but a run is refused until a brief is approved in Consult. Its decisions are then pre-set here.</Banner> : null;
   }
-  if (stale) return <Banner tone="warning" title={`Brief version ${approved} no longer fits the estate`}>Reconfirm it in Consult before a run: the estate changed since it was approved.</Banner>;
+  if (stale) return <Banner tone="warning" title={`Brief version ${approved} no longer fits`}>Reconfirm it in Consult before a run: what it rests on (the estate, the questions, or the Fabric target) changed since it was approved.</Banner>;
   if (!check || !check.differences.length) return <p className="faint note-line">Pre-set from migration brief version {approved}. Nothing here differs from it.</p>;
   const leftOut = plan.filter((p) => excluded[p.id]);
   return (

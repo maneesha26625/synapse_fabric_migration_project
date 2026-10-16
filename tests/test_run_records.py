@@ -53,9 +53,11 @@ class Project:
 
 
 def finished(svc: MigrationService) -> bool:
-    """The pass is over and its thread has tidied up."""
+    """The pass is over and its thread has tidied up, and so has the Fabric Git commit after it (on Windows a file it is
+    still writing cannot be read)."""
     return wait_until(lambda: svc.state()["status"] not in run_state.WORKING
-                      and not (svc._thread is not None and svc._thread.is_alive()))  # noqa: SLF001
+                      and not (svc._thread is not None and svc._thread.is_alive())  # noqa: SLF001
+                      and not (svc._git_thread is not None and svc._git_thread.is_alive()))  # noqa: SLF001
 
 
 def crash_after_starting_an_object(self, run, trigger="start"):

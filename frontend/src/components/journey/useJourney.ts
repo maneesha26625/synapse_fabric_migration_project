@@ -43,7 +43,9 @@ const plural = (count: number, one: string, many = `${one}s`) => `${n(count)} ${
 export function useJourney(): { steps: StepStatus[]; current: StepKey; finished: boolean } {
   const { discovery, ready, mode } = useAppState();
   const { graph, graphLoading, graphError, plan, analysis, analysisBusy, execution: run, executionReady, validation, validationBusy, confirmed } = useMigration();
-  const { consult, approved, stale: briefStale, required, brief } = useConsult();
+  const { consult, approved, stale: briefStale, required, brief, policy } = useConsult();
+  const outdated = !!policy?.inForce?.outdated;
+  const targetMoved = !!policy?.inForce?.targetMoved;
   const discovered = discovery.state === "completed" || discovery.state === "completed_with_warnings";
   const summary = discovery.summary;
   const total = summary?.total ?? 0;
@@ -72,18 +74,20 @@ export function useJourney(): { steps: StepStatus[]; current: StepKey; finished:
       waiting: "Waiting for discovery.",
     },
     consult: {
-      // Required: a run is refused until a brief that fits the estate is approved. Advisory: the brief is a record.
-      complete: discovered && (required ? approved !== null && !briefStale : !!consult),
+      // Read, it is done as a step: Plan and the rest stay open to look at. What a required consultation holds back is
+      // the run itself, which Migrate refuses (and says why) until a brief that fits the estate is approved.
+      complete: discovered && !!consult,
       running: false,
       paused: false,
-      attention: briefStale ? "The estate changed since the brief was approved"
-        : discovered && consult && !approved && !required ? "No approved brief" : null,
+      attention: briefStale ? (outdated ? "The questions changed since the brief was approved"
+        : targetMoved ? "Another Fabric workspace is the target now" : "The estate changed since the brief was approved")
+        : discovered && consult && !approved ? (required ? "No approved brief: runs wait for one" : "No approved brief") : null,
       metric: !discovered ? "—" : !consult ? "Reading…" : approved ? `Brief v${approved}${briefStale ? " · reconfirm" : " approved"}`
         : pending ? `v${pending} to approve` : `${n(consult.progress.answered)}/${n(consult.progress.applicable)} answered`,
       outcome: approved && decided ? `Brief version ${approved} approved by ${decided.decidedBy?.id ?? "a person"}: ${plural(decided.decisions, "decision")}, ${plural(decided.assumptions, "assumption")}.`
         : !required && consult ? `No brief approved yet: ${n(consult.progress.answered)} of ${plural(consult.progress.applicable, "question")} answered. Runs start without one (advisory).` : "",
       waiting: !discovered ? "Waiting for discovery."
-        : briefStale ? "The estate changed since it was approved: confirm what changed, submit the brief again and have it approved."
+        : briefStale ? `${outdated ? "The questions changed" : targetMoved ? "The Fabric target changed" : "The estate changed"} since it was approved: review what changed, submit the brief again and have it approved.`
         : pending ? `Version ${pending} of the brief waits for a person to approve it.`
         : consult && !consult.submittable ? `${plural(consult.progress.needsPerson, "item")} need${consult.progress.needsPerson === 1 ? "s" : ""} a person before the brief can be submitted.`
         : "Submit the brief, then have it approved.",
@@ -139,10 +143,9 @@ export function useJourney(): { steps: StepStatus[]; current: StepKey; finished:
       ? "The discovery result is no longer here: the source was signed out or reconnected, discovery was reset, or the server restarted."
       : null,
     assess: null,
-    // Read once, so a page still loading never looks lost: a required brief that went stale, or is no longer approved.
-    consult: consult && required && (approved === null || briefStale)
-      ? briefStale ? "The approved brief no longer fits the estate." : "The brief is no longer approved."
-      : null,
+    // A brief that went stale, or is no longer approved, is something to attend to (above), never results lost: the
+    // steps after Consult stay open, and Migrate says why a run cannot start yet.
+    consult: null,
     waves: null,
     plan: plan.length === 0 ? "The plan is empty now." : null,
     migrate: executionReady && run.state === "idle"

@@ -132,11 +132,20 @@ class ProjectsService:
         #: Every request the API answers passes through it, so a switch can run alone.
         self.gate = RequestGate()
         self.switch_wait = SWITCH_WAIT_SECONDS
+        #: Told of every record written (the orchestrator wakes on them): never told anything that was not written.
+        self._listeners: List[Callable[[Dict[str, Any]], None]] = []
+        self._orchestrator: Any = None
 
-    def attach(self, session: Any, fabric: Any, migration: Any, transforms: Any = None, consult: Any = None) -> None:
+    def attach(self, session: Any, fabric: Any, migration: Any, transforms: Any = None, consult: Any = None,
+               orchestrator: Any = None) -> None:
         """The services that hold the active project's state, and are switched with it."""
         self._session, self._fabric, self._migration, self._transforms = session, fabric, migration, transforms
-        self._consult = consult
+        self._consult, self._orchestrator = consult, orchestrator
+
+    def listen(self, listener: Callable[[Dict[str, Any]], None]) -> None:
+        """Be told of each audit record once it is written: how the orchestrator wakes on runs, approvals and briefs
+        without any service knowing it is there. A listener must return at once and never raise."""
+        self._listeners.append(listener)
 
     @property
     def projects(self) -> Projects:
@@ -162,9 +171,16 @@ class ProjectsService:
             ident = context.project_id()
             with self._cache:
                 known = ident in self._known
-            return self.auditor(ident if known else None).record(action, **kwargs)
+            written = self.auditor(ident if known else None).record(action, **kwargs)
         except Exception:  # noqa: BLE001 - recording never fails what it records (Auditor.record logs its own failures)
             return None
+        if written is not None:
+            for listener in list(self._listeners):
+                try:
+                    listener(written)
+                except Exception as exc:  # noqa: BLE001 - a listener never fails what was recorded
+                    _log.warning("An audit listener failed: %s: %s", type(exc).__name__, exc)
+        return written
 
     def _trail_of(self, query: Dict[str, str]) -> Auditor:
         ident = str(query.get("project") or self._active)
@@ -206,7 +222,9 @@ class ProjectsService:
         return {**self._trail_of(query).verify(), "project": str(query.get("project") or self._active)}
 
     def confirm_step(self, body: dict) -> dict:
-        """A person confirmed a step of the journey: the trail keeps who, which step and when."""
+        """A person confirmed a step of the journey: the trail keeps who, which step and when. Only a person does."""
+        if context.actor().kind != context.PERSON:
+            raise ApiError(403, "person_only", "Only a person confirms a step of the journey.")
         step = str(body.get("step") or "")
         if step not in JOURNEY_STEPS:
             raise ApiError(400, "invalid_request", f"step must be one of {', '.join(JOURNEY_STEPS)}.")
@@ -291,7 +309,8 @@ class ProjectsService:
     def _busy(self) -> Optional[str]:
         for reason in (self._session.busy() if self._session is not None else None,
                        self._migration.busy_reason() if self._migration is not None else None,
-                       self._transforms.busy() if self._transforms is not None and hasattr(self._transforms, "busy") else None):
+                       self._transforms.busy() if self._transforms is not None and hasattr(self._transforms, "busy") else None,
+                       self._orchestrator.busy() if self._orchestrator is not None else None):
             if reason:
                 return reason
         return None
@@ -330,6 +349,32 @@ class ProjectsService:
         reason = self._busy()  # again, now that nothing else can start
         if reason:
             raise ApiError(409, "project_busy", f"Not switched: {reason}")
+        # The supervisor is not a request the gate waits for: it is held instead, its wake-up in flight finished first,
+        # so none reads one project and writes into the other.
+        held = self._hold_supervisor()
+        try:
+            previous = self._activate_held(project_id, body)
+        finally:
+            if held:
+                self._orchestrator.release()
+        with context.bound(project=project_id):
+            self.audit("project.activated", target={"type": "project", "id": project_id},
+                       details={"name": target["name"], "previous": previous})
+        return self.listing()
+
+    def _hold_supervisor(self) -> bool:
+        hold = getattr(self._orchestrator, "hold", None)
+        if not callable(hold):
+            return False
+        try:
+            hold()
+        except TimeoutError:
+            raise ApiError(409, "project_busy", "Not switched: the agent is finishing what it was doing. Try again in a moment.") from None
+        return True
+
+    def _activate_held(self, project_id: str, body: dict) -> str:
+        """Every service switched to the project, or each one that had switched put back on error. Returns the project
+        that was active."""
         previous = self._active
         try:
             self._projects.activate(project_id, _version(body.get("version")))
@@ -350,10 +395,7 @@ class ProjectsService:
                 self._undo(previous, done)
             raise
         self._active = project_id
-        with context.bound(project=project_id):
-            self.audit("project.activated", target={"type": "project", "id": project_id},
-                       details={"name": target["name"], "previous": previous})
-        return self.listing()
+        return previous
 
     def _steps(self, project_id: str) -> Tuple[Tuple[str, Callable[[], None]], ...]:
         steps: Tuple[Tuple[str, Callable[[], None]], ...] = (
@@ -363,6 +405,8 @@ class ProjectsService:
         )
         if self._consult is not None:
             steps += (("consult", lambda: self._consult.switch(self._projects.store(project_id))),)
+        if self._orchestrator is not None:
+            steps += (("orchestrator", lambda: self._orchestrator.switch(self._projects.store(project_id))),)
         return steps
 
     def _switch(self, project_id: str, done: List[str]) -> None:

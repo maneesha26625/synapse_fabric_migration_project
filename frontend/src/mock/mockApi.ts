@@ -62,6 +62,7 @@ import {
   type FilterableTable,
 } from "../types";
 import { DemoConsult, type DemoEstate } from "./mockConsult";
+import { DemoOrchestrator, type DemoWorld } from "./mockOrchestrator";
 import { generateObjects } from "./mockData";
 import { RUN_KIND, applyDemoRuntime } from "./mockRuntime";
 import { DEMO_PROJECT, KIND_OF_TYPE, demoNeedsWork, demoPrompt, demoSource, demoTransformSettings } from "./mockTransform";
@@ -201,6 +202,16 @@ const DEMO_CATALOG: Record<string, string> = {
   "brief.rejected": "A migration brief version was rejected", "brief.exported": "A migration brief version was exported",
   "plan.deviation": "A plan that differs from the approved brief was confirmed, with a reason",
   "run.wave_signed_off": "A person signed off the next wave of a run",
+  "orchestrator.plan_built": "A new version of the execution plan was built, from the brief, the plan and the estate",
+  "orchestrator.step_marked": "A person marked a step of the execution plan done, or not done",
+  "orchestrator.action_proposed": "The agent proposed an action, for a person to confirm",
+  "orchestrator.action_confirmed": "A person confirmed a proposed action, which then ran as that person",
+  "orchestrator.action_rejected": "A person rejected a proposed action, with the reason",
+  "orchestrator.action_expired": "A proposed action lapsed: it no longer applied, or nobody decided in time",
+  "orchestrator.paused": "A person paused the agent: it proposes and does nothing until resumed", "orchestrator.resumed": "A person resumed the agent",
+  "assistant.asked": "A person asked the assistant a question",
+  "assistant.finished": "The assistant finished with a question: answered, stopped at a limit, or cancelled",
+  "report.exported": "The sign-off report was exported",
 };
 
 // ---- demo projects: kept in this browser, as projects always were in Demo data ---------------------
@@ -226,7 +237,7 @@ function checkVersion(version?: number) {
   }
 }
 
-/** What Demo data asks a person to sign off, under the approved brief's rule (G3), else the backend's default: a run that
+/** What Demo data asks a person to sign off, under the approved brief's rule (E4), else the backend's default: a run that
  *  changes what Fabric has. */
 function demoApproval(options?: RunOptions, rule: RunApproval["policy"] = "overwrite"): RunApproval {
   const reasons = [
@@ -551,7 +562,7 @@ function runNow(): ExecutionRun {
     for (const n of done.notes) logs.push(line(end, "NOTE", si.name, n));
     return { ...base, step: done.step, status: "COMPLETED", startedAt: at(begin), completedAt: at(end), target: done.target, notes: done.notes };
   });
-  // The brief signs each wave off (A4): the run stops before the first object of a later wave nobody has released yet.
+  // The brief signs each wave off (A6): the run stops before the first object of a later wave nobody has released yet.
   if (sim.waveGate && sim.waitingWave === null && sim.resumedAt !== null) {
     const first = Math.min(...sim.items.map((i) => i.wave));
     const gate = sim.items.find((si) => si.wave > first && !sim.released.includes(si.wave) && begins.has(si.id) && elapsed >= (begins.get(si.id) as number));
@@ -663,6 +674,7 @@ export function resetDemo(): void {
   trail = [];
   projectsVersion = 1;
   consult = new DemoConsult(DEMO_PERSON, consultAudit);
+  orchestrator = new DemoOrchestrator(demoWorld);
 }
 
 /** A small stand-in for the backend planner so the demo page is fully populated. */
@@ -740,9 +752,39 @@ export function setDemoConsultation(mode: "required" | "advisory"): void {
 }
 const consultAudit = (action: string, details: Record<string, unknown>, target?: { type: string; id: string | null }) => record(action, { details, target });
 let consult = new DemoConsult(DEMO_PERSON, consultAudit);
+
+/** What the Demo orchestrator reads of the Demo data, and the one thing it asks the Demo run to do (retry). */
+const demoWorld: DemoWorld = {
+  person: DEMO_PERSON,
+  run: () => runNow(),
+  validation: () => (lastValidation ? { state: "completed", rows: lastValidation.rows } : { state: "idle" }),
+  plan: () => (plannerHistory[0] ? { id: plannerHistory[0].id, objects: plannerHistory[0].objects, blocking: plannerHistory[0].blocking, readiness: plannerHistory[0].readiness } : null),
+  policy: () => consult.policy(demoFacts(), demoEstate(), CONSULT_MODE),
+  flags: () => {
+    const out: Record<string, string[]> = {};
+    for (const [id, marks] of Object.entries(demoEstate().flags)) for (const m of marks) (out[m] ??= []).push(id);
+    return out;
+  },
+  names: () => Object.fromEntries(completedObjects().map((o) => [o.id, o.name])),
+  ready: () => ({ source: s.connection.status === "connected", target: fabric.status === "connected", capacity: !!fabric.capacityAssigned,
+    discovered: !!s.objects?.length, complete: !(s.summary?.failedCategories ?? []).length }),
+  drafts: () => {
+    const objects = completedObjects().filter((o) => KIND_OF_TYPE[o.type]);
+    const states = objects.map((o) => current(o).state);
+    return { needsWork: objects.filter((o) => demoNeedsWork(o)).length, drafts: states.filter((x) => x === "draft").length,
+      accepted: states.filter((x) => x === "accepted").length };
+  },
+  retry: () => mockApi.controlExecution("retry"),
+  record: (action, details, target, actor) => record(action, { details, target, actor }),
+};
+let orchestrator = new DemoOrchestrator(demoWorld);
 const warehouseNameFor = (pool: string) => { const name = pool.replace(/[^A-Za-z0-9_]/g, "_") || "SynapseMigration"; return /^[A-Za-z]/.test(name) ? name : `wh_${name}`; };
 /** Demo: the SQL scripts written for the serverless pool, the same ones every time. */
 const isServerless = (o: { type: string; id: string }) => o.type === "SQL Script" && hash(o.id) % 5 === 0;
+/** Demo: the views and procedures that still use T-SQL Fabric rejects after the rules, and the tables with a column
+ *  Fabric stores with less, the same ones every time. */
+const isUnconvertible = (o: { type: string; id: string }) => (o.type === "View" || o.type === "Stored Procedure") && demoNeedsWork(o);
+const isLossy = (o: { type: string; id: string }) => o.type === "Table" && hash(o.id) % 7 === 0;
 const config = (o: ObjectDetail) => (o.configuration ?? {}) as Record<string, unknown>;
 
 /** The demo's tables a date filter can apply to (as the backend's filterable_tables). */
@@ -763,6 +805,9 @@ function demoEstate(): DemoEstate {
     else if (["Notebook", "Pipeline", "SQL Script", "Spark Job Definition", "Dataset"].includes(o.type)) groupOf[o.id] = ["folder:(top level)"];
     if (isServerless(o)) flags[o.id] = ["serverless"];
     if (isMultiStatement(o.type, o.name)) flags[o.id] = [...(flags[o.id] ?? []), "multiStatement"];
+    if (["View", "Stored Procedure", "Function"].includes(o.type)) flags[o.id] = [...(flags[o.id] ?? []), "sqlModule"];
+    if (isUnconvertible(o)) flags[o.id] = [...(flags[o.id] ?? []), "unconvertible"];
+    if (isLossy(o)) flags[o.id] = [...(flags[o.id] ?? []), "lossy"];
   }
   return { items: objects.map((o) => ({ id: o.id, name: o.name })), groupOf, flags, filterable: demoTables() };
 }
@@ -798,6 +843,10 @@ function demoFacts(): Record<string, unknown> {
     "tables.changeWithoutKeys": changing.filter((t) => !t.keyColumns.length).length, "storage.locations": of("Storage Reference").length,
     "security.principals": security.length, "security.roles": security.filter((o) => /role/i.test(String(config(o).principalKind ?? ""))).length,
     "security.sqlUsers": sqlUsers.length, "security.sqlUserNames": sqlUsers, "security.masks": of("Table").filter((o) => hash(o.id) % 11 === 0).length,
+    "tables.lossyTypes": objects.filter(isLossy).length,
+    "code.sqlModules": objects.filter((o) => ["View", "Stored Procedure", "Function"].includes(o.type)).length,
+    "code.unconvertibleSql": objects.filter(isUnconvertible).length,
+    "pipelines.count": of("Pipeline").length, "notebooks.count": of("Notebook").length,
     "code.multiStatementFunctions": of("Function").filter((o) => isMultiStatement(o.type, o.name)).length, "code.dotnetNotebooks": 0,
     "code.unsupportedPipelines": 0, "code.needsRewrite": 0, "code.serverlessObjects": objects.filter(isServerless).length,
     "linkedServices.count": services.length, "linkedServices.byType": byType,
@@ -808,6 +857,7 @@ function demoFacts(): Record<string, unknown> {
     "source.commit": repo?.commit ?? null, "source.environment": repo?.environment ?? null,
     "discovery.complete": failed.length === 0, "discovery.failedCategories": failed.map((f) => f.name), "discovery.snapshot": "S001",
     "target.connected": fabric.status === "connected", "target.workspace": fabric.status === "connected" ? fabric.workspaceName ?? null : null,
+    "target.workspaceId": fabric.status === "connected" ? fabric.workspaceId || null : null,
     "target.capacity": fabric.status === "connected" ? !!fabric.capacityAssigned : null, "target.gitConnected": fabric.status === "connected" ? gitConnected() : null,
     "llm.available": true,
   };
@@ -1417,6 +1467,9 @@ export const mockApi: MigrationApi = {
   },
 
   async runValidation(_items, _options, runtime, onProgress): Promise<ValidationRow[]> {
+    // Really running pipelines and notebooks: refused while the brief says they may write to production systems (H4).
+    const refused = consult.inForce(demoFacts())?.externalWritesRefusal([...(runtime?.run ?? [])]);
+    if (refused) throw new ApiRequestError("external_writes", refused, 409);
     record("validation.started", { target: { type: "validation", id: null }, details: { probe: !!runtime?.probe, run: runtime?.run ?? [] } });
     onProgress?.("Comparing Synapse with Fabric (demo)");
     await sleep(500);
@@ -1488,28 +1541,39 @@ export const mockApi: MigrationApi = {
   async getTransformSettings() {
     await sleep(60);
     const gate = consult.llmGate("transform", CONSULT_MODE);
-    return { ...demoTransformSettings, consent: { allowed: gate.allowed, reason: gate.reason, code: gate.code, consent: gate.consent, budgetUsd: gate.budgetUsd, spentUsd: gate.spentUsd } };
+    return { ...demoTransformSettings, consent: { allowed: gate.allowed, reason: gate.reason, code: gate.code, consent: gate.consent, budgetUsd: gate.budgetUsd, spentUsd: gate.spentUsd },
+      context: consult.contextFile(demoFacts())?.ref ?? null };
   },
   async listTransforms() {
-    return [...transforms.values()].map((t) => ({ ...t }));
+    const now = contextNow();
+    return [...transforms.values()].map((t) => withContext({ ...t }, now));
   },
   async getTransform(id) {
     await sleep(80);
     const o = transformable(id);
-    return { ...current(o), source: demoSource(o) };
+    return { ...withContext(current(o)), source: demoSource(o), needsWork: demoNeedsWork(o) };
   },
   async getTransformPrompt(id) {
     await sleep(80);
-    const prompt = demoPrompt(transformable(id));
-    return { objectId: id, prompt, characters: prompt.length, promptsDir: demoTransformSettings.promptsDir };
+    const made = consult.contextFile(demoFacts());
+    const base = demoPrompt(transformable(id));
+    const prompt = made ? `${base.trimEnd()}\n\n## The migration context (MIGRATION_CONTEXT.md)\n\n\`\`\`\`markdown\n${made.text}\`\`\`\`\n` : base;
+    return { objectId: id, prompt, characters: prompt.length, promptsDir: demoTransformSettings.promptsDir, context: made?.ref ?? null };
   },
   async generateTransforms(ids) {
     await sleep(120);
     const gate = consult.llmGate("transform", CONSULT_MODE);
     if (!gate.allowed) throw new ApiRequestError(gate.code ?? "llm_refused", gate.reason ?? "Drafts may not be generated now.", 403);
+    const policy = consult.policy(demoFacts(), demoEstate(), CONSULT_MODE);
+    const made = consult.contextFile(demoFacts());
     return ids.map((id) => {
       const o = completedObjects().find((x) => x.id === id);
       if (!o || !KIND_OF_TYPE[o.type]) return { objectId: id, state: "rejected" as const, error: "Drafts are not available for this type of object yet." };
+      if (policy.llmScope === "needs_work" && !demoNeedsWork(o)) {
+        const why = `${o.name} converts with the rules as it is, and the approved brief sends only objects the rules cannot convert to Claude (D6).`;
+        if (ids.length === 1) throw new ApiRequestError("llm_scope", why, 403);
+        return { objectId: id, state: "rejected" as const, error: why };
+      }
       const t = current(o);
       transforms.set(id, { ...t, state: "running", error: null, startedAt: new Date().toISOString() });
       setTimeout(() => {
@@ -1522,6 +1586,7 @@ export const mockApi: MigrationApi = {
             checks: [{ level: "ok", message: "Passed the automatic checks. They are not a substitute for reading it." },
               ...(src.unconverted.length ? [{ level: "warning" as const, message: `The model left ${src.unconverted.length} item for a person; see below.` }] : [])],
             sourceHash: src.hash, generatedAt: new Date().toISOString(), model: "demo", costUsd: null, durationMs: 1800, stale: false,
+            context: made?.ref ?? null, contextApplied: made ? demoApplied(made.text) : [],
           },
         });
       }, 1800);
@@ -1537,16 +1602,18 @@ export const mockApi: MigrationApi = {
     if (!text) throw new ApiRequestError("invalid_request", "The code to accept is empty.", 400);
     const { costUsd: _c, durationMs: _d, ...rest } = t.draft;
     transforms.set(id, { ...t, state: "accepted", draft: null, accepted: { ...rest, code: text, acceptedAt: new Date().toISOString(), edited: text !== t.draft.code.trim() } });
-    return { ...current(o), source: demoSource(o) };
+    return { ...withContext(current(o)), source: demoSource(o), needsWork: demoNeedsWork(o) };
   },
   async listTransformCandidates() {
     await sleep(200);
+    const now = contextNow();
     const items = completedObjects().filter((o) => KIND_OF_TYPE[o.type]).map((o) => {
-      const t = current(o);
+      const t = withContext(current(o), now);
       const problems = demoNeedsWork(o) ? demoSource(o).problems : [];
       const latest = t.draft ?? t.accepted;
       return { objectId: o.id, name: o.name, type: o.type, kind: KIND_OF_TYPE[o.type], problems, rulesChange: !problems.length,
-        state: t.state, error: t.error, confidence: latest?.confidence ?? null, stale: latest ? false : null, unavailable: null };
+        state: t.state, error: t.error, confidence: latest?.confidence ?? null, stale: latest ? false : null,
+        contextStale: latest?.contextStale ?? null, unavailable: null };
     }).sort((a, b) => Number(!a.problems.length) - Number(!b.problems.length) || a.name.localeCompare(b.name));
     const n = (f: (i: (typeof items)[number]) => boolean) => items.filter(f).length;
     return { items, summary: { total: items.length, needsWork: n((i) => i.problems.length > 0), drafts: n((i) => i.state === "draft"),
@@ -1586,9 +1653,9 @@ export const mockApi: MigrationApi = {
     await sleep(60);
     return consult.withdraw(demoFacts(), CONSULT_MODE, question);
   },
-  async acceptRecommendations(section) {
+  async acceptRecommendations(section, questions) {
     await sleep(80);
-    return consult.accept(demoFacts(), CONSULT_MODE, section);
+    return consult.accept(demoFacts(), CONSULT_MODE, section, questions);
   },
   async resolveConflict(conflict, resolution, reason) {
     await sleep(60);
@@ -1636,6 +1703,51 @@ export const mockApi: MigrationApi = {
     await sleep(100);
     return consult.importAnswers(demoFacts(), CONSULT_MODE, answers);
   },
+  async getMigrationContext() {
+    await sleep(60);
+    return consult.contextView(demoFacts());
+  },
+  // -- the orchestrator (demo: the plan from the Demo data's state; the agent only proposes) --
+  async getExecutionPlan() {
+    await sleep(60);
+    return orchestrator.plan();
+  },
+  async markStep(step, done, note) {
+    await sleep(60);
+    return orchestrator.mark(step, done, note);
+  },
+  async decideAction(id, decision, text) {
+    await sleep(80);
+    return orchestrator.decide(id, decision, text);
+  },
+  async controlAgent(action) {
+    await sleep(60);
+    return orchestrator.control(action);
+  },
+  async exportSignoffReport(format) {
+    await sleep(60);
+    return orchestrator.report(format);
+  },
+  async askAssistant(text, taskId) {
+    await sleep(120);
+    return orchestrator.ask(text, taskId);
+  },
+  async getAssistantTasks() {
+    return orchestrator.tasks_();
+  },
+  async getAssistantTask(id) {
+    return orchestrator.task(id);
+  },
+  async cancelAssistantTask(id) {
+    return orchestrator.task(id);
+  },
+  async continueAssistantTask(id) {
+    return orchestrator.task(id);
+  },
+  async exportMigrationContext(hash) {
+    await sleep(60);
+    return { text: consult.contextText(hash), fileName: `MIGRATION_CONTEXT-${hash.slice(0, 12)}.md` };
+  },
   async discardTransform(id, scope) {
     await sleep(100);
     const o = transformable(id);
@@ -1654,6 +1766,25 @@ function transformable(id: string) {
   if (!o) throw new ApiRequestError("object_not_found", "That object is not in the current discovery results.", 404);
   if (!KIND_OF_TYPE[o.type]) throw new ApiRequestError("not_transformable", `Drafts are not available for ${o.type} objects yet.`, 400);
   return o;
+}
+
+/** The hash of the migration context a draft made now would be sent: worked out once for a whole list. */
+/** The migration context a draft made now would be sent: its hash, and the hash of its decisions alone. */
+const contextNow = (): { hash: string; decisionsHash: string } | null => {
+  const ref = consult.contextFile(demoFacts())?.ref;
+  return ref ? { hash: ref.hash, decisionsHash: ref.decisionsHash ?? ref.hash } : null;
+};
+/** A draft or an accepted transform, flagged when it was made with another migration context than the one in force. */
+function withContext(t: TransformObject, now: { hash: string; decisionsHash: string } | null = contextNow()): TransformObject {
+  // Made with other decisions than the ones in force: one made under a brief approved again with the same decisions is current.
+  const flag = <T extends { context?: { hash: string; decisionsHash?: string } | null } | null>(part: T): T =>
+    part && now !== null ? { ...part, contextStale: part.context?.decisionsHash ? part.context.decisionsHash !== now.decisionsHash
+      : (part.context?.hash ?? null) !== now.hash } : part;
+  return { ...t, draft: flag(t.draft), accepted: flag(t.accepted) };
+}
+/** Demo: what a model says it applied, a few of the context's own instructions, in a few words. */
+function demoApplied(text: string): string[] {
+  return text.split("\n").filter((l) => l.startsWith("- ")).slice(0, 3).map((l) => l.slice(2).split(":")[0].split(".")[0].slice(0, 80));
 }
 
 function current(o: { id: string; name: string; type: string }): TransformObject {

@@ -340,7 +340,7 @@ class FabricStageMixin:
         self._need_definition(source, "trigger")
         wid, client = self.run.workspace_id, self._client()  # type: ignore[attr-defined]
         try:
-            bodies, notes = jobs.schedule_bodies(source.payload or {})
+            bodies, notes = jobs.schedule_bodies(source.payload or {}, as_in_synapse=self.run.settings.get("schedules") == "match")
         except jobs.NotConvertible as exc:
             return DEFERRED_STATUS, "Recreate it by hand", None, [str(exc)]
         pipeline_ids = self._ids("dataPipelines")
@@ -357,7 +357,8 @@ class FabricStageMixin:
             created.append(name)
         if not created:
             return SKIPPED, "The pipeline(s) already have a schedule; left unchanged", None, notes
-        return COMPLETED, f"Schedule created (switched off) on {', '.join(created)}", None, notes
+        state = "switched on" if bodies and bodies[0][1].get("enabled") else "switched off"
+        return COMPLETED, f"Schedule created ({state}) on {', '.join(created)}", None, notes
 
     # -- external tables -> OneLake shortcuts ----------------------------------------------------
 

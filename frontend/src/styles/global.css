@@ -1,48 +1,81 @@
-/* Migration Accelerator — dark enterprise theme.
-   Tokens first; components below use only tokens. Semantic colours are used
-   sparingly: success, warning, error, info/running, disconnected. */
+/* Migration Accelerator — the light theme of the MNP accelerator, on this application's own layout.
+   Tokens first; components below use only tokens, so a page never carries a colour that only works on one
+   background. Semantic colours: success, warning, error, info/running, disconnected; and one warm accent
+   (--ai) for everything a model does, so an AI-backed action reads as one family wherever it appears. */
 
 :root {
-  color-scheme: dark;
-  --bg: #080c16;
-  --surface: #0e1424;
-  --surface-2: #131a2d;
-  --surface-3: #1b2440;
-  --border: #1d2640;
-  --border-strong: #2a3556;
-  --text: #e8edf7;
-  --text-muted: #9aa5bd;
-  --text-faint: #6b7794;
-  --accent: #4f8cff;
-  --accent-2: #8b5cf6;
-  --accent-grad: linear-gradient(135deg, #4f8cff, #8b5cf6);
-  --accent-soft: rgba(79, 140, 255, 0.16);
-  --success: #3fb950;
-  --success-soft: rgba(63, 185, 80, 0.14);
-  --warning: #d6a232;
-  --warning-soft: rgba(214, 162, 50, 0.14);
-  --error: #f26b62;
-  --error-soft: rgba(242, 107, 98, 0.14);
-  --info: #58a6ff;
-  --info-soft: rgba(88, 166, 255, 0.14);
-  --disconnected: #6b7686;
-  --radius: 14px;
-  --radius-sm: 8px;
+  color-scheme: light;
+  --bg: #f5f7fb;
+  --surface: #ffffff;
+  --surface-2: #f8fafc;
+  --surface-3: #f1f5f9;
+  --border: #e6e9f0;
+  --border-strong: #d5dae3;
+  --border-hover: #b6bfcc;
+  --border-highlight: rgba(79, 70, 229, 0.45);
+  --text: #0f172a;
+  --text-muted: #475569;
+  --text-faint: #64748b;
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --accent-text: #4338ca;
+  --accent-2: #0ea5e9;
+  --accent-grad: linear-gradient(135deg, #6366f1, #0ea5e9);
+  --accent-soft: #eef2ff;
+  --accent-border: #c7d2fe;
+  --success: #059669;
+  --success-text: #047857;
+  --success-soft: #ecfdf5;
+  --success-border: #a7f3d0;
+  --warning: #d97706;
+  --warning-text: #b45309;
+  --warning-soft: #fffbeb;
+  --warning-border: #fde68a;
+  --error: #e11d48;
+  --error-text: #be123c;
+  --error-soft: #fff1f2;
+  --error-border: #fecdd3;
+  --info: #2563eb;
+  --info-text: #1d4ed8;
+  --info-soft: #eff6ff;
+  --info-border: #bfdbfe;
+  --purple: #7c3aed;
+  --purple-text: #6d28d9;
+  --purple-soft: #f5f3ff;
+  --purple-border: #ddd6fe;
+  --ai: #c2703f;
+  --ai-text: #9a5530;
+  --ai-soft: #fbf3ed;
+  --ai-border: #efd2bd;
+  --ai-grad: linear-gradient(135deg, #d98a5b, #c2703f 55%, #a65a30);
+  --disconnected: #94a3b8;
+  --radius: 12px;
+  --radius-sm: 9px;
   --header-h: 64px;
-  --font: Inter, "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
-  --mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+  --shadow-card: 0 1px 2px rgba(15, 23, 42, 0.04), 0 4px 16px -6px rgba(15, 23, 42, 0.08);
+  --shadow-raised: 0 10px 30px -12px rgba(15, 23, 42, 0.18);
+  --shadow-glow: 0 0 0 4px rgba(79, 70, 229, 0.12);
+  --shadow-primary: 0 1px 2px rgba(15, 23, 42, 0.1), 0 4px 12px -4px rgba(79, 70, 229, 0.55);
+  --font: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "Cascadia Code", Consolas, monospace;
 }
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; }
 body {
   margin: 0;
-  background: radial-gradient(1200px 600px at 85% -10%, rgba(139, 92, 246, 0.10), transparent 60%), var(--bg);
+  background-color: var(--bg);
+  background-image: radial-gradient(at 0% 0%, rgba(99, 102, 241, 0.06) 0px, transparent 45%),
+    radial-gradient(at 100% 0%, rgba(14, 165, 233, 0.05) 0px, transparent 40%);
   background-attachment: fixed;
   color: var(--text);
   font: 15.5px/1.5 var(--font);
   -webkit-font-smoothing: antialiased;
 }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #cfd5df; border-radius: 10px; border: 2px solid var(--bg); }
+::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
 h1, h2, h3, h4, p { margin: 0; }
 h1 { font-size: 30px; font-weight: 600; letter-spacing: -0.01em; }
 h2 { font-size: 17px; font-weight: 600; }
@@ -943,7 +976,45 @@ a.release-toggle:hover { text-decoration: underline; }
 .consult-proposals, .consult-versions { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .consult-proposals li, .consult-versions li { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); }
 .consult-differs { margin-left: 6px; font-size: 11.5px; vertical-align: middle; }
+.consult-context { margin: 0; max-height: 440px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 12.5px; line-height: 1.5; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); color: var(--text-muted); }
+.context-ref { display: inline-flex; gap: 6px; align-items: center; flex-wrap: wrap; font-size: 13px; }
 @media (max-width: 640px) {
   .consult-q { padding: 12px; }
   .consult-input { max-width: none; }
 }
+
+/* ---- the orchestrator: the plan board, the agent's requests, the assistant's conversation ------------------------ */
+.plan-phase { gap: 8px; }
+.plan-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.plan-step { border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface); padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+.plan-step .plan-step-icon { margin-top: 2px; flex: none; color: var(--text-faint); }
+.plan-step.status-done .plan-step-icon { color: var(--success); }
+.plan-step.status-ready .plan-step-icon, .plan-step.status-in_progress .plan-step-icon { color: var(--info); }
+.plan-step.status-failed { border-color: rgba(242, 107, 98, .45); }
+.plan-step.status-failed .plan-step-icon { color: var(--error); }
+.plan-step.status-warn { border-color: rgba(214, 162, 50, .45); }
+.plan-step.status-warn .plan-step-icon { color: var(--warning); }
+.plan-step.status-waiting { opacity: .8; }
+.agent-strip { padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--surface-2); }
+.action-card { border: 1px solid var(--border); border-left: 3px solid var(--info); border-radius: var(--radius-sm); background: var(--surface-2); padding: 10px 12px; }
+.action-card.tier-change { border-left-color: var(--warning); }
+.action-card.tier-high { border-left-color: var(--error); }
+.action-preview { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 6px 0 0; font-size: 13px; }
+.action-preview > div { display: contents; }
+.action-preview dt { color: var(--text-faint); }
+.action-preview dd { margin: 0; color: var(--text-muted); word-break: break-word; }
+.ai-fab-badge { position: absolute; top: -4px; right: -4px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--warning); color: #111; font-size: 11px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; }
+.ai-tabs { margin: 0 14px 6px; }
+.ai-msg.mine { justify-content: flex-end; }
+.ai-msg.mine .ai-bubble { background: var(--accent-soft); }
+.ai-step { margin: 0; font-size: 13px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.ai-step code, .ai-result code { font-size: 12px; }
+.ai-error { color: var(--error); }
+.ai-data { margin: 4px 0 0; max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 11.5px; color: var(--text-muted); }
+.ai-history { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+.ai-checklist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.ai-checklist li { display: flex; gap: 6px; align-items: flex-start; color: var(--text-muted); }
+.ai-checklist li.status-done { color: var(--text-faint); text-decoration: line-through; }
+.ai-checklist li.status-done svg { color: var(--success); }
+.ai-checklist li.status-failed svg { color: var(--error); }
+.ai-checklist li.status-warn svg { color: var(--warning); }

@@ -39,9 +39,14 @@ function toDraft(def: ConsultQuestionDef, value: unknown): Draft {
     default: return value === null || value === undefined ? "" : String(value);
   }
 }
-/** What is sent: the backend checks and cleans it, and says what is wrong in words. */
-function fromDraft(def: ConsultQuestionDef, draft: Draft): unknown {
+/** What is sent: the backend checks and cleans it, and says what is wrong in words. A principal map sends only the SQL
+ *  users on the page: one a new discovery no longer finds is dropped, never sent back as an error. */
+function fromDraft(def: ConsultQuestionDef, draft: Draft, q?: ConsultQuestion): unknown {
   if (def.type === "number") return draft === "" ? null : Number(draft);
+  if (def.type === "principalMap") {
+    const rows = new Set(q?.rows ?? []);
+    return Object.fromEntries(Object.entries(draft as Record<string, string>).filter(([user]) => rows.has(user)));
+  }
   return draft;
 }
 const sameDraft = (a: Draft, b: Draft) => JSON.stringify(a) === JSON.stringify(b);
@@ -127,8 +132,11 @@ function PreviewLine({ preview }: { preview: AnswerPreview["preview"] }) {
 /** One question: where it stands, who answered it and why, what it rests on, and the controls to answer it. */
 export function QuestionCard({ def, q, focused }: { def: ConsultQuestionDef; q: ConsultQuestion; focused?: boolean }) {
   const { api } = useAppState();
-  const { answer, skip, withdraw, explain, busy } = useConsult();
-  const current = useMemo(() => toDraft(def, q.value), [def, q.value]);
+  const { answer, accept, skip, withdraw, explain, busy } = useConsult();
+  // Keyed on what the value is, not on the object read: every read of the page makes a new one, and resetting the
+  // form on each would lose what a person is typing whenever anything else on the page is answered.
+  const valueKey = JSON.stringify(q.value ?? null);
+  const current = useMemo(() => toDraft(def, q.value), [def, valueKey]); // eslint-disable-line react-hooks/exhaustive-deps
   const [draft, setDraft] = useState<Draft>(current);
   const [note, setNote] = useState("");
   const [preview, setPreview] = useState<AnswerPreview["preview"] | null>(null);
@@ -141,13 +149,13 @@ export function QuestionCard({ def, q, focused }: { def: ConsultQuestionDef; q: 
     if (!dirty || !["choice", "boolean", "multi"].includes(def.type)) { setPreview(null); return; }
     let live = true;
     const t = setTimeout(() => {
-      api.previewAnswer(def.id, fromDraft(def, draft)).then((p) => { if (live) setPreview(p.preview); }, () => { if (live) setPreview(null); });
+      api.previewAnswer(def.id, fromDraft(def, draft, q)).then((p) => { if (live) setPreview(p.preview); }, () => { if (live) setPreview(null); });
     }, 250);
     return () => { live = false; clearTimeout(t); };
-  }, [api, def, draft, dirty]);
+  }, [api, def, draft, dirty]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const st = STATUS[q.status];
-  const save = async () => { if (await answer(def.id, fromDraft(def, draft), note.trim() || undefined)) setNote(""); };
+  const save = async () => { if (await answer(def.id, fromDraft(def, draft, q), note.trim() || undefined)) setNote(""); };
   const empty = draft === "" || (Array.isArray(draft) && !draft.length);
   // Saved when changed, when an answer is confirmed again, or when an open question gets one.
   const canSave = dirty || q.status === "stale" || (q.status === "open" && !empty);
@@ -177,6 +185,9 @@ export function QuestionCard({ def, q, focused }: { def: ConsultQuestionDef; q: 
       {q.evidence.length > 0 && (
         <p className="faint" style={{ margin: 0 }}>Rests on: {q.evidence.map((e) => `${e.description} (${show(e.value)})`).join("; ")}.</p>
       )}
+      {def.drives.some((d) => d.status === "context") && (
+        <p className="faint" style={{ margin: 0 }}><Sparkles size={12} aria-hidden="true" /> Sent to the AI with each draft, in the migration context (MIGRATION_CONTEXT.md).</p>
+      )}
       {(confirmed || q.status === "skipped") && q.by && (
         <p className="faint" style={{ margin: 0 }}>
           {q.status === "skipped" ? "Skipped" : q.source ? SOURCE[q.source].charAt(0).toUpperCase() + SOURCE[q.source].slice(1) : "Answered"} by {q.by.id}{q.at ? ` on ${new Date(q.at).toLocaleString()}` : ""}{q.note ? `: ${q.note}` : ""}.
@@ -193,7 +204,7 @@ export function QuestionCard({ def, q, focused }: { def: ConsultQuestionDef; q: 
           {q.status === "stale" && !dirty ? "Confirm answer" : "Save answer"}
         </Button>
         {canAccept && !dirty && (
-          <Button size="small" onClick={() => void answer(def.id, q.recommendation!.value)} disabled={working}>Use the recommendation</Button>
+          <Button size="small" onClick={() => void accept(undefined, [def.id])} loading={busy === `accept:${def.id}`} disabled={working}>Use the recommendation</Button>
         )}
         {dirty && <Button size="small" variant="ghost" onClick={() => setDraft(current)} disabled={working}><RotateCcw size={13} aria-hidden="true" />Undo</Button>}
         {!def.required && q.status !== "skipped" && q.status !== "answered" && q.recommendation && (

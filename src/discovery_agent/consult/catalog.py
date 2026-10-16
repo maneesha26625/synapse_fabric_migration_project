@@ -8,15 +8,22 @@ estate. Loading checks that:
 * every fact a condition, a reason or an evidence list names exists in ``facts``;
 * conditions use only known operators, and read only questions that come **earlier** in the catalog, so the
   engine evaluates them in one pass, never in a loop;
-* every contradiction has a resolution a person can always take.
+* every contradiction has a resolution a person can always take;
+* its ``history`` maps the question ids of each earlier version to this version's, onto questions that exist.
 
 A catalog that fails any of these is refused, whole: the accelerator never runs on half a catalog.
+
+**Earlier versions.** Every answer records the catalog version it was made against. When a later catalog renames
+questions, its ``history`` says, for each earlier version, which question each old id is now (straight to this
+version's ids, not through the versions in between) and which contradictions are gone. ``translate`` reads an old
+record as this version's: so answers given before a catalog change are kept, under the questions they answer now.
 """
 
 from __future__ import annotations
 
 import datetime as _dt
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -115,7 +122,7 @@ class Question:
                 raise ValueError("Answer yes or no.")
             return value
         if kind == "number":
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError("Enter a number.")
             if self.minimum is not None and value < self.minimum or self.maximum is not None and value > self.maximum:
                 raise ValueError(f"Enter a number from {self.minimum:g} to {self.maximum:g}.")
@@ -150,14 +157,14 @@ class Question:
             rows = {str(r).lower(): str(r) for r in (facts.get(self.rows_from) or [])} if self.rows_from else {}
             out: Dict[str, str] = {}
             for key, target in value.items():
+                if isinstance(target, str) and not target.strip():
+                    continue  # blank: left for a person, even for a user a new discovery no longer finds
                 name = rows.get(str(key).lower())
                 if name is None:
                     raise ValueError(f"{key} is not one of the SQL users discovered.")
                 if not isinstance(target, str):
                     raise ValueError(f"Enter a Microsoft Entra user or group for {name}.")
                 principal = " ".join(target.split())
-                if not principal:
-                    continue  # blank: left for a person
                 if len(principal) > 256 or any(c in principal for c in "[]"):
                     raise ValueError(f"{principal[:40]} is not a Microsoft Entra user or group name.")
                 out[name] = principal
@@ -190,9 +197,31 @@ class Catalog:
     sections: Tuple[Tuple[str, str], ...]
     questions: Tuple[Question, ...]
     conflicts: Tuple[Conflict, ...]
+    #: Earlier version -> {its question id: this version's}. An id not listed kept its name.
+    renamed: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
+    #: Earlier version -> the contradictions this version no longer has.
+    removed_conflicts: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
 
     def question(self, question_id: str) -> Optional[Question]:
         return next((q for q in self.questions if q.id == question_id), None)
+
+    def translate(self, record: Mapping[str, Any]) -> Mapping[str, Any]:
+        """A record made against an earlier version of the catalog, read as this one's: its question, the contradiction it
+        resolves and the answers it was kept for, under the ids they have now. It then says this version, and keeps the
+        one it was made with (``madeWithCatalog``), so translating it again changes nothing."""
+        made = str(record.get("catalogVersion") or "")
+        names = self.renamed.get(made)
+        if not made or made == self.version or names is None:
+            return record
+        out = dict(record)
+        if out.get("question") is not None:
+            out["question"] = names.get(str(out["question"]), str(out["question"]))
+        if isinstance(out.get("answers"), dict):
+            out["answers"] = {names.get(str(k), str(k)): v for k, v in out["answers"].items()}
+        if str(out.get("conflict") or "") in self.removed_conflicts.get(made, ()):
+            out["conflict"] = None
+        out["catalogVersion"], out["madeWithCatalog"] = self.version, made
+        return out
 
     def conflict(self, conflict_id: str) -> Optional[Conflict]:
         return next((c for c in self.conflicts if c.id == conflict_id), None)
@@ -255,7 +284,16 @@ def parse(data: Mapping[str, Any]) -> Catalog:
             ))
         except (KeyError, TypeError) as exc:
             problems.append(f"A contradiction cannot be read ({exc}): {str(raw)[:80]}")
-    catalog = Catalog(str(data.get("version") or ""), sections, tuple(questions), tuple(conflicts))
+    renamed: Dict[str, Dict[str, str]] = {}
+    removed: Dict[str, Tuple[str, ...]] = {}
+    for raw in data.get("history") or []:
+        try:
+            version = str(raw["version"])
+            renamed[version] = {str(k): str(v) for k, v in (raw.get("renamed") or {}).items()}
+            removed[version] = tuple(str(c) for c in raw.get("removedConflicts") or [])
+        except (KeyError, TypeError, AttributeError) as exc:
+            problems.append(f"A history entry cannot be read ({exc}): {str(raw)[:80]}")
+    catalog = Catalog(str(data.get("version") or ""), sections, tuple(questions), tuple(conflicts), renamed, removed)
     problems += check(catalog)
     if problems:
         raise CatalogError("The consultation catalog is not valid:\n- " + "\n- ".join(problems))
@@ -373,9 +411,23 @@ def check(catalog: Catalog) -> List[str]:
             problems.append(f"Question {q.id}: no fact '{f}'.")
         for a in answers - ids:
             problems.append(f"Question {q.id}: its separate approver reads no question '{a}'.")
+    for version, names in catalog.renamed.items():
+        where = f"History {version}"
+        if version == catalog.version:
+            problems.append(f"{where} is this catalog's own version.")
+        for old, new in names.items():
+            if new not in ids:
+                problems.append(f"{where}: {old} is renamed to {new}, which is not a question.")
+        targets = list(names.values())
+        if len(set(targets)) != len(targets):
+            problems.append(f"{where}: two questions are renamed to the same one.")
     conflict_ids = [c.id for c in catalog.conflicts]
     if len(set(conflict_ids)) != len(conflict_ids):
         problems.append("Two contradictions share an id.")
+    for version, gone in catalog.removed_conflicts.items():
+        for c in gone:
+            if c in conflict_ids:
+                problems.append(f"History {version}: contradiction {c} is said to be removed, but this catalog has it.")
     for c in catalog.conflicts:
         where = f"Contradiction {c.id}"
         try:

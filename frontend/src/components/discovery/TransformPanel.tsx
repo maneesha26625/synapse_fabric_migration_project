@@ -1,7 +1,7 @@
-import { AlertTriangle, CheckCircle2, Eye, RotateCcw, Sparkles, Trash2, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle2, Eye, FileText, RotateCcw, Sparkles, Trash2, XCircle } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useAppState } from "../../state/AppState";
-import { ApiRequestError, type ObjectDetail, type TransformCheck, type TransformObject, type TransformSettings } from "../../types";
+import { ApiRequestError, type MigrationContextRef, type ObjectDetail, type TransformCheck, type TransformObject, type TransformSettings } from "../../types";
 import { Banner, Button, Collapsible, ConfirmDialog, Skeleton, StatusBadge, Tabs, type Tone } from "../shared/Shared";
 
 /** Synapse types a draft can be generated for; the server's settings have the final say. */
@@ -55,6 +55,23 @@ function Section({ title, actions, children }: { title: string; actions?: ReactN
       </div>
       {children}
     </section>
+  );
+}
+
+/** Which migration context (MIGRATION_CONTEXT.md, from the approved brief) a draft was sent, what it applied, and
+ *  whether the brief has moved on since. */
+function ContextLine({ context, applied, stale }: { context?: MigrationContextRef | null; applied?: string[]; stale?: boolean | null }) {
+  if (context === undefined) return null;
+  return (
+    <div className="stack" style={{ gap: 4 }}>
+      <p className="faint context-ref" style={{ margin: 0 }}>
+        <FileText size={13} aria-hidden="true" />
+        {context ? <>Sent <strong>MIGRATION_CONTEXT.md</strong> from brief version {context.briefVersion}{context.minimal ? " (decisions only)" : ""} · <code>{context.hash.slice(0, 12)}</code></>
+          : "Made without a migration context: no brief was approved."}
+      </p>
+      {stale && <Banner tone="warning" title="Made with an earlier migration context">The approved brief has changed since this was drafted. Generate a new draft, so it follows the brief as it is.</Banner>}
+      {applied && applied.length > 0 && <List title="What it applied from the migration context" items={applied} />}
+    </div>
   );
 }
 
@@ -146,8 +163,9 @@ export function TransformPanel({ object }: { object: ObjectDetail }) {
   return (
     <div className="stack" style={{ gap: 24 }}>
       <Banner tone="info" title="Convert with an LLM (Claude, through Claude Code)">
-        This sends the object's definition, its rule-based conversion and your project requirements
-        (<code>prompts/transform/project.md</code>) to Claude, using the Claude Code CLI on the machine running the API.
+        This sends the object's definition, its rule-based conversion, the migration context made from the approved brief
+        (<code>MIGRATION_CONTEXT.md</code>) and your project requirements (<code>prompts/transform/project.md</code>) to Claude,
+        using the Claude Code CLI on the machine running the API.
         A draft is never deployed as it is: you review it here, and only what you accept is used by the next migration run.
       </Banner>
       {settings && !settings.enabled && <Banner tone="warning" title="Generation is switched off">{settings.disabledReason}</Banner>}
@@ -215,6 +233,7 @@ export function TransformPanel({ object }: { object: ObjectDetail }) {
             <StatusBadge tone={CONFIDENCE_TONE[draft.confidence]}>Model confidence: {draft.confidence}</StatusBadge>
             <span className="faint">{draft.model || "model"} · {fmt(draft.generatedAt)} · {(draft.durationMs / 1000).toFixed(0)} s{draft.costUsd != null ? ` · $${draft.costUsd.toFixed(3)}` : ""}</span>
           </div>
+          <ContextLine context={draft.context} applied={draft.contextApplied} stale={draft.contextStale} />
           <Checks checks={draft.checks} />
           <List title="Left for a person" items={draft.unconverted} tone="warning" />
           <List title="What the model changed" items={draft.notes} />
@@ -228,6 +247,7 @@ export function TransformPanel({ object }: { object: ObjectDetail }) {
           {t.accepted.stale
             ? <Banner tone="warning" title="Out of date">The source changed after this was accepted, so the next run uses the rule-based output instead. Generate and accept a new draft.</Banner>
             : <p className="muted">The next migration run creates this object from the accepted code{t.accepted.edited ? " (edited by the reviewer)" : ""}, accepted {fmt(t.accepted.acceptedAt)}.</p>}
+          <ContextLine context={t.accepted.context} applied={t.accepted.contextApplied} stale={t.accepted.contextStale} />
           {draft && <Collapsible summary="Show the accepted code"><Code text={t.accepted.code} label="Accepted transform" /></Collapsible>}
           <List title="Left for a person" items={t.accepted.unconverted} tone="warning" />
         </Section>

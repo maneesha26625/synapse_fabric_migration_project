@@ -130,6 +130,7 @@ def main() -> int:
         except KeyboardInterrupt:
             pass
         finally:
+            server.orchestrator.stop()
             server.server_close()
             with context.bound(actor=context.system()):
                 server.projects.audit("system.stopped", details={"pid": os.getpid()})

@@ -111,6 +111,19 @@ def map_type(column: SqlColumn) -> Tuple[str, Optional[str]]:
     raise UnsupportedColumn(f"Column {name} has type {source or 'unknown'}, which Fabric Warehouse cannot store.")
 
 
+#: Source types whose Fabric type keeps less than they held: a time-zone offset, auto-updated row versions, XML and
+#: spatial behaviour. (datetime2 and time with more than 6 fractional digits lose the 7th, checked by scale.)
+_LOSSY = {"datetimeoffset", "timestamp", "rowversion", "xml", "geography", "geometry"}
+
+
+def loses(column: SqlColumn) -> bool:
+    """Whether the column's Fabric type keeps less than its Synapse one did, beyond a renamed type."""
+    source = (column.data_type or "").strip().lower()
+    if source in _LOSSY:
+        return True
+    return source in ("datetime2", "time") and (column.scale if column.scale is not None else MAX_TIME_PRECISION) > MAX_TIME_PRECISION
+
+
 def identity_columns(table: SqlTable) -> List[SqlColumn]:
     """The table's IDENTITY columns that stay IDENTITY in Fabric (in practice, at most one)."""
     return [c for c in sorted(table.columns, key=lambda c: c.column_id)

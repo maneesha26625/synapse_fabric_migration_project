@@ -343,16 +343,24 @@ to what, when and how it ended, filtered by kind of action and by who did it.
 changed, removed or moved; **CSV** and **JSON lines** download it (the JSON
 lines keep the hashes, so the trail can be checked elsewhere).
 
-### Migration assistant (preview)
+### Migration assistant and the execution plan
 
 The round **+** button at the bottom right (or **Ctrl+I**) opens the
-assistant, docked on the right like an editor's chat. It will help resolve
-migration errors without leaving the screen: explain why an object failed from
-its error and definition, suggest a fix (for example T-SQL a Fabric Warehouse
-accepts) for you to review, and apply it and retry just that object. This
-release shows the panel, the context it will use (step, source, target,
-failed objects) and suggested questions; the conversation itself is not built
-yet, and nothing typed there is sent anywhere.
+assistant, docked on the right like an editor's chat; the number on the button
+is how many of the agent's requests wait for you. Ask it why something failed,
+what is left to do, or where the migration stands: it answers from the
+accelerator's own record (the run, its diagnosis, the execution plan). With
+consent in an approved brief (D1) it asks Claude, one checked step at a time, and
+anything it would change is an **action card** you confirm or reject; without it,
+it answers the questions it knows by its rules. Its **Plan** tab is the execution
+plan as a checklist, and **Requests** lists what waits for you.
+
+**Migrate → Execution plan** is the plan board: every step from the readiness
+checks to the sign-off report, who owns it (a person, the agent, the
+accelerator), the brief answers it came from, and what the agent proposes. A
+person marks their own tasks done, pauses or resumes the agent (the kill switch),
+and downloads the **sign-off report**. See
+[The orchestrator](#the-orchestrator-execution-plan-agent-and-assistant).
 
 The layout works from wide screens down to phones: on a phone the top bar
 takes two rows, the step strip swipes sideways with the selected step kept in
@@ -382,6 +390,8 @@ data**.
     ├─ mapping/              Synapse → Fabric mapping, classification, dependency waves
     ├─ api/fabric.py         Fabric sign-in through the Azure CLI or the Fabric CLI
     ├─ migration/            planner, stages, T-SQL rules, Fabric REST, data pipelines, validation, Fabric Git
+    ├─ consult/              the questions, the migration brief, the policy, MIGRATION_CONTEXT.md
+    ├─ orchestrator/         the execution plan, diagnosis, the tool registry, the assistant's task loop
     └─ state/                projects, run records, sign-off, audit trail, logs and correlation ids
              │               (.accelerator/state/projects/<project>/, .accelerator/logs/)
              │
@@ -405,9 +415,10 @@ Live mode that is `realApi.ts` and the local API; in Demo mode it is
 | `src/discovery_agent/discovery.py`, `records.py`, `extractors/`, `sql/`, `synapse/`, `acquisition/`, `artifacts/` | The discovery engine: what the workspace, the SQL pool and the Git repository say, merged into one record per object. |
 | `src/discovery_agent/mapping/` | `synapse_fabric_mapping.py` (Fabric target, classification and workstream for each object type and pipeline activity) and `waves.py` (dependency waves). |
 | `src/discovery_agent/migration/` | The planner, the eleven stages, the T-SQL rules, Fabric REST calls, data pipelines, validation, `fabric_git.py` (the target workspace's Fabric Git: status, commit, pull-request link), `run_state.py` (the statuses of a run and its objects, and the moves between them) and `failures.py` (what kind of failure an object's error is). See [Migration](#migration) and [Fabric Git (Dev)](#fabric-git-dev). |
-| `src/discovery_agent/consult/` | The consultation: `catalog.json` (the questions, as data) and `catalog.py` (checks it at load), `conditions.py` (when a question applies), `facts.py` (what the estate facts are), `settings.py` (the settings a brief can set, and who acts on each), `engine.py` (where every question stands), `brief.py` (versions, hashes, Markdown) and `policy.py` (what every consumer reads). See [Consultation and the migration brief](#consultation-and-the-migration-brief). |
+| `src/discovery_agent/consult/` | The consultation: `catalog.json` (the questions, as data, and their history) and `catalog.py` (checks it at load, reads older answers under new ids), `conditions.py` (when a question applies), `facts.py` (what the estate facts are), `settings.py` (the settings a brief can set, and who acts on each), `engine.py` (where every question stands), `brief.py` (versions, hashes, Markdown), `policy.py` (what every consumer reads) and `context_file.py` (MIGRATION_CONTEXT.md). See [Consultation and the migration brief](#consultation-and-the-migration-brief). |
+| `src/discovery_agent/orchestrator/` | The orchestrator: `plan.py` (the execution plan, and where each step stands), `diagnosis.py` (what each failure allows), `tools.py` (the tool registry and its tiers) and `assistant.py` (the task loop and its fixed intents). See [The orchestrator](#the-orchestrator-execution-plan-agent-and-assistant). |
 | `src/discovery_agent/state/` | What the backend keeps and records: `store.py` (a project's files: versioned documents, append-only streams, blobs, leases), `projects.py`, `runs.py` (run records), `approvals.py` (sign-off), `audit.py` (the hash-chained trail), `context.py` (correlation id and actor), `logs.py` (JSON logs), `processes.py`. See [Projects, run records and the audit trail](#projects-run-records-and-the-audit-trail). |
-| `src/discovery_agent/api/` | The local HTTP API: `service.py` (connections, discovery, results), `fabric.py` (Fabric sign-in), `consult.py` (the consultation, the brief, the LLM gate), `migration.py` (plan, run, sign-off, run history, validate), `projects.py` (projects, the audit trail), `mapping.py`, `server.py`. |
+| `src/discovery_agent/api/` | The local HTTP API: `service.py` (connections, discovery, results), `fabric.py` (Fabric sign-in), `consult.py` (the consultation, the brief, the LLM gate, the migration context), `orchestrator.py` (the plan board, requests, the supervisor, the report, the assistant), `migration.py` (plan, run, sign-off, run history, validate), `projects.py` (projects, the audit trail), `mapping.py`, `server.py`. |
 | `prompts/transform/` | The prompt templates for LLM-assisted transformation: `base.md`, one file per object type, and `project.md` for your project's own rules. |
 | `transforms/` | Drafts and accepted LLM-assisted transforms, one JSON file per object (created on first use; git-ignored, because it holds the client's code). |
 | `tests/` | The backend test suite; runs offline. |
@@ -428,7 +439,8 @@ All under `/api`, JSON in and out. Nothing returns a token or a secret.
 | Mapping and waves | `GET /mapping/components` · `GET /dependencies` |
 | Fabric connection | `GET /fabric/connection` · `POST /fabric/authenticate` · `POST /fabric/workspaces` · `POST /fabric/test` · `DELETE /fabric/connection` |
 | LLM transformation | `GET /transform/settings` · `GET /transform` · `GET /transform/objects/<id>` · `GET /transform/prompt/<id>` · `POST /transform/generate` (`ids`) · `POST /transform/accept` (`id`, optional edited `code`) · `POST /transform/discard` (`id`, `scope`: `draft` or `all`) · `GET /transform/candidates` · `GET`/`POST /transform/project` |
-| Consultation | `GET /consult` (every question as it stands, the contradictions, what is next, the brief, proposals, the LLM gate) · `GET /consult/catalog` · `POST /consult/answer` (`question`, `value`, `note?`; `preview: true` says what it would change without recording it) · `POST /consult/skip` · `POST /consult/withdraw` · `POST /consult/accept` (`section?`) · `POST /consult/resolve` (`conflict`, `resolution`: `take` or `keep`, `reason`) · `GET /consult/brief` · `POST /consult/brief/submit` (`note?`) · `POST /consult/brief/approve` (`version`, `decision`: `approve` or `reject`, `comment?`, `hash?`; a person only) · `GET /consult/brief/export?version=&format=md|json` · `GET /consult/policy` (what Plan pre-sets: run options, date filters, objects left out, names, sign-off, Validate's depth) · `POST /consult/deviation` (`items`, `options`, `reason`) · `POST /consult/propose` (`text`) · `POST /consult/proposals` (`ids`, `decision`: `confirm` or `reject`) · `POST /consult/explain` (`question`) · `GET /consult/questionnaire?format=md|json` · `POST /consult/questionnaire` (`answers`) |
+| Consultation | `GET /consult` (every question as it stands, the contradictions, what is next, the brief, proposals, the LLM gate) · `GET /consult/catalog` · `POST /consult/answer` (`question`, `value`, `note?`; `preview: true` says what it would change without recording it) · `POST /consult/skip` · `POST /consult/withdraw` · `POST /consult/accept` (`section?`, `questions?`) · `POST /consult/resolve` (`conflict`, `resolution`: `take` or `keep`, `reason`) · `GET /consult/brief` · `POST /consult/brief/submit` (`note?`) · `POST /consult/brief/approve` (`version`, `decision`: `approve` or `reject`, `comment?`, `hash?`; a person only) · `GET /consult/brief/export?version=&format=md|json` · `GET /consult/policy` (what Plan pre-sets: run options, date filters, objects left out, names, sign-off, Validate's depth) · `POST /consult/deviation` (`items`, `options`, `reason`) · `POST /consult/propose` (`text`) · `POST /consult/proposals` (`ids`, `decision`: `confirm` or `reject`) · `POST /consult/explain` (`question`) · `GET /consult/questionnaire?format=md|json` · `POST /consult/questionnaire` (`answers`) · `GET /consult/context` (MIGRATION_CONTEXT.md as every draft is sent it now) · `GET /consult/context/<sha256>` (one a draft was made with) |
+| Orchestrator and assistant | `GET /orchestrator/plan` (the execution plan: every step with its status, the open requests, the agent) · `POST /orchestrator/steps/mark` (`step`, `done`, `note?`; a person only) · `GET /orchestrator/actions?status=open|all` · `POST /orchestrator/actions/decide` (`id`, `decision`: `confirm` or `reject`, `note?`, `reason`; a person only) · `POST /orchestrator/supervisor` (`action`: `pause`, `resume`, `wake`) · `GET /orchestrator/tools` · `GET /orchestrator/diagnosis/<id>` · `GET /orchestrator/report?format=md|json` · `GET /assistant/tasks` · `GET /assistant/tasks/<id>` · `POST /assistant/ask` (`text`, `taskId?` to reply) · `POST /assistant/tasks/<id>/cancel` · `POST /assistant/tasks/<id>/continue` |
 | Migration | `GET /migration/capabilities` · `POST /migration/plan` (`credentialNames`: which linked services have credentials; a request carrying the credentials themselves is refused; `record` keeps it as a plan version) · `POST /migration/start` (refused with `plan_blocked` while the planner finds a blocking risk, and under a required consultation with `brief_required`, `brief_stale` or `deviation_unexplained`; `deviationReason` explains a difference from the brief; a run that changes what Fabric has answers `awaiting_approval`) · `POST /migration/approve` (`decision`: `approve` or `reject`, `comment`, `subjectHash`; a person only) · `GET /migration/run` (with `status`, `pausedReason`, `needsInput`, `passes`, `approval`, `executions`, and `git`: the commit after the run) · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: close the run, keeping its record; `version` refuses a page that read an older run; `credentials` for the connections a restart lost) · `GET /migration/runs` · `GET /migration/runs/<id>` · `GET /migration/runs/<id>/events?after=&limit=` · `GET /migration/runs/<id>/artifacts/<sha256>` (what the run sent to Fabric for an object) · `GET /migration/plans/<P001>` · `GET /migration/policy` · `POST /migration/validate` (starts it in the background) · `GET /migration/validation` (also the last one, after a restart) |
 | Projects | `GET /projects` · `POST /projects` (`name`, `id?`, `version?`, `activate?`, `copyFrom?`) · `POST /projects/<id>/rename` · `POST /projects/<id>/activate` (refused with `project_busy` while something of the current project works) · `DELETE /projects/<id>?version=` (archives the folder) |
 | Audit trail | `GET /audit` (newest first; `action` (a family such as `run`), `actor` (`person`, `system`, `agent` or `kind:id`), `outcome`, `run`, `since`, `until`, `correlationId`, `limit`, `before` to page back, `project` for another project's trail) · `GET /audit/verify` · `GET /audit/export?format=jsonl|csv` · `POST /journey/confirm` (`step`, `note?`) |
@@ -505,10 +517,13 @@ tenant setting for Git, and connecting the Dev workspace to Git (see
 
 **Coming next:** deploying from Git to Fabric Test and Prod (with
 `fabric-cicd`): each environment's workspace, connections, Warehouse schema
-and data loads, and schedules switched on only where they should run.
+and data loads, and schedules switched on only where they should run; and the
+orchestrator's **learning loop**: a fix a person accepts for a statement Fabric
+rejected becomes a deterministic T-SQL rule (admitted only once its example
+statements pass), so the next estate converts it without a model call.
 
 **Shown in the UI, not built yet:** sources and destinations other than
-Synapse and Fabric; the migration assistant's conversation.
+Synapse and Fabric.
 
 ## Discovery engine
 
@@ -963,8 +978,11 @@ every run is checked against it.
 ### The questions
 
 The questions are data, not code: `src/discovery_agent/consult/catalog.json`
-(39 questions in nine sections: scope and approach, target and standards, data,
-code, security, release, validation, the assistant, context). Each says when it
+(version 2.0.0: 61 questions and 10 contradictions, in sections lettered as a
+SQL Server → Databricks consultation letters them: **A** scope and approach, **B**
+target and standards, **C** data loading, **D** code conversion and AI, **E**
+environments and operations, **G** security and governance, **H** validation and
+cutover, **I** context for the team and the AI). Each says when it
 applies (a condition over what discovery found and the answers before it), what
 it recommends and why (ordered rules whose reasons quote the estate, such as
 *4 objects use the serverless pool*), which settings it drives, and whether a
@@ -975,7 +993,8 @@ every recommendation gives a brief that can be submitted.
 
 A question appears only when the estate makes it relevant: the data questions
 when there are tables, the SQL-user question when SQL users were discovered, the
-Git questions when the Fabric workspace is connected to Git. What a question
+Git questions when the Fabric workspace is connected to Git, the type question when
+a table has a column Fabric stores with less. What a question
 rests on is a **fact**, worked out once per discovery from metadata only (counts,
 names and short lists, never a definition, a row or a credential):
 `consult/facts.py` names them, `api/consult.py` (`estate_facts`) works them out.
@@ -989,16 +1008,52 @@ names and short lists, never a definition, a row or a credential):
 | Confirm again | What the answer rests on changed since it was given (a new discovery): a person confirms it, or changes it. |
 | Parked | Answered on a branch that no longer applies. The answer is kept, and comes back if the branch applies again. |
 
+**From the SQL Server → Databricks question list.** Most of its questions are
+common to any migration and are asked here as they are; some are about Databricks
+and are asked the way Synapse → Fabric needs them; a few have nothing to act on:
+
+| That list | Here | How |
+|---|---|---|
+| A0 what moves, A2 schemas and tables, A5/A5b history from a date, A6 one cutover or waves | A0, A2 (A2I, A2X), A5/A5D, A6 | As they are; A6's waves are the run's dependency waves, signed off one by one if chosen |
+| A1 each source: migrate, ingest or federate | A1 | Federating is a OneLake shortcut: storage the code reads is reached in place, or left as it is |
+| A3 procedures, views and functions converted | A3, plus A3S | Bring them across, or move the tables first; A3S is Synapse's serverless SQL pool, which Fabric does not have |
+| A4b SSIS | A4 (A4O) | Pipelines with an activity Fabric lacks (an SSIS package, a mapping data flow) and .NET notebooks: rebuilt by hand, or left out |
+| B2/B4 schema per layer, B3 flatten schemas | not asked | A lift to a Fabric Warehouse keeps every Synapse schema as it is; there are no medallion layers to map |
+| B6 naming convention | B6, plus B1, B2, B2L, B3 | Naming for anything new a draft creates; the Warehouse's collation (set once), the Warehouse and Lakehouse names, coding standards |
+| C1 full reload or incremental, C2 watermark column, C3 tables without a key, C4 deletes, C6 parallel reads | C1, C2 (C2N), C3, C4, C8, plus C5, C6, C7, C9 | Sync after the first load; the change column detected or named; a keyless table loaded once or appended to; deletes kept, or the synced tables reloaded at cutover; tables copied at once (the load pipeline's batch). Also the sync's re-read window, replacing rows, running the loads, and how the pool connection signs in |
+| D1 notebook language | D7 | Only .NET notebooks need a language (Fabric Spark has no .NET): PySpark or Scala |
+| D2 AI may write code, G4 metadata to the AI, G5 AI budget | D1, G4, D2 | Consent to send definitions; what goes with each draft (the whole migration context, or only its decisions); the budget |
+| D4 DECIMAL precision | D4 | Fabric's own precision limits: time keeps 6 fractional digits, datetimeoffset its offset no more, rowversion stops changing; accepted, or reviewed before the data loads |
+| D5 procedural T-SQL by AI, D6 which objects AI translates | D5, D6, plus D3 | Code Fabric rejects after the rules: drafted with AI or rewritten by hand; drafts only for what the rules cannot convert, or any object; multi-statement functions (Fabric has none) |
+| E0 delivery, E1 target roles, E2 user or service principal, E4 sign-off, E5 jobs paused, E6 autonomy, E7 promotion | E0 (E0S), E1, E2, E4, E5 (E5O), E6, E7 | Delivery is the commit to the Fabric workspace's Git branch; a production target signs off every run; schedules created switched off, or as they were |
+| E8 parallel loads | C8 | One load pipeline per wave copies its tables in parallel; runs themselves go wave by wave |
+| F1 source structure intake, F2 live extract | not asked | Chosen on Connections: the live workspace, its Git repository, or a ZIP export |
+| G1 PII columns, G2 grants, G3 residency | G1 (G1M), G2 (G2U), G3 | Sensitive columns kept out of logs and copies by every draft, and masked if chosen; roles and permissions, with each SQL user mapped to a Microsoft Entra principal; the capacity's region checked |
+| H1 output comparison, H2/H2a parallel run, H3 cutover window, H4 test copy | H1, H2 (H2A), H3, H4 | Validate's depth; side-by-side cycles before cutover; the window; whether pipelines write to production systems, which keeps Validate from running them (K10) |
+| H5, H5a, H5b comparison tolerances | not asked | Validate compares definitions, columns, types and row counts, not values: there is nothing a tolerance would apply to yet |
+| I1–I4 timeline, pain points, consumers, team skills | I1–I4, plus I5 | Sent to the AI with each draft, in the migration context; I5 (who approves) is kept for people only |
+
+**Answers given before the questions changed.** Every answer records the catalog
+version it was made against. The catalog's `history` says which question each
+old id is now (version 1.0.0's A1, what moves, is A0; its G3, the sign-off, is
+E4), so answers given before are read under the questions they answer now, and
+nothing is lost. A brief approved against an earlier major version of the
+questions never answered those added since: it is stale (*The consultation's
+questions (catalog version): 1.0.0 → 2.0.0*) until it is submitted and approved
+again.
+
 **Accept all recommendations** answers every assumed question with its
 recommendation in one go, the two a person must answer included (D1, whether
-definitions may be sent to Claude, and G3, which runs need a sign-off); each
-section has its own button. A choice says what it would change before it is saved
+definitions may be sent to Claude, and E4, which runs need a sign-off); each
+section has its own button, and **Use the recommendation** answers one question. A choice says what it would change before it is saved
 (*This answer opens A2I; plan.scopeMode: all → include*), and **Explain** says
 what a question decides for this estate.
 
 **Contradictions.** Some answers contradict the estate or each other: replacing
 rows while no run needs a sign-off, a case-sensitive Warehouse for a
-case-insensitive pool, keeping tables in sync when some have no key. A
+case-insensitive pool, a production target with runs nobody signs off, running
+pipelines in Validate when they may write to production systems, AI drafts without
+consent. A
 contradiction comes first and holds the brief back until a person **takes the
 finding** (the safe answer, recorded as theirs), **keeps the answers with a
 reason** (kept in the brief and the audit trail), or changes an answer. One kept
@@ -1021,17 +1076,22 @@ approver was the submitter is recorded either way, and
 `MIGRATION_BRIEF_APPROVAL=separate` refuses such a version's self-approval. Each
 version downloads as Markdown (for the client, and the final report) or JSON.
 
-A version lists each decision with who made it and why, the settings the
-accelerator acts on and who acts on each, the assumptions, what is recorded but
-not acted on (the assistant's autonomy, owners, the cutover window), the
-contradictions kept with their reasons, and the facts it rests on with their
-fingerprint.
+A version lists each decision with who made it and why (a recommendation's
+reason only where the decision is that recommendation), the settings the
+accelerator acts on and who acts on each, what only the AI acts on (sent with
+every draft), the assumptions, what is kept for people (owners, the cutover
+window), the contradictions kept with their reasons, and the facts it rests on
+with their fingerprint.
 
 **Freshness.** A new discovery whose facts differ makes the approved brief
 **stale**: *Changes since approval* lists exactly what moved (*SQL Script 12 →
 11*), answers whose own evidence changed are to be confirmed again, and the brief
 is submitted and approved again. Only facts about the estate count: a target
-that is briefly disconnected never stales a brief.
+that is briefly disconnected never stales a brief. One environment fact does: the
+approval keeps which Fabric workspace was the target, and once another is connected
+the brief is stale (*The Fabric target workspace: Sales WS → Sales PROD*), because
+what it says about the target (E1, what it is for) was about the one it was
+approved for.
 
 ### What the brief changes
 
@@ -1045,14 +1105,23 @@ answer.
 | What is in scope (schemas and folders, or name patterns left out), and leaving out serverless-pool code, multi-statement functions and what must be rebuilt | Plan's **Add all** leaves those objects out, each with why |
 | How a run goes through the waves | Stop at a wave with failures, or a person **signs off each wave** before the next one starts (the run pauses, `awaiting_wave_signoff`; Resume, by a person, releases that wave and is recorded as `run.wave_signed_off`) |
 | Objects already in Fabric, the Warehouse collation, tables that already have rows, whether load pipelines run, the sync re-read window | Plan's stage options are pre-set |
-| How much history loads, and whether tables stay in sync | Each table's date filter is pre-set |
+| How much history loads, and whether tables stay in sync | Each table's date filter is pre-set (a brief that decides them decides every table: none means none) |
 | Storage the code reads directly | Routed through OneLake shortcuts, or left |
 | The Warehouse's and the Lakehouse's names | The run creates them under those names; Validate compares against them |
 | The Microsoft Entra user or group that replaces each SQL user | The SQL user is migrated as that principal: its role memberships and its grants go to it |
 | Commit each run to Fabric Git, and what the commit takes | Only what the run made (the default), or everything waiting in the workspace |
 | Which runs a person signs off | The sign-off rule, which never loosens one this machine is set to (`MIGRATION_SIGNOFF`): the stricter holds |
 | Whether definitions may be sent to Claude, and the budget | Every LLM call is refused without consent, and once the budget is spent |
-| Naming and coding standards | Added to every draft's prompt |
+| Views, procedures and functions now, or the tables first (A3) | Plan's **Add all** leaves them out for a later run |
+| Which column marks a changed row, and tables with no key (C2, C2N, C3) | Each table's sync follows the named column (first found); a keyless table is loaded once, or appended to |
+| How many tables load at once (C8) | The load pipeline's batch (1 to 50) |
+| Schedules switched off, or as they were in Synapse (E5) | Schedules are created that way; on only where the Synapse trigger had been started |
+| Sensitive columns, and masking them (G1, G1M) | Each matching column without a mask gets the default dynamic data mask; drafts keep them out of logs and copies |
+| What the target workspace is for (E1) | Production signs off every run, and the agent never acts alone there |
+| Which objects may be drafted with AI, and what goes with each draft (D6, G4) | A draft for an object the rules convert is refused (`llm_scope`); the migration context in full, or only its decisions |
+| Deletes, reviews, rewrites by hand, residency, identity, parallel runs (C4, D4, D3, D5, A4, G3, E2, H2) | Steps of the execution plan: a person's task, or a check (see [The orchestrator](#the-orchestrator-execution-plan-agent-and-assistant)) |
+| What the assistant may do alone (E6) | Observe, suggest (the default), or act on a development workspace |
+| Naming and coding standards, the notebook language, the context answers (B3, B6, D7, I1–I4) | Sent to the AI with every draft, in `MIGRATION_CONTEXT.md` |
 | How deep Validate checks | Validate's checks are pre-set |
 
 Plan is pre-set **once for each set of decisions**, so a person's later changes
@@ -1071,6 +1140,34 @@ reason given (`deviation_unexplained`; the reason can also be given at Start).
 with each run. Every run keeps the brief it started under (`pins.brief`: its
 version and hash, the differences, and the reason).
 
+### The migration context (MIGRATION_CONTEXT.md)
+
+Every LLM draft is sent the approved brief written for the model: the
+**migration context**, made by `consult/context_file.py` from the policy in force.
+It holds the decisions that shape code, each as an instruction (*The Warehouse
+compares names and text case-insensitively, as the Synapse pool did*; *Storage the
+code reads directly is reached through OneLake shortcuts*; *These columns hold
+personal or sensitive data …*), then the coding standards and the naming
+convention as they were written, then the context answers. It goes in the prompt
+fenced off, after the project requirements, and wins where the two disagree.
+
+* **Referred to by each draft.** A draft records the file it was sent: its content
+  hash, the hash of its decisions alone, the brief version and whether it was
+  minimal (G4). The model lists, in its answer, each instruction of the context the
+  draft applies; the review shows them. A draft or an accepted transform made with
+  other decisions than the ones in force is flagged (*Made with an earlier migration
+  context*): draft it again to follow the brief as it is. A brief approved again with
+  the same decisions, or with others that never reach the model (who signs runs off,
+  say), leaves every draft current. `transform.drafted` in the audit trail carries
+  the context's hash.
+* **Read and kept.** **Consult → Migration context** shows the file every draft is
+  sent now (`GET /consult/context`); each one a draft was made with is kept in the
+  project's `blobs/` by its hash and downloads with `GET /consult/context/<sha256>`.
+  The same brief makes the same file, byte for byte.
+* **Minimal (G4).** Only the decisions: no context answers, and no names of
+  sensitive columns or Microsoft Entra principals; the objects a draft reads are
+  named without their columns.
+
 ### Help: notes, explanations, a questionnaire
 
 * **Read answers from notes.** Paste meeting notes or an email (*the last 3
@@ -1078,7 +1175,9 @@ version and hash, the differences, and the reason).
   are proposed, each with the words it was read from, and nothing is answered
   until a person confirms each one. With consent (D1) Claude reads the notes;
   what is sent is the text pasted, the questions, and counts and yes/no facts
-  about the estate, never a name or a definition. Otherwise built-in rules read them.
+  about the estate, never a name from the estate or a definition (a
+  recommendation goes only as a value of the catalog's own, never its reason).
+  Otherwise built-in rules read them.
 * **Explain** says what a question decides for this estate: Claude, with
   consent, or the catalog's own words.
 * **Questionnaire.** Download the questions (Markdown to read, JSON to fill in)
@@ -1088,15 +1187,20 @@ version and hash, the differences, and the reason).
 **The LLM gate.** Consent (D1) and the budget (D2) are what the approved brief
 says, with two exceptions that only make the gate stricter and so take effect at
 once: a person withdrawing consent, or lowering the budget. What every call cost
-is kept in the project's `llm/spend` ledger. The consultation's own help follows
-a person's latest answer to D1, so it works before any brief is approved.
+is kept in the project's `llm/spend` ledger; once the spend reaches the budget the
+next call is refused (the call that crosses it can go over by its own cost).
+Before any brief is approved, the consultation's own help follows a person's
+latest answer to D1; once one is, the brief decides there too, and a later "yes"
+loosens nothing until a brief with it is approved. The assistant's task loop uses
+the model only with an approved brief's consent.
 
 **Demo data** runs the same consultation in the browser:
-`frontend/src/mock/consultCatalog.json` is a copy of the catalog (a backend test
-keeps the two the same) and `frontend/src/mock/mockConsult.ts` a TypeScript copy
-of the engine, checked against the server's on the cases `tests/test_consult.py`
-writes to `frontend/src/test/consultParity.json`. Demo data reads notes with the
-rules only: nothing is sent anywhere.
+`frontend/src/mock/consultCatalog.json` is a copy of the catalog and
+`consultVocabulary.json` of the settings and facts (backend tests keep them the
+same), and `frontend/src/mock/mockConsult.ts` a TypeScript copy of the engine,
+the brief, the policy and the migration context, checked against the server's on
+the cases `tests/test_consult.py` writes to `frontend/src/test/consultParity.json`.
+Demo data reads notes with the rules only: nothing is sent anywhere.
 
 ## Migration
 
@@ -1256,7 +1360,12 @@ sides without writing to either. Each row says what it saw on each side:
 | Manual | Integration runtimes and anything else set up by hand, listed for review. |
 
 A check that could not run is a REVIEW with the reason, never a match. Row
-counts need the Synapse connection; without it they are reported as unread.
+counts need the Synapse connection; without it they are reported as unread. A
+table loaded from a date is counted from that date: the date filters the request
+names, or else the ones the run itself was given (what the agent's validations
+use). Really running pipelines, notebooks, scripts and Spark jobs is refused while
+the approved brief says they may write to production systems, or nobody knows (H4),
+unless a person kept running them anyway when the brief was approved (K10).
 
 **Does it run in Fabric?** Arriving is not working, so each object Fabric can run
 is also checked there (`migration/runtime_checks.py`). The result is shown in the
@@ -1401,12 +1510,14 @@ Accepted SQL still goes through the T-SQL rules, which are safe to repeat. An ac
 *Synapse-shaped* pipeline, and the usual converter embeds its datasets and resolves the Fabric ids. The
 run log marks every object created this way.
 
-**Consent and budget.** Drafts follow the migration brief: none is generated without
-consent to send definitions to Claude (D1), and none once the project has spent its
-budget (D2; every draft's cost is kept in the project's `llm/spend` ledger). Under a
-required consultation, consent comes from the approved brief; a person withdrawing it
-in Consult stops drafts at once. The brief's naming and coding standards (B3) are
-added to every prompt. See [Consultation and the migration brief](#consultation-and-the-migration-brief).
+**Consent, budget and the migration context.** Drafts follow the migration brief:
+none is generated without consent to send definitions to Claude (D1), and none once
+the project has spent its budget (D2; every draft's cost is kept in the project's
+`llm/spend` ledger). Under a required consultation, consent comes from the approved
+brief; a person withdrawing it in Consult stops drafts at once. D6 can keep drafts to
+the objects the rules cannot convert. Every draft is sent `MIGRATION_CONTEXT.md`, the
+approved brief written for the model, and records which one by its hash (see
+[The migration context](#the-migration-context-migration_contextmd)).
 
 **Changing the prompt for a project.** The prompt is put together on the server from Markdown files in
 `prompts/transform/`:
@@ -1434,10 +1545,108 @@ The files support `{{placeholders}}` (`object.name`, `object.schema`, `object.ty
 | `MIGRATION_TRANSFORMS_DIR` | `transforms` | Where drafts and accepted transforms are kept. |
 
 **What leaves the machine.** The object's definition, its rule output, the names and column types of
-what it depends on, and your `project.md` are sent to Anthropic through Claude Code. No credential,
-connection string or table data is ever sent. If this client's code must not leave the network, set `MIGRATION_LLM=off`.
+what it depends on (names only, with G4 at minimal), your `project.md` and the migration context are sent to
+Anthropic through Claude Code. No credential, connection string or table data is ever sent. If this client's
+code must not leave the network, set `MIGRATION_LLM=off`.
 
 **Demo mode** shows the whole flow with canned drafts, and no model is called.
+
+## The orchestrator: execution plan, agent and assistant
+
+**The agent proposes and sequences. The engine executes. A person approves.** The
+agent's tools are the same service calls the page's buttons make, so the run's
+state machine, the sign-off, the leases and the audit trail apply to it exactly as
+they do to a person (`src/discovery_agent/orchestrator/`, `api/orchestrator.py`).
+
+**The execution plan** is built from the approved brief, the latest recorded plan
+version and the discovery snapshot; the same inputs always give the same steps and
+the same hash, and a new version is kept only when one of them moves. A person's
+task marked done under one version stays done in the next while the task itself is
+unchanged. A check the accelerator cannot tell (which kind of identity Fabric is
+signed in as, a source signed out after discovery) a person may confirm by hand; one
+it sees failing is fixed, never confirmed, and a confirmation stops counting once
+the accelerator sees the check fail.
+
+| Phase | Steps |
+|---|---|
+| Readiness | The source and the target connected (with a capacity), discovery complete, the brief approved and current, a plan with no blocking risk; the Fabric sign-in's kind (E2) and the capacity's region (G3, a person's check the run waits for) |
+| Before the run | Credentials to enter (the agent only names them), SQL users to map, tables whose types change to review (D4), code to rewrite or rebuild by hand (D3, D5, A4) |
+| Prepare | Drafts the brief sends to AI (D3, D5), then a person reviews and accepts each |
+| Deliver | The run, as A6 says, and the fix loop; integration runtimes and event triggers set up by hand |
+| Validate | At H1's depth; each mismatch resolved, or accepted with a reason |
+| Release | The commit to Fabric Git (E0, E0S), then the pull request reviewed and merged |
+| Cutover | The synced tables reloaded to remove deletes (C4), side-by-side cycles (H2, H2A), the window (H3) |
+| Sign-off | The report: the brief, the plans, the runs, validation, what was left for a person, and the audit trail's head hash (`GET /orchestrator/report?format=md|json`) |
+
+**Tools and tiers.** One registry (`GET /orchestrator/tools`), each tool with typed
+arguments, a preview, a re-check and an idempotency key:
+
+| Tier | Tools | Who may trigger them |
+|---|---|---|
+| read | the journey, discovery, objects, the plan's analysis, a run and its failures and log, validation, Fabric Git, drafts, the brief, a diagnosis, the plan's steps | always, at once |
+| prepare | LLM drafts, a compare-only validation | always a request: a draft sends a definition to Claude and spends the budget (D2) |
+| change | start, pause, resume, retry, a probing validation, a Fabric Git commit | a request; at *act on Dev* the agent resumes a pass a restart cut short, and retries failures that were each a timeout or throttling, each at most twice a run |
+| high | update in place, replace rows, run pipelines in Validate, close a run, discover again; and any start whose brief options overwrite (A7, C6), which is never a plain start | always a request, each confirmed on its own |
+| person only | approve a brief or a run, accept or discard a draft, enter credentials, answer the brief, confirm a step | never the agent: they are not tools at all, and the services refuse anything but a person |
+
+**Requests.** What the agent proposes waits as an action card with exactly what it
+would do (the plan and options of a run, what it overwrites, whether a person signs
+it off or the rule in force approves it). It is bound to what it acts on: the run and
+its version, the plan and what a start would send. When a person confirms it, it is
+re-checked and runs, as that person, only while that is still so (*It was for run
+004, and the current run is 005 now*); a retry or resume sends the run's version it
+was proposed for, so the run itself refuses one that moved in between. A rejection
+needs a reason, which goes back to the assistant, and the agent never asks for the
+same thing again until what it acts on moves (nor for a run a person declined or
+stopped, until a new plan is recorded). One request at a time for the same thing; a
+question to the assistant can wait on another's card, and hears its decision. One
+that no longer applies lapses on the next wake-up, even with the agent paused, and
+one nobody decided lapses after a day and can no longer be confirmed.
+
+**Autonomy (E6).** *Observe* proposes nothing; *suggest* (the default) makes
+everything a request; *act on Dev* does the two things above on its own, recorded as
+the agent's (`orchestrator.action_taken`), and only on the very workspace the brief
+was approved for and calls development (E1): a brief's approval keeps which Fabric
+workspace was the target, another one connected later makes the brief stale (every
+run is then signed off there until it is reconfirmed), and a brief approved with no
+workspace connected names none, so the agent asks for everything. The plan board
+says why when it does. At most three new actions a wake-up, in every mode.
+
+**The supervisor** wakes on what the audit trail records (a pass finished, halted
+or cut short, a sign-off, a brief approved, a validation finished, a draft
+accepted), at once when the accelerator starts, and on a five-minute timer as a
+fallback, and rebuilds what it knows from the services and the store each time: a
+restart loses nothing. The trail only signals it: its work happens in its own
+thread, never in the one that wrote the record (which may hold a service's lock),
+one wake-up at a time. A project switch holds it: the wake-up in flight finishes
+first (or the switch is refused), and none starts until the switch is done. Each
+wake-up that did something is kept (`orchestrator/wakeups`). **Pause the agent**
+stops it, and the assistant's proposals, until resumed; `MIGRATION_AGENT=off` keeps
+the plan board and switches the agent off.
+
+**Diagnosis.** A failure's category (see [Run records](#run-records)) allows a closed
+set of actions, the rule's choice first: a passing failure is retried; one Fabric
+rejects gets a draft (with consent) or a rewrite; a sign-in or capacity problem is
+escalated to a person with what to do; a name already in use is left, or updated
+in place (high tier). `GET /orchestrator/diagnosis/<id>` says it for one object. A
+model's explanation can never widen what a category allows.
+
+**The assistant** (`POST /assistant/ask`). With an approved brief's consent, each
+turn is one structured answer naming one step (read, change, ask or finish); the
+server checks the tool exists, its tier fits the step and the arguments fit the
+tool. A read runs at once and its result, redacted and cut to size, is added as
+data, fenced and escaped (nothing in it can close the fence), so text from Fabric or
+a log can never instruct the model; with G4 at *minimal* the brief it reads holds
+only the decisions, and errors come without the values they quote. Reads never
+include a definition. A change becomes an action card and the loop waits for the
+person. Each task has limits (12 turns, 3 changes, 10 minutes of work across its
+continuations, $2) and every turn's cost goes to the `llm/spend` ledger (estimated
+when the CLI does not say). **Cancel** stops it at once, even mid-turn (that turn's
+answer is dropped and nothing more is proposed). A task a restart cut short, or
+that hit an unexpected error, is stopped and says so; **Continue** carries it on. Without consent it answers fixed
+questions from the read tools: why something failed (with each failure's
+diagnosis), what is left to do, where the migration stands, the brief, validation,
+the drafts. Demo data answers by the rules only, and its agent only proposes.
 
 ## Projects, run records and the audit trail
 
@@ -1458,10 +1667,12 @@ active at a time. Each keeps its own folder, `.accelerator/state/projects/<id>/`
 | `approvals.jsonl` | Every sign-off decision, a wave's included |
 | `consult/answers.jsonl`, `consult/proposals.jsonl` | Every answer, skip, withdrawal and resolution, and the answers proposed from notes or a questionnaire with what a person decided |
 | `consult/briefs/<n>.json`, `consult/brief_events.jsonl`, `consult/deviations.jsonl` | Each brief version, never changed; each version's lifecycle; the plans confirmed although they differ from the brief, with the reason |
-| `llm/spend.jsonl` | What each LLM call cost, against the brief's budget |
+| `llm/spend.jsonl` | What each LLM call cost (drafts, consultation help, the assistant), against the brief's budget |
+| `orchestrator/plans/<n>.json`, `orchestrator/marks.jsonl`, `orchestrator/actions.jsonl`, `orchestrator/wakeups.jsonl`, `orchestrator/control.json` | Each version of the execution plan; a person's marks on its tasks; every request and what became of it; the supervisor's wake-ups; whether the agent is paused |
+| `assistant/tasks/<id>.json`, `assistant/<id>.jsonl` | Each question to the assistant, and its conversation |
 | `validation.json`, `git.json` | The last validation, and the last Fabric Git commit |
 | `audit.jsonl` | The audit trail (below) |
-| `blobs/` | What the runs sent to Fabric, by hash |
+| `blobs/` | What the runs sent to Fabric, and each migration context a draft was sent, by hash |
 
 **Switching** to another project (the project menu, `POST /projects/<id>/activate`)
 is like restarting into it: its discovery and Fabric target come back the way they
@@ -1541,9 +1752,11 @@ kept: it carries credentials.
 
 ### Sign-off
 
-The approved brief's G3 decides which runs a person signs off before they write
-to Fabric. `MIGRATION_SIGNOFF` is this machine's own rule: with no brief it
-decides, and with one the stricter of the two holds:
+The approved brief's E4 decides which runs a person signs off before they write
+to Fabric, and a production target (E1) signs off every run. `MIGRATION_SIGNOFF` is
+this machine's own rule: with no brief it decides, and with one the stricter of the
+two holds. A run waiting for sign-off is started only while the brief it was checked
+against is still the one in force and still fits (`brief_changed` otherwise):
 
 | Value | A person signs off |
 |---|---|
@@ -1561,10 +1774,11 @@ and stages, which a run never changes once made.
 `audit.jsonl` holds one record per action: what it was (a closed catalog:
 `project.*`, `source.*`, `discovery.*`, `fabric.*`, `consult.*`, `brief.*`,
 `plan.recorded`, `plan.deviation`, `run.*`, `validation.*`, `git.*`,
-`transform.*`, `llm.refused`, `journey.step_confirmed`, `system.*`,
-`audit.exported`), who did it (`person`: `MIGRATION_OPERATOR`, else the account
-the API runs as; `agent`: the LLM, for a draft it wrote; `system`: the accelerator
-itself), the target, the outcome (`done`, `failed`, `refused`) with a code and a
+`transform.*`, `llm.refused`, `orchestrator.*`, `assistant.*`, `report.exported`,
+`journey.step_confirmed`, `system.*`, `audit.exported`), who did it (`person`:
+`MIGRATION_OPERATOR`, else the account the API runs as; `agent`: the LLM for a draft
+it wrote, the orchestrator for what it proposed or did, the assistant for what it
+proposed; `system`: the accelerator itself), the target, the outcome (`done`, `failed`, `refused`) with a code and a
 reason, the details its action allows (nothing else is kept, and text is masked
 for secrets), and the correlation id, project and run. Each record carries the
 hash of the one before it and its own, so `GET /audit/verify` shows where the file
@@ -1584,12 +1798,13 @@ Writing a record never fails the action it records.
 | `MIGRATION_CONSULTATION` | `required` | `required`: no run without an approved brief that fits the estate, and differences from it explained. `advisory`: neither is refused. |
 | `MIGRATION_BRIEF_APPROVAL` | (unset) | `separate`: a brief with a decision that loosens a safeguard cannot be approved by the person who submitted it. |
 | `MIGRATION_OPERATOR` | the account the API runs as | The person the log and the audit trail name. |
+| `MIGRATION_AGENT` | `on` | `off` switches the orchestrator's agent off: the execution plan and the plan board stay, nothing is proposed or done by it. |
 
 ## Tests
 
 ```
-pytest                                  # backend: 1,673 tests pass, 104 skipped (below)
-cd frontend && npm run typecheck && npm test   # UI: type check and 87 tests
+pytest                                  # backend: 1,765 tests pass, 104 skipped (below)
+cd frontend && npm run typecheck && npm test   # UI: type check and 95 tests
 ```
 
 **Safe to run beside a live session.** `tests/conftest.py` points everything a
@@ -1597,8 +1812,9 @@ real session keeps on the machine into each test's own temporary folder:
 `MIGRATION_STATE_DIR` (the projects, their discoveries, runs and audit trails),
 `MIGRATION_TRANSFORMS_DIR` (accepted LLM transforms), `MIGRATION_LOG_DIR`, and
 the upload and working-copy folders under `input/`. It also fixes the operator's
-name, sets `MIGRATION_SIGNOFF=never` and `MIGRATION_CONSULTATION=advisory`, so a
-test asks for a sign-off or an approved brief only when it means to, and makes
+name, sets `MIGRATION_SIGNOFF=never`, `MIGRATION_CONSULTATION=advisory` and
+`MIGRATION_AGENT=off`, so a test asks for a sign-off, an approved brief or the agent
+only when it means to (and no supervisor wakes in a test's background), and makes
 sure no test finds a real `claude` on the machine. A test API used to delete a running
 session's saved `discovery.pickle` and leave uploads behind; a test now checks
 that nothing points at the real folders. (`MIGRATION_STATE=off` alone was never
@@ -1612,9 +1828,32 @@ a change to the catalog or the engine, write the cases the Demo engine is checke
 against again, then run the UI tests:
 
 ```
-UPDATE_CONSULT_PARITY=1 pytest tests/test_consult.py -k demo_engine
+UPDATE_CONSULT_PARITY=1 pytest tests/test_consult.py -k "demo_engine or demo_pages_settings"
 cd frontend && npx vitest run src/test/consult.test.ts
 ```
+
+The orchestrator tests (`tests/test_orchestrator.py`): the same inputs give the same
+plan; the brief's answers become steps naming them; each step's status from what the
+services report; a person's mark carried over only while the task is unchanged; a
+check confirmed by hand only while the accelerator cannot tell (one it sees failing is
+fixed, never confirmed, and a confirmation stops counting once it fails); each
+failure category's actions, a model never widening them; the tiers, with no tool for
+what only a person does; a request re-checked on confirm and run as the person, and
+never on another run or plan than its card showed (a retry sends the version it was
+proposed for); the agent never deciding its own, and never asking again for what a
+person rejected or a run they declined; a start that overwrites proposed as a
+high-tier one whose card says so; at *suggest* it asks and never acts, at *act on Dev*
+it retries timeouts alone and resumes alone, each at most twice, never drafts or
+validates alone, never off the workspace the brief was approved for or while paused,
+and at *observe* proposes nothing; a pass cut short resumed, a wave's sign-off never;
+requests that lapse, even while paused, and one past its time never carried out; the
+trail only signalling it (no deadlock with a service's lock); a project switch holding
+it; drafts proposed only where one would be made; the sign-off report; and the
+assistant: its rules without consent, the brief and errors as G4 lets them go to the
+AI, a fence nothing can close, the task loop reading, proposing, waiting for a person
+(or another's card) and finishing, a cancel mid-turn, a step it cannot take, a question
+back, its limits across continuations, an unexpected error stopping it, and a task
+carried on after a restart.
 
 The skipped backend tests are the two opt-in integration suites (39 tests,
 below), 63 that read a local snapshot of a sample repository

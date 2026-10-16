@@ -8,7 +8,7 @@ A condition is plain data, never code, so a catalog can be read, checked and mov
 * comparisons ``==  !=  >  >=  <  <=`` and ``{"in": [needle, haystack]}`` over two operands;
 * ``{"and": [...]}``, ``{"or": [...]}``, ``{"not": c}``; ``{"+": [...]}`` adds numbers; ``{"len": c}`` counts a list.
 
-**An unknown fact or a question with no value means "does not hold".** Every operation over one is unknown in
+**An unknown fact (missing, or None) or a question with no value means "does not hold".** Every operation over one is unknown in
 turn (``not`` of it too), and a condition holds only when it is plainly true. So a fact the discovery could not
 compute never switches a question on, nor a recommendation, nor a contradiction.
 """
@@ -65,9 +65,11 @@ def evaluate(condition: Any, facts: Mapping[str, Any], values: Mapping[str, Any]
         raise ConditionError(f"A condition has exactly one operator: {condition!r}")
     op, arg = next(iter(condition.items()))
     if op == "fact":
-        return facts.get(str(arg), UNKNOWN)
+        found = facts.get(str(arg), UNKNOWN)
+        return UNKNOWN if found is None else found  # a fact discovery could not work out is unknown, never a value
     if op == "answer":
-        return values.get(str(arg), UNKNOWN)
+        found = values.get(str(arg), UNKNOWN)
+        return UNKNOWN if found is None else found
     if op in _COMPARE:
         if not isinstance(arg, list) or len(arg) != 2:
             raise ConditionError(f"'{op}' takes two operands")
@@ -78,7 +80,10 @@ def evaluate(condition: Any, facts: Mapping[str, Any], values: Mapping[str, Any]
         needle, haystack = evaluate(arg[0], facts, values), evaluate(arg[1], facts, values)
         if needle is UNKNOWN or haystack is UNKNOWN or not isinstance(haystack, (list, tuple, dict, str)):
             return UNKNOWN
-        return needle in haystack
+        try:
+            return needle in haystack
+        except TypeError:
+            return UNKNOWN  # a list looked for in a text, a list as a map's key: neither true nor false
     if op in ("and", "or"):
         if not isinstance(arg, list) or not arg:
             raise ConditionError(f"'{op}' takes a list of conditions")

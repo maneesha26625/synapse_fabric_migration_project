@@ -5,7 +5,7 @@
   "records": [],
   "expected": {
    "questions": {
-    "A1": {
+    "A0": {
      "applies": true,
      "status": "assumed",
      "value": [
@@ -21,6 +21,12 @@
       ],
       "reason": "unknown objects were discovered, and everything can move in this migration."
      }
+    },
+    "A1": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
     },
     "A2": {
      "applies": true,
@@ -49,13 +55,43 @@
      "value": null,
      "recommendation": null
     },
+    "A3S": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
     "A4": {
      "applies": false,
      "status": "not_applicable",
      "value": null,
      "recommendation": null
     },
+    "A4O": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
     "A5": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A5D": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A6": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A7": {
      "applies": true,
      "status": "assumed",
      "value": "skip",
@@ -91,19 +127,25 @@
       "reason": "None beyond the project requirements already set."
      }
     },
+    "B6": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
     "C1": {
      "applies": false,
      "status": "not_applicable",
      "value": null,
      "recommendation": null
     },
-    "C1D": {
+    "C2": {
      "applies": false,
      "status": "not_applicable",
      "value": null,
      "recommendation": null
     },
-    "C2": {
+    "C2N": {
      "applies": false,
      "status": "not_applicable",
      "value": null,
@@ -128,6 +170,24 @@
      "recommendation": null
     },
     "C6": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C7": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C8": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C9": {
      "applies": false,
      "status": "not_applicable",
      "value": null,
@@ -160,37 +220,100 @@
      "value": null,
      "recommendation": null
     },
-    "D4O": {
+    "D5": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "D6": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "D7": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "E0": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "E0S": {
      "applies": false,
      "status": "not_applicable",
      "value": null,
      "recommendation": null
     },
     "E1": {
-     "applies": false,
-     "status": "not_applicable",
-     "value": null,
-     "recommendation": null
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "A migration is built in a development workspace first, then promoted."
+     }
     },
     "E2": {
-     "applies": false,
-     "status": "not_applicable",
-     "value": null,
-     "recommendation": null
-    },
-    "E3": {
-     "applies": false,
-     "status": "not_applicable",
-     "value": null,
-     "recommendation": null
+     "applies": true,
+     "status": "assumed",
+     "value": "person",
+     "recommendation": {
+      "value": "person",
+      "reason": "Migrate signs in as a person today; a service principal is set up in Azure first."
+     }
     },
     "E4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "overwrite",
+     "recommendation": {
+      "value": "overwrite",
+      "reason": "A run that changes what Fabric already has waits for a person; any other is approved by the accelerator, and recorded as such."
+     }
+    },
+    "E5": {
      "applies": false,
      "status": "not_applicable",
      "value": null,
      "recommendation": null
     },
+    "E5O": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "E6": {
+     "applies": true,
+     "status": "assumed",
+     "value": "suggest",
+     "recommendation": {
+      "value": "suggest",
+      "reason": "It proposes; a person decides."
+     }
+    },
+    "E7": {
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "Deploying from Git to Test and Prod is not built yet: promotion is done from Fabric's deployment pipelines or Git, by a person."
+     }
+    },
     "G1": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "G1M": {
      "applies": false,
      "status": "not_applicable",
      "value": null,
@@ -202,14 +325,17 @@
      "value": null,
      "recommendation": null
     },
+    "G2U": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
     "G3": {
      "applies": true,
-     "status": "assumed",
-     "value": "overwrite",
-     "recommendation": {
-      "value": "overwrite",
-      "reason": "A run that changes what Fabric already has waits for a person; any other is approved by the accelerator, and recorded as such."
-     }
+     "status": "open",
+     "value": null,
+     "recommendation": null
     },
     "G4": {
      "applies": false,
@@ -218,13 +344,10 @@
      "recommendation": null
     },
     "G5": {
-     "applies": true,
-     "status": "assumed",
-     "value": "dev",
-     "recommendation": {
-      "value": "dev",
-      "reason": "Deploying from Git to Test and Prod is not built yet."
-     }
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
     },
     "H1": {
      "applies": true,
@@ -237,38 +360,56 @@
     },
     "H2": {
      "applies": true,
+     "status": "assumed",
+     "value": false,
+     "recommendation": {
+      "value": false,
+      "reason": "A development workspace is not cut over: decide this for the production migration."
+     }
+    },
+    "H2A": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "H3": {
+     "applies": true,
      "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "H4": {
+     "applies": false,
+     "status": "not_applicable",
      "value": null,
      "recommendation": null
     },
     "I1": {
      "applies": true,
-     "status": "assumed",
-     "value": "suggest",
-     "recommendation": {
-      "value": "suggest",
-      "reason": "It proposes; a person decides."
-     }
+     "status": "open",
+     "value": null,
+     "recommendation": null
     },
-    "X1": {
+    "I2": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X2": {
+    "I3": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X3": {
+    "I4": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X4": {
+    "I5": {
      "applies": true,
      "status": "open",
      "value": null,
@@ -278,13 +419,15 @@
    "next": "D1",
    "blockers": [
     "D1: May object definitions be sent to Claude for drafts? Code only: never rows or credentials. A person answers this one.",
-    "G3: When must a person sign a run off before it writes to Fabric? A person answers this one."
+    "E4: When must a person sign a run off before it writes to Fabric? A person answers this one."
    ],
    "conflicts": [],
    "settings": {
     "assistant.autonomy": "suggest",
+    "cutover.parallelRun": false,
     "llm.consent": false,
     "llm.standards": "",
+    "operations.identity": "person",
     "plan.scopeMode": "all",
     "release.path": "dev",
     "release.signoff": "overwrite",
@@ -294,6 +437,7 @@
      "data",
      "orchestration"
     ],
+    "target.role": "dev",
     "validate.depth": "probe"
    }
   }
@@ -311,18 +455,26 @@
    "tables.count": 10,
    "tables.withDateColumn": 5,
    "tables.withChangeColumn": 3,
-   "tables.changeWithoutKeys": 0,
+   "tables.changeWithoutKeys": 1,
+   "tables.lossyTypes": 1,
    "storage.locations": 2,
    "security.principals": 4,
    "security.sqlUsers": 1,
    "security.sqlUserNames": [
     "app_user"
    ],
+   "code.sqlModules": 6,
+   "code.unconvertibleSql": 1,
    "code.multiStatementFunctions": 1,
    "code.needsRewrite": 2,
+   "code.unsupportedPipelines": 1,
+   "code.dotnetNotebooks": 1,
    "code.serverlessObjects": 1,
+   "pipelines.count": 3,
+   "notebooks.count": 2,
    "linkedServices.count": 3,
    "linkedServices.keyVault": 1,
+   "triggers.schedule": 1,
    "manual.setupCount": 2,
    "scope.groups": [
     "schema:dbo"
@@ -334,7 +486,7 @@
   "records": [],
   "expected": {
    "questions": {
-    "A1": {
+    "A0": {
      "applies": true,
      "status": "assumed",
      "value": [
@@ -349,6 +501,15 @@
        "orchestration"
       ],
       "reason": "40 objects were discovered, and everything can move in this migration."
+     }
+    },
+    "A1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "2 storage locations are read by the code directly."
      }
     },
     "A2": {
@@ -375,6 +536,15 @@
     "A3": {
      "applies": true,
      "status": "assumed",
+     "value": "convert",
+     "recommendation": {
+      "value": "convert",
+      "reason": "6 views, procedures and functions were discovered."
+     }
+    },
+    "A3S": {
+     "applies": true,
+     "status": "assumed",
      "value": "leave_out",
      "recommendation": {
       "value": "leave_out",
@@ -384,13 +554,43 @@
     "A4": {
      "applies": true,
      "status": "assumed",
+     "value": "by_hand",
+     "recommendation": {
+      "value": "by_hand",
+      "reason": "1 pipelines and 1 notebooks have no Fabric equivalent as they are."
+     }
+    },
+    "A4O": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "A5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "5 tables have a date column. Loading every row keeps both sides identical, which Validate's row counts then show."
+     }
+    },
+    "A5D": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A6": {
+     "applies": true,
+     "status": "assumed",
      "value": "stop_on_failures",
      "recommendation": {
       "value": "stop_on_failures",
       "reason": "3 waves. Stopping after a wave with failures keeps a failed table from letting the views that read it start."
      }
     },
-    "A5": {
+    "A7": {
      "applies": true,
      "status": "assumed",
      "value": "skip",
@@ -435,22 +635,13 @@
       "reason": "None beyond the project requirements already set."
      }
     },
-    "C1": {
+    "B6": {
      "applies": true,
-     "status": "assumed",
-     "value": "all",
-     "recommendation": {
-      "value": "all",
-      "reason": "5 tables have a date column. Loading every row keeps both sides identical, which Validate's row counts then show."
-     }
-    },
-    "C1D": {
-     "applies": false,
-     "status": "not_applicable",
+     "status": "open",
      "value": null,
      "recommendation": null
     },
-    "C2": {
+    "C1": {
      "applies": true,
      "status": "assumed",
      "value": false,
@@ -459,6 +650,18 @@
       "reason": "3 tables have a column like ModifiedAt that could drive a sync. A one-off migration needs none."
      }
     },
+    "C2": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C2N": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
     "C3": {
      "applies": false,
      "status": "not_applicable",
@@ -466,6 +669,18 @@
      "recommendation": null
     },
     "C4": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C5": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C6": {
      "applies": true,
      "status": "assumed",
      "value": "if_empty",
@@ -474,7 +689,7 @@
       "reason": "Skipping never touches data already there, so a re-run is safe."
      }
     },
-    "C5": {
+    "C7": {
      "applies": true,
      "status": "assumed",
      "value": "run",
@@ -483,7 +698,16 @@
       "reason": "Running them lets the run compare row counts table by table."
      }
     },
-    "C6": {
+    "C8": {
+     "applies": true,
+     "status": "assumed",
+     "value": 4,
+     "recommendation": {
+      "value": 4,
+      "reason": "Four at a time is fast, and gentle on a small pool."
+     }
+    },
+    "C9": {
      "applies": true,
      "status": "assumed",
      "value": "workspaceIdentity",
@@ -519,55 +743,37 @@
     "D4": {
      "applies": true,
      "status": "assumed",
+     "value": "accept",
+     "recommendation": {
+      "value": "accept",
+      "reason": "1 tables have such columns; each gets the closest type Fabric has."
+     }
+    },
+    "D5": {
+     "applies": true,
+     "status": "assumed",
      "value": "by_hand",
      "recommendation": {
       "value": "by_hand",
-      "reason": "unknown pipelines and unknown notebooks have no Fabric equivalent as they are."
+      "reason": "1 objects, and no AI drafts (D1)."
      }
     },
-    "D4O": {
-     "applies": true,
-     "status": "open",
+    "D6": {
+     "applies": false,
+     "status": "not_applicable",
      "value": null,
      "recommendation": null
     },
-    "E1": {
+    "D7": {
      "applies": true,
      "status": "assumed",
-     "value": true,
+     "value": "pyspark",
      "recommendation": {
-      "value": true,
-      "reason": "unknown roles and the permissions of 4 roles and users can be recreated in the Warehouse."
+      "value": "pyspark",
+      "reason": "1 notebooks use .NET; PySpark is what most Fabric notebooks are written in."
      }
     },
-    "E2": {
-     "applies": true,
-     "status": "assumed",
-     "value": {},
-     "recommendation": {
-      "value": {},
-      "reason": "None mapped: 1 SQL users stay listed for a person."
-     }
-    },
-    "E3": {
-     "applies": true,
-     "status": "assumed",
-     "value": "keyVault",
-     "recommendation": {
-      "value": "keyVault",
-      "reason": "1 linked services already read their secrets from Azure Key Vault."
-     }
-    },
-    "E4": {
-     "applies": true,
-     "status": "assumed",
-     "value": "all",
-     "recommendation": {
-      "value": "all",
-      "reason": "2 storage locations are read by the code."
-     }
-    },
-    "G1": {
+    "E0": {
      "applies": true,
      "status": "assumed",
      "value": true,
@@ -576,7 +782,7 @@
       "reason": "The target workspace is connected to Git: each run's items are committed, ready for a pull request."
      }
     },
-    "G2": {
+    "E0S": {
      "applies": true,
      "status": "assumed",
      "value": "run",
@@ -585,7 +791,25 @@
       "reason": "Other changes in the workspace are someone else's work, left for Fabric's Source control panel."
      }
     },
-    "G3": {
+    "E1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "A migration is built in a development workspace first, then promoted."
+     }
+    },
+    "E2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "person",
+     "recommendation": {
+      "value": "person",
+      "reason": "Migrate signs in as a person today; a service principal is set up in Azure first."
+     }
+    },
+    "E4": {
      "applies": true,
      "status": "assumed",
      "value": "overwrite",
@@ -594,19 +818,88 @@
       "reason": "A run that changes what Fabric already has waits for a person; any other is approved by the accelerator, and recorded as such."
      }
     },
-    "G4": {
+    "E5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "off",
+     "recommendation": {
+      "value": "off",
+      "reason": "1 schedule triggers; none runs before a person says so."
+     }
+    },
+    "E5O": {
      "applies": true,
      "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "E6": {
+     "applies": true,
+     "status": "assumed",
+     "value": "suggest",
+     "recommendation": {
+      "value": "suggest",
+      "reason": "It proposes; a person decides."
+     }
+    },
+    "E7": {
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "Deploying from Git to Test and Prod is not built yet: promotion is done from Fabric's deployment pipelines or Git, by a person."
+     }
+    },
+    "G1": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "G1M": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "G2": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "unknown roles and the permissions of 4 roles and users can be recreated in the Warehouse."
+     }
+    },
+    "G2U": {
+     "applies": true,
+     "status": "assumed",
+     "value": {},
+     "recommendation": {
+      "value": {},
+      "reason": "None mapped: 1 SQL users stay listed for a person."
+     }
+    },
+    "G3": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "G4": {
+     "applies": false,
+     "status": "not_applicable",
      "value": null,
      "recommendation": null
     },
     "G5": {
      "applies": true,
      "status": "assumed",
-     "value": "dev",
+     "value": "keyVault",
      "recommendation": {
-      "value": "dev",
-      "reason": "Deploying from Git to Test and Prod is not built yet."
+      "value": "keyVault",
+      "reason": "1 linked services already read their secrets from Azure Key Vault."
      }
     },
     "H1": {
@@ -620,38 +913,59 @@
     },
     "H2": {
      "applies": true,
+     "status": "assumed",
+     "value": false,
+     "recommendation": {
+      "value": false,
+      "reason": "A development workspace is not cut over: decide this for the production migration."
+     }
+    },
+    "H2A": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "H3": {
+     "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
+    },
+    "H4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "unsure",
+     "recommendation": {
+      "value": "unsure",
+      "reason": "Nobody has checked yet: until someone does, Validate does not run them."
+     }
     },
     "I1": {
      "applies": true,
-     "status": "assumed",
-     "value": "suggest",
-     "recommendation": {
-      "value": "suggest",
-      "reason": "It proposes; a person decides."
-     }
+     "status": "open",
+     "value": null,
+     "recommendation": null
     },
-    "X1": {
+    "I2": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X2": {
+    "I3": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X3": {
+    "I4": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X4": {
+    "I5": {
      "applies": true,
      "status": "open",
      "value": null,
@@ -661,17 +975,21 @@
    "next": "D1",
    "blockers": [
     "D1: May object definitions be sent to Claude for drafts? Code only: never rows or credentials. A person answers this one.",
-    "E2: Which Microsoft Entra user or group replaces each SQL user? A person answers this one.",
-    "G3: When must a person sign a run off before it writes to Fabric? A person answers this one."
+    "E4: When must a person sign a run off before it writes to Fabric? A person answers this one.",
+    "G2U: Which Microsoft Entra user or group replaces each SQL user? A person answers this one."
    ],
    "conflicts": [],
    "settings": {
     "assistant.autonomy": "suggest",
     "code.multiStatement": "manual",
+    "code.notebookLanguage": "pyspark",
     "code.rebuild": "by_hand",
+    "code.unconvertible": "by_hand",
     "connections.defaultSignIn": "keyVault",
+    "cutover.parallelRun": false,
     "data.historyMode": "all",
     "data.mode": "if_empty",
+    "data.parallelCopies": 4,
     "data.poolSignIn": "workspaceIdentity",
     "data.run": "run",
     "data.sync": false,
@@ -679,8 +997,10 @@
     "llm.standards": "",
     "names.lakehouse": "sqlpool1_lakehouse",
     "names.warehouse": "sqlpool1",
+    "operations.identity": "person",
     "plan.scopeMode": "all",
     "plan.serverless": "leave_out",
+    "plan.sqlModules": "convert",
     "release.commitScope": "run",
     "release.gitCommit": true,
     "release.path": "dev",
@@ -693,10 +1013,14 @@
     ],
     "run.stopOnFailure": true,
     "run.waveGate": false,
+    "schedules.enabled": "off",
     "security.migrate": true,
     "security.sqlUserMap": {},
     "storage.routes": "all",
+    "target.role": "dev",
+    "types.lossy": "accept",
     "validate.depth": "probe",
+    "validate.externalWrites": "unsure",
     "warehouse.collation": "match_synapse"
    }
   }
@@ -714,18 +1038,26 @@
    "tables.count": 10,
    "tables.withDateColumn": 5,
    "tables.withChangeColumn": 3,
-   "tables.changeWithoutKeys": 0,
+   "tables.changeWithoutKeys": 1,
+   "tables.lossyTypes": 1,
    "storage.locations": 2,
    "security.principals": 4,
    "security.sqlUsers": 1,
    "security.sqlUserNames": [
     "app_user"
    ],
+   "code.sqlModules": 6,
+   "code.unconvertibleSql": 1,
    "code.multiStatementFunctions": 1,
    "code.needsRewrite": 2,
+   "code.unsupportedPipelines": 1,
+   "code.dotnetNotebooks": 1,
    "code.serverlessObjects": 1,
+   "pipelines.count": 3,
+   "notebooks.count": 2,
    "linkedServices.count": 3,
    "linkedServices.keyVault": 1,
+   "triggers.schedule": 1,
    "manual.setupCount": 2,
    "scope.groups": [
     "schema:dbo"
@@ -753,21 +1085,21 @@
    },
    {
     "type": "answer",
-    "question": "C4",
+    "question": "C6",
     "value": "replace",
     "source": "person",
     "seq": 3
    },
    {
     "type": "answer",
-    "question": "G3",
+    "question": "E4",
     "value": "never",
     "source": "person",
     "seq": 4
    },
    {
     "type": "answer",
-    "question": "A4",
+    "question": "A6",
     "value": "signoff_each_wave",
     "source": "person",
     "seq": 5
@@ -781,34 +1113,34 @@
    },
    {
     "type": "answer",
-    "question": "C1",
+    "question": "A5",
     "value": "since",
     "source": "person",
     "seq": 7
    },
    {
     "type": "answer",
-    "question": "C1D",
+    "question": "A5D",
     "value": "2024-01-01",
     "source": "person",
     "seq": 8
    },
    {
     "type": "answer",
-    "question": "C1",
+    "question": "A5",
     "value": "all",
     "source": "person",
     "seq": 9
    },
    {
     "type": "skip",
-    "question": "A5",
+    "question": "A7",
     "seq": 10
    }
   ],
   "expected": {
    "questions": {
-    "A1": {
+    "A0": {
      "applies": true,
      "status": "assumed",
      "value": [
@@ -823,6 +1155,15 @@
        "orchestration"
       ],
       "reason": "40 objects were discovered, and everything can move in this migration."
+     }
+    },
+    "A1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "2 storage locations are read by the code directly."
      }
     },
     "A2": {
@@ -851,6 +1192,15 @@
     "A3": {
      "applies": true,
      "status": "assumed",
+     "value": "convert",
+     "recommendation": {
+      "value": "convert",
+      "reason": "6 views, procedures and functions were discovered."
+     }
+    },
+    "A3S": {
+     "applies": true,
+     "status": "assumed",
      "value": "leave_out",
      "recommendation": {
       "value": "leave_out",
@@ -859,6 +1209,36 @@
     },
     "A4": {
      "applies": true,
+     "status": "assumed",
+     "value": "by_hand",
+     "recommendation": {
+      "value": "by_hand",
+      "reason": "1 pipelines and 1 notebooks have no Fabric equivalent as they are."
+     }
+    },
+    "A4O": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "A5": {
+     "applies": true,
+     "status": "answered",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "5 tables have a date column. Loading every row keeps both sides identical, which Validate's row counts then show."
+     }
+    },
+    "A5D": {
+     "applies": false,
+     "status": "parked",
+     "value": "2024-01-01",
+     "recommendation": null
+    },
+    "A6": {
+     "applies": true,
      "status": "answered",
      "value": "signoff_each_wave",
      "recommendation": {
@@ -866,7 +1246,7 @@
       "reason": "3 waves. Stopping after a wave with failures keeps a failed table from letting the views that read it start."
      }
     },
-    "A5": {
+    "A7": {
      "applies": true,
      "status": "skipped",
      "value": "skip",
@@ -911,22 +1291,13 @@
       "reason": "None beyond the project requirements already set."
      }
     },
-    "C1": {
+    "B6": {
      "applies": true,
-     "status": "answered",
-     "value": "all",
-     "recommendation": {
-      "value": "all",
-      "reason": "5 tables have a date column. Loading every row keeps both sides identical, which Validate's row counts then show."
-     }
-    },
-    "C1D": {
-     "applies": false,
-     "status": "parked",
-     "value": "2024-01-01",
+     "status": "open",
+     "value": null,
      "recommendation": null
     },
-    "C2": {
+    "C1": {
      "applies": true,
      "status": "assumed",
      "value": false,
@@ -935,6 +1306,18 @@
       "reason": "3 tables have a column like ModifiedAt that could drive a sync. A one-off migration needs none."
      }
     },
+    "C2": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C2N": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
     "C3": {
      "applies": false,
      "status": "not_applicable",
@@ -942,6 +1325,18 @@
      "recommendation": null
     },
     "C4": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C5": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C6": {
      "applies": true,
      "status": "answered",
      "value": "replace",
@@ -950,7 +1345,7 @@
       "reason": "Skipping never touches data already there, so a re-run is safe."
      }
     },
-    "C5": {
+    "C7": {
      "applies": true,
      "status": "assumed",
      "value": "run",
@@ -959,7 +1354,16 @@
       "reason": "Running them lets the run compare row counts table by table."
      }
     },
-    "C6": {
+    "C8": {
+     "applies": true,
+     "status": "assumed",
+     "value": 4,
+     "recommendation": {
+      "value": 4,
+      "reason": "Four at a time is fast, and gentle on a small pool."
+     }
+    },
+    "C9": {
      "applies": true,
      "status": "assumed",
      "value": "workspaceIdentity",
@@ -998,55 +1402,40 @@
     "D4": {
      "applies": true,
      "status": "assumed",
-     "value": "by_hand",
+     "value": "accept",
      "recommendation": {
-      "value": "by_hand",
-      "reason": "unknown pipelines and unknown notebooks have no Fabric equivalent as they are."
+      "value": "accept",
+      "reason": "1 tables have such columns; each gets the closest type Fabric has."
      }
     },
-    "D4O": {
-     "applies": true,
-     "status": "open",
-     "value": null,
-     "recommendation": null
-    },
-    "E1": {
+    "D5": {
      "applies": true,
      "status": "assumed",
-     "value": true,
+     "value": "ai",
      "recommendation": {
-      "value": true,
-      "reason": "unknown roles and the permissions of 4 roles and users can be recreated in the Warehouse."
+      "value": "ai",
+      "reason": "1 objects, and AI drafts are allowed (D1)."
      }
     },
-    "E2": {
+    "D6": {
      "applies": true,
      "status": "assumed",
-     "value": {},
+     "value": "needs_work",
      "recommendation": {
-      "value": {},
-      "reason": "None mapped: 1 SQL users stay listed for a person."
+      "value": "needs_work",
+      "reason": "It sends the fewest definitions."
      }
     },
-    "E3": {
+    "D7": {
      "applies": true,
      "status": "assumed",
-     "value": "keyVault",
+     "value": "pyspark",
      "recommendation": {
-      "value": "keyVault",
-      "reason": "1 linked services already read their secrets from Azure Key Vault."
+      "value": "pyspark",
+      "reason": "1 notebooks use .NET; PySpark is what most Fabric notebooks are written in."
      }
     },
-    "E4": {
-     "applies": true,
-     "status": "assumed",
-     "value": "all",
-     "recommendation": {
-      "value": "all",
-      "reason": "2 storage locations are read by the code."
-     }
-    },
-    "G1": {
+    "E0": {
      "applies": true,
      "status": "assumed",
      "value": true,
@@ -1055,7 +1444,7 @@
       "reason": "The target workspace is connected to Git: each run's items are committed, ready for a pull request."
      }
     },
-    "G2": {
+    "E0S": {
      "applies": true,
      "status": "assumed",
      "value": "run",
@@ -1064,7 +1453,25 @@
       "reason": "Other changes in the workspace are someone else's work, left for Fabric's Source control panel."
      }
     },
-    "G3": {
+    "E1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "A migration is built in a development workspace first, then promoted."
+     }
+    },
+    "E2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "person",
+     "recommendation": {
+      "value": "person",
+      "reason": "Migrate signs in as a person today; a service principal is set up in Azure first."
+     }
+    },
+    "E4": {
      "applies": true,
      "status": "answered",
      "value": "never",
@@ -1073,19 +1480,91 @@
       "reason": "A run that changes what Fabric already has waits for a person; any other is approved by the accelerator, and recorded as such."
      }
     },
-    "G4": {
+    "E5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "off",
+     "recommendation": {
+      "value": "off",
+      "reason": "1 schedule triggers; none runs before a person says so."
+     }
+    },
+    "E5O": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "G5": {
+    "E6": {
+     "applies": true,
+     "status": "assumed",
+     "value": "suggest",
+     "recommendation": {
+      "value": "suggest",
+      "reason": "It proposes; a person decides."
+     }
+    },
+    "E7": {
      "applies": true,
      "status": "assumed",
      "value": "dev",
      "recommendation": {
       "value": "dev",
-      "reason": "Deploying from Git to Test and Prod is not built yet."
+      "reason": "Deploying from Git to Test and Prod is not built yet: promotion is done from Fabric's deployment pipelines or Git, by a person."
+     }
+    },
+    "G1": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "G1M": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "G2": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "unknown roles and the permissions of 4 roles and users can be recreated in the Warehouse."
+     }
+    },
+    "G2U": {
+     "applies": true,
+     "status": "assumed",
+     "value": {},
+     "recommendation": {
+      "value": {},
+      "reason": "None mapped: 1 SQL users stay listed for a person."
+     }
+    },
+    "G3": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "G4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "context",
+     "recommendation": {
+      "value": "context",
+      "reason": "Drafts follow the brief best with all of it; each draft records which context file it was made with."
+     }
+    },
+    "G5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "keyVault",
+     "recommendation": {
+      "value": "keyVault",
+      "reason": "1 linked services already read their secrets from Azure Key Vault."
      }
     },
     "H1": {
@@ -1099,48 +1578,69 @@
     },
     "H2": {
      "applies": true,
+     "status": "assumed",
+     "value": false,
+     "recommendation": {
+      "value": false,
+      "reason": "A development workspace is not cut over: decide this for the production migration."
+     }
+    },
+    "H2A": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "H3": {
+     "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
+    },
+    "H4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "unsure",
+     "recommendation": {
+      "value": "unsure",
+      "reason": "Nobody has checked yet: until someone does, Validate does not run them."
+     }
     },
     "I1": {
      "applies": true,
-     "status": "assumed",
-     "value": "suggest",
-     "recommendation": {
-      "value": "suggest",
-      "reason": "It proposes; a person decides."
-     }
+     "status": "open",
+     "value": null,
+     "recommendation": null
     },
-    "X1": {
+    "I2": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X2": {
+    "I3": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X3": {
+    "I4": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X4": {
+    "I5": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     }
    },
-   "next": "C4",
+   "next": "C6",
    "blockers": [
     "Contradiction: Replacing rows empties tables that already have data, and no person would sign such a run off first.",
-    "E2: Which Microsoft Entra user or group replaces each SQL user? A person answers this one."
+    "G2U: Which Microsoft Entra user or group replaces each SQL user? A person answers this one."
    ],
    "conflicts": [
     {
@@ -1152,23 +1652,31 @@
    "settings": {
     "assistant.autonomy": "suggest",
     "code.multiStatement": "llm",
+    "code.notebookLanguage": "pyspark",
     "code.rebuild": "by_hand",
+    "code.unconvertible": "ai",
     "connections.defaultSignIn": "keyVault",
+    "cutover.parallelRun": false,
     "data.historyMode": "all",
     "data.mode": "replace",
+    "data.parallelCopies": 4,
     "data.poolSignIn": "workspaceIdentity",
     "data.run": "run",
     "data.sync": false,
     "llm.budgetUsd": 25,
     "llm.consent": true,
+    "llm.context": "context",
+    "llm.scope": "needs_work",
     "llm.standards": "",
     "names.lakehouse": "sqlpool1_lakehouse",
     "names.warehouse": "sqlpool1",
+    "operations.identity": "person",
     "plan.scopeInclude": [
      "schema:dbo"
     ],
     "plan.scopeMode": "include",
     "plan.serverless": "leave_out",
+    "plan.sqlModules": "convert",
     "release.commitScope": "run",
     "release.gitCommit": true,
     "release.path": "dev",
@@ -1181,10 +1689,14 @@
     ],
     "run.stopOnFailure": true,
     "run.waveGate": true,
+    "schedules.enabled": "off",
     "security.migrate": true,
     "security.sqlUserMap": {},
     "storage.routes": "all",
+    "target.role": "dev",
+    "types.lossy": "accept",
     "validate.depth": "probe",
+    "validate.externalWrites": "unsure",
     "warehouse.collation": "match_synapse"
    }
   }
@@ -1202,18 +1714,26 @@
    "tables.count": 10,
    "tables.withDateColumn": 5,
    "tables.withChangeColumn": 3,
-   "tables.changeWithoutKeys": 0,
+   "tables.changeWithoutKeys": 1,
+   "tables.lossyTypes": 1,
    "storage.locations": 2,
    "security.principals": 4,
    "security.sqlUsers": 1,
    "security.sqlUserNames": [
     "app_user"
    ],
+   "code.sqlModules": 6,
+   "code.unconvertibleSql": 1,
    "code.multiStatementFunctions": 1,
    "code.needsRewrite": 2,
+   "code.unsupportedPipelines": 1,
+   "code.dotnetNotebooks": 1,
    "code.serverlessObjects": 2,
+   "pipelines.count": 3,
+   "notebooks.count": 2,
    "linkedServices.count": 3,
    "linkedServices.keyVault": 1,
+   "triggers.schedule": 1,
    "manual.setupCount": 2,
    "scope.groups": [
     "schema:dbo"
@@ -1225,14 +1745,14 @@
   "records": [
    {
     "type": "answer",
-    "question": "C4",
+    "question": "C6",
     "value": "replace",
     "source": "person",
     "seq": 1
    },
    {
     "type": "answer",
-    "question": "G3",
+    "question": "E4",
     "value": "never",
     "source": "person",
     "seq": 2
@@ -1245,13 +1765,13 @@
     "seq": 3,
     "facts": {},
     "answers": {
-     "C4": "replace",
-     "G3": "never"
+     "C6": "replace",
+     "E4": "never"
     }
    },
    {
     "type": "answer",
-    "question": "A3",
+    "question": "A3S",
     "value": "keep",
     "source": "person",
     "seq": 4,
@@ -1262,7 +1782,7 @@
   ],
   "expected": {
    "questions": {
-    "A1": {
+    "A0": {
      "applies": true,
      "status": "assumed",
      "value": [
@@ -1277,6 +1797,15 @@
        "orchestration"
       ],
       "reason": "40 objects were discovered, and everything can move in this migration."
+     }
+    },
+    "A1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "2 storage locations are read by the code directly."
      }
     },
     "A2": {
@@ -1302,6 +1831,15 @@
     },
     "A3": {
      "applies": true,
+     "status": "assumed",
+     "value": "convert",
+     "recommendation": {
+      "value": "convert",
+      "reason": "6 views, procedures and functions were discovered."
+     }
+    },
+    "A3S": {
+     "applies": true,
      "status": "stale",
      "value": "keep",
      "recommendation": {
@@ -1312,13 +1850,43 @@
     "A4": {
      "applies": true,
      "status": "assumed",
+     "value": "by_hand",
+     "recommendation": {
+      "value": "by_hand",
+      "reason": "1 pipelines and 1 notebooks have no Fabric equivalent as they are."
+     }
+    },
+    "A4O": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "A5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "5 tables have a date column. Loading every row keeps both sides identical, which Validate's row counts then show."
+     }
+    },
+    "A5D": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A6": {
+     "applies": true,
+     "status": "assumed",
      "value": "stop_on_failures",
      "recommendation": {
       "value": "stop_on_failures",
       "reason": "3 waves. Stopping after a wave with failures keeps a failed table from letting the views that read it start."
      }
     },
-    "A5": {
+    "A7": {
      "applies": true,
      "status": "assumed",
      "value": "skip",
@@ -1363,22 +1931,13 @@
       "reason": "None beyond the project requirements already set."
      }
     },
-    "C1": {
+    "B6": {
      "applies": true,
-     "status": "assumed",
-     "value": "all",
-     "recommendation": {
-      "value": "all",
-      "reason": "5 tables have a date column. Loading every row keeps both sides identical, which Validate's row counts then show."
-     }
-    },
-    "C1D": {
-     "applies": false,
-     "status": "not_applicable",
+     "status": "open",
      "value": null,
      "recommendation": null
     },
-    "C2": {
+    "C1": {
      "applies": true,
      "status": "assumed",
      "value": false,
@@ -1387,6 +1946,18 @@
       "reason": "3 tables have a column like ModifiedAt that could drive a sync. A one-off migration needs none."
      }
     },
+    "C2": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C2N": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
     "C3": {
      "applies": false,
      "status": "not_applicable",
@@ -1394,6 +1965,18 @@
      "recommendation": null
     },
     "C4": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C5": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C6": {
      "applies": true,
      "status": "answered",
      "value": "replace",
@@ -1402,7 +1985,7 @@
       "reason": "Skipping never touches data already there, so a re-run is safe."
      }
     },
-    "C5": {
+    "C7": {
      "applies": true,
      "status": "assumed",
      "value": "run",
@@ -1411,7 +1994,16 @@
       "reason": "Running them lets the run compare row counts table by table."
      }
     },
-    "C6": {
+    "C8": {
+     "applies": true,
+     "status": "assumed",
+     "value": 4,
+     "recommendation": {
+      "value": 4,
+      "reason": "Four at a time is fast, and gentle on a small pool."
+     }
+    },
+    "C9": {
      "applies": true,
      "status": "assumed",
      "value": "workspaceIdentity",
@@ -1447,55 +2039,37 @@
     "D4": {
      "applies": true,
      "status": "assumed",
+     "value": "accept",
+     "recommendation": {
+      "value": "accept",
+      "reason": "1 tables have such columns; each gets the closest type Fabric has."
+     }
+    },
+    "D5": {
+     "applies": true,
+     "status": "assumed",
      "value": "by_hand",
      "recommendation": {
       "value": "by_hand",
-      "reason": "unknown pipelines and unknown notebooks have no Fabric equivalent as they are."
+      "reason": "1 objects, and no AI drafts (D1)."
      }
     },
-    "D4O": {
-     "applies": true,
-     "status": "open",
+    "D6": {
+     "applies": false,
+     "status": "not_applicable",
      "value": null,
      "recommendation": null
     },
-    "E1": {
+    "D7": {
      "applies": true,
      "status": "assumed",
-     "value": true,
+     "value": "pyspark",
      "recommendation": {
-      "value": true,
-      "reason": "unknown roles and the permissions of 4 roles and users can be recreated in the Warehouse."
+      "value": "pyspark",
+      "reason": "1 notebooks use .NET; PySpark is what most Fabric notebooks are written in."
      }
     },
-    "E2": {
-     "applies": true,
-     "status": "assumed",
-     "value": {},
-     "recommendation": {
-      "value": {},
-      "reason": "None mapped: 1 SQL users stay listed for a person."
-     }
-    },
-    "E3": {
-     "applies": true,
-     "status": "assumed",
-     "value": "keyVault",
-     "recommendation": {
-      "value": "keyVault",
-      "reason": "1 linked services already read their secrets from Azure Key Vault."
-     }
-    },
-    "E4": {
-     "applies": true,
-     "status": "assumed",
-     "value": "all",
-     "recommendation": {
-      "value": "all",
-      "reason": "2 storage locations are read by the code."
-     }
-    },
-    "G1": {
+    "E0": {
      "applies": true,
      "status": "assumed",
      "value": true,
@@ -1504,7 +2078,7 @@
       "reason": "The target workspace is connected to Git: each run's items are committed, ready for a pull request."
      }
     },
-    "G2": {
+    "E0S": {
      "applies": true,
      "status": "assumed",
      "value": "run",
@@ -1513,7 +2087,25 @@
       "reason": "Other changes in the workspace are someone else's work, left for Fabric's Source control panel."
      }
     },
-    "G3": {
+    "E1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "A migration is built in a development workspace first, then promoted."
+     }
+    },
+    "E2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "person",
+     "recommendation": {
+      "value": "person",
+      "reason": "Migrate signs in as a person today; a service principal is set up in Azure first."
+     }
+    },
+    "E4": {
      "applies": true,
      "status": "answered",
      "value": "never",
@@ -1522,19 +2114,88 @@
       "reason": "A run that changes what Fabric already has waits for a person; any other is approved by the accelerator, and recorded as such."
      }
     },
-    "G4": {
+    "E5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "off",
+     "recommendation": {
+      "value": "off",
+      "reason": "1 schedule triggers; none runs before a person says so."
+     }
+    },
+    "E5O": {
      "applies": true,
      "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "E6": {
+     "applies": true,
+     "status": "assumed",
+     "value": "suggest",
+     "recommendation": {
+      "value": "suggest",
+      "reason": "It proposes; a person decides."
+     }
+    },
+    "E7": {
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "Deploying from Git to Test and Prod is not built yet: promotion is done from Fabric's deployment pipelines or Git, by a person."
+     }
+    },
+    "G1": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "G1M": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "G2": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "unknown roles and the permissions of 4 roles and users can be recreated in the Warehouse."
+     }
+    },
+    "G2U": {
+     "applies": true,
+     "status": "assumed",
+     "value": {},
+     "recommendation": {
+      "value": {},
+      "reason": "None mapped: 1 SQL users stay listed for a person."
+     }
+    },
+    "G3": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "G4": {
+     "applies": false,
+     "status": "not_applicable",
      "value": null,
      "recommendation": null
     },
     "G5": {
      "applies": true,
      "status": "assumed",
-     "value": "dev",
+     "value": "keyVault",
      "recommendation": {
-      "value": "dev",
-      "reason": "Deploying from Git to Test and Prod is not built yet."
+      "value": "keyVault",
+      "reason": "1 linked services already read their secrets from Azure Key Vault."
      }
     },
     "H1": {
@@ -1548,38 +2209,59 @@
     },
     "H2": {
      "applies": true,
+     "status": "assumed",
+     "value": false,
+     "recommendation": {
+      "value": false,
+      "reason": "A development workspace is not cut over: decide this for the production migration."
+     }
+    },
+    "H2A": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "H3": {
+     "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
+    },
+    "H4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "unsure",
+     "recommendation": {
+      "value": "unsure",
+      "reason": "Nobody has checked yet: until someone does, Validate does not run them."
+     }
     },
     "I1": {
      "applies": true,
-     "status": "assumed",
-     "value": "suggest",
-     "recommendation": {
-      "value": "suggest",
-      "reason": "It proposes; a person decides."
-     }
+     "status": "open",
+     "value": null,
+     "recommendation": null
     },
-    "X1": {
+    "I2": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X2": {
+    "I3": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X3": {
+    "I4": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X4": {
+    "I5": {
      "applies": true,
      "status": "open",
      "value": null,
@@ -1588,9 +2270,9 @@
    },
    "next": "D1",
    "blockers": [
-    "A3: what it rests on changed since it was answered; confirm it again.",
+    "A3S: what it rests on changed since it was answered; confirm it again.",
     "D1: May object definitions be sent to Claude for drafts? Code only: never rows or credentials. A person answers this one.",
-    "E2: Which Microsoft Entra user or group replaces each SQL user? A person answers this one."
+    "G2U: Which Microsoft Entra user or group replaces each SQL user? A person answers this one."
    ],
    "conflicts": [
     {
@@ -1602,10 +2284,14 @@
    "settings": {
     "assistant.autonomy": "suggest",
     "code.multiStatement": "manual",
+    "code.notebookLanguage": "pyspark",
     "code.rebuild": "by_hand",
+    "code.unconvertible": "by_hand",
     "connections.defaultSignIn": "keyVault",
+    "cutover.parallelRun": false,
     "data.historyMode": "all",
     "data.mode": "replace",
+    "data.parallelCopies": 4,
     "data.poolSignIn": "workspaceIdentity",
     "data.run": "run",
     "data.sync": false,
@@ -1613,8 +2299,10 @@
     "llm.standards": "",
     "names.lakehouse": "sqlpool1_lakehouse",
     "names.warehouse": "sqlpool1",
+    "operations.identity": "person",
     "plan.scopeMode": "all",
     "plan.serverless": "keep",
+    "plan.sqlModules": "convert",
     "release.commitScope": "run",
     "release.gitCommit": true,
     "release.path": "dev",
@@ -1627,10 +2315,14 @@
     ],
     "run.stopOnFailure": true,
     "run.waveGate": false,
+    "schedules.enabled": "off",
     "security.migrate": true,
     "security.sqlUserMap": {},
     "storage.routes": "all",
+    "target.role": "dev",
+    "types.lossy": "accept",
     "validate.depth": "probe",
+    "validate.externalWrites": "unsure",
     "warehouse.collation": "match_synapse"
    }
   }
@@ -1648,18 +2340,26 @@
    "tables.count": 10,
    "tables.withDateColumn": 5,
    "tables.withChangeColumn": 3,
-   "tables.changeWithoutKeys": 0,
+   "tables.changeWithoutKeys": 1,
+   "tables.lossyTypes": 1,
    "storage.locations": 2,
    "security.principals": 4,
    "security.sqlUsers": 1,
    "security.sqlUserNames": [
     "app_user"
    ],
+   "code.sqlModules": 6,
+   "code.unconvertibleSql": 1,
    "code.multiStatementFunctions": 1,
    "code.needsRewrite": 2,
+   "code.unsupportedPipelines": 1,
+   "code.dotnetNotebooks": 1,
    "code.serverlessObjects": 1,
+   "pipelines.count": 3,
+   "notebooks.count": 2,
    "linkedServices.count": 3,
    "linkedServices.keyVault": 1,
+   "triggers.schedule": 1,
    "manual.setupCount": 2,
    "scope.groups": [
     "schema:dbo"
@@ -1682,7 +2382,7 @@
    },
    {
     "type": "answer",
-    "question": "A1",
+    "question": "A0",
     "value": [
      "data"
     ],
@@ -1704,7 +2404,7 @@
   ],
   "expected": {
    "questions": {
-    "A1": {
+    "A0": {
      "applies": true,
      "status": "answered",
      "value": [
@@ -1717,6 +2417,15 @@
        "orchestration"
       ],
       "reason": "40 objects were discovered, and everything can move in this migration."
+     }
+    },
+    "A1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "2 storage locations are read by the code directly."
      }
     },
     "A2": {
@@ -1741,6 +2450,12 @@
      "recommendation": null
     },
     "A3": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A3S": {
      "applies": true,
      "status": "assumed",
      "value": "leave_out",
@@ -1752,13 +2467,43 @@
     "A4": {
      "applies": true,
      "status": "assumed",
+     "value": "by_hand",
+     "recommendation": {
+      "value": "by_hand",
+      "reason": "1 pipelines and 1 notebooks have no Fabric equivalent as they are."
+     }
+    },
+    "A4O": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "A5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "5 tables have a date column. Loading every row keeps both sides identical, which Validate's row counts then show."
+     }
+    },
+    "A5D": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A6": {
+     "applies": true,
+     "status": "assumed",
      "value": "stop_on_failures",
      "recommendation": {
       "value": "stop_on_failures",
       "reason": "3 waves. Stopping after a wave with failures keeps a failed table from letting the views that read it start."
      }
     },
-    "A5": {
+    "A7": {
      "applies": true,
      "status": "assumed",
      "value": "skip",
@@ -1803,22 +2548,13 @@
       "reason": "None beyond the project requirements already set."
      }
     },
-    "C1": {
+    "B6": {
      "applies": true,
-     "status": "assumed",
-     "value": "all",
-     "recommendation": {
-      "value": "all",
-      "reason": "5 tables have a date column. Loading every row keeps both sides identical, which Validate's row counts then show."
-     }
-    },
-    "C1D": {
-     "applies": false,
-     "status": "not_applicable",
+     "status": "open",
      "value": null,
      "recommendation": null
     },
-    "C2": {
+    "C1": {
      "applies": true,
      "status": "assumed",
      "value": false,
@@ -1827,6 +2563,18 @@
       "reason": "3 tables have a column like ModifiedAt that could drive a sync. A one-off migration needs none."
      }
     },
+    "C2": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C2N": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
     "C3": {
      "applies": false,
      "status": "not_applicable",
@@ -1834,6 +2582,18 @@
      "recommendation": null
     },
     "C4": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C5": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "C6": {
      "applies": true,
      "status": "assumed",
      "value": "if_empty",
@@ -1842,7 +2602,7 @@
       "reason": "Skipping never touches data already there, so a re-run is safe."
      }
     },
-    "C5": {
+    "C7": {
      "applies": true,
      "status": "assumed",
      "value": "run",
@@ -1851,7 +2611,16 @@
       "reason": "Running them lets the run compare row counts table by table."
      }
     },
-    "C6": {
+    "C8": {
+     "applies": true,
+     "status": "assumed",
+     "value": 4,
+     "recommendation": {
+      "value": 4,
+      "reason": "Four at a time is fast, and gentle on a small pool."
+     }
+    },
+    "C9": {
      "applies": true,
      "status": "assumed",
      "value": "workspaceIdentity",
@@ -1887,55 +2656,37 @@
     "D4": {
      "applies": true,
      "status": "assumed",
+     "value": "accept",
+     "recommendation": {
+      "value": "accept",
+      "reason": "1 tables have such columns; each gets the closest type Fabric has."
+     }
+    },
+    "D5": {
+     "applies": true,
+     "status": "assumed",
      "value": "by_hand",
      "recommendation": {
       "value": "by_hand",
-      "reason": "unknown pipelines and unknown notebooks have no Fabric equivalent as they are."
+      "reason": "1 objects, and no AI drafts (D1)."
      }
     },
-    "D4O": {
-     "applies": true,
-     "status": "open",
+    "D6": {
+     "applies": false,
+     "status": "not_applicable",
      "value": null,
      "recommendation": null
     },
-    "E1": {
+    "D7": {
      "applies": true,
      "status": "assumed",
-     "value": true,
+     "value": "pyspark",
      "recommendation": {
-      "value": true,
-      "reason": "unknown roles and the permissions of 4 roles and users can be recreated in the Warehouse."
+      "value": "pyspark",
+      "reason": "1 notebooks use .NET; PySpark is what most Fabric notebooks are written in."
      }
     },
-    "E2": {
-     "applies": true,
-     "status": "assumed",
-     "value": {},
-     "recommendation": {
-      "value": {},
-      "reason": "None mapped: 1 SQL users stay listed for a person."
-     }
-    },
-    "E3": {
-     "applies": true,
-     "status": "assumed",
-     "value": "keyVault",
-     "recommendation": {
-      "value": "keyVault",
-      "reason": "1 linked services already read their secrets from Azure Key Vault."
-     }
-    },
-    "E4": {
-     "applies": true,
-     "status": "assumed",
-     "value": "all",
-     "recommendation": {
-      "value": "all",
-      "reason": "2 storage locations are read by the code."
-     }
-    },
-    "G1": {
+    "E0": {
      "applies": true,
      "status": "assumed",
      "value": true,
@@ -1944,7 +2695,7 @@
       "reason": "The target workspace is connected to Git: each run's items are committed, ready for a pull request."
      }
     },
-    "G2": {
+    "E0S": {
      "applies": true,
      "status": "assumed",
      "value": "run",
@@ -1953,7 +2704,25 @@
       "reason": "Other changes in the workspace are someone else's work, left for Fabric's Source control panel."
      }
     },
-    "G3": {
+    "E1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "A migration is built in a development workspace first, then promoted."
+     }
+    },
+    "E2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "person",
+     "recommendation": {
+      "value": "person",
+      "reason": "Migrate signs in as a person today; a service principal is set up in Azure first."
+     }
+    },
+    "E4": {
      "applies": true,
      "status": "assumed",
      "value": "overwrite",
@@ -1962,19 +2731,88 @@
       "reason": "A run that changes what Fabric already has waits for a person; any other is approved by the accelerator, and recorded as such."
      }
     },
-    "G4": {
+    "E5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "off",
+     "recommendation": {
+      "value": "off",
+      "reason": "1 schedule triggers; none runs before a person says so."
+     }
+    },
+    "E5O": {
      "applies": true,
      "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "E6": {
+     "applies": true,
+     "status": "assumed",
+     "value": "suggest",
+     "recommendation": {
+      "value": "suggest",
+      "reason": "It proposes; a person decides."
+     }
+    },
+    "E7": {
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "Deploying from Git to Test and Prod is not built yet: promotion is done from Fabric's deployment pipelines or Git, by a person."
+     }
+    },
+    "G1": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "G1M": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "G2": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "unknown roles and the permissions of 4 roles and users can be recreated in the Warehouse."
+     }
+    },
+    "G2U": {
+     "applies": true,
+     "status": "assumed",
+     "value": {},
+     "recommendation": {
+      "value": {},
+      "reason": "None mapped: 1 SQL users stay listed for a person."
+     }
+    },
+    "G3": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "G4": {
+     "applies": false,
+     "status": "not_applicable",
      "value": null,
      "recommendation": null
     },
     "G5": {
      "applies": true,
      "status": "assumed",
-     "value": "dev",
+     "value": "keyVault",
      "recommendation": {
-      "value": "dev",
-      "reason": "Deploying from Git to Test and Prod is not built yet."
+      "value": "keyVault",
+      "reason": "1 linked services already read their secrets from Azure Key Vault."
      }
     },
     "H1": {
@@ -1988,52 +2826,73 @@
     },
     "H2": {
      "applies": true,
+     "status": "assumed",
+     "value": false,
+     "recommendation": {
+      "value": false,
+      "reason": "A development workspace is not cut over: decide this for the production migration."
+     }
+    },
+    "H2A": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "H3": {
+     "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
+    },
+    "H4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "unsure",
+     "recommendation": {
+      "value": "unsure",
+      "reason": "Nobody has checked yet: until someone does, Validate does not run them."
+     }
     },
     "I1": {
      "applies": true,
-     "status": "assumed",
-     "value": "suggest",
-     "recommendation": {
-      "value": "suggest",
-      "reason": "It proposes; a person decides."
-     }
+     "status": "open",
+     "value": null,
+     "recommendation": null
     },
-    "X1": {
+    "I2": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X2": {
+    "I3": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X3": {
+    "I4": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     },
-    "X4": {
+    "I5": {
      "applies": true,
      "status": "open",
      "value": null,
      "recommendation": null
     }
    },
-   "next": "A1",
+   "next": "A0",
    "blockers": [
     "Contradiction: Data loads into the Warehouse's tables, which Structure creates. Without it the loads fail, unless the tables are already in Fabric.",
     "Contradiction: The pool (SQL_Latin1_General_CP1_CI_AS) compares names and text case-insensitively. Code that relies on that, such as a join of 'ABC' with 'abc', behaves differently in a case-sensitive Warehouse.",
     "Contradiction: This brief rests on a discovery that could not read: Triggers, Pools. Run discovery again, or go on knowing it.",
     "D1: May object definitions be sent to Claude for drafts? Code only: never rows or credentials. A person answers this one.",
-    "E2: Which Microsoft Entra user or group replaces each SQL user? A person answers this one.",
-    "G3: When must a person sign a run off before it writes to Fabric? A person answers this one."
+    "E4: When must a person sign a run off before it writes to Fabric? A person answers this one.",
+    "G2U: Which Microsoft Entra user or group replaces each SQL user? A person answers this one."
    ],
    "conflicts": [
     {
@@ -2055,10 +2914,14 @@
    "settings": {
     "assistant.autonomy": "suggest",
     "code.multiStatement": "manual",
+    "code.notebookLanguage": "pyspark",
     "code.rebuild": "by_hand",
+    "code.unconvertible": "by_hand",
     "connections.defaultSignIn": "keyVault",
+    "cutover.parallelRun": false,
     "data.historyMode": "all",
     "data.mode": "if_empty",
+    "data.parallelCopies": 4,
     "data.poolSignIn": "workspaceIdentity",
     "data.run": "run",
     "data.sync": false,
@@ -2066,6 +2929,7 @@
     "llm.standards": "",
     "names.lakehouse": "sqlpool1_lakehouse",
     "names.warehouse": "sqlpool1",
+    "operations.identity": "person",
     "plan.scopeMode": "all",
     "plan.serverless": "leave_out",
     "release.commitScope": "run",
@@ -2078,11 +2942,729 @@
     ],
     "run.stopOnFailure": true,
     "run.waveGate": false,
+    "schedules.enabled": "off",
     "security.migrate": true,
     "security.sqlUserMap": {},
     "storage.routes": "all",
+    "target.role": "dev",
+    "types.lossy": "accept",
     "validate.depth": "probe",
+    "validate.externalWrites": "unsure",
     "warehouse.collation": "case_sensitive"
+   }
+  }
+ },
+ {
+  "name": "a production target, a sync and the AI",
+  "facts": {
+   "objects.total": 40,
+   "waves.count": 3,
+   "pool.present": true,
+   "pool.name": "sqlpool1",
+   "pool.warehouseName": "sqlpool1",
+   "pool.collation": null,
+   "pool.caseInsensitive": true,
+   "tables.count": 10,
+   "tables.withDateColumn": 5,
+   "tables.withChangeColumn": 3,
+   "tables.changeWithoutKeys": 1,
+   "tables.lossyTypes": 1,
+   "storage.locations": 2,
+   "security.principals": 4,
+   "security.sqlUsers": 1,
+   "security.sqlUserNames": [
+    "app_user"
+   ],
+   "code.sqlModules": 6,
+   "code.unconvertibleSql": 1,
+   "code.multiStatementFunctions": 1,
+   "code.needsRewrite": 2,
+   "code.unsupportedPipelines": 1,
+   "code.dotnetNotebooks": 1,
+   "code.serverlessObjects": 1,
+   "pipelines.count": 3,
+   "notebooks.count": 2,
+   "linkedServices.count": 3,
+   "linkedServices.keyVault": 1,
+   "triggers.schedule": 1,
+   "manual.setupCount": 2,
+   "scope.groups": [
+    "schema:dbo"
+   ],
+   "discovery.complete": true,
+   "target.gitConnected": true,
+   "llm.available": true
+  },
+  "records": [
+   {
+    "type": "answer",
+    "question": "E1",
+    "value": "prod",
+    "source": "person",
+    "seq": 1
+   },
+   {
+    "type": "answer",
+    "question": "C1",
+    "value": true,
+    "source": "person",
+    "seq": 2
+   },
+   {
+    "type": "answer",
+    "question": "C2",
+    "value": "named",
+    "source": "person",
+    "seq": 3
+   },
+   {
+    "type": "answer",
+    "question": "C2N",
+    "value": [
+     "ModifiedDate"
+    ],
+    "source": "person",
+    "seq": 4
+   },
+   {
+    "type": "answer",
+    "question": "D1",
+    "value": true,
+    "source": "person",
+    "seq": 5
+   },
+   {
+    "type": "answer",
+    "question": "H1",
+    "value": "run",
+    "source": "person",
+    "seq": 6
+   },
+   {
+    "type": "answer",
+    "question": "G1",
+    "value": [
+     "*.*.email"
+    ],
+    "source": "person",
+    "seq": 7
+   },
+   {
+    "type": "answer",
+    "question": "E6",
+    "value": "act_dev",
+    "source": "person",
+    "seq": 8
+   },
+   {
+    "type": "answer",
+    "question": "A7",
+    "value": "update",
+    "source": "person",
+    "seq": 9
+   },
+   {
+    "type": "skip",
+    "question": "A7",
+    "seq": 10
+   }
+  ],
+  "expected": {
+   "questions": {
+    "A0": {
+     "applies": true,
+     "status": "assumed",
+     "value": [
+      "structure",
+      "data",
+      "orchestration"
+     ],
+     "recommendation": {
+      "value": [
+       "structure",
+       "data",
+       "orchestration"
+      ],
+      "reason": "40 objects were discovered, and everything can move in this migration."
+     }
+    },
+    "A1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "2 storage locations are read by the code directly."
+     }
+    },
+    "A2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "Nothing discovered is marked as out of scope."
+     }
+    },
+    "A2I": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A2X": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "convert",
+     "recommendation": {
+      "value": "convert",
+      "reason": "6 views, procedures and functions were discovered."
+     }
+    },
+    "A3S": {
+     "applies": true,
+     "status": "assumed",
+     "value": "leave_out",
+     "recommendation": {
+      "value": "leave_out",
+      "reason": "1 objects use the serverless pool, which the Lakehouse's SQL endpoint replaces in Fabric."
+     }
+    },
+    "A4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "by_hand",
+     "recommendation": {
+      "value": "by_hand",
+      "reason": "1 pipelines and 1 notebooks have no Fabric equivalent as they are."
+     }
+    },
+    "A4O": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "A5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "all",
+     "recommendation": {
+      "value": "all",
+      "reason": "5 tables have a date column. Loading every row keeps both sides identical, which Validate's row counts then show."
+     }
+    },
+    "A5D": {
+     "applies": false,
+     "status": "not_applicable",
+     "value": null,
+     "recommendation": null
+    },
+    "A6": {
+     "applies": true,
+     "status": "assumed",
+     "value": "stop_on_failures",
+     "recommendation": {
+      "value": "stop_on_failures",
+      "reason": "3 waves. Stopping after a wave with failures keeps a failed table from letting the views that read it start."
+     }
+    },
+    "A7": {
+     "applies": true,
+     "status": "skipped",
+     "value": "skip",
+     "recommendation": {
+      "value": "skip",
+      "reason": "Leaving what is there makes every run safe to repeat."
+     }
+    },
+    "B1": {
+     "applies": true,
+     "status": "assumed",
+     "value": "match_synapse",
+     "recommendation": {
+      "value": "match_synapse",
+      "reason": "The Synapse pool's collation is unknown."
+     }
+    },
+    "B2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "sqlpool1",
+     "recommendation": {
+      "value": "sqlpool1",
+      "reason": "Named after the pool, sqlpool1."
+     }
+    },
+    "B2L": {
+     "applies": true,
+     "status": "assumed",
+     "value": "sqlpool1_lakehouse",
+     "recommendation": {
+      "value": "sqlpool1_lakehouse",
+      "reason": "Named after the Warehouse."
+     }
+    },
+    "B3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "",
+     "recommendation": {
+      "value": "",
+      "reason": "None beyond the project requirements already set."
+     }
+    },
+    "B6": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "C1": {
+     "applies": true,
+     "status": "answered",
+     "value": true,
+     "recommendation": {
+      "value": false,
+      "reason": "3 tables have a column like ModifiedAt that could drive a sync. A one-off migration needs none."
+     }
+    },
+    "C2": {
+     "applies": true,
+     "status": "answered",
+     "value": "named",
+     "recommendation": {
+      "value": "detect",
+      "reason": "3 tables have such a column."
+     }
+    },
+    "C2N": {
+     "applies": true,
+     "status": "answered",
+     "value": [
+      "ModifiedDate"
+     ],
+     "recommendation": null
+    },
+    "C3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "once",
+     "recommendation": {
+      "value": "once",
+      "reason": "1 tables have a change column but no key: appending would double every changed row."
+     }
+    },
+    "C4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "keep",
+     "recommendation": {
+      "value": "keep",
+      "reason": "A sync never removes rows; most tables that change are only added to and updated."
+     }
+    },
+    "C5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "1h",
+     "recommendation": {
+      "value": "1h",
+      "reason": "An hour catches rows committed late, and nothing doubles."
+     }
+    },
+    "C6": {
+     "applies": true,
+     "status": "assumed",
+     "value": "if_empty",
+     "recommendation": {
+      "value": "if_empty",
+      "reason": "Skipping never touches data already there, so a re-run is safe."
+     }
+    },
+    "C7": {
+     "applies": true,
+     "status": "assumed",
+     "value": "run",
+     "recommendation": {
+      "value": "run",
+      "reason": "Running them lets the run compare row counts table by table."
+     }
+    },
+    "C8": {
+     "applies": true,
+     "status": "assumed",
+     "value": 4,
+     "recommendation": {
+      "value": 4,
+      "reason": "Four at a time is fast, and gentle on a small pool."
+     }
+    },
+    "C9": {
+     "applies": true,
+     "status": "assumed",
+     "value": "workspaceIdentity",
+     "recommendation": {
+      "value": "workspaceIdentity",
+      "reason": "No secret passes through the accelerator."
+     }
+    },
+    "D1": {
+     "applies": true,
+     "status": "answered",
+     "value": true,
+     "recommendation": {
+      "value": false,
+      "reason": "Nothing leaves this machine unless a person says so."
+     }
+    },
+    "D2": {
+     "applies": true,
+     "status": "assumed",
+     "value": 25,
+     "recommendation": {
+      "value": 25,
+      "reason": "Enough for a few hundred drafts at typical prices."
+     }
+    },
+    "D3": {
+     "applies": true,
+     "status": "assumed",
+     "value": "llm",
+     "recommendation": {
+      "value": "llm",
+      "reason": "1 functions, and AI drafts are allowed (D1)."
+     }
+    },
+    "D4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "accept",
+     "recommendation": {
+      "value": "accept",
+      "reason": "1 tables have such columns; each gets the closest type Fabric has."
+     }
+    },
+    "D5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "ai",
+     "recommendation": {
+      "value": "ai",
+      "reason": "1 objects, and AI drafts are allowed (D1)."
+     }
+    },
+    "D6": {
+     "applies": true,
+     "status": "assumed",
+     "value": "needs_work",
+     "recommendation": {
+      "value": "needs_work",
+      "reason": "It sends the fewest definitions."
+     }
+    },
+    "D7": {
+     "applies": true,
+     "status": "assumed",
+     "value": "pyspark",
+     "recommendation": {
+      "value": "pyspark",
+      "reason": "1 notebooks use .NET; PySpark is what most Fabric notebooks are written in."
+     }
+    },
+    "E0": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "The target workspace is connected to Git: each run's items are committed, ready for a pull request."
+     }
+    },
+    "E0S": {
+     "applies": true,
+     "status": "assumed",
+     "value": "run",
+     "recommendation": {
+      "value": "run",
+      "reason": "Other changes in the workspace are someone else's work, left for Fabric's Source control panel."
+     }
+    },
+    "E1": {
+     "applies": true,
+     "status": "answered",
+     "value": "prod",
+     "recommendation": {
+      "value": "dev",
+      "reason": "A migration is built in a development workspace first, then promoted."
+     }
+    },
+    "E2": {
+     "applies": true,
+     "status": "assumed",
+     "value": "person",
+     "recommendation": {
+      "value": "person",
+      "reason": "Migrate signs in as a person today; a service principal is set up in Azure first."
+     }
+    },
+    "E4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "always",
+     "recommendation": {
+      "value": "always",
+      "reason": "A production workspace: every run waits for a person."
+     }
+    },
+    "E5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "off",
+     "recommendation": {
+      "value": "off",
+      "reason": "1 schedule triggers; none runs before a person says so."
+     }
+    },
+    "E5O": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "E6": {
+     "applies": true,
+     "status": "answered",
+     "value": "act_dev",
+     "recommendation": {
+      "value": "suggest",
+      "reason": "It proposes; a person decides."
+     }
+    },
+    "E7": {
+     "applies": true,
+     "status": "assumed",
+     "value": "dev",
+     "recommendation": {
+      "value": "dev",
+      "reason": "Deploying from Git to Test and Prod is not built yet: promotion is done from Fabric's deployment pipelines or Git, by a person."
+     }
+    },
+    "G1": {
+     "applies": true,
+     "status": "answered",
+     "value": [
+      "*.*.email"
+     ],
+     "recommendation": null
+    },
+    "G1M": {
+     "applies": true,
+     "status": "assumed",
+     "value": "keep",
+     "recommendation": {
+      "value": "keep",
+      "reason": "Masking changes what people see: it is decided on purpose, not by default."
+     }
+    },
+    "G2": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "unknown roles and the permissions of 4 roles and users can be recreated in the Warehouse."
+     }
+    },
+    "G2U": {
+     "applies": true,
+     "status": "assumed",
+     "value": {},
+     "recommendation": {
+      "value": {},
+      "reason": "None mapped: 1 SQL users stay listed for a person."
+     }
+    },
+    "G3": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "G4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "context",
+     "recommendation": {
+      "value": "context",
+      "reason": "Drafts follow the brief best with all of it; each draft records which context file it was made with."
+     }
+    },
+    "G5": {
+     "applies": true,
+     "status": "assumed",
+     "value": "keyVault",
+     "recommendation": {
+      "value": "keyVault",
+      "reason": "1 linked services already read their secrets from Azure Key Vault."
+     }
+    },
+    "H1": {
+     "applies": true,
+     "status": "answered",
+     "value": "run",
+     "recommendation": {
+      "value": "probe",
+      "reason": "Querying and compiling proves objects work without changing anything."
+     }
+    },
+    "H2": {
+     "applies": true,
+     "status": "assumed",
+     "value": true,
+     "recommendation": {
+      "value": true,
+      "reason": "A production cutover is proved by running both side by side."
+     }
+    },
+    "H2A": {
+     "applies": true,
+     "status": "assumed",
+     "value": 3,
+     "recommendation": {
+      "value": 3,
+      "reason": "Three cycles catch most differences that come and go."
+     }
+    },
+    "H3": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "H4": {
+     "applies": true,
+     "status": "assumed",
+     "value": "unsure",
+     "recommendation": {
+      "value": "unsure",
+      "reason": "Nobody has checked yet: until someone does, Validate does not run them."
+     }
+    },
+    "I1": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "I2": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "I3": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "I4": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    },
+    "I5": {
+     "applies": true,
+     "status": "open",
+     "value": null,
+     "recommendation": null
+    }
+   },
+   "next": "H1",
+   "blockers": [
+    "Contradiction: Validate would really run pipelines and notebooks that may write to production systems (H4).",
+    "Contradiction: The assistant acts on its own only on a development workspace; on this one it will ask a person for everything.",
+    "E4: When must a person sign a run off before it writes to Fabric? A person answers this one.",
+    "G2U: Which Microsoft Entra user or group replaces each SQL user? A person answers this one."
+   ],
+   "conflicts": [
+    {
+     "id": "K10",
+     "status": "open",
+     "message": "Validate would really run pipelines and notebooks that may write to production systems (H4)."
+    },
+    {
+     "id": "K11",
+     "status": "open",
+     "message": "The assistant acts on its own only on a development workspace; on this one it will ask a person for everything."
+    }
+   ],
+   "settings": {
+    "assistant.autonomy": "act_dev",
+    "code.multiStatement": "llm",
+    "code.notebookLanguage": "pyspark",
+    "code.rebuild": "by_hand",
+    "code.unconvertible": "ai",
+    "connections.defaultSignIn": "keyVault",
+    "cutover.parallelCycles": 3,
+    "cutover.parallelRun": true,
+    "data.deletes": "keep",
+    "data.historyMode": "all",
+    "data.keylessSync": "once",
+    "data.mode": "if_empty",
+    "data.parallelCopies": 4,
+    "data.poolSignIn": "workspaceIdentity",
+    "data.run": "run",
+    "data.sync": true,
+    "data.syncOverlap": "1h",
+    "data.watermark": "named",
+    "data.watermarkColumns": [
+     "ModifiedDate"
+    ],
+    "llm.budgetUsd": 25,
+    "llm.consent": true,
+    "llm.context": "context",
+    "llm.scope": "needs_work",
+    "llm.standards": "",
+    "names.lakehouse": "sqlpool1_lakehouse",
+    "names.warehouse": "sqlpool1",
+    "operations.identity": "person",
+    "plan.scopeMode": "all",
+    "plan.serverless": "leave_out",
+    "plan.sqlModules": "convert",
+    "release.commitScope": "run",
+    "release.gitCommit": true,
+    "release.path": "dev",
+    "release.signoff": "always",
+    "run.existing": "skip",
+    "run.parts": [
+     "structure",
+     "data",
+     "orchestration"
+    ],
+    "run.stopOnFailure": true,
+    "run.waveGate": false,
+    "schedules.enabled": "off",
+    "security.maskSensitive": "keep",
+    "security.migrate": true,
+    "security.sensitiveColumns": [
+     "*.*.email"
+    ],
+    "security.sqlUserMap": {},
+    "storage.routes": "all",
+    "target.role": "prod",
+    "types.lossy": "accept",
+    "validate.depth": "run",
+    "validate.externalWrites": "unsure",
+    "warehouse.collation": "match_synapse"
    }
   }
  }

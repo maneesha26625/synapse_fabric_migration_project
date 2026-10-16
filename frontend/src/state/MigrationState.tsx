@@ -52,6 +52,14 @@ const PROJECT_KEYS = [PLAN_KEY, OPTIONS_KEY, JOURNEY_KEY];
 export const STEP_KEYS = ["discover", "assess", "consult", "waves", "plan", "migrate", "validate"] as const;
 export type StepKey = (typeof STEP_KEYS)[number];
 
+/** The confirmed steps of a journey saved before Consult was a step: one that confirmed a later step had nothing to
+ *  confirm there, so Consult counts as confirmed (its work is the brief, which Migrate checks for itself). */
+function loadJourney(key: string): StepKey[] {
+  const saved = load<StepKey[]>(key, []).filter((k): k is StepKey => (STEP_KEYS as readonly string[]).includes(k));
+  const after = STEP_KEYS.slice(STEP_KEYS.indexOf("consult") + 1);
+  return saved.includes("consult") || !saved.some((k) => (after as readonly string[]).includes(k)) ? saved : [...saved, "consult"];
+}
+
 function load<T>(key: string, fallback: T): T {
   try {
     const raw = localStorage.getItem(key);
@@ -326,8 +334,8 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
 
   // ---- journey (which steps were confirmed), per mode and project like the plan
   const journeyKey = `${JOURNEY_KEY}.${mode}.${project.id}`;
-  const [confirmed, setConfirmed] = useState<StepKey[]>(() => load<StepKey[]>(journeyKey, []));
-  useEffect(() => { setConfirmed(load<StepKey[]>(journeyKey, [])); }, [journeyKey]);
+  const [confirmed, setConfirmed] = useState<StepKey[]>(() => loadJourney(journeyKey));
+  useEffect(() => { setConfirmed(loadJourney(journeyKey)); }, [journeyKey]);
   useEffect(() => save(journeyKey, confirmed), [journeyKey, confirmed]);
   const confirmStep = useCallback((step: StepKey) => {
     setConfirmed((c) => (c.includes(step) ? c : [...c, step]));

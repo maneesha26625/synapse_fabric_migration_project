@@ -23,6 +23,7 @@ in the middle of making. Reset closes a run and keeps its record, as the run his
 
 from __future__ import annotations
 
+import fnmatch
 import logging
 import re
 import threading
@@ -201,6 +202,12 @@ def parse_credentials(raw: Any) -> Dict[str, Dict[str, str]]:
         if any(v.strip() for v in clean.values()):  # all blank: nothing chosen, so the connection stays deferred
             out[name] = clean
     return out
+
+
+def _person_enters_credentials() -> None:
+    """Credentials come only with a request a person makes: never from the agent or the accelerator itself."""
+    if context.actor().kind != context.PERSON:
+        raise ApiError(403, "person_only", "Only a person enters credentials: they travel once, with the request a person makes.")
 
 
 def parse_credential_names(raw: Any) -> Set[str]:
@@ -425,16 +432,21 @@ def _security_source(oid: str, name: str, object_type: str, wave: int, catalog: 
     return Source(oid, name, object_type, wave, SECURITY, payload=mapped if mapped is not None else sec)
 
 
-def sources_for(plan: List[dict], job: Any, pool: Optional[str], principals: Optional[Dict[str, str]] = None) -> List[Source]:
+def sources_for(plan: List[dict], job: Any, pool: Optional[str], principals: Optional[Dict[str, str]] = None,
+                masks: Optional[List[str]] = None) -> List[Source]:
     """Turn plan entries into what the runner needs, from the finished discovery. ``principals``: the Microsoft Entra
-    user or group that replaces each SQL user, by its name (the migration brief's ``security.sqlUserMap``)."""
+    user or group that replaces each SQL user, by its name (the migration brief's ``security.sqlUserMap``). ``masks``:
+    patterns of schema.table.column whose columns get the default dynamic data mask where Synapse has none (the
+    brief's G1 and G1M); a mask only hides, so adding one never shows anything Synapse did not."""
     from discovery_agent.migration import security as security_sql
+    from discovery_agent.sql.security import SqlMaskedColumn
 
     rows = {item["id"]: item for item in job.items}
     artifacts = _artifacts(job)
     catalog = _catalog(job)
     catalog_security = getattr(catalog, "security", None) if catalog is not None else None
     replacements = {str(k).lower(): str(v) for k, v in (principals or {}).items() if v}
+    masks_wanted = [str(p).lower() for p in masks or [] if str(p).strip()]
     mapped = security_sql.replace_sql_users(catalog_security, replacements) if catalog_security is not None and replacements else None
     by_kind = {
         NOTEBOOK: artifacts.get(P0Artifact.NOTEBOOK, {}), PIPELINE: artifacts.get(P0Artifact.PIPELINE, {}),
@@ -504,10 +516,20 @@ def sources_for(plan: List[dict], job: Any, pool: Optional[str], principals: Opt
         schema = getattr(key, "schema", None) or record.identity.schema or "dbo"
         object_name = getattr(key, "name", None) or record.identity.name
         masks = tuple(catalog_security.masks_on(schema, object_name)) if kind == TABLE and catalog_security is not None else ()
+        if kind == TABLE and masks_wanted:
+            have = {str(m.column).lower() for m in masks}
+            masks += tuple(SqlMaskedColumn(schema, object_name, c.name, "default()") for c in getattr(content, "columns", None) or ()
+                           if str(c.name).lower() not in have and _sensitive(schema, object_name, c.name, masks_wanted))
         sources.append(Source(
             oid, name, object_type, wave, kind, payload=content, schema=schema, object_name=object_name, masks=masks,
         ))
     return sources
+
+
+def _sensitive(schema: str, table: str, column: str, patterns: List[str]) -> bool:
+    """Whether schema.table.column matches one of the brief's sensitive-column patterns (lower case, * for any text)."""
+    name = f"{schema}.{table}.{column}".lower()
+    return any(fnmatch.fnmatchcase(name, p) for p in patterns)
 
 
 def data_sources(sources: List[Source], filters: Optional[Dict[str, datafilter.DataFilter]] = None) -> List[Source]:
@@ -693,8 +715,9 @@ class MigrationService:
         if same:
             options = {"stages": document.get("stages") or list(capabilities.STAGE_KEYS), "scope": document.get("scope") or "all",
                        "dataFilters": parse_data_filters(pins.get("dataFilters"))}
-            principals = (document.get("settings") or {}).get("sqlUserMap") or {}
-            sources = apply_stages(sources_for(pins.get("plan") or [], job, pool, principals), options)
+            settings = document.get("settings") or {}
+            sources = apply_stages(sources_for(pins.get("plan") or [], job, pool, settings.get("sqlUserMap") or {},
+                                               settings.get("maskColumns") or []), options)
             if self._transforms is not None:
                 self._transforms.apply(sources)
         run = MigrationRun.restore(document, items, sources, self._runs)
@@ -796,6 +819,15 @@ class MigrationService:
         policy = policy if policy is not None else self._brief()
         return policy.sql_user_map() if policy is not None else {}
 
+    def _masks(self, policy: Any = None) -> List[str]:
+        """The sensitive columns the approved brief masks, as schema.table.column patterns."""
+        policy = policy if policy is not None else self._brief()
+        return policy.mask_columns() if policy is not None else []
+
+    @staticmethod
+    def _signoff_rule(brief: Any) -> str:
+        return approvals.rule_for_policy(brief)
+
     # -- capacity and blocking risks ----------------------------------------------------------------
 
     def _check_capacity(self, workspace_id: str) -> None:
@@ -832,7 +864,7 @@ class MigrationService:
     def policy(self) -> dict:
         """How runs and their objects move, and the sign-off rule in force: what the page reads instead of a copy."""
         brief = self._brief()
-        return {**run_state.describe(), "signoff": approvals.rule_for(brief.signoff() if brief else None),
+        return {**run_state.describe(), "signoff": self._signoff_rule(brief),
                 "signoffPolicies": list(approvals.POLICIES), "signoffConfigured": approvals.configured(),
                 "failureCategories": {c: failures.MEANING[c] for c in failures.CATEGORIES}}
 
@@ -841,7 +873,8 @@ class MigrationService:
         """The planner's analysis of a plan run with these options, and the sources it read. Reads, never writes.
 
         ``analyze`` shows it on the Plan step; ``start`` refuses a run it finds a blocking risk in."""
-        every = sources_for(plan, job, pool, self._principals())
+        brief = self._brief()
+        every = sources_for(plan, job, pool, self._principals(brief), self._masks(brief))
         stages = set(options["stages"])
         sources = apply_stages(every, {**options, "scope": "automated"})
         if self._transforms is not None:
@@ -905,6 +938,15 @@ class MigrationService:
         self._audit("plan.recorded", target={"type": "plan", "id": entry["id"]}, details={
             "fingerprint": entry["fingerprint"], "objects": entry["objects"], "readiness": entry["readiness"],
             "blocking": entry["blocking"], "snapshot": entry.get("snapshot")})
+
+    def latest_plan(self) -> Optional[dict]:
+        """The latest recorded plan version, with its objects and options (never credentials), or None: what the
+        orchestrator's execution plan rests on, and what it starts a run of."""
+        with self._lock:
+            latest = dict(self._history[-1]) if self._history else None
+        if latest is not None:
+            latest.pop("seq", None)
+        return latest
 
     def plan_version(self, version_id: str) -> dict:
         """One recorded plan version, with its objects and options."""
@@ -973,6 +1015,8 @@ class MigrationService:
             raise ApiError(400, "invalid_plan", "The migration plan is not in a valid format.")
         options = parse_options(body)
         credentials = parse_credentials(body.pop("credentials", None))
+        if credentials:
+            _person_enters_credentials()
         # Everything that can refuse the request is checked before anything changes: a refused Start never touches
         # the current run.
         entries = [{"id": str(p.get("id") or ""), "wave": _int(p.get("wave"), 1, "wave")} for p in plan]
@@ -984,16 +1028,16 @@ class MigrationService:
             raise ApiError(409, "run_in_progress", "A migration run is already in progress. Pause it or wait for it to finish.")
         # The brief the run starts under: refused here, under a required consultation, without an approved one that fits
         # the estate, or with differences from it that nobody explained.
-        gate, brief = (self._consult.run_gate(entries, options, job, pool, body.get("deviationReason"))
-                       if self._consult is not None else ({"mode": None, "version": None, "differences": []}, None))
+        gate, brief, explained = (self._consult.run_gate(entries, options, job, pool, body.get("deviationReason"))
+                                  if self._consult is not None else ({"mode": None, "version": None, "differences": []}, None, None))
         self._check_capacity(workspace_id)
         analysis = self._refuse_blocking(plan, options, credentials, job, pool)
         with self._lock:
             self._same_project(generation)
             if self._busy():
                 raise ApiError(409, "run_in_progress", "A migration run is already in progress. Pause it or wait for it to finish.")
-            principals = self._principals(brief)
-            sources = apply_stages(sources_for(plan, job, pool, principals), options)
+            principals, masks = self._principals(brief), self._masks(brief)
+            sources = apply_stages(sources_for(plan, job, pool, principals, masks), options)
             if not [s for s in sources if s.kind not in (DEFERRED, MISSING)]:
                 raise ApiError(400, "nothing_to_migrate", "No object in the plan can be created by this build. Choose scope All to see them listed as deferred.")
             transform_log = self._transforms.apply(sources) if self._transforms is not None else []
@@ -1008,7 +1052,11 @@ class MigrationService:
                             "existing": options["existing"], "storageRoutes": options["storageRoutes"],
                             "syncOverlap": options["syncOverlap"], "gitCommit": options["gitCommit"],
                             "commitScope": options["commitScope"], "waveGate": options["waveGate"],
-                            "lakehouse": lakehouse_of(warehouse, {"lakehouse": named_lakehouse}), "sqlUserMap": principals}
+                            "lakehouse": lakehouse_of(warehouse, {"lakehouse": named_lakehouse}), "sqlUserMap": principals,
+                            # Taken from the brief itself, as the names are (C8, E5, G1 and G1M, E1).
+                            "parallelCopies": (brief.parallel_copies() if brief is not None else None) or datapipeline.PARALLEL_COPIES,
+                            "schedules": (brief.schedules() if brief is not None else None) or "off",
+                            "maskColumns": masks, "targetRole": brief.target_role() if brief is not None else None}
             self._describe_source(run, job, pool)
             snapshot = getattr(job, "snapshot", None) or {}
             # What the run was made from, so its record can say, and a later reader can check, exactly that.
@@ -1018,7 +1066,7 @@ class MigrationService:
                         "dataFilters": {k: f.to_dict() for k, f in options["dataFilters"].items()},
                         # The migration brief it starts under, by version and hash, and how the run differs from it.
                         "brief": gate}
-            rule = approvals.rule_for(brief.signoff() if brief is not None else None)
+            rule = self._signoff_rule(brief)
             reason = approvals.required(run.settings, run.stages, rule=rule)
             run.approval = approvals.request(reason, approvals.subject_hash(entries, run.settings, run.stages), rule=rule)
             # Nothing is left to refuse: the new run replaces the current one, which is closed and kept in the history.
@@ -1028,6 +1076,10 @@ class MigrationService:
             if credentials:
                 self._credentials = credentials
             self._run = run
+            if explained and brief is not None:
+                # The reason given with this request for differing from the brief, kept now that the run exists.
+                recorded = self._consult.record_deviation(brief, gate.get("differences") or [], explained)
+                gate["deviation"] = {k: recorded.get(k) for k in ("seq", "reason", "by", "at")}
             run.save()
             self._save_pointer(run.run_id)
             run.log("RUN", "run", f"{len(sources)} objects, workspace {workspace_name}, warehouse {run.warehouse}, signed in with {via}")
@@ -1063,6 +1115,9 @@ class MigrationService:
         decision = str(body.get("decision") or "")
         if decision not in ("approve", "reject"):
             raise ApiError(400, "invalid_request", "Choose approve or reject.")
+        # Before anything is taken from the request (the credentials that come with a sign-off among them).
+        if context.actor().kind != context.PERSON:
+            raise ApiError(403, "person_only", "Only a person signs a run off, or declines it.")
         with self._lock:
             run = self._run
             if run is None or (body.get("runId") and str(body.get("runId")) != run.run_id):
@@ -1077,6 +1132,9 @@ class MigrationService:
                 if not run.resumable:
                     raise ApiError(409, "not_resumable", run.unresumable_reason
                                    or "This run cannot run any more. Decline it, or close it with Reset.")
+                changed = self._consult.still_holds(run.pins.get("brief")) if self._consult is not None else None
+                if changed:
+                    raise ApiError(409, "brief_changed", changed)
                 self._take_credentials(run, body)
             try:
                 record = approvals.decide(asked, decision == "approve", str(body.get("comment") or ""))
@@ -1127,9 +1185,11 @@ class MigrationService:
                     self._audit("run.pause_requested", target={"type": "run", "id": run.run_id}, run_id=run.run_id)
             elif action == "resume":
                 if run.status == run_state.PAUSED and not self._busy():
-                    self._ready_to_carry_on(run, body)
                     # A run waiting for a wave's sign-off: this Resume, by a person, is that sign-off, for that wave only.
                     wave = run.waiting_wave()
+                    if wave is not None and context.actor().kind != context.PERSON:
+                        raise ApiError(403, "person_only", f"Only a person can sign off wave {wave} and let it start.")
+                    self._ready_to_carry_on(run, body)
                     run.pause.clear()
                     with run.lock:
                         if wave is not None:
@@ -1189,6 +1249,7 @@ class MigrationService:
         refusal while any it needs are missing (they were lost with a restart: they are never kept)."""
         given = parse_credentials(body.get("credentials"))
         if given:
+            _person_enters_credentials()
             self._credentials.update(given)
         missing = [n for n in run.needs_input if n not in self._credentials]
         if missing:
@@ -1291,10 +1352,22 @@ class MigrationService:
             return False
         return self._run is not None and self._run.status in run_state.WORKING
 
+    def runtime_refusal(self, runtime: Any) -> Optional[str]:
+        """Why Validate may not really run what ``runtime.run`` names now (the brief's H4, unless K10 was kept), or None."""
+        runs = [str(k) for k in (runtime or {}).get("run") or []] if isinstance(runtime, dict) else []
+        brief = self._brief() if runs else None
+        return brief.external_writes_refusal(runs) if brief is not None else None
+
+    def _refuse_runtime(self, body: dict) -> None:
+        refused = self.runtime_refusal(body.get("runtime"))
+        if refused:
+            raise ApiError(409, "external_writes", refused)
+
     def start_validation(self, body: dict) -> dict:
         """Validate in the background, so runs in Fabric can be followed for as long as they take. Poll ``validation_state``."""
         self._session.migration_snapshot()       # refuse now, not in the thread, when there is nothing to validate
         self._fabric.migration_target()
+        self._refuse_runtime(body)
         with self._lock:
             if self._validation_thread is not None and self._validation_thread.is_alive():
                 raise ApiError(409, "validation_running", "Validation is already running; wait for it to finish.")
@@ -1346,22 +1419,30 @@ class MigrationService:
             raise ApiError(400, "invalid_plan", "The list of objects to validate is not in a valid format.")
         job, pool = self._session.migration_snapshot()
         workspace_id, workspace_name, _ = self._fabric.migration_target()
+        self._refuse_runtime(body)
         plan = plan or [{"id": i["id"], "wave": 1} for i in job.items]
         given = body.get("options") if isinstance(body.get("options"), dict) else {}
-        filters = parse_data_filters(given.get("dataFilters"))
         # Compared with what the run made: its Warehouse and its principals, else what the approved brief names.
         run, brief = self._run, self._brief()
         made = run if run is not None and run.workspace_id == workspace_id else None
-        principals = (made.settings.get("sqlUserMap") if made is not None else None) or self._principals(brief)
-        sources = apply_stages(sources_for(plan, job, pool, principals),
+        # The rows each table was loaded with: the date filters the request names, else the ones the run itself was
+        # given (the agent's validations name none), so a table loaded from a date is never counted against all of it.
+        filters = parse_data_filters(given["dataFilters"] if "dataFilters" in given
+                                     else (made.pins.get("dataFilters") if made is not None else None))
+        # The run's own map, even an empty one: what it made is what is checked, not what the brief says now.
+        principals = (made.settings.get("sqlUserMap") or {}) if made is not None else self._principals(brief)
+        masks = (made.settings.get("maskColumns") or []) if made is not None else self._masks(brief)
+        sources = apply_stages(sources_for(plan, job, pool, principals, masks),
                                {"stages": list(capabilities.STAGE_KEYS), "scope": "all", "dataFilters": filters})
         factory = self._source_factory or getattr(self._session, "source_sql_factory", lambda: None)()
-        warehouse = made.warehouse if made is not None else ((brief.names()[0] if brief is not None else None) or warehouse_name_for(pool))
+        named_warehouse, named_lakehouse = brief.names() if brief is not None else (None, None)
+        warehouse = made.warehouse if made is not None else (named_warehouse or warehouse_name_for(pool))
+        lakehouse = lakehouse_of(warehouse, made.settings if made is not None else {"lakehouse": named_lakehouse})
         validator = Validator(
             self._rest_factory(), workspace_id, workspace_name, warehouse, self._sql_factory, factory,
             artifacts={"pipelines": _artifacts(job).get(P0Artifact.PIPELINE, {})},
             runtime=RuntimeOptions.parse(body["runtime"]) if isinstance(body.get("runtime"), dict) else None,
-            progress=progress or (lambda text: None))
+            progress=progress or (lambda text: None), lakehouse_name=lakehouse)
         rows = validator.run(sources)
         order = {c: n for n, c in enumerate(VALIDATION_ORDER)}
         rows.sort(key=lambda r: (order.get(r["category"], len(order)), r["object"].lower()))
@@ -1484,7 +1565,7 @@ class MigrationService:
             if not conn.connected:
                 out = {"state": "skipped", "message": fabric_git.KNOWN_NOT_CONNECTED, "at": started}
             else:
-                # The brief decides what the commit takes (G2): only what the run made (the default), or all that waits.
+                # The brief decides what the commit takes (E0S): only what the run made (the default), or all that waits.
                 whole = run.settings.get("commitScope") == "all"
                 result = fabric_git.commit(client, workspace_id, comment, only=None if whole else git_items(run))
                 out = {"state": result.state, "items": result.items, "skipped": result.skipped, "others": result.others,

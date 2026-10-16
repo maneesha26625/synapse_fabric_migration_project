@@ -5,6 +5,7 @@ import { DeviationDialog } from "../consult/DeviationDialog";
 import { MetricCard } from "../shared/Metrics";
 import { Banner, Button, Card, EmptyState, Modal, StatusBadge, TextField, type Tone } from "../shared/Shared";
 import { useAppState } from "../../state/AppState";
+import { useConsult } from "../../state/ConsultState";
 import { useMigration } from "../../state/MigrationState";
 import type { ExecItem, ExecutionRun } from "../../types";
 import { STRATEGY_TONE } from "./StrategyPanel";
@@ -35,7 +36,10 @@ const finished = (s: ExecItem["status"]) => s === "COMPLETED" || s === "SKIPPED"
 /** Checks before anything is touched: the target, the capacity, the SQL driver. */
 export function Preflight() {
   const { analysis } = useMigration();
+  const { required, approved, stale: briefStale } = useConsult();
   if (!analysis) return null;
+  // The approved brief a run starts under: refused without one (required), recorded without one (advisory).
+  const brief = approved !== null && !briefStale ? "ok" : required ? "fail" : "warn";
   const icon = (s: string) => s === "ok" ? <CheckCircle2 size={15} aria-label="passed" /> : s === "warn" ? <CircleAlert size={15} aria-label="warning" /> : <XCircle size={15} aria-label="failed" />;
   const failed = analysis.checks.filter((c) => c.status === "fail").length;
   return (
@@ -47,6 +51,11 @@ export function Preflight() {
             <span><strong>{c.label}</strong>{c.detail ? <span className="muted"> — {c.detail}</span> : null}</span>
           </li>
         ))}
+        <li className={`check ${brief === "ok" ? "ok" : brief === "warn" ? "skipped" : "failed"}`}>
+          {icon(brief)}
+          <span><strong>Approved migration brief</strong><span className="muted"> — {approved !== null && !briefStale ? `version ${approved}, in force`
+            : briefStale ? `version ${approved} no longer fits: reconfirm it in Consult` : required ? "none yet: approve one in Consult before a run can start" : "none (advisory): the run starts without one"}</span></span>
+        </li>
         <li className={`check ${analysis.blocking ? "failed" : "ok"}`}>
           {analysis.blocking ? <XCircle size={15} aria-label="failed" /> : <CheckCircle2 size={15} aria-label="passed" />}
           <span><strong>Plan has no blocking risks</strong><span className="muted"> — {analysis.blocking ? `${analysis.blocking} to resolve in Plan, under Readiness & risks` : "dependency order and object content checked"}</span></span>
@@ -286,7 +295,10 @@ export function RunPanel() {
   const needsAttention = run.failed + (run.blocked ?? 0);
   const badge = runBadge(run);
   const blocked = (analysis?.blocking ?? 0) > 0;
-  const ready = plan.length > 0 && fabric.status === "connected" && !blocked && analysis !== null && options.stages.length > 0;
+  const { required: briefRequired, approved: briefVersion, stale: briefStale } = useConsult();
+  // A required consultation refuses a run without an approved brief that fits the estate: Start says so, before it is pressed.
+  const briefMissing = briefRequired && (briefVersion === null || briefStale);
+  const ready = plan.length > 0 && fabric.status === "connected" && !blocked && analysis !== null && options.stages.length > 0 && !briefMissing;
   // Only waiting for the plan's score (after a reload, or an edit): not a problem to report.
   const scoring = plan.length > 0 && fabric.status === "connected" && analysis === null && !analysisError;
   const runIds = new Set(run.items.map((i) => i.id));
@@ -331,7 +343,9 @@ export function RunPanel() {
             {blocked ? "The planner found blocking risks. " : ""}
             {options.stages.length === 0 ? "Every stage is switched off: switch some on in Plan, under Stages & credentials. " : ""}
             {analysisError ? `The plan could not be scored: ${analysisError} ` : ""}
+            {briefMissing ? (briefVersion === null ? "No migration brief is approved yet: a run starts only under one. " : "The approved brief no longer fits: reconfirm it. ") : ""}
             {fabric.status !== "connected" && <button type="button" className="link" onClick={() => navigate("/")}>Open Connections</button>}
+            {briefMissing && <button type="button" className="link" onClick={() => navigate("/migration?step=consult")}>Open Consult</button>}
           </Banner>
         ))}
         <div className="row">

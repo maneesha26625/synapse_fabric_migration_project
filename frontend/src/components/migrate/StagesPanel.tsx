@@ -1,10 +1,11 @@
-import { CircleAlert, KeyRound } from "lucide-react";
-import { useMemo } from "react";
+import { CircleAlert, KeyRound, ScrollText } from "lucide-react";
+import { useEffect, useMemo } from "react";
 import { Banner, Button, Card, Collapsible, StatusBadge, type Tone } from "../shared/Shared";
+import { useConsult } from "../../state/ConsultState";
 import { useMigration } from "../../state/MigrationState";
 import { DataFiltersPanel } from "./DataFiltersPanel";
 import { StorageRoutesPanel } from "./StorageRoutesPanel";
-import type { ExecItem, LinkedServiceInput, RunOptions, StageDef } from "../../types";
+import type { ConsultPolicy, ExecItem, LinkedServiceInput, RunOptions, StageDef } from "../../types";
 
 const SECRET_FIELDS = new Set(["password", "clientSecret", "key", "token"]);
 const FIELD_LABEL: Record<string, string> = { username: "Username", password: "Password", tenantId: "Tenant ID", clientId: "Client ID", clientSecret: "Client secret", key: "Account key", token: "SAS token", keyVault: "Key Vault reference (alias or ID)", secretName: "Secret name" };
@@ -30,9 +31,25 @@ function stageProgress(stage: StageDef, items: ExecItem[]): { label: string; ton
   return { label: `${done}/${mine.length}`, tone: "neutral" };
 }
 
+/** The sign-in the approved brief chose for this connection (C9 for the pool, G5 for linked services), if this
+ *  connection offers it: Key Vault means the first Key Vault option the connection has. */
+function preferredAuth(service: LinkedServiceInput, signIn: ConsultPolicy["signIn"]): string | null {
+  if (!signIn) return null;
+  const wanted = service.stage === "data" ? signIn.pool
+    : signIn.linkedServices === "keyVault" ? service.authTypes.find((a) => a.value.endsWith("KeyVault"))?.value ?? null : signIn.linkedServices;
+  return wanted && service.authTypes.some((a) => a.value === wanted) ? wanted : null;
+}
+
 function CredentialForm({ service }: { service: LinkedServiceInput }) {
   const { credentials, setCredential } = useMigration();
+  const { policy } = useConsult();
   const value = credentials[service.name] ?? {};
+  const preferred = service.unsupported ? null : preferredAuth(service, policy?.signIn);
+  // The brief decided how this connection signs in: preselected once, never over a choice made here. Choosing a
+  // method sends no secret; any secret is still typed by a person.
+  useEffect(() => {
+    if (preferred && !value.authType) setCredential(service.name, { authType: preferred });
+  }, [preferred]); // eslint-disable-line react-hooks/exhaustive-deps
   if (service.unsupported) {
     return <div className="cred"><strong>{service.name}</strong> <span className="muted">({service.type})</span><p className="muted">{service.unsupported}</p></div>;
   }
@@ -52,6 +69,7 @@ function CredentialForm({ service }: { service: LinkedServiceInput }) {
           {service.authTypes.map((a) => <option key={a.value} value={a.value}>{a.label}</option>)}
         </select>
       </div>
+      {preferred && auth?.value === preferred && <p className="faint" style={{ margin: "6px 0 0" }}>Preselected from the approved brief ({service.stage === "data" ? "C9" : "G5"}).</p>}
       {auth?.hint && <p className="muted" style={{ margin: "6px 0 0" }}>{auth.hint}</p>}
       {auth && <div className="form-grid" style={{ marginTop: 8 }}>
         {auth.fields.map((f) => (
@@ -83,6 +101,24 @@ function Differs({ option }: { option: string }) {
  * Which stages run, and how. Configuration only: nothing is written from the
  * Plan step. The Migrate step runs every stage that is on, or one on its own.
  */
+/** What a run takes from the approved brief itself, as it takes the names: shown here, never changed here. */
+function FromTheBrief() {
+  const { policy } = useConsult();
+  const run = policy?.run;
+  if (!policy?.inForce || !run) return null;
+  const items = [
+    run.parallelCopies ? `the load pipeline copies ${run.parallelCopies} table${run.parallelCopies === 1 ? "" : "s"} at a time (C8)` : "",
+    run.schedules ? `schedules are created ${run.schedules === "match" ? "switched on where Synapse had started them" : "switched off"} (E5)` : "",
+    run.maskColumns.length ? `the default mask goes on ${run.maskColumns.length} sensitive column pattern${run.maskColumns.length === 1 ? "" : "s"} without one (G1)` : "",
+    run.targetRole === "prod" ? "a production target: every run waits for a person's sign-off (E1)" : "",
+    policy.names?.warehouse ? `the Warehouse is ${policy.names.warehouse}${policy.names.lakehouse ? `, the Lakehouse ${policy.names.lakehouse}` : ""} (B2)` : "",
+  ].filter(Boolean);
+  if (!items.length) return null;
+  return (
+    <p className="faint" style={{ margin: 0 }}><ScrollText size={13} aria-hidden="true" /> From brief version {policy.inForce.version}: {items.join("; ")}.</p>
+  );
+}
+
 export function StagesPanel() {
   const { capabilities, options, setOptions, graph, plan, execution: run, credentials, clearCredentials, fabricGit } = useMigration();
   const waves = useMemo(() => new Set(plan.map((p) => p.wave)).size, [plan]);
@@ -183,6 +219,7 @@ export function StagesPanel() {
         })}
       </div>
 
+      <FromTheBrief />
       {enabled.has("data") && filterable.length > 0 && <DataFiltersPanel tables={filterable} />}
       <StorageRoutesPanel />
 

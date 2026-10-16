@@ -11,9 +11,14 @@ no sidebar:
 * **Migration** (`/migration?step=…`): the seven steps (Discover, Assess,
   Consult, Waves, Plan, Migrate, Validate) side by side. Click a step to see its
   details below; each step is confirmed with Next before the following one opens.
-  **Consult** asks the questions before a migration and has the migration brief
-  approved; Plan is pre-set from it, and confirming a plan that differs from it
-  asks why. Beside the
+  **Consult** asks the questions before a migration (sections A to I) and has the
+  migration brief approved; Plan is pre-set from it, confirming a plan that differs
+  from it asks why, and its **Migration context** tab shows MIGRATION_CONTEXT.md,
+  the brief as every LLM draft is sent it. Consult never locks the steps after it:
+  a required consultation holds back the run itself, and Migrate says why.
+  **Migrate** has two tabs: the **Run**, and the **Execution plan** (every step
+  from readiness to the sign-off report, who owns it, what the agent proposes, and
+  the agent's pause switch). Beside the
   steps, the **workspace explorer** shows the discovered workspace as a
   repository tree; under them, the **release path** shows the way from Dev to
   Prod, with a live **Fabric Git** chip (branch, last commit, what waits to be
@@ -30,8 +35,13 @@ from the start. When the migration is finished, **Download report (CSV)** saves
 every object's result and every validation check.
 
 A **+** button at the bottom right (or Ctrl+I) opens the migration assistant
-panel on the right. It is a preview: the panel and its context are there, the
-conversation is planned for a later release.
+panel on the right; the number on it is how many of the agent's requests wait for
+you. **Ask** is the conversation (answered from the accelerator's record by its
+rules, or with an approved brief's consent by Claude, one checked step at a time,
+every change an action card you confirm or reject), **Plan** the execution plan as
+a checklist, and **Requests** what waits for you. Each LLM draft's review says
+which MIGRATION_CONTEXT.md it was sent and what it applied, and flags one made
+under an earlier brief.
 
 What each step does, and what a migration run creates in Fabric, is described
 in the [root README](../README.md).
@@ -64,7 +74,7 @@ python -m discovery_agent.api            # open http://127.0.0.1:8001
 ```
 
 On Windows, `..\start-ui.ps1` starts both. Checks: `npm run typecheck`,
-`npm test` (70 tests, on Demo data), and `pytest tests/test_api.py
+`npm test` (95 tests, on Demo data), and `pytest tests/test_api.py
 tests/test_fabric_git.py` for the API. After pulling backend changes, restart
 the API: the UI dev server reloads by itself, the API does not.
 
@@ -200,13 +210,14 @@ src/
     connections/  SourceConnection (Synapse), TargetConnection (Fabric), MethodTiles
     journey/      steps, useJourney (each step's state), ResetStep, report (CSV), WorkspaceExplorer, ReleasePath, panels/ (one per step)
     discovery/    Inventory, object details, summaries, mapping, dependency graph
-    consult/      ConsultPanel (questions, brief, changes since approval, help), QuestionCard, DeviationDialog, format
+    consult/      ConsultPanel (questions, brief, changes since approval, the migration context, help), QuestionCard, DeviationDialog, format
+    orchestrator/ PlanBoard (the execution plan, the agent), ActionCard (a request: confirm or reject)
     migrate/      planner runs, stages and credentials (and the Fabric Git option), strategy, run panel (and its Git banner)
-    layout/       Layout (top bar, project menu, backend bar), Assistant (launcher and panel)
+    layout/       Layout (top bar, project menu, backend bar), Assistant (launcher with its badge, and the conversation)
     shared/       buttons, fields, banners, tabs, metrics, dialogs, notify (toasts)
-  state/        AppState (connection, discovery), MigrationState (projects, plan, run, journey), ConsultState (the consultation, and Plan pre-set from the approved brief)
+  state/        AppState (connection, discovery), MigrationState (projects, plan, run, journey), ConsultState (the consultation, and Plan pre-set from the approved brief), OrchestratorState (the execution plan, requests, the assistant's questions)
   services/     realApi, mode selection            (the only code that calls fetch)
-  mock/         mockApi, mockData, mockConsult and consultCatalog.json (the server's catalog and engine, in TypeScript)   (demo only)
+  mock/         mockApi, mockData, mockConsult with consultCatalog.json and consultVocabulary.json (the server's catalog, settings, facts and engine, in TypeScript), mockOrchestrator (the plan and a proposing agent from Demo data)   (demo only)
   styles/       global.css (tokens and every style)
   test/         app.test.tsx, consult.test.ts (the Demo engine against the server's, on consultParity.json)
 ```

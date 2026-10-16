@@ -115,6 +115,7 @@ def fold(records: Iterable[Mapping[str, Any]]) -> Tuple[Dict[str, Mapping[str, A
             skips.pop(qid, None)
         elif kind == "skip":
             skips[qid] = r
+            answers.pop(qid, None)  # skipped after an answer: the recommendation stands again, as an assumption
         elif kind == "resolve":
             resolutions[str(r.get("conflict") or "")] = r
     return answers, skips, resolutions
@@ -154,8 +155,14 @@ def recommendation(question: Question, facts: Mapping[str, Any], values: Mapping
     return None
 
 
+def translate(catalog: Catalog, records: Iterable[Mapping[str, Any]]) -> List[Mapping[str, Any]]:
+    """Every record as this version of the catalog reads it (``Catalog.translate``): an answer given before questions
+    were renamed answers the question it is now."""
+    return [catalog.translate(r) for r in records]
+
+
 def evaluate(catalog: Catalog, facts: Mapping[str, Any], records: Iterable[Mapping[str, Any]]) -> State:
-    answers, skips, resolutions = fold(records)
+    answers, skips, resolutions = fold(translate(catalog, records))
     values: Dict[str, Any] = {}
     states: Dict[str, QuestionState] = {}
     order = [q.id for q in catalog.questions]

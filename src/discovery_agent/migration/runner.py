@@ -497,6 +497,8 @@ class MigrationRun:
                 "createdAt": self.created_at, "startedAt": self.started_at, "finishedAt": self.finished_at,
                 "closedAt": self.closed_at, "requestedBy": dict(self.requested_by),
                 "approval": dict(self.approval) if self.approval else None,
+                # The connections it was given credentials for: their names only, never what was given.
+                "credentialNames": list((self.pins or {}).get("credentialNames") or []),
                 "resumable": self.resumable, "unresumableReason": self.unresumable_reason,
                 "executions": [dict(e) for e in self.executions],
                 "items": [i.to_dict() for i in self.items], "logs": list(self.logs[-2000:]),
@@ -685,7 +687,8 @@ class Migrator(StageMixin, FabricStageMixin):
         if not run.settings.get("waveGate"):
             return None
         wave = item.source.wave
-        first = min((i.source.wave for i in run.items), default=wave)
+        # The first wave with work in it: objects the run only reports (deferred, missing) never open one.
+        first = min((i.source.wave for i in run.items if i.source.kind not in (DEFERRED, MISSING)), default=wave)
         if wave <= first or wave in run.released_waves:
             return None
         return (f"Wave {wave} waits for a person to sign it off: check what the waves before it made in Fabric, then "

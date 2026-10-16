@@ -54,17 +54,22 @@ _ALL = (
     _f("tables.withKeys", "Tables with a primary key or a unique constraint"),
     _f("tables.withoutKeys", "Tables with no key"),
     _f("tables.changeWithoutKeys", "Tables with a change column but no key: a sync can only append to them"),
+    _f("tables.lossyTypes", "Tables with a column Fabric stores with less (7-digit time, datetimeoffset, rowversion, XML, spatial)"),
     _f("storage.locations", "Storage locations the code reads directly"),
     _f("security.principals", "Database roles and users"),
     _f("security.roles", "Database roles"),
     _f("security.sqlUsers", "SQL-authenticated users (Fabric has no SQL authentication)"),
     _f("security.sqlUserNames", "The SQL-authenticated users"),
     _f("security.masks", "Columns with a dynamic data mask"),
+    _f("code.sqlModules", "Views, stored procedures and functions"),
+    _f("code.unconvertibleSql", "Procedures, views, functions and scripts that still use T-SQL Fabric rejects after the rules"),
     _f("code.multiStatementFunctions", "Multi-statement table-valued functions (Fabric has none)"),
     _f("code.dotnetNotebooks", ".NET for Spark notebooks (Fabric has none)"),
     _f("code.unsupportedPipelines", "Pipelines with an activity Fabric has no equivalent for"),
     _f("code.needsRewrite", "Objects that must be rebuilt by hand (unsupported pipelines and .NET notebooks)"),
     _f("code.serverlessObjects", "Scripts and pipelines written for the serverless SQL pool"),
+    _f("pipelines.count", "Pipelines"),
+    _f("notebooks.count", "Notebooks"),
     _f("linkedServices.count", "Linked services"),
     _f("linkedServices.byType", "Linked services by type"),
     _f("linkedServices.keyVault", "Linked services that read a secret from Azure Key Vault"),
@@ -84,12 +89,19 @@ _ALL = (
     _f("discovery.snapshot", "The discovery snapshot", informational=True),
     _f("target.connected", "The Fabric target is connected", ENVIRONMENT),
     _f("target.workspace", "The Fabric target workspace", ENVIRONMENT),
+    # The id a brief's approval keeps (``Policy.target``): another workspace connected later makes it stale.
+    _f("target.workspaceId", "The Fabric target workspace's id", ENVIRONMENT, informational=True),
     _f("target.capacity", "The Fabric workspace is on a capacity", ENVIRONMENT),
     _f("target.gitConnected", "The Fabric workspace is connected to Git", ENVIRONMENT),
     _f("llm.available", "Claude Code is installed on this machine", ENVIRONMENT),
 )
 
 FACTS: Dict[str, Fact] = {f.name: f for f in _ALL}
+
+
+def describe() -> Dict[str, Dict[str, Any]]:
+    """The facts, as the Demo page's copy of the engine reads them (``frontend/src/mock/consultVocabulary.json``)."""
+    return {f.name: {"description": f.description, "scope": f.scope, "informational": f.informational} for f in _ALL}
 
 
 def fingerprinted(values: Mapping[str, Any]) -> Dict[str, Any]:

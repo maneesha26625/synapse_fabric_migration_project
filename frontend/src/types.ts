@@ -518,7 +518,7 @@ export interface RunOptions {
   gitCommit?: "auto" | "off";
   /** What that commit takes: only what the run created or updated (run), or everything waiting in the workspace (all). */
   commitScope?: "run" | "all";
-  /** A person signs off each wave before the next one starts (the brief's A4). */
+  /** A person signs off each wave before the next one starts (the brief's A6). */
   waveGate?: boolean;
 }
 
@@ -531,7 +531,9 @@ export type ConsultStatus = "answered" | "assumed" | "open" | "skipped" | "stale
 /** Every source but an assumption is a person's action: their own answer, an accepted recommendation, a finding they
  *  took, or a proposal they confirmed (read from notes by the model or the rules, or from an imported questionnaire). */
 export type AnswerSource = "person" | "recommendation" | "finding" | "ai" | "rules" | "import";
-export type SettingStatus = "enforced" | "recorded" | "note";
+/** enforced: the accelerator acts on it; context: sent to the AI with every draft (MIGRATION_CONTEXT.md);
+ *  recorded: kept for a feature that does not act on it yet; note: for people. */
+export type SettingStatus = "enforced" | "context" | "recorded" | "note";
 export interface SettingDrive { setting: string; status: SettingStatus; applies: string }
 export interface ConsultQuestionDef {
   id: string;
@@ -680,6 +682,8 @@ export interface BriefContent {
   enforced: Record<string, unknown>;
   assumptions: string[];
   recordedOnly: { setting: string; value: unknown; status: SettingStatus; applies: string }[];
+  /** Decisions only the AI acts on: written into the migration context every draft is sent. */
+  contextOnly?: { setting: string; value: unknown; status: SettingStatus; applies: string }[];
   keptContradictions: { conflict: string; message: string; reason: string; by: Actor | null; at: string | null }[];
   separateApprover: { question: string; reason: string }[];
 }
@@ -726,7 +730,11 @@ export interface BriefCheck {
 export interface ConsultPolicy {
   mode: "required" | "advisory";
   inForce: { version: number; hash: string; approvedBy: Actor | null; approvedAt: string | null; stale: boolean; changes: FactChange[];
-    settings: Record<string, unknown> } | null;
+    settings: Record<string, unknown>;
+    /** Approved against an earlier major version of the questions: it needs reconfirming. */
+    outdated?: boolean; catalogVersion?: string;
+    /** The Fabric workspace that was the target when it was approved; another one connected since makes it stale. */
+    target?: { workspaceId: string; workspaceName: string | null } | null; targetMoved?: boolean } | null;
   llm: LlmGate;
   runOptions?: Partial<RunOptions>;
   dataFilters?: Record<string, DataFilterInput>;
@@ -737,8 +745,140 @@ export interface ConsultPolicy {
   names?: { warehouse: string | null; lakehouse: string | null };
   validate?: { probe: boolean; run: RunnableKind[] } | null;
   sqlUserMap?: Record<string, string>;
+  /** How the pool and each linked service sign in, preselected in Plan (C9, G5). */
+  signIn?: { pool: string | null; linkedServices: string | null };
+  /** What a run takes from the brief itself, as it takes the names: shown in Plan, never changed there. */
+  run?: { parallelCopies: number | null; schedules: "off" | "match" | null; maskColumns: string[]; targetRole: "dev" | "test" | "prod" | null };
+  assistant?: { autonomy: "observe" | "suggest" | "act_dev" };
+  llmScope?: "needs_work" | "any" | null;
+  llmContext?: "context" | "minimal";
+}
+
+/** The migration context a draft was sent: MIGRATION_CONTEXT.md, made from the approved brief, by its content hash. */
+export interface MigrationContextRef {
+  file: "MIGRATION_CONTEXT.md";
+  hash: string;
+  briefVersion: number;
+  briefHash: string;
+  /** G4: only the decisions, no names or context answers. */
+  minimal: boolean;
+  /** The hash of what it tells the model, without the line naming the brief version: what a draft is judged current by. */
+  decisionsHash?: string;
+}
+/** The migration context every draft is sent now; empty fields with a reason when no brief is approved. */
+export interface MigrationContextView {
+  file: "MIGRATION_CONTEXT.md";
+  hash: string | null;
+  briefVersion: number | null;
+  briefHash: string | null;
+  minimal: boolean | null;
+  /** The hash of its decisions alone (what a draft is judged current by), or null with no brief. */
+  decisionsHash?: string | null;
+  text: string | null;
+  reason: string | null;
 }
 export interface ConsultExplanation { question: string; text: string; source: "ai" | "rules"; model: string | null; message?: string }
+
+// ---- the orchestrator: the execution plan, the agent's requests, the assistant ------------------------------------
+
+export type PlanStepStatus = "waiting" | "ready" | "in_progress" | "done" | "failed" | "warn" | "skipped";
+export type ToolTier = "read" | "prepare" | "change" | "high";
+export type AgentActionStatus = "proposed" | "done" | "failed" | "rejected" | "stale" | "expired";
+/** Something the agent proposed (or did alone, at act on Dev): a person confirms it, and it then runs as them. */
+export interface AgentAction {
+  id: string;
+  tool: string;
+  tier: ToolTier;
+  args: Record<string, unknown>;
+  /** Exactly what it would do: a summary, and what it acts on. */
+  preview: { summary?: string; note?: string; signoff?: string; overwrites?: string[]; [key: string]: unknown };
+  rationale: string;
+  step: string | null;
+  task: string | null;
+  status: AgentActionStatus;
+  proposedBy: Actor;
+  createdAt: string;
+  expiresAt?: string;
+  decidedBy?: Actor | null;
+  decidedAt?: string | null;
+  note?: string | null;
+  reason?: string | null;
+  result?: string | null;
+  error?: string | null;
+  /** Done by the agent alone, as the brief's autonomy allows on a development workspace. */
+  autonomous?: boolean;
+  /** What it acts on, as it stood when it was proposed (the run and its version, the plan): confirmed only while it still is. */
+  binding?: Record<string, unknown>;
+  /** Other questions to the assistant waiting on this same request. */
+  watchers?: string[];
+}
+export interface PlanStep {
+  key: string;
+  phase: string;
+  title: string;
+  owner: "person" | "agent" | "system";
+  kind: "check" | "task" | "action" | "report";
+  detail: string;
+  depends: string[];
+  /** The brief questions it came from. */
+  answers: string[];
+  params: Record<string, unknown>;
+  digest: string;
+  status: PlanStepStatus;
+  message: string;
+  markedBy: Actor | null;
+  actions: AgentAction[];
+}
+export interface AgentWake { at: string; trigger: string; plan: number; acted: { action: string; tool: string; status: string }[];
+  proposed: { action: string; tool: string }[]; expired: string[]; skipped?: string }
+export interface ExecutionPlanView {
+  version: number;
+  hash: string;
+  inputs: { briefVersion: number | null; briefHash: string | null; planVersion: string | null; snapshot: string | null };
+  phases: { id: string; title: string }[];
+  steps: PlanStep[];
+  /** Every request waiting for a person. */
+  actions: AgentAction[];
+  agent: { on: boolean; paused: boolean; pausedBy: Actor | null; autonomy: "observe" | "suggest" | "act_dev"; targetRole: string | null;
+    actsAlone: boolean;
+    /** At act on Dev, why it still asks for everything here (another workspace than the brief's, a stale brief...). */
+    aloneWhyNot?: string | null; lastWake: AgentWake | null };
+  /** Whether the assistant's questions go to the model, and why not. */
+  assistant?: { ai: boolean; reason: string | null };
+}
+export interface AssistantEntry {
+  type: "person" | "step" | "result" | "action" | "decision" | "ask" | "answer" | "notice" | "error";
+  at: string;
+  text?: string;
+  kind?: string;
+  tool?: string | null;
+  args?: Record<string, unknown>;
+  message?: string;
+  ok?: boolean;
+  data?: string;
+  error?: string;
+  actionId?: string;
+  tier?: ToolTier;
+  preview?: AgentAction["preview"];
+  decision?: "confirmed" | "rejected" | "lapsed";
+  reason?: string | null;
+}
+export type AssistantTaskStatus = "running" | "waiting_for_person" | "waiting_for_reply" | "done" | "cancelled" | "paused" | "blocked";
+export interface AssistantTask {
+  id: string;
+  question: string;
+  status: AssistantTaskStatus;
+  /** ai: the model chose each step; rules: answered by the fixed intents, from the read tools. */
+  source: "ai" | "rules";
+  createdAt: string;
+  updatedAt: string;
+  turns: number;
+  changes: number;
+  costUsd: number;
+  answer: string | null;
+  entries?: AssistantEntry[];
+  actions?: AgentAction[];
+}
 
 // ---- Git: the Synapse workspace's repository, and the Fabric workspace's branch ---------------
 
@@ -976,7 +1116,7 @@ export interface ExecutionRun {
   resumable?: boolean;
   unresumableReason?: string | null;
   executions?: RunExecution[];
-  /** The waves a person has signed off, when each wave is signed off (the brief's A4). */
+  /** The waves a person has signed off, when each wave is signed off (the brief's A6). */
   releasedWaves?: number[];
   /** The wave a paused run waits to start until a person signs it off. */
   waitingWave?: number | null;
@@ -1100,6 +1240,8 @@ export interface TransformSettings {
   storeDir: string;
   /** What the migration brief allows: consent to send definitions (D1), the budget (D2) and what is spent. */
   consent?: Pick<LlmGate, "allowed" | "reason" | "code" | "consent" | "budgetUsd" | "spentUsd">;
+  /** The migration context every draft is sent now, or null when no brief is approved. */
+  context?: MigrationContextRef | null;
 }
 
 export interface TransformCheck {
@@ -1120,6 +1262,11 @@ export interface TransformDraft {
   durationMs: number;
   /** The source changed since this was generated; null when unknown. */
   stale: boolean | null;
+  /** The migration context it was sent (null: none, no brief was approved), and what the model says it applied. */
+  context?: MigrationContextRef | null;
+  contextApplied?: string[];
+  /** Made with another migration context than the one in force now: draft it again to follow the brief as it is. */
+  contextStale?: boolean | null;
 }
 
 export interface TransformAccepted extends Omit<TransformDraft, "costUsd" | "durationMs"> {
@@ -1138,6 +1285,8 @@ export interface TransformObject {
   startedAt: string | null;
   draft: TransformDraft | null;
   accepted: TransformAccepted | null;
+  /** The rules cannot convert it as it is (a single object only): what the brief's D6 may limit drafts to. */
+  needsWork?: boolean;
   /** Present on a single object, not in the list. */
   source?: {
     code: string;
@@ -1154,6 +1303,8 @@ export interface TransformPrompt {
   prompt: string;
   characters: number;
   promptsDir: string;
+  /** The migration context the prompt carries, or null. */
+  context?: MigrationContextRef | null;
 }
 
 export interface TransformQueued {
@@ -1176,6 +1327,8 @@ export interface TransformCandidate {
   error: string | null;
   confidence: "high" | "medium" | "low" | null;
   stale: boolean | null;
+  /** Its draft or accepted transform was made with an earlier migration context. */
+  contextStale?: boolean | null;
   /** Why no draft can be made (for example the definition was not kept), or null. */
   unavailable: string | null;
 }
@@ -1284,8 +1437,8 @@ export interface MigrationApi {
   previewAnswer(question: string, value: unknown): Promise<AnswerPreview>;
   skipQuestion(question: string): Promise<ConsultState>;
   withdrawAnswer(question: string): Promise<ConsultState>;
-  /** Accept the recommendations as answers: every section's, or one's. */
-  acceptRecommendations(section?: string): Promise<ConsultState>;
+  /** Accept the recommendations as answers: every section's, one's, or the questions named. */
+  acceptRecommendations(section?: string, questions?: string[]): Promise<ConsultState>;
   resolveConflict(conflict: string, resolution: "take" | "keep", reason?: string): Promise<ConsultState>;
   getBrief(): Promise<BriefView>;
   submitBrief(note?: string): Promise<BriefView>;
@@ -1303,6 +1456,22 @@ export interface MigrationApi {
   exportQuestionnaire(format: "md" | "json"): Promise<{ url?: string; text?: string; fileName: string }>;
   /** A questionnaire's answers, by question id: each proposed for a person to confirm. */
   importQuestionnaire(answers: Record<string, unknown>): Promise<ConsultState>;
+  /** MIGRATION_CONTEXT.md as every draft is sent it now. */
+  getMigrationContext(): Promise<MigrationContextView>;
+  // The orchestrator: the execution plan, the agent's requests, the sign-off report, and the assistant.
+  getExecutionPlan(): Promise<ExecutionPlanView>;
+  markStep(step: string, done: boolean, note?: string): Promise<ExecutionPlanView>;
+  /** A person confirms a request (re-checked, it then runs as them) or rejects it with a reason. */
+  decideAction(id: string, decision: "confirm" | "reject", text?: string): Promise<{ action: AgentAction; plan: ExecutionPlanView }>;
+  controlAgent(action: "pause" | "resume" | "wake"): Promise<ExecutionPlanView>;
+  exportSignoffReport(format: "md" | "json"): Promise<{ url?: string; text?: string; fileName: string }>;
+  askAssistant(text: string, taskId?: string): Promise<AssistantTask>;
+  getAssistantTasks(): Promise<{ tasks: AssistantTask[] }>;
+  getAssistantTask(id: string): Promise<AssistantTask>;
+  cancelAssistantTask(id: string): Promise<AssistantTask>;
+  continueAssistantTask(id: string): Promise<AssistantTask>;
+  /** One a draft was made with, by its hash: where it downloads from (real), or its text (demo). */
+  exportMigrationContext(hash: string): Promise<{ url?: string; text?: string; fileName: string }>;
 }
 
 export class ApiRequestError extends Error {

@@ -1,0 +1,828 @@
+{
+ "settings": {
+  "run.parts": {
+   "kind": "list",
+   "status": "enforced",
+   "applies": "Migrate: which stages are on",
+   "values": [
+    "structure",
+    "data",
+    "orchestration"
+   ],
+   "ai": true
+  },
+  "storage.routes": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Plan: storage the code reads directly, routed through OneLake shortcuts",
+   "values": [
+    "all",
+    "none"
+   ],
+   "ai": true
+  },
+  "plan.scopeMode": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Plan: which objects Add all puts in the plan",
+   "values": [
+    "all",
+    "include",
+    "exclude"
+   ],
+   "ai": false
+  },
+  "plan.scopeInclude": {
+   "kind": "list",
+   "status": "enforced",
+   "applies": "Plan: the schemas and folders in scope",
+   "values": [],
+   "ai": false
+  },
+  "plan.scopeExclude": {
+   "kind": "list",
+   "status": "enforced",
+   "applies": "Plan: name patterns left out of the plan",
+   "values": [],
+   "ai": false
+  },
+  "plan.sqlModules": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Plan: whether Add all puts views, stored procedures and functions in the plan",
+   "values": [
+    "convert",
+    "leave_out"
+   ],
+   "ai": false
+  },
+  "plan.serverless": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Plan: scripts and pipelines written for the serverless pool",
+   "values": [
+    "leave_out",
+    "keep"
+   ],
+   "ai": true
+  },
+  "code.rebuild": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Plan: Add all leaves them out; the execution plan gives a person a task to rebuild each one kept",
+   "values": [
+    "by_hand",
+    "leave_out"
+   ],
+   "ai": false
+  },
+  "owners.rebuild": {
+   "kind": "text",
+   "status": "note",
+   "applies": "People: who rebuilds what has no Fabric equivalent",
+   "values": [],
+   "ai": false
+  },
+  "data.historyMode": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Plan: how much of each table's history loads",
+   "values": [
+    "all",
+    "since"
+   ],
+   "ai": true
+  },
+  "data.historyFrom": {
+   "kind": "date",
+   "status": "enforced",
+   "applies": "Plan: the first date loaded, on each table's date column",
+   "values": [],
+   "ai": true
+  },
+  "run.stopOnFailure": {
+   "kind": "bool",
+   "status": "enforced",
+   "applies": "Migrate: stop at the end of a wave that has failures",
+   "values": [],
+   "ai": false
+  },
+  "run.waveGate": {
+   "kind": "bool",
+   "status": "enforced",
+   "applies": "Migrate: a person signs off each wave before the next one starts",
+   "values": [],
+   "ai": false
+  },
+  "run.existing": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Migrate: objects already in Fabric",
+   "values": [
+    "skip",
+    "update"
+   ],
+   "ai": false
+  },
+  "warehouse.collation": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Migrate: the Warehouse collation, set when it is created",
+   "values": [
+    "match_synapse",
+    "case_insensitive",
+    "case_sensitive"
+   ],
+   "ai": true
+  },
+  "names.warehouse": {
+   "kind": "text",
+   "status": "enforced",
+   "applies": "Migrate and Validate: the Warehouse's name",
+   "values": [],
+   "ai": true
+  },
+  "names.lakehouse": {
+   "kind": "text",
+   "status": "enforced",
+   "applies": "Migrate: the Lakehouse's name (shortcuts, storage routes, Spark jobs)",
+   "values": [],
+   "ai": true
+  },
+  "llm.standards": {
+   "kind": "text",
+   "status": "context",
+   "applies": "LLM drafts: the coding standards every draft follows",
+   "values": [],
+   "ai": true
+  },
+  "llm.naming": {
+   "kind": "text",
+   "status": "context",
+   "applies": "LLM drafts: how anything new a draft creates is named",
+   "values": [],
+   "ai": true
+  },
+  "data.sync": {
+   "kind": "bool",
+   "status": "enforced",
+   "applies": "Plan: tables with a change column are kept in sync after the first load",
+   "values": [],
+   "ai": true
+  },
+  "data.watermark": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Plan: how each table's change column is found",
+   "values": [
+    "detect",
+    "named"
+   ],
+   "ai": true
+  },
+  "data.watermarkColumns": {
+   "kind": "list",
+   "status": "enforced",
+   "applies": "Plan: the change columns, by name, first found first",
+   "values": [],
+   "ai": true
+  },
+  "data.keylessSync": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Plan: tables with a change column but no key",
+   "values": [
+    "once",
+    "append"
+   ],
+   "ai": true
+  },
+  "data.deletes": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Execution plan: a cutover task to reload the synced tables in full",
+   "values": [
+    "keep",
+    "reload"
+   ],
+   "ai": true
+  },
+  "data.syncOverlap": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Migrate: the re-read window of each sync",
+   "values": [
+    "1h",
+    "1d",
+    "none"
+   ],
+   "ai": false
+  },
+  "data.mode": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Migrate: tables that already have rows",
+   "values": [
+    "if_empty",
+    "replace"
+   ],
+   "ai": false
+  },
+  "data.run": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Migrate: run the load pipelines, or only create them",
+   "values": [
+    "run",
+    "create"
+   ],
+   "ai": false
+  },
+  "data.parallelCopies": {
+   "kind": "number",
+   "status": "enforced",
+   "applies": "Migrate: how many tables the load pipeline copies at the same time",
+   "values": [],
+   "ai": false
+  },
+  "data.poolSignIn": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Plan: how the load connection signs in to the pool, preselected (the secret is never kept)",
+   "values": [
+    "workspaceIdentity",
+    "basicKeyVault",
+    "servicePrincipalKeyVault",
+    "basic",
+    "servicePrincipal"
+   ],
+   "ai": false
+  },
+  "llm.consent": {
+   "kind": "bool",
+   "status": "enforced",
+   "applies": "LLM drafts, consultation help and the assistant: whether anything may be sent to Claude",
+   "values": [],
+   "ai": false
+  },
+  "llm.budgetUsd": {
+   "kind": "number",
+   "status": "enforced",
+   "applies": "LLM calls: once this much is spent, the next call is refused",
+   "values": [],
+   "ai": false
+  },
+  "code.multiStatement": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Plan: Add all leaves them out; the execution plan asks to draft each with AI, or gives a person a task to rewrite it",
+   "values": [
+    "llm",
+    "manual",
+    "leave_out"
+   ],
+   "ai": true
+  },
+  "types.lossy": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Execution plan: a task to review those tables before the data loads",
+   "values": [
+    "accept",
+    "review"
+   ],
+   "ai": true
+  },
+  "code.unconvertible": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Execution plan: asks to draft each with AI, or gives a person a task to rewrite it",
+   "values": [
+    "ai",
+    "by_hand"
+   ],
+   "ai": false
+  },
+  "llm.scope": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "LLM drafts: which objects may be sent",
+   "values": [
+    "needs_work",
+    "any"
+   ],
+   "ai": false
+  },
+  "code.notebookLanguage": {
+   "kind": "choice",
+   "status": "context",
+   "applies": "LLM drafts: the language a .NET notebook is rewritten in",
+   "values": [
+    "pyspark",
+    "scala"
+   ],
+   "ai": true
+  },
+  "release.gitCommit": {
+   "kind": "bool",
+   "status": "enforced",
+   "applies": "Migrate: commit each run to the target workspace's Fabric Git branch",
+   "values": [],
+   "ai": false
+  },
+  "release.commitScope": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Migrate: what that commit takes",
+   "values": [
+    "run",
+    "all"
+   ],
+   "ai": false
+  },
+  "target.role": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Migrate and the assistant: a production workspace signs off every run, and the assistant never acts on its own there",
+   "values": [
+    "dev",
+    "test",
+    "prod"
+   ],
+   "ai": true
+  },
+  "operations.identity": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Execution plan: checks that the Fabric sign-in is this kind",
+   "values": [
+    "person",
+    "service_principal"
+   ],
+   "ai": false
+  },
+  "release.signoff": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Migrate: which runs a person signs off before they write",
+   "values": [
+    "never",
+    "overwrite",
+    "always"
+   ],
+   "ai": false
+  },
+  "schedules.enabled": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Migrate: schedules created switched off, or as they are in Synapse",
+   "values": [
+    "off",
+    "match"
+   ],
+   "ai": true
+  },
+  "owners.setup": {
+   "kind": "text",
+   "status": "note",
+   "applies": "People: who sets up integration runtimes and event triggers, and switches schedules on",
+   "values": [],
+   "ai": false
+  },
+  "assistant.autonomy": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Assistant: what it may do without asking",
+   "values": [
+    "observe",
+    "suggest",
+    "act_dev"
+   ],
+   "ai": false
+  },
+  "release.path": {
+   "kind": "choice",
+   "status": "note",
+   "applies": "People: the path to Test and Prod",
+   "values": [
+    "dev",
+    "dev_test",
+    "dev_test_prod"
+   ],
+   "ai": false
+  },
+  "security.sensitiveColumns": {
+   "kind": "list",
+   "status": "enforced",
+   "applies": "LLM drafts keep them out of logs and copies; Migrate masks them when G1M says so",
+   "values": [],
+   "ai": true
+  },
+  "security.maskSensitive": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Migrate: the default dynamic data mask on each sensitive column without one",
+   "values": [
+    "keep",
+    "mask"
+   ],
+   "ai": true
+  },
+  "security.migrate": {
+   "kind": "bool",
+   "status": "enforced",
+   "applies": "Migrate: whether the Roles & permissions stage is on",
+   "values": [],
+   "ai": false
+  },
+  "security.sqlUserMap": {
+   "kind": "map",
+   "status": "enforced",
+   "applies": "Migrate: the Microsoft Entra principal that replaces each SQL user",
+   "values": [],
+   "ai": true
+  },
+  "governance.residency": {
+   "kind": "text",
+   "status": "enforced",
+   "applies": "Execution plan: a person checks the target capacity's region, and the agent starts no run until they have",
+   "values": [],
+   "ai": false
+  },
+  "llm.context": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "LLM drafts: what goes with each draft besides its definition",
+   "values": [
+    "context",
+    "minimal"
+   ],
+   "ai": false
+  },
+  "connections.defaultSignIn": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Plan: how each linked service's connection signs in, preselected",
+   "values": [
+    "workspaceIdentity",
+    "keyVault"
+   ],
+   "ai": false
+  },
+  "validate.depth": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Validate: how deep it checks by default",
+   "values": [
+    "compare",
+    "probe",
+    "run"
+   ],
+   "ai": false
+  },
+  "cutover.parallelRun": {
+   "kind": "bool",
+   "status": "enforced",
+   "applies": "Execution plan: a task for each side-by-side cycle before cutover",
+   "values": [],
+   "ai": false
+  },
+  "cutover.parallelCycles": {
+   "kind": "number",
+   "status": "enforced",
+   "applies": "Execution plan: how many side-by-side cycles",
+   "values": [],
+   "ai": false
+  },
+  "release.cutover": {
+   "kind": "text",
+   "status": "note",
+   "applies": "People: the cutover window and what a rollback means",
+   "values": [],
+   "ai": false
+  },
+  "validate.externalWrites": {
+   "kind": "choice",
+   "status": "enforced",
+   "applies": "Validate: runs pipelines and notebooks only once a person says it is safe (K10)",
+   "values": [
+    "no",
+    "yes",
+    "unsure"
+   ],
+   "ai": true
+  },
+  "context.timeline": {
+   "kind": "text",
+   "status": "context",
+   "applies": "LLM drafts and people: the timeline",
+   "values": [],
+   "ai": true
+  },
+  "context.painPoints": {
+   "kind": "text",
+   "status": "context",
+   "applies": "LLM drafts and people: what hurts today",
+   "values": [],
+   "ai": true
+  },
+  "context.consumers": {
+   "kind": "text",
+   "status": "context",
+   "applies": "LLM drafts and people: what reads the data downstream",
+   "values": [],
+   "ai": true
+  },
+  "context.teamSkills": {
+   "kind": "text",
+   "status": "context",
+   "applies": "LLM drafts and people: what the team knows best",
+   "values": [],
+   "ai": true
+  },
+  "context.approver": {
+   "kind": "text",
+   "status": "note",
+   "applies": "People: who approves the migration",
+   "values": [],
+   "ai": false
+  }
+ },
+ "facts": {
+  "objects.total": {
+   "description": "Objects discovered",
+   "scope": "estate",
+   "informational": false
+  },
+  "objects.byType": {
+   "description": "Objects by type",
+   "scope": "estate",
+   "informational": false
+  },
+  "objects.byClass": {
+   "description": "Objects by how they move (Direct, Reconfigure, Transform, Manual, Review)",
+   "scope": "estate",
+   "informational": false
+  },
+  "waves.count": {
+   "description": "Dependency waves",
+   "scope": "estate",
+   "informational": false
+  },
+  "pool.present": {
+   "description": "A dedicated SQL pool was discovered",
+   "scope": "estate",
+   "informational": false
+  },
+  "pool.name": {
+   "description": "The dedicated SQL pool",
+   "scope": "estate",
+   "informational": false
+  },
+  "pool.warehouseName": {
+   "description": "The Warehouse name the pool's name gives",
+   "scope": "estate",
+   "informational": false
+  },
+  "pool.collation": {
+   "description": "The Synapse pool's collation",
+   "scope": "estate",
+   "informational": false
+  },
+  "pool.caseInsensitive": {
+   "description": "The pool compares text case-insensitively",
+   "scope": "estate",
+   "informational": false
+  },
+  "tables.count": {
+   "description": "Tables (external tables aside)",
+   "scope": "estate",
+   "informational": false
+  },
+  "tables.external": {
+   "description": "External tables",
+   "scope": "estate",
+   "informational": false
+  },
+  "tables.withDateColumn": {
+   "description": "Tables with a date or time column",
+   "scope": "estate",
+   "informational": false
+  },
+  "tables.withChangeColumn": {
+   "description": "Tables with a column like ModifiedAt, which moves when a row changes",
+   "scope": "estate",
+   "informational": false
+  },
+  "tables.withKeys": {
+   "description": "Tables with a primary key or a unique constraint",
+   "scope": "estate",
+   "informational": false
+  },
+  "tables.withoutKeys": {
+   "description": "Tables with no key",
+   "scope": "estate",
+   "informational": false
+  },
+  "tables.changeWithoutKeys": {
+   "description": "Tables with a change column but no key: a sync can only append to them",
+   "scope": "estate",
+   "informational": false
+  },
+  "tables.lossyTypes": {
+   "description": "Tables with a column Fabric stores with less (7-digit time, datetimeoffset, rowversion, XML, spatial)",
+   "scope": "estate",
+   "informational": false
+  },
+  "storage.locations": {
+   "description": "Storage locations the code reads directly",
+   "scope": "estate",
+   "informational": false
+  },
+  "security.principals": {
+   "description": "Database roles and users",
+   "scope": "estate",
+   "informational": false
+  },
+  "security.roles": {
+   "description": "Database roles",
+   "scope": "estate",
+   "informational": false
+  },
+  "security.sqlUsers": {
+   "description": "SQL-authenticated users (Fabric has no SQL authentication)",
+   "scope": "estate",
+   "informational": false
+  },
+  "security.sqlUserNames": {
+   "description": "The SQL-authenticated users",
+   "scope": "estate",
+   "informational": false
+  },
+  "security.masks": {
+   "description": "Columns with a dynamic data mask",
+   "scope": "estate",
+   "informational": false
+  },
+  "code.sqlModules": {
+   "description": "Views, stored procedures and functions",
+   "scope": "estate",
+   "informational": false
+  },
+  "code.unconvertibleSql": {
+   "description": "Procedures, views, functions and scripts that still use T-SQL Fabric rejects after the rules",
+   "scope": "estate",
+   "informational": false
+  },
+  "code.multiStatementFunctions": {
+   "description": "Multi-statement table-valued functions (Fabric has none)",
+   "scope": "estate",
+   "informational": false
+  },
+  "code.dotnetNotebooks": {
+   "description": ".NET for Spark notebooks (Fabric has none)",
+   "scope": "estate",
+   "informational": false
+  },
+  "code.unsupportedPipelines": {
+   "description": "Pipelines with an activity Fabric has no equivalent for",
+   "scope": "estate",
+   "informational": false
+  },
+  "code.needsRewrite": {
+   "description": "Objects that must be rebuilt by hand (unsupported pipelines and .NET notebooks)",
+   "scope": "estate",
+   "informational": false
+  },
+  "code.serverlessObjects": {
+   "description": "Scripts and pipelines written for the serverless SQL pool",
+   "scope": "estate",
+   "informational": false
+  },
+  "pipelines.count": {
+   "description": "Pipelines",
+   "scope": "estate",
+   "informational": false
+  },
+  "notebooks.count": {
+   "description": "Notebooks",
+   "scope": "estate",
+   "informational": false
+  },
+  "linkedServices.count": {
+   "description": "Linked services",
+   "scope": "estate",
+   "informational": false
+  },
+  "linkedServices.byType": {
+   "description": "Linked services by type",
+   "scope": "estate",
+   "informational": false
+  },
+  "linkedServices.keyVault": {
+   "description": "Linked services that read a secret from Azure Key Vault",
+   "scope": "estate",
+   "informational": false
+  },
+  "triggers.count": {
+   "description": "Triggers",
+   "scope": "estate",
+   "informational": false
+  },
+  "triggers.schedule": {
+   "description": "Schedule triggers (recreated switched off)",
+   "scope": "estate",
+   "informational": false
+  },
+  "triggers.event": {
+   "description": "Event, tumbling-window and custom triggers (set up by hand)",
+   "scope": "estate",
+   "informational": false
+  },
+  "integrationRuntimes.count": {
+   "description": "Integration runtimes (set up by hand)",
+   "scope": "estate",
+   "informational": false
+  },
+  "manual.setupCount": {
+   "description": "Triggers and integration runtimes someone sets up or switches on",
+   "scope": "estate",
+   "informational": false
+  },
+  "scope.groups": {
+   "description": "The schemas and folders discovered",
+   "scope": "estate",
+   "informational": false
+  },
+  "source.kind": {
+   "description": "Where the definitions were read from (the live workspace, Git or a ZIP)",
+   "scope": "estate",
+   "informational": false
+  },
+  "source.workspace": {
+   "description": "The Synapse workspace",
+   "scope": "estate",
+   "informational": false
+  },
+  "source.ref": {
+   "description": "The Git branch or tag read",
+   "scope": "estate",
+   "informational": false
+  },
+  "source.commit": {
+   "description": "The Git commit read",
+   "scope": "estate",
+   "informational": false
+  },
+  "source.environment": {
+   "description": "The environment the definitions are for",
+   "scope": "estate",
+   "informational": false
+  },
+  "discovery.complete": {
+   "description": "Discovery read every part of the source",
+   "scope": "estate",
+   "informational": false
+  },
+  "discovery.failedCategories": {
+   "description": "The parts of the source discovery could not read",
+   "scope": "estate",
+   "informational": false
+  },
+  "discovery.snapshot": {
+   "description": "The discovery snapshot",
+   "scope": "estate",
+   "informational": true
+  },
+  "target.connected": {
+   "description": "The Fabric target is connected",
+   "scope": "environment",
+   "informational": false
+  },
+  "target.workspace": {
+   "description": "The Fabric target workspace",
+   "scope": "environment",
+   "informational": false
+  },
+  "target.workspaceId": {
+   "description": "The Fabric target workspace's id",
+   "scope": "environment",
+   "informational": true
+  },
+  "target.capacity": {
+   "description": "The Fabric workspace is on a capacity",
+   "scope": "environment",
+   "informational": false
+  },
+  "target.gitConnected": {
+   "description": "The Fabric workspace is connected to Git",
+   "scope": "environment",
+   "informational": false
+  },
+  "llm.available": {
+   "description": "Claude Code is installed on this machine",
+   "scope": "environment",
+   "informational": false
+  }
+ }
+}

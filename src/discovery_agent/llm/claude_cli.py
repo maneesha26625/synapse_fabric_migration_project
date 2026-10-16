@@ -32,8 +32,9 @@ RESULT_SCHEMA = {
         "notes": {"type": "array", "items": {"type": "string"}},
         "unconverted": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "string", "enum": list(CONFIDENCE)},
+        "context": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["code", "notes", "unconverted", "confidence"],
+    "required": ["code", "notes", "unconverted", "confidence", "context"],
     "additionalProperties": False,
 }
 SYSTEM_PROMPT = ("You convert Azure Synapse objects to Microsoft Fabric for a migration accelerator. "
@@ -53,6 +54,8 @@ class Answer:
     model: str = ""
     cost_usd: Optional[float] = None
     duration_ms: int = 0
+    #: The instructions of the migration context the model says the draft applies.
+    context: List[str] = field(default_factory=list)
 
 
 def executable() -> Optional[str]:
@@ -123,6 +126,7 @@ def parse(stdout: str) -> Answer:
         confidence=confidence if confidence in CONFIDENCE else "low",
         model=reply.model,
         cost_usd=reply.cost_usd,
+        context=[str(n) for n in data.get("context") or [] if str(n).strip()][:30],
     )
 
 

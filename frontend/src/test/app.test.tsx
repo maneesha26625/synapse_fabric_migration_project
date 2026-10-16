@@ -672,23 +672,87 @@ describe("resetting a step", () => {
 });
 
 describe("assistant", () => {
-  it("opens from the + button (or Ctrl+I) as a panel on the right, marked as a preview, and closes with Escape", async () => {
+  it("opens from the + button (or Ctrl+I) as a panel on the right, answering by its rules in Demo data, and closes with Escape", async () => {
     const user = userEvent.setup();
     go("/");
-    await user.click(await screen.findByRole("button", { name: "Open the migration assistant (Ctrl+I)" }));
+    await user.click(await screen.findByRole("button", { name: /^Open the migration assistant \(Ctrl\+I\)/ }));
     const panel = screen.getByRole("complementary", { name: "Migration assistant" });
-    expect(within(panel).getByText("Preview")).toBeInTheDocument();
-    expect(within(panel).getByLabelText("Message the assistant")).toBeDisabled();
+    expect(within(panel).getByText("Rules")).toBeInTheDocument();
+    expect(within(panel).getByLabelText("Message the assistant")).toBeEnabled();
     expect(within(panel).getByRole("button", { name: "Send" })).toBeDisabled();
     // The launcher hides while the panel is open.
-    expect(screen.queryByRole("button", { name: "Open the migration assistant (Ctrl+I)" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Open the migration assistant/ })).toBeNull();
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("complementary", { name: "Migration assistant" })).toBeNull();
     await user.keyboard("{Control>}i{/Control}");
     expect(screen.getByRole("complementary", { name: "Migration assistant" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Close the assistant" }));
-    expect(screen.getByRole("button", { name: "Open the migration assistant (Ctrl+I)" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Open the migration assistant \(Ctrl\+I\)/ })).toBeInTheDocument();
   });
+
+  it("answers what is left to do from the execution plan, and why a run failed from its diagnosis", async () => {
+    setDemoConsultation("advisory");
+    await discovered();
+    await seedPlan(5);
+    await mockApi.analyzePlan(JSON.parse(localStorage.getItem(PLAN) ?? "[]"), true);
+    const user = userEvent.setup();
+    go("/");
+    await user.click(await screen.findByRole("button", { name: /^Open the migration assistant/ }));
+    const panel = screen.getByRole("complementary", { name: "Migration assistant" });
+    await user.click(within(panel).getByRole("button", { name: "What is left to do?" }));
+    const open = await within(panel).findByText(/What is open now, in order:/);
+    expect(open.textContent).toMatch(/Run the migration|A plan is recorded/);
+    await user.click(within(panel).getByRole("button", { name: "All questions" }));
+    await user.type(within(panel).getByLabelText("Message the assistant"), "Why did it fail?");
+    await user.click(within(panel).getByRole("button", { name: "Send" }));
+    expect(await within(panel).findByText("Nothing in the current run failed or was blocked.")).toBeInTheDocument();
+    const trail = await mockApi.getAudit({ limit: 50 });
+    expect(trail.records.filter((r) => r.action === "assistant.asked")).toHaveLength(2);
+  }, 30000);
+});
+
+describe("the execution plan (demo)", () => {
+  beforeEach(() => { resetDemo(); setDemoConsultation("advisory"); });
+
+  it("builds the plan from the brief and the run, proposes a retry for what failed, and runs it once a person confirms", async () => {
+    await discovered();
+    await approveBrief([["G3", "West Europe"]]);
+    const items = await seedPlan(25);
+    await mockApi.analyzePlan(items, true);
+    let plan = await mockApi.getExecutionPlan();
+    const keys = plan.steps.map((s) => s.key);
+    expect(keys.slice(0, 5)).toEqual(["ready.source", "ready.target", "ready.discovery", "ready.brief", "ready.plan"]);
+    expect(plan.steps.find((s) => s.key === "ready.residency")).toMatchObject({ owner: "person", answers: ["G3"] });
+    await mockApi.startExecution(items, (await mockApi.getConsultPolicy()).runOptions as RunOptions);
+    await waitFor(async () => expect((await mockApi.getExecution()).state).toBe("completed"), { timeout: 90000 });
+    plan = await mockApi.getExecutionPlan();
+    const retry = plan.actions.find((a) => a.tool === "run.retry");
+    expect(retry?.status).toBe("proposed");
+    expect(plan.steps.find((s) => s.key === "deliver.fix")?.status).toBe("ready");
+    localStorage.setItem(PLAN, JSON.stringify(items));
+    unlockTo("migrate");
+    const user = userEvent.setup();
+    go("/migration?step=migrate&view=plan");
+    const card = await screen.findByRole("article", { name: /Proposed: Retry the/ }, { timeout: 8000 });
+    await user.click(within(card).getByRole("button", { name: "Confirm" }));
+    await waitFor(async () => expect((await mockApi.getAudit({ limit: 100 })).records.some((r) => r.action === "orchestrator.action_confirmed")).toBe(true));
+    const step = await screen.findByRole("listitem", { name: /The target capacity is in West Europe/ });
+    await user.click(within(step).getByRole("button", { name: "Mark done" }));
+    await waitFor(() => expect(screen.getByRole("listitem", { name: /The target capacity is in West Europe: Done/ })).toBeInTheDocument());
+  }, 120000);
+
+  it("lets a person confirm by hand only a check the accelerator cannot tell, and answers the brief and validation by its rules", async () => {
+    await discovered();
+    const plan = await mockApi.getExecutionPlan();
+    expect(plan.steps.find((s) => s.key === "ready.plan")?.status).toBe("failed");
+    await expect(mockApi.markStep("ready.plan", true)).rejects.toMatchObject({ code: "check_fails" });  // fixed on Plan, never confirmed
+    await expect(mockApi.markStep("ready.discovery", true)).rejects.toMatchObject({ code: "nothing_to_confirm" });
+    expect(plan.steps.find((s) => s.key === "ready.brief")?.status).toBe("warn");  // advisory: no brief only warns
+    const confirmed = await mockApi.markStep("ready.brief", true, "Advisory for this pilot");
+    expect(confirmed.steps.find((s) => s.key === "ready.brief")).toMatchObject({ status: "done", message: "Confirmed by a person." });
+    expect((await mockApi.askAssistant("Which brief is in force?")).answer).toMatch(/^No migration brief is approved yet/);
+    expect((await mockApi.askAssistant("Any validation mismatches?")).answer).toBe("Validation is not run.");
+  }, 30000);
 });
 
 describe("projects and the frame", () => {
@@ -1525,14 +1589,15 @@ describe("consultation (demo)", () => {
     expect(trail.records.map((r) => r.action)).toEqual(expect.arrayContaining(["consult.accepted", "brief.submitted", "brief.approved", "run.requested"]));
   });
 
-  it("asks what needs a person, takes every recommendation in one go, and has the brief approved before Waves opens", async () => {
+  it("asks what needs a person, takes every recommendation in one go, has the brief approved, and never locks the steps after it", async () => {
     unlockTo("consult");
     const user = userEvent.setup();
     go("/migration?step=consult");
     expect(await stepHeading("Consult")).toBeInTheDocument();
     const summary = await screen.findByLabelText("Consultation summary", {}, { timeout: 5000 });
     expect(within(summary).getByText("Not approved")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Continue to Waves/ })).toBeDisabled();
+    // Waves and the rest stay open without a brief: what a required consultation holds back is the run itself.
+    expect(screen.getByRole("button", { name: /Continue to Waves anyway/ })).toBeEnabled();
     const d1 = screen.getByRole("region", { name: /^D1\./ });
     expect(within(d1).getByText("A person answers")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Accept all recommendations" }));
@@ -1550,13 +1615,13 @@ describe("consultation (demo)", () => {
     unlockTo("consult");
     const user = userEvent.setup();
     go("/migration?step=consult");
-    const c4 = await screen.findByRole("region", { name: /^C4\./ }, { timeout: 5000 });
-    await user.click(within(c4).getByRole("radio", { name: /Replace their rows/ }));
-    expect(await within(c4).findByText(/This answer .*data\.mode: if_empty → replace/)).toBeInTheDocument();
-    await user.click(within(c4).getByRole("button", { name: "Save answer" }));
-    const g3 = screen.getByRole("region", { name: /^G3\./ });
-    await user.click(within(g3).getByRole("radio", { name: /^Never/ }));
-    await user.click(within(g3).getByRole("button", { name: "Save answer" }));
+    const c6 = await screen.findByRole("region", { name: /^C6\./ }, { timeout: 5000 });
+    await user.click(within(c6).getByRole("radio", { name: /Replace their rows/ }));
+    expect(await within(c6).findByText(/This answer .*data\.mode: if_empty → replace/)).toBeInTheDocument();
+    await user.click(within(c6).getByRole("button", { name: "Save answer" }));
+    const e4 = screen.getByRole("region", { name: /^E4\./ });
+    await user.click(within(e4).getByRole("radio", { name: /^Never/ }));
+    await user.click(within(e4).getByRole("button", { name: "Save answer" }));
     const conflict = await screen.findByRole("listitem", { name: "Contradiction K2" });
     expect(conflict).toHaveTextContent(/Replacing rows empties tables/);
     await user.click(within(conflict).getByRole("button", { name: "Keep my answers" }));
@@ -1566,7 +1631,7 @@ describe("consultation (demo)", () => {
   }, 30000);
 
   it("pre-sets Plan from the brief, leaves out what the brief does, and asks why when the plan differs from it", async () => {
-    await approveBrief([["A1", ["structure", "orchestration"]]]);
+    await approveBrief([["A0", ["structure", "orchestration"]]]);
     unlockTo("plan");
     const user = userEvent.setup();
     go("/migration?step=plan");
@@ -1590,7 +1655,7 @@ describe("consultation (demo)", () => {
   }, 40000);
 
   it("pauses a run before each later wave until a person signs that wave off", async () => {
-    const options = await approveBrief([["A4", "signoff_each_wave"]]);
+    const options = await approveBrief([["A6", "signoff_each_wave"]]);
     expect(options.waveGate).toBe(true);
     const graph = await mockApi.getDependencies();
     const notebooks = graph.nodes.filter((n) => n.type === "Notebook").slice(0, 2);
@@ -1620,7 +1685,75 @@ describe("consultation (demo)", () => {
     await user.click(screen.getByRole("tab", { name: /^Questions/ }));
     await user.click(await screen.findByRole("button", { name: "Confirm D1" }));
     await waitFor(() => expect(within(screen.getByRole("region", { name: /^D1\./ })).getByText(/Read from notes, confirmed by/)).toBeInTheDocument());
-    expect(screen.getByRole("list", { name: "Proposed answers" })).toHaveTextContent(/G3/);
+    expect(screen.getByRole("list", { name: "Proposed answers" })).toHaveTextContent(/E4/);
     await expect(mockApi.generateTransforms(["anything"])).rejects.toMatchObject({ code: "llm_no_consent" });
+  }, 30000);
+
+  it("writes the approved brief into MIGRATION_CONTEXT.md, sends it with every draft, and flags a draft made under an earlier one", async () => {
+    await discovered();
+    expect((await mockApi.getMigrationContext()).hash).toBeNull();
+    await approveBrief([["D1", true], ["B3", "Prefix every view with v_."], ["I4", "T-SQL first"]]);
+    const made = await mockApi.getMigrationContext();
+    expect(made.text).toMatch(/^# Migration context/);
+    expect(made.text).toContain("Prefix every view with v_.");
+    expect(made.text).toContain("T-SQL first");
+    const procs = await mockApi.getResults({ ...Q, types: ["Stored Procedure"] });
+    const [a] = procs.items;
+    await mockApi.generateTransforms([a.id]);
+    await waitFor(async () => expect((await mockApi.getTransform(a.id)).state).toBe("draft"), { timeout: 4000 });
+    const draft = (await mockApi.getTransform(a.id)).draft!;
+    expect(draft.context?.hash).toBe(made.hash);
+    expect(draft.contextStale).toBe(false);
+    expect((await mockApi.getTransformPrompt(a.id)).prompt).toContain("MIGRATION_CONTEXT.md");
+    expect((await mockApi.exportMigrationContext(made.hash!)).text).toBe(made.text);
+    await approveBrief([["B3", "Keywords in lower case."]]);
+    expect((await mockApi.getTransform(a.id)).draft?.contextStale).toBe(true);
+  }, 30000);
+
+  it("keeps a draft current when the brief is approved again with the same decisions, and runs nothing H4 says may write to production", async () => {
+    await discovered();
+    await approveBrief([["D1", true], ["H4", "unsure"]]);
+    const first = await mockApi.getMigrationContext();
+    const [a] = (await mockApi.getResults({ ...Q, types: ["Stored Procedure"] })).items;
+    await mockApi.generateTransforms([a.id]);
+    await waitFor(async () => expect((await mockApi.getTransform(a.id)).state).toBe("draft"), { timeout: 4000 });
+    await approveBrief([["E4", "always"]]);  // a decision that never reaches the model
+    const again = await mockApi.getMigrationContext();
+    expect(again.hash).not.toBe(first.hash);
+    expect(again.decisionsHash).toBe(first.decisionsHash);
+    expect((await mockApi.getTransform(a.id)).draft?.contextStale).toBe(false);
+    await expect(mockApi.runValidation([], {}, { probe: true, run: ["pipeline"], timeoutMinutes: 30 })).rejects.toMatchObject({ code: "external_writes" });
+  }, 30000);
+
+  it("says on a draft's review which MIGRATION_CONTEXT.md it was sent and what it applied, and flags it once the brief moves on", async () => {
+    await discovered();
+    await approveBrief([["D1", true], ["B3", "Prefix every view with v_."]]);
+    const made = await mockApi.getMigrationContext();
+    const views = await mockApi.getResults({ ...Q, types: ["View"] });
+    const object = await mockApi.getObject(views.items[0].id);
+    const user = userEvent.setup();
+    const first = render(<AppStateProvider><TransformPanel object={object} /></AppStateProvider>);
+    await user.click(await screen.findByRole("button", { name: /Generate with LLM/ }));
+    await screen.findByLabelText("LLM draft (editable)", {}, { timeout: 6000 });
+    const sent = document.querySelector(".context-ref");
+    expect(sent?.textContent).toContain(`Sent MIGRATION_CONTEXT.md from brief version ${made.briefVersion}`);
+    expect(sent?.textContent).toContain(made.hash!.slice(0, 12));
+    expect(screen.getByText("What it applied from the migration context")).toBeInTheDocument();
+    expect(screen.queryByText("Made with an earlier migration context")).toBeNull();
+    first.unmount();
+    await approveBrief([["B3", "Keywords in lower case."]]);
+    render(<AppStateProvider><TransformPanel object={object} /></AppStateProvider>);
+    expect(await screen.findByText("Made with an earlier migration context", {}, { timeout: 6000 })).toBeInTheDocument();
+  }, 30000);
+
+  it("shows the migration context on the Consult step, and a journey saved before Consult existed keeps its later steps open", async () => {
+    await approveBrief([["D1", true]]);
+    localStorage.setItem(JOURNEY, JSON.stringify(["discover", "assess", "waves"]));
+    const user = userEvent.setup();
+    go("/migration?step=plan");
+    expect(await stepHeading("Plan")).toBeInTheDocument();
+    go("/migration?step=consult");
+    await user.click(await screen.findByRole("tab", { name: "Migration context" }, { timeout: 5000 }));
+    expect(await screen.findByLabelText("The migration context")).toHaveTextContent(/Made from the approved migration brief, version 1/);
   }, 30000);
 });

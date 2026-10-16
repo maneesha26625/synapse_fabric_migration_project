@@ -41,6 +41,8 @@ from discovery_agent.sql.models import SqlTable
 
 #: Tables copied at the same time inside one pipeline run.
 PARALLEL_COPIES = 4
+#: The most a Fabric ForEach runs at once.
+MAX_PARALLEL_COPIES = 50
 #: How long one pipeline run may take before the stage stops waiting for it.
 RUN_TIMEOUT_SECONDS = 6 * 60 * 60
 #: Seconds between status checks while a pipeline runs.
@@ -195,8 +197,11 @@ def _script_or_nothing(field: str) -> Dict[str, Any]:
     return _expression(f"@if(empty(item()?.{field}), '{NOTHING}', item()?.{field})")
 
 
-def definition(entries: List[Mapping[str, str]], connection_id: str, warehouse: WarehouseTarget) -> Dict[str, Any]:
-    """The ``pipeline-content.json`` of one wave's data pipeline."""
+def definition(entries: List[Mapping[str, str]], connection_id: str, warehouse: WarehouseTarget,
+               parallel: Optional[int] = None) -> Dict[str, Any]:
+    """The ``pipeline-content.json`` of one wave's data pipeline. ``parallel``: how many tables it copies at the same
+    time (the migration brief's C8), 1 to 50 as Fabric allows; the accelerator's default otherwise."""
+    batch = max(1, min(int(parallel), MAX_PARALLEL_COPIES)) if parallel else PARALLEL_COPIES
     copy = _copy("Copy table", _expression("@item().query"), _expression("@item().schema"), _expression("@item().table"),
                  _expression("@item().preCopyScript"), connection_id, warehouse)
     # IDENTITY tables only: staged rows into the table with IDENTITY_INSERT, then the staging table emptied and the
@@ -222,7 +227,7 @@ def definition(entries: List[Mapping[str, str]], connection_id: str, warehouse: 
             "typeProperties": {
                 "items": _expression("@pipeline().parameters.tables"),
                 "isSequential": False,
-                "batchCount": PARALLEL_COPIES,
+                "batchCount": batch,
                 "activities": [copy, after],
             },
         }],

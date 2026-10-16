@@ -3,9 +3,11 @@
 // a backend. It mirrors src/discovery_agent/consult/ and api/consult.py; where the two could differ, the server is right.
 //
 // Demo differences, on purpose: the notes are always read with the built-in rules (nothing is sent anywhere, so there is
-// no model to ask), and the questions' facts come from the demo estate.
+// no model to ask), the questions' facts come from the demo estate, answers are never from an earlier catalog (Demo
+// data starts afresh with each page load), and the migration context's hash is the Demo's own digest.
 
 import raw from "./consultCatalog.json";
+import vocabulary from "./consultVocabulary.json";
 import {
   ApiRequestError,
   type Actor,
@@ -29,6 +31,8 @@ import {
   type FactChange,
   type FilterableTable,
   type LlmGate,
+  type MigrationContextRef,
+  type MigrationContextView,
   type PlanDifference,
   type RunOptions,
   type RunnableKind,
@@ -54,78 +58,20 @@ interface RawConflict {
 const CAT = raw as unknown as { version: string; sections: { id: string; title: string }[]; questions: RawQuestion[]; conflicts: RawConflict[] };
 const QUESTION = new Map(CAT.questions.map((q) => [q.id, q]));
 
-/** How far the accelerator acts on each setting, and who: mirrors consult/settings.py. */
-const ENFORCED = "enforced", RECORDED = "recorded", NOTE = "note";
-const SETTING_STATUS: Record<string, SettingStatus> = Object.fromEntries([
-  "run.parts", "plan.scopeMode", "plan.scopeInclude", "plan.scopeExclude", "plan.serverless", "run.stopOnFailure", "run.waveGate",
-  "run.existing", "warehouse.collation", "names.warehouse", "names.lakehouse", "llm.standards", "data.historyMode", "data.historyFrom",
-  "data.sync", "data.syncOverlap", "data.mode", "data.run", "data.poolSignIn", "llm.consent", "llm.budgetUsd", "code.multiStatement",
-  "code.rebuild", "security.migrate", "security.sqlUserMap", "connections.defaultSignIn", "storage.routes", "release.gitCommit",
-  "release.commitScope", "release.signoff", "validate.depth",
-].map((n) => [n, ENFORCED as SettingStatus]).concat([["assistant.autonomy", RECORDED]],
-  ["owners.rebuild", "owners.setup", "release.path", "release.cutover", "context.timeline", "context.approver", "context.consumers",
-    "context.painPoints"].map((n) => [n, NOTE as SettingStatus])));
-const SETTING_APPLIES: Record<string, string> = {
-  "run.parts": "Migrate: which stages are on", "plan.scopeMode": "Plan: which objects Add all puts in the plan",
-  "plan.scopeInclude": "Plan: the schemas and folders in scope", "plan.scopeExclude": "Plan: name patterns left out of the plan",
-  "plan.serverless": "Plan: scripts and pipelines written for the serverless pool",
-  "run.stopOnFailure": "Migrate: stop at the end of a wave that has failures",
-  "run.waveGate": "Migrate: a person signs off each wave before the next one starts", "run.existing": "Migrate: objects already in Fabric",
-  "warehouse.collation": "Migrate: the Warehouse collation, set when it is created", "names.warehouse": "Migrate and Validate: the Warehouse's name",
-  "names.lakehouse": "Migrate: the Lakehouse's name (shortcuts, storage routes, Spark jobs)",
-  "llm.standards": "LLM drafts: rules every draft follows, added to the project requirements",
-  "data.historyMode": "Plan: how much of each table's history loads", "data.historyFrom": "Plan: the first date loaded, on each table's date column",
-  "data.sync": "Plan: tables with a change column are kept in sync after the first load", "data.syncOverlap": "Migrate: the re-read window of each sync",
-  "data.mode": "Migrate: tables that already have rows", "data.run": "Migrate: run the load pipelines, or only create them",
-  "data.poolSignIn": "Plan: how the load connection signs in to the pool (the secret is never kept)",
-  "llm.consent": "LLM drafts, consultation help and the assistant: whether anything may be sent to Claude",
-  "llm.budgetUsd": "LLM calls: the most this project may spend", "code.multiStatement": "Plan: multi-statement table-valued functions",
-  "code.rebuild": "Plan: pipelines with activities Fabric lacks, and .NET notebooks", "owners.rebuild": "People: who rebuilds what has no Fabric equivalent",
-  "security.migrate": "Migrate: whether the Roles & permissions stage is on",
-  "security.sqlUserMap": "Migrate: the Microsoft Entra principal that replaces each SQL user",
-  "connections.defaultSignIn": "Plan: how each linked service's connection signs in, preselected",
-  "storage.routes": "Plan: storage the code reads directly, routed through OneLake shortcuts",
-  "release.gitCommit": "Migrate: commit each run to the target workspace's Fabric Git branch", "release.commitScope": "Migrate: what that commit takes",
-  "release.signoff": "Migrate: which runs a person signs off before they write",
-  "owners.setup": "People: who sets up schedules, integration runtimes and event triggers", "release.path": "People: the path to Test and Prod",
-  "validate.depth": "Validate: how deep it checks by default", "release.cutover": "People: the cutover window and what a rollback means",
-  "assistant.autonomy": "Assistant: what it may do alone (the assistant is not built yet)", "context.timeline": "People: the timeline",
-  "context.approver": "People: who approves the migration", "context.consumers": "People: what reads the data downstream (Power BI, applications)",
-  "context.painPoints": "People: what hurts today",
+/** The settings and facts as the server names them: consult/settings.py and consult/facts.py, through
+ *  consultVocabulary.json, which a backend test keeps the same. */
+const VOCAB = vocabulary as unknown as {
+  settings: Record<string, { kind: string; status: SettingStatus; applies: string; values: string[]; ai: boolean }>;
+  facts: Record<string, { description: string; scope: "estate" | "environment"; informational: boolean }>;
 };
+const ENFORCED = "enforced", CONTEXT = "context", RECORDED = "recorded", NOTE = "note";
+const SETTING_STATUS: Record<string, SettingStatus> = Object.fromEntries(Object.entries(VOCAB.settings).map(([n, x]) => [n, x.status]));
+const SETTING_APPLIES: Record<string, string> = Object.fromEntries(Object.entries(VOCAB.settings).map(([n, x]) => [n, x.applies]));
 /** The estate facts: what a brief rests on, and what stales it when it changes (environment facts never do). */
-export const FACT_DESCRIPTIONS: Record<string, string> = {
-  "objects.total": "Objects discovered", "objects.byType": "Objects by type",
-  "objects.byClass": "Objects by how they move (Direct, Reconfigure, Transform, Manual, Review)", "waves.count": "Dependency waves",
-  "pool.present": "A dedicated SQL pool was discovered", "pool.name": "The dedicated SQL pool",
-  "pool.warehouseName": "The Warehouse name the pool's name gives", "pool.collation": "The Synapse pool's collation",
-  "pool.caseInsensitive": "The pool compares text case-insensitively", "tables.count": "Tables (external tables aside)",
-  "tables.external": "External tables", "tables.withDateColumn": "Tables with a date or time column",
-  "tables.withChangeColumn": "Tables with a column like ModifiedAt, which moves when a row changes",
-  "tables.withKeys": "Tables with a primary key or a unique constraint", "tables.withoutKeys": "Tables with no key",
-  "tables.changeWithoutKeys": "Tables with a change column but no key: a sync can only append to them",
-  "storage.locations": "Storage locations the code reads directly", "security.principals": "Database roles and users",
-  "security.roles": "Database roles", "security.sqlUsers": "SQL-authenticated users (Fabric has no SQL authentication)",
-  "security.sqlUserNames": "The SQL-authenticated users", "security.masks": "Columns with a dynamic data mask",
-  "code.multiStatementFunctions": "Multi-statement table-valued functions (Fabric has none)",
-  "code.dotnetNotebooks": ".NET for Spark notebooks (Fabric has none)",
-  "code.unsupportedPipelines": "Pipelines with an activity Fabric has no equivalent for",
-  "code.needsRewrite": "Objects that must be rebuilt by hand (unsupported pipelines and .NET notebooks)",
-  "code.serverlessObjects": "Scripts and pipelines written for the serverless SQL pool", "linkedServices.count": "Linked services",
-  "linkedServices.byType": "Linked services by type", "linkedServices.keyVault": "Linked services that read a secret from Azure Key Vault",
-  "triggers.count": "Triggers", "triggers.schedule": "Schedule triggers (recreated switched off)",
-  "triggers.event": "Event, tumbling-window and custom triggers (set up by hand)",
-  "integrationRuntimes.count": "Integration runtimes (set up by hand)",
-  "manual.setupCount": "Triggers and integration runtimes someone sets up or switches on", "scope.groups": "The schemas and folders discovered",
-  "source.kind": "Where the definitions were read from (the live workspace, Git or a ZIP)", "source.workspace": "The Synapse workspace",
-  "source.ref": "The Git branch or tag read", "source.commit": "The Git commit read", "source.environment": "The environment the definitions are for",
-  "discovery.complete": "Discovery read every part of the source", "discovery.failedCategories": "The parts of the source discovery could not read",
-};
-const ENVIRONMENT_FACTS: Record<string, string> = {
-  "target.connected": "The Fabric target is connected", "target.workspace": "The Fabric target workspace",
-  "target.capacity": "The Fabric workspace is on a capacity", "target.gitConnected": "The Fabric workspace is connected to Git",
-  "llm.available": "Claude Code is installed on this machine",
-};
+export const FACT_DESCRIPTIONS: Record<string, string> = Object.fromEntries(Object.entries(VOCAB.facts)
+  .filter(([, f]) => f.scope === "estate" && !f.informational).map(([n, f]) => [n, f.description]));
+const ENVIRONMENT_FACTS: Record<string, string> = Object.fromEntries(Object.entries(VOCAB.facts)
+  .filter(([, f]) => f.scope === "environment").map(([n, f]) => [n, f.description]));
 const STAGE_KEYS = ["warehouse", "data", "security", "spark", "notebooks", "connections", "pipelines", "spark_jobs", "sql_scripts", "schedules", "shortcuts"];
 
 // ---- conditions: as consult/conditions.py, "unknown" never holds ---------------------------------------------------
@@ -166,8 +112,9 @@ export function evaluate(c: V, facts: Facts, values: Values): V {
   }
   if (c === null || typeof c !== "object") return c;
   const [op, arg] = Object.entries(c as Record<string, V>)[0];
-  if (op === "fact") return String(arg) in facts ? facts[String(arg)] : UNKNOWN;
-  if (op === "answer") return String(arg) in values ? values[String(arg)] : UNKNOWN;
+  // A fact discovery could not work out (null) is unknown, never a value; so is a question with no value.
+  if (op === "fact") return facts[String(arg)] ?? UNKNOWN;
+  if (op === "answer") return values[String(arg)] ?? UNKNOWN;
   const args = Array.isArray(arg) ? arg : [];
   if (["==", "!=", ">", ">=", "<", "<="].includes(op)) {
     const a = evaluate(args[0], facts, values), b = evaluate(args[1], facts, values);
@@ -180,8 +127,9 @@ export function evaluate(c: V, facts: Facts, values: Values): V {
     const needle = evaluate(args[0], facts, values), hay = evaluate(args[1], facts, values);
     if (needle === UNKNOWN || hay === UNKNOWN) return UNKNOWN;
     if (Array.isArray(hay)) return hay.some((h) => same(h, needle));
-    if (typeof hay === "string") return typeof needle === "string" && hay.includes(needle);
-    if (hay && typeof hay === "object") return String(needle) in (hay as object);
+    // As Python: a text holds only text, and a map's keys (always text from JSON) are never a list or a map.
+    if (typeof hay === "string") return typeof needle === "string" ? hay.includes(needle) : UNKNOWN;
+    if (hay && typeof hay === "object") return needle && typeof needle === "object" ? UNKNOWN : typeof needle === "string" && needle in (hay as object);
     return UNKNOWN;
   }
   if (op === "and" || op === "or") {
@@ -247,7 +195,7 @@ export function check(q: RawQuestion, value: unknown, facts: Facts): unknown {
     }
     case "boolean": if (typeof value !== "boolean") bad(`${q.id}: Answer yes or no.`); return value;
     case "number": {
-      if (typeof value !== "number" || Number.isNaN(value)) bad(`${q.id}: Enter a number.`);
+      if (typeof value !== "number" || !Number.isFinite(value)) bad(`${q.id}: Enter a number.`);
       if ((q.min !== undefined && (value as number) < q.min) || (q.max !== undefined && (value as number) > q.max)) bad(`${q.id}: Enter a number from ${q.min} to ${q.max}.`);
       return value;
     }
@@ -275,11 +223,11 @@ export function check(q: RawQuestion, value: unknown, facts: Facts): unknown {
       const rows = new Map(((facts[q.rowsFrom ?? ""] as string[]) ?? []).map((r) => [r.toLowerCase(), r]));
       const out: Record<string, string> = {};
       for (const [key, target] of Object.entries(value as Record<string, unknown>)) {
+        if (typeof target === "string" && !target.trim()) continue; // blank: left for a person, even for a user no longer discovered
         const name = rows.get(key.toLowerCase());
         if (!name) bad(`${q.id}: ${key} is not one of the SQL users discovered.`);
         if (typeof target !== "string") bad(`${q.id}: Enter a Microsoft Entra user or group for ${name}.`);
         const principal = (target as string).split(/\s+/).filter(Boolean).join(" ");
-        if (!principal) continue;
         if (principal.length > 256 || /[[\]]/.test(principal)) bad(`${q.id}: ${principal.slice(0, 40)} is not a Microsoft Entra user or group name.`);
         out[name as string] = principal;
       }
@@ -350,7 +298,7 @@ function fold(records: AnswerRecord[]) {
     const q = r.question ?? "";
     if (r.type === "answer") { answers.set(q, r); skips.delete(q); }
     else if (r.type === "withdraw") { answers.delete(q); skips.delete(q); }
-    else if (r.type === "skip") skips.set(q, r);
+    else if (r.type === "skip") { skips.set(q, r); answers.delete(q); } // skipped after an answer: the recommendation stands again
     else if (r.type === "resolve") resolutions.set(r.conflict ?? "", r);
   }
   return { answers, skips, resolutions };
@@ -489,7 +437,8 @@ function draft(facts: Facts, st: EngineState): BriefContent {
     const assumed = s.status === "assumed" || s.status === "skipped";
     decisions.push({ question: q.id, section: q.section, sectionTitle: titles.get(q.section) ?? q.section, text: q.text, value: s.value,
       display: display(q, s.value), assumed, source: assumed ? null : s.source, by: assumed ? null : s.by, at: assumed ? null : s.at,
-      reason: !assumed && s.note ? s.note : s.recommendation?.reason ?? null,
+      // A person's note, else the recommendation's reason, but only where the decision is that recommendation.
+      reason: !assumed && s.note ? s.note : assumed || (s.recommendation && same(s.value, s.recommendation.value)) ? s.recommendation?.reason ?? null : null,
       drives: q.drives.map((n) => ({ setting: n, status: SETTING_STATUS[n], applies: SETTING_APPLIES[n] })) });
   }
   const settings = settingsOf(st);
@@ -497,7 +446,9 @@ function draft(facts: Facts, st: EngineState): BriefContent {
     catalogVersion: CAT.version, factsFingerprint: fingerprint(facts), facts: estateOf(facts), snapshot: (facts["discovery.snapshot"] as string) ?? null,
     decisions, settings, enforced: Object.fromEntries(Object.entries(settings).filter(([k]) => SETTING_STATUS[k] === ENFORCED)),
     assumptions: decisions.filter((d) => d.assumed).map((d) => d.question),
-    recordedOnly: Object.entries(settings).filter(([k]) => SETTING_STATUS[k] !== ENFORCED)
+    recordedOnly: Object.entries(settings).filter(([k]) => SETTING_STATUS[k] === RECORDED || SETTING_STATUS[k] === NOTE)
+      .map(([k, value]) => ({ setting: k, value, status: SETTING_STATUS[k], applies: SETTING_APPLIES[k] })),
+    contextOnly: Object.entries(settings).filter(([k]) => SETTING_STATUS[k] === CONTEXT)
       .map(([k, value]) => ({ setting: k, value, status: SETTING_STATUS[k], applies: SETTING_APPLIES[k] })),
     keptContradictions: st.conflicts.filter((c) => c.status === "kept").map((c) => ({ conflict: c.id, message: c.message, reason: c.reason ?? "", by: c.by, at: c.at })),
     separateApprover: CAT.questions.filter((q) => q.separateApprover && st.questions.get(q.id)!.applies && holds(q.separateApprover.when, facts, st.values))
@@ -517,7 +468,9 @@ const WHO: Record<string, string> = { person: "answered", recommendation: "recom
 
 interface StoredVersion { version: number; hash: string; content: BriefContent; submittedAt: string; submittedBy: Actor; note: string | null }
 interface BriefEvent { event: "submitted" | "approved" | "rejected" | "superseded"; version: number; by: Actor; at: string; comment?: string | null;
-  selfApproved?: boolean; separateApprover?: string[]; hash?: string }
+  selfApproved?: boolean; separateApprover?: string[]; hash?: string;
+  /** The Fabric workspace that was the target when it was approved (Policy.target in consult/policy.py). */
+  target?: { workspaceId: string; workspaceName: string | null } | null }
 
 function toMarkdown(v: StoredVersion, events: BriefEvent[]): string {
   const c = v.content;
@@ -540,6 +493,8 @@ function toMarkdown(v: StoredVersion, events: BriefEvent[]): string {
   }
   lines.push("", "## What the accelerator acts on", "", "| Setting | Value | Acted on by |", "|---|---|---|");
   for (const [k, value] of Object.entries(c.enforced)) lines.push(`| \`${k}\` | ${cell(valueText(value))} | ${cell(SETTING_APPLIES[k])} |`);
+  lines.push("", "## Sent to the AI with each draft", "", "Every LLM draft is sent the migration context (MIGRATION_CONTEXT.md), made from the approved brief: the decisions above that shape code, and these, which only the AI acts on (a person reviews each draft).");
+  if (c.contextOnly?.length) lines.push("", ...c.contextOnly.map((x) => `- \`${x.setting}\`: ${valueText(x.value)}.`));
   if (c.assumptions.length) lines.push("", "## Assumptions", "", `Recommendations nobody confirmed: ${c.assumptions.join(", ")}.`);
   if (c.recordedOnly.length) lines.push("", "## Recorded, not acted on", "", ...c.recordedOnly.map((r) => `- \`${r.setting}\` (${r.status}): ${valueText(r.value)}. ${r.applies}.`));
   if (c.keptContradictions.length) lines.push("", "## Contradictions kept, with their reasons", "", ...c.keptContradictions.map((k) => `- ${k.message} Kept by ${k.by?.id ?? "—"}: ${k.reason}`));
@@ -570,15 +525,46 @@ const said = (v: unknown) => typeof v === "boolean" ? (v ? "yes" : "no") : Array
 /** What Plan's Add all and the differences are judged on: each object, its scope groups and what the estate says of it. */
 export interface DemoEstate { items: { id: string; name: string }[]; groupOf: Record<string, string[]>; flags: Record<string, string[]>; filterable: FilterableTable[] }
 
-class Policy {
+const major = (version: string | undefined) => String(version ?? "").split(".")[0];
+const NL = String.fromCharCode(10);
+
+export class Policy {
   constructor(readonly version: number, readonly hash: string, readonly settings: Record<string, unknown>, readonly made: Facts,
-    readonly approvedBy: Actor | null, readonly approvedAt: string | null, now: Facts) {
-    this.stale = Object.keys(now).length > 0 && fingerprint(now) !== fingerprint(made);
-    this.changes = this.stale ? changes(made, now) : [];
+    readonly approvedBy: Actor | null, readonly approvedAt: string | null, now: Facts, readonly catalogVersion: string = CAT.version,
+    readonly target: { workspaceId: string; workspaceName: string | null } | null = null, private readonly kept: string[] = []) {
+    const moved = Object.keys(now).length > 0 && fingerprint(now) !== fingerprint(made);
+    this.outdated = major(catalogVersion) !== major(CAT.version);
+    const nowId = now["target.workspaceId"] as string | null | undefined;
+    // Another workspace is the target now than when it was approved: what the brief says about the target is about that one.
+    this.targetMoved = !!(target?.workspaceId && nowId && nowId !== target.workspaceId);
+    this.stale = moved || this.outdated || this.targetMoved;
+    this.changes = moved ? changes(made, now) : [];
+    if (this.outdated) this.changes.push({ fact: "catalog.version", description: "The consultation's questions (catalog version)", before: catalogVersion, after: CAT.version });
+    if (this.targetMoved) this.changes.push({ fact: "target.workspace", description: "The Fabric target workspace", before: target?.workspaceName ?? target?.workspaceId ?? null,
+      after: (now["target.workspace"] as string | null | undefined) ?? nowId ?? null });
   }
   readonly stale: boolean;
+  readonly outdated: boolean;
+  readonly targetMoved: boolean;
+  /** Why Validate may not really run these kinds of object under this brief (H4, unless K10 was kept), or null. */
+  externalWritesRefusal(runs: string[]): string | null {
+    const writes = this.get("validate.externalWrites");
+    if (!runs.length || (writes !== "yes" && writes !== "unsure") || this.kept.includes("K10")) return null;
+    const said = writes === "yes" ? "write to production systems outside Fabric" : "may write to production systems outside Fabric (nobody is sure)";
+    return `The approved brief says the pipelines and notebooks ${said} (H4), so Validate does not run them. Query and compile instead; or, once they write only to test copies, answer H4 so, or keep running them (K10), and have the brief approved again.`;
+  }
   readonly changes: FactChange[];
   get = (name: string) => this.settings[name];
+  maskColumns(): string[] { return this.get("security.maskSensitive") === "mask" ? ((this.get("security.sensitiveColumns") as string[]) ?? []).map(String) : []; }
+  llmContext(): "context" | "minimal" { return (this.get("llm.context") as "context" | "minimal") ?? "context"; }
+  changeColumnOf(dates: string[]): string | undefined {
+    if (this.get("data.watermark") === "named") {
+      const named = ((this.get("data.watermarkColumns") as string[]) ?? []).map((n) => String(n).toLowerCase());
+      for (const n of named) { const found = dates.find((d) => d.toLowerCase() === n); if (found) return found; }
+      return undefined;
+    }
+    return dates.find((n) => CHANGE.test(n));
+  }
   stages(): string[] | null {
     const parts = this.get("run.parts") as string[] | undefined;
     if (!parts) return null;
@@ -602,7 +588,8 @@ class Policy {
       const dates = t.dateColumns.map((c) => c.name);
       let entry: DataFilterInput | null = null;
       if (since && dates.length) entry = { column: dates.find((n) => EVENT.test(n)) ?? dates.find((n) => CHANGE.test(n)) ?? dates[0], from: since, to: "", sync: false, changeColumn: "", keys: [] };
-      const change = sync ? dates.find((n) => CHANGE.test(n)) : undefined;
+      let change = sync ? this.changeColumnOf(dates) : undefined;
+      if (change && !t.keyColumns.length && this.get("data.keylessSync") === "once") change = undefined; // loaded once (C3)
       if (change) entry = { ...(entry ?? { column: "", from: "", to: "", sync: false, changeColumn: "", keys: [] }), sync: true, changeColumn: change, keys: [...t.keyColumns] };
       if (entry) out[t.key] = entry;
     }
@@ -610,9 +597,10 @@ class Policy {
   }
   excluded(item: { id: string; name: string }, estate: DemoEstate): string | null {
     const marks = estate.flags[item.id] ?? [];
-    if (marks.includes("serverless") && this.get("plan.serverless") === "leave_out") return "Written for the serverless SQL pool: the brief leaves it out (A3).";
+    if (marks.includes("serverless") && this.get("plan.serverless") === "leave_out") return "Written for the serverless SQL pool: the brief leaves it out (A3S).";
     if (marks.includes("multiStatement") && this.get("code.multiStatement") === "leave_out") return "A multi-statement table-valued function: the brief leaves these out (D3).";
-    if (marks.includes("rebuild") && this.get("code.rebuild") === "leave_out") return "No Fabric equivalent as it is: the brief leaves these out (D4).";
+    if (marks.includes("rebuild") && this.get("code.rebuild") === "leave_out") return "No Fabric equivalent as it is: the brief leaves these out (A4).";
+    if (marks.includes("sqlModule") && this.get("plan.sqlModules") === "leave_out") return "A view, procedure or function: the brief moves the tables first and leaves these for a later run (A3).";
     const mode = this.get("plan.scopeMode");
     if (mode === "include") {
       const chosen = (this.get("plan.scopeInclude") as string[]) ?? [];
@@ -654,27 +642,42 @@ class Policy {
 // ---- the rules that read answers from notes ---------------------------------------------------------------------------
 
 const RULES: [string, unknown, RegExp][] = ([
-  ["A1", ["structure"], /\b(structure|schema|tables?) only\b|\bno data\b|\bwithout (the )?data\b/i],
-  ["A1", ["structure", "data"], /\b(no|without|skip) (the )?(pipelines|orchestration|notebooks)\b/i],
-  ["A5", "update", /\b(update|overwrite) (what is |objects |items )?(already )?(there|in fabric|existing)\b|\bupdate in place\b/i],
-  ["A5", "skip", /\b(never|don'?t|do not) (overwrite|update)\b/i],
+  ["A0", ["structure"], /\b(structure|schema|tables?) only\b|\bno data\b|\bwithout (the )?data\b/i],
+  ["A0", ["structure", "data"], /\b(no|without|skip) (the )?(pipelines|orchestration|notebooks)\b/i],
+  ["A1", "none", /\b(leave|keep) (the )?(storage )?paths( as they are)?\b|\bno shortcuts\b/i],
+  ["A1", "all", /\b(use|through|via) (onelake )?shortcuts\b/i],
+  ["A3", "leave_out", /\b(tables|data) first\b|\b(views|procedures|procs) (later|in a later run)\b/i],
+  ["A6", "signoff_each_wave", /\b(sign[- ]off|approve) (each|every) wave\b|\bwave by wave\b/i],
+  ["A6", "one_run", /\b(one|a single|single) (run|cutover|go)\b|\bbig[- ]bang\b/i],
+  ["A7", "update", /\b(update|overwrite) (what is |objects |items )?(already )?(there|in fabric|existing)\b|\bupdate in place\b/i],
+  ["A7", "skip", /\b(never|don'?t|do not) (overwrite|update)\b/i],
   ["B1", "case_sensitive", /\bcase[- ]sensitive\b(?! *(?:is|was) not)/i],
   ["B1", "case_insensitive", /\bcase[- ]insensitive\b/i],
-  ["C2", true, /\b(keep (it |them |the tables )?in sync|incremental(ly)?|sync (it|them|the tables))\b/i],
-  ["C2", false, /\b(one[- ]off|one[- ]time|single) (load|copy|migration)\b/i],
-  ["C4", "replace", /\b(replace|truncate|reload) (the )?(rows|data|tables)\b/i],
-  ["C5", "create", /\b(only create|create only|don'?t run|do not run) (the )?(load )?pipelines\b/i],
+  ["C1", true, /\b(keep (it |them |the tables )?in sync|incremental(ly)?|sync (it|them|the tables))\b/i],
+  ["C1", false, /\b(one[- ]off|one[- ]time|single) (load|copy|migration)\b|\bfull reload\b/i],
+  ["C4", "reload", /\b(propagate|carry over|remove) (the )?delet\w*\b|\bdeletes? (must|should) (go|propagate)\b/i],
+  ["C6", "replace", /\b(replace|truncate|reload) (the )?(rows|data|tables)\b/i],
+  ["C7", "create", /\b(only create|create only|don'?t run|do not run) (the )?(load )?pipelines\b/i],
   ["D1", false, /\b(no (ai|llm|claude|gen ?ai)|don'?t send|do not send|never send|not (allowed|permitted) to send)\b/i],
   ["D1", true, /\b(ai|llm|claude) (is )?(fine|ok|okay|allowed|welcome)\b|\buse (ai|an llm|claude)\b/i],
-  ["E1", false, /\b(skip|no|without) (the )?(security|permissions|roles)\b/i],
-  ["G1", false, /\b(no|without|skip) (fabric )?git\b|\bdon'?t commit\b/i],
-  ["G1", true, /\bcommit (it |each run |every run )?to (fabric )?git\b/i],
-  ["G3", "always", /\b(sign[- ]off|approv\w*) (for |on |before )?(every|each|all) runs?\b|\balways (sign[- ]off|approve)\b|\b(every|each) run (must|should|has to|needs to) be (signed[- ]off|approved)\b/i],
-  ["G3", "never", /\bno (sign[- ]off|approvals?)\b/i],
-  ["G5", "dev_test_prod", /\b(test and prod|dev,? test,? (and )?prod)\b/i],
-  ["G5", "dev_test", /\bdev and test\b/i],
+  ["D7", "scala", /\b(rewrite|convert)\w* (\w+ )?(in|to) scala\b/i],
+  ["D7", "pyspark", /\b(rewrite|convert)\w* (\w+ )?(in|to) (pyspark|python)\b/i],
+  ["E0", false, /\b(no|without|skip) (fabric )?git\b|\bdon'?t commit\b/i],
+  ["E0", true, /\bcommit (it |each run |every run )?to (fabric )?git\b/i],
+  ["E1", "prod", /\b(target|fabric) (workspace )?is (the )?prod(uction)?\b|\bstraight (in)?to prod(uction)?\b/i],
+  ["E1", "test", /\b(target|fabric) (workspace )?is (the )?test\b/i],
+  ["E2", "service_principal", /\b(as|with|under) a service principal\b|\bservice principal (owns|should own)\b/i],
+  ["E4", "always", /\b(sign[- ]off|approv\w*) (for |on |before )?(every|each|all) runs?\b|\balways (sign[- ]off|approve)\b|\b(every|each) run (must|should|has to|needs to) be (signed[- ]off|approved)\b/i],
+  ["E4", "never", /\bno (sign[- ]off|approvals?)\b/i],
+  ["E5", "match", /\b(switch|turn) (the )?schedules on\b|\bschedules (switched |turned )?on\b/i],
+  ["E7", "dev_test_prod", /\b(test and prod|dev,? test,? (and )?prod)\b/i],
+  ["E7", "dev_test", /\bdev and test\b/i],
+  ["G1M", "mask", /\bmask (the |those |these )?(pii|personal|sensitive)\b/i],
+  ["G2", false, /\b(skip|no|without) (the )?(security|permissions|roles)\b/i],
   ["H1", "run", /\b(run (the )?(pipelines|notebooks) (in|during|to) valid\w*|full validation)\b/i],
   ["H1", "compare", /\b(compare only|just compare)\b/i],
+  ["H2", true, /\b(parallel run|side[- ]by[- ]side|run both)\b/i],
+  ["H4", "yes", /\b(write|writes|writing) to (a )?prod(uction)?\b/i],
 ] as [string, unknown, RegExp][]);
 
 export function ruleProposals(text: string, today = new Date()): { question: string; value: unknown; reason: string }[] {
@@ -685,15 +688,82 @@ export function ruleProposals(text: string, today = new Date()): { question: str
   const since = /\b(?:since|from|after)\s+(\d{4}-\d{2}-\d{2}|\d{4})\b/i.exec(text);
   if (years) {
     const d = new Date(Date.UTC(today.getUTCFullYear() - Number(years[1]), today.getUTCMonth(), Math.min(today.getUTCDate(), 28)));
-    add("C1", "since", years[0]);
-    add("C1D", d.toISOString().slice(0, 10), years[0]);
+    add("A5", "since", years[0]);
+    add("A5D", d.toISOString().slice(0, 10), years[0]);
   } else if (since) {
-    add("C1", "since", since[0]);
-    add("C1D", since[1].length === 10 ? since[1] : `${since[1]}-01-01`, since[0]);
+    add("A5", "since", since[0]);
+    add("A5D", since[1].length === 10 ? since[1] : `${since[1]}-01-01`, since[0]);
   }
   const budget = /(?:budget|spend|up to|at most|max(?:imum)?)\D{0,20}\$\s?(\d{1,5})|\$\s?(\d{1,5})\s*(?:budget|for ai|for the ai|on ai)/i.exec(text);
   if (budget) add("D2", Number(budget[1] ?? budget[2]), budget[0]);
+  const cycles = /\b(?:parallel|side[- ]by[- ]side)\D{0,30}?(\d{1,2}) (?:cycles?|runs?)\b/i.exec(text);
+  if (cycles) { add("H2", true, cycles[0]); add("H2A", Number(cycles[1]), cycles[0]); }
+  const copies = /\b(\d{1,2}) (?:tables? )?(?:copies|loads|tables) (?:at a time|at once|in parallel)\b/i.exec(text);
+  if (copies) add("C8", Number(copies[1]), copies[0]);
   return [...out.values()];
+}
+
+// ---- the migration context: as consult/context_file.py --------------------------------------------------------------
+
+const code = (v: unknown) => `\`${String(v).replace(/`/g, "'")}\``;
+const codes = (vs: unknown) => ((vs as unknown[]) ?? []).length ? ((vs as unknown[]) ?? []).map(code).join(", ") : "none";
+function renderContext(p: Policy): string {
+  const get = p.get, minimal = p.llmContext() === "minimal";
+  const sections: [string, string[]][] = [["Target", []], ["What moves", []], ["Data", []], ["Code", []], ["Security", []], ["Operations", []]];
+  const add = (name: string, line: string) => sections.find(([n]) => n === name)![1].push(line);
+  if (get("names.warehouse")) add("Target", `The Fabric Warehouse is ${code(get("names.warehouse"))}. Use it wherever a database name is needed; every schema keeps its Synapse name.`);
+  if (get("names.lakehouse")) add("Target", `The Lakehouse is ${code(get("names.lakehouse"))}: the OneLake shortcuts are in it, and Spark jobs use it as their default lakehouse.`);
+  const collation = get("warehouse.collation"), ci = p.made["pool.caseInsensitive"];
+  if (collation === "case_sensitive") add("Target", "The Warehouse is case-sensitive: 'ABC' and 'abc' differ, in object names and in text. Write every identifier exactly as it is declared, and compare text knowing case counts.");
+  else if (collation === "case_insensitive" || (collation === "match_synapse" && ci === true)) add("Target", "The Warehouse compares names and text case-insensitively, as the Synapse pool did ('ABC' equals 'abc'). Code may rely on that, as it did in Synapse.");
+  else if (collation === "match_synapse" && ci === false) add("Target", "The Warehouse is case-sensitive, as the Synapse pool was: write identifiers exactly as they are declared.");
+  else if (collation === "match_synapse") add("Target", "The Warehouse has the Synapse pool's collation.");
+  const role = get("target.role") as string | undefined;
+  if (role) add("Target", { dev: "The target workspace is for development.", test: "The target workspace is for testing: what a draft does there is checked by testers.",
+    prod: "The target workspace is production: change nothing that Fabric does not require." }[role] ?? "");
+  const parts = get("run.parts") as string[] | undefined;
+  if (parts) add("What moves", `This migration moves: ${parts.join(", ") || "nothing"}.`);
+  if (get("storage.routes") === "all") add("What moves", "Storage the code reads directly is reached through OneLake shortcuts in the Lakehouse: read it by its OneLake path, not the storage account's abfss:// path.");
+  else if (get("storage.routes") === "none") add("What moves", "The code keeps reading the data lake directly, as the signed-in user: keep its storage paths as they are.");
+  if (get("plan.serverless") === "keep") add("What moves", "Scripts written for the serverless SQL pool are kept: in Fabric they run on the Lakehouse's SQL endpoint, over the shortcuts.");
+  else if (get("plan.serverless") === "leave_out") add("What moves", "Scripts written for the serverless SQL pool are not migrated.");
+  if (get("data.historyMode") === "since" && get("data.historyFrom")) add("Data", `Only rows dated from ${get("data.historyFrom")} are loaded, on each table's date column.`);
+  else if (get("data.historyMode") === "all") add("Data", "Every row of every table is loaded.");
+  if (get("data.sync") === true) {
+    add("Data", `After the first load, tables with a change column are kept in sync by a sync pipeline; ${get("data.watermark") === "named"
+      ? `the change column is the first of ${codes(get("data.watermarkColumns"))} a table has` : "each table's change column is the one named like ModifiedAt, UpdatedAt or LastModified"}.`);
+    if (get("data.keylessSync") === "once") add("Data", "A table with a change column but no key is loaded once and not synced.");
+    else if (get("data.keylessSync") === "append") add("Data", "A table with a change column but no key is synced by appending: changed rows appear again.");
+    if (get("data.deletes") === "keep") add("Data", "Rows deleted in Synapse after the first load stay in Fabric: a sync never removes rows.");
+    else if (get("data.deletes") === "reload") add("Data", "Synced tables are reloaded in full at cutover, which removes rows deleted in Synapse.");
+  } else if (get("data.sync") === false) add("Data", "Tables are loaded once; nothing is kept in sync.");
+  const multi = get("code.multiStatement") as string | undefined;
+  if (multi) add("Code", `Multi-statement table-valued functions become an inline table-valued function or a view, with exactly the same result set.${{ llm: "", manual: " A person rewrites them.", leave_out: " They are not migrated." }[multi] ?? ""}`);
+  if (get("types.lossy")) add("Code", `Columns are stored with Fabric's closest types: datetime2(7) and time(7) keep 6 fractional digits, datetimeoffset becomes datetime2 without its offset, rowversion becomes a varbinary(8) that never changes, XML becomes text and spatial types binary. Never rely on what they lost.${get("types.lossy") === "review" ? " A person reviews those tables before the data loads." : ""}`);
+  if (get("code.notebookLanguage")) add("Code", `.NET for Spark code is rewritten in ${get("code.notebookLanguage") === "pyspark" ? "PySpark (Python)" : "Scala"}.`);
+  if (get("validate.externalWrites") === "yes" || get("validate.externalWrites") === "unsure") add("Code", "The pipelines and notebooks may write to production systems outside Fabric: never add a write, and never change where one goes.");
+  const sensitive = ((get("security.sensitiveColumns") as string[]) ?? []).map(String);
+  if (sensitive.length) add("Security", minimal ? "Some columns hold personal or sensitive data: never log, print or return a column's values in a message, and never copy them anywhere new."
+    : `These columns hold personal or sensitive data: ${codes(sensitive)} (schema.table.column, * for any text). Never log, print or return their values in a message, and never copy them anywhere new.`);
+  if (get("security.maskSensitive") === "mask") add("Security", "Those columns are masked in the Warehouse with the default dynamic data mask: keep every mask, and never grant UNMASK.");
+  const users = Object.entries((get("security.sqlUserMap") as Record<string, string>) ?? {}).sort(([a], [b]) => a.localeCompare(b));
+  if (users.length && !minimal) add("Security", `SQL users are replaced by Microsoft Entra principals: ${users.map(([u, x]) => `${code(u)} becomes ${code(x)}`).join("; ")}. Use the Entra name wherever code names the user (GRANT, EXECUTE AS).`);
+  if (get("schedules.enabled") === "off") add("Operations", "Schedules are created switched off: a person switches each on in Fabric.");
+  else if (get("schedules.enabled") === "match") add("Operations", "Schedules are switched on as they were in Synapse.");
+  const lines = ["# Migration context", "", `Made from the approved migration brief, version ${p.version} (content hash ${p.hash.slice(0, 16)}), for the model that drafts code. It is what the client approved for this migration: follow it wherever it applies to the object. Where it and the project requirements disagree, follow this. Where it and the object's own code disagree, keep what the code does and say so in \`notes\`.`,
+    "", "In your answer, list in `context` each instruction below that the draft applies, in a few words."];
+  for (const [name, items] of sections) if (items.length) lines.push("", `## ${name}`, "", ...items.map((x) => `- ${x}`));
+  const standards = String(get("llm.standards") ?? "").trim();
+  if (standards) lines.push("", "## Coding standards", "", standards);
+  const naming = String(get("llm.naming") ?? "").trim();
+  if (naming) lines.push("", "## Naming anything new", "", "Existing objects keep their Synapse names. Anything new a draft has to create is named this way:", "", naming);
+  if (!minimal) {
+    const told = ([["context.timeline", "Timeline"], ["context.painPoints", "What hurts today"], ["context.consumers", "What reads the data downstream: keep the names and shapes it depends on"],
+      ["context.teamSkills", "What the team knows best: code a draft adds is written that way"]] as const)
+      .map(([n, label]) => [label, String(get(n) ?? "").trim()] as const).filter(([, x]) => x);
+    if (told.length) lines.push("", "## About this migration", "", ...told.map(([label, x]) => `- ${label}: ${x}`));
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 // ---- the demo consultation itself -------------------------------------------------------------------------------------
@@ -744,7 +814,8 @@ export class DemoConsult {
     const v = n === null ? undefined : this.versions.find((x) => x.version === n);
     if (!v) return null;
     const approval = [...this.events].reverse().find((e) => e.version === n && e.event === "approved");
-    return new Policy(v.version, v.hash, v.content.settings, v.content.facts, approval?.by ?? null, approval?.at ?? null, facts);
+    return new Policy(v.version, v.hash, v.content.settings, v.content.facts, approval?.by ?? null, approval?.at ?? null, facts, v.content.catalogVersion,
+      approval?.target ?? null, (v.content.keptContradictions ?? []).map((k) => k.conflict));
   }
 
   private versionsView(): BriefVersion[] {
@@ -792,7 +863,7 @@ export class DemoConsult {
     const policy = this.inForce({});
     let consent = policy ? (policy.get("llm.consent") as boolean | undefined) ?? null : null;
     let budget = policy && consent ? (policy.get("llm.budgetUsd") as number | undefined) ?? null : null;
-    if (purpose === "consult" && live !== null) consent = live;
+    if (purpose === "consult" && live !== null && !policy) consent = live; // once a brief is approved, it decides
     if (liveBudget !== null && (budget === null || liveBudget < budget)) budget = liveBudget;
     if (budget === null && consent) budget = 25;
     const out: LlmGate = { purpose, mode, consent, liveConsent: live, budgetUsd: budget, spentUsd: 0, allowed: true, reason: null, code: null };
@@ -844,13 +915,14 @@ export class DemoConsult {
     this.audit("consult.withdrawn", { question: q.id }, { type: "question", id: q.id });
     return this.state(facts, mode);
   }
-  accept(facts: Facts, mode: "required" | "advisory", section?: string): ConsultState {
+  accept(facts: Facts, mode: "required" | "advisory", section?: string, questions?: string[]): ConsultState {
     const accepted: string[] = [];
     for (let i = 0; i < CAT.questions.length; i++) {
       const st = evaluateAll(facts, this.records);
       const found = CAT.questions.filter((q) => {
         const s = st.questions.get(q.id)!;
-        return s.applies && (s.status === "assumed" || s.status === "skipped") && s.recommendation && (!section || q.section === section) && !accepted.includes(q.id);
+        return s.applies && (s.status === "assumed" || s.status === "skipped") && s.recommendation && (!section || q.section === section)
+          && (!questions || questions.includes(q.id)) && !accepted.includes(q.id);
       });
       if (!found.length) break;
       for (const q of found) {
@@ -923,7 +995,9 @@ export class DemoConsult {
     const previous = this.approvedNumber();
     if (previous !== null) this.events.push({ event: "superseded", version: previous, by: this.person, at: this.now() });
     const selfApproved = v.submittedBy.id === this.person.id;
-    this.events.push({ event: "approved", version, by: this.person, at: this.now(), comment: said, selfApproved, separateApprover: v.content.separateApprover.map((x) => x.question) });
+    const workspaceId = facts["target.workspaceId"] as string | null | undefined;
+    const target = workspaceId ? { workspaceId, workspaceName: (facts["target.workspace"] as string | null | undefined) ?? null } : null;
+    this.events.push({ event: "approved", version, by: this.person, at: this.now(), comment: said, selfApproved, separateApprover: v.content.separateApprover.map((x) => x.question), target });
     this.audit("brief.approved", { version, hash: v.hash, comment: said, selfApproved, superseded: previous }, { type: "brief", id: String(version) });
     return this.brief(facts);
   }
@@ -943,7 +1017,13 @@ export class DemoConsult {
     const llm = this.llmGate("transform", mode);
     if (!p) return { mode, inForce: null, llm };
     return {
-      mode, llm, inForce: { version: p.version, hash: p.hash, approvedBy: p.approvedBy, approvedAt: p.approvedAt, stale: p.stale, changes: p.changes, settings: p.settings },
+      mode, llm, inForce: { version: p.version, hash: p.hash, approvedBy: p.approvedBy, approvedAt: p.approvedAt, stale: p.stale, changes: p.changes, settings: p.settings,
+        outdated: p.outdated, catalogVersion: p.catalogVersion, target: p.target, targetMoved: p.targetMoved },
+      signIn: { pool: (p.get("data.poolSignIn") as string) ?? null, linkedServices: (p.get("connections.defaultSignIn") as string) ?? null },
+      run: { parallelCopies: (p.get("data.parallelCopies") as number) ?? null, schedules: (p.get("schedules.enabled") as "off" | "match") ?? null,
+        maskColumns: p.maskColumns(), targetRole: (p.get("target.role") as "dev" | "test" | "prod") ?? null },
+      assistant: { autonomy: (p.get("assistant.autonomy") as "observe" | "suggest" | "act_dev") ?? "suggest" },
+      llmScope: (p.get("llm.scope") as "needs_work" | "any") ?? null, llmContext: p.llmContext(),
       runOptions: p.runOptions(), dataFilters: p.dataFilters(estate.filterable), storageRoutes: (p.get("storage.routes") as "all" | "none" | undefined) ?? null,
       excluded: Object.fromEntries(estate.items.flatMap((i) => { const why = p.excluded(i, estate); return why ? [[i.id, why]] : []; })),
       signoff: (p.get("release.signoff") as ConsultPolicy["signoff"]) ?? null,
@@ -989,7 +1069,8 @@ export class DemoConsult {
     }
     if (p.stale && mode === "required") {
       const shown = p.changes.slice(0, 3).map((c) => `${c.description}: ${said(c.before)} → ${said(c.after)}`).join("; ");
-      throw new ApiRequestError("brief_stale", `The estate changed since brief version ${p.version} was approved (${shown}). Reconfirm it in Consult: submit the brief again and have it approved.`, 409);
+      const what = p.targetMoved && p.changes.length === 1 ? "The Fabric target changed" : "The estate changed";
+      throw new ApiRequestError("brief_stale", `${what} since brief version ${p.version} was approved (${shown}). Reconfirm it in Consult: submit the brief again and have it approved.`, 409);
     }
     const differences = this.differences(p, items, options, estate);
     let deviation: string | null = null;
@@ -1001,7 +1082,9 @@ export class DemoConsult {
         throw new ApiRequestError("deviation_unexplained", `The run differs from the approved brief (version ${p.version}): ${differences.slice(0, 3).map((d) => d.message).join(" ")} Confirm the plan with a reason, or change it to match the brief.`, 409);
       }
     }
-    return { brief: { version: p.version, hash: p.hash, differences, deviation }, signoff: (p.get("release.signoff") as string) ?? null,
+    // A production target signs off every run, whatever E4 says (approvals.rule_for).
+    const signoff = p.get("target.role") === "prod" ? "always" : (p.get("release.signoff") as string) ?? null;
+    return { brief: { version: p.version, hash: p.hash, differences, deviation }, signoff,
       names: { warehouse: (p.get("names.warehouse") as string) ?? null, lakehouse: (p.get("names.lakehouse") as string) ?? null } };
   }
 
@@ -1036,14 +1119,26 @@ export class DemoConsult {
     const pending = new Map(this.pending(st).map((p) => [p.id, p]));
     const missing = ids.find((i) => !pending.has(i));
     if (missing) throw new ApiRequestError("not_pending", `Proposal ${missing} is not waiting for a decision any more. Read the page again.`, 409);
-    const answered: string[] = [];
-    for (const id of ids) {
+    // Every one is checked before anything is written: a batch is decided whole, or not at all.
+    const planned: { id: string; q: RawQuestion; value: unknown }[] = [];
+    const extra: AnswerRecord[] = [];
+    for (const id of [...new Set(ids)]) {
       const p = pending.get(id)!;
       const q = this.question(p.question);
+      let value: unknown = null;
+      if (decision === "confirm") {
+        this.applicable(evaluateAll(facts, [...this.records, ...extra]), q);
+        value = check(q, p.value, facts);
+        extra.push({ type: "answer", question: q.id, value, source: "rules", seq: this.records.length + extra.length + 1, by: this.person, at: this.now(), catalogVersion: CAT.version });
+      }
+      planned.push({ id, q, value });
+    }
+    const answered: string[] = [];
+    for (const { id, q, value } of planned) {
+      const p = pending.get(id)!;
       const stored = this.proposals.find((x) => x.id === id)!;
       if (decision === "confirm") {
-        this.applicable(evaluateAll(facts, this.records), q);
-        this.write({ type: "answer", question: q.id, value: check(q, p.value, facts), source: p.source === "import" ? "import" : p.source === "ai" ? "ai" : "rules", note: p.reason, facts: evidenceOf(q, facts) });
+        this.write({ type: "answer", question: q.id, value, source: p.source === "import" ? "import" : p.source === "ai" ? "ai" : "rules", note: p.reason, facts: evidenceOf(q, facts) });
         answered.push(q.id);
         stored.decided = "confirmed";
         this.audit("consult.proposal_confirmed", { proposal: id, question: q.id, value: p.display, source: p.source }, { type: "question", id: q.id });
@@ -1054,6 +1149,31 @@ export class DemoConsult {
     }
     return { ...this.state(facts, mode), answered };
   }
+
+  /** MIGRATION_CONTEXT.md for the brief in force, as every Demo draft is sent it (consult/context_file.py). */
+  contextFile(facts: Facts): { text: string; ref: MigrationContextRef } | null {
+    const p = this.inForce(facts);
+    if (!p) return null;
+    const text = renderContext(p);
+    const hash = digest(text);
+    // What the file tells the model, without the line naming the brief's version: a brief approved again with the same
+    // decisions leaves every draft current (consult/context_file.py).
+    const decisionsHash = digest(text.split(NL).filter((_, i) => i !== 2).join(NL));
+    this.contexts.set(hash, text);
+    return { text, ref: { file: "MIGRATION_CONTEXT.md", hash, decisionsHash, briefVersion: p.version, briefHash: p.hash, minimal: p.llmContext() === "minimal" } };
+  }
+  contextView(facts: Facts): MigrationContextView {
+    const made = this.contextFile(facts);
+    if (!made) return { file: "MIGRATION_CONTEXT.md", hash: null, briefVersion: null, briefHash: null, minimal: null, text: null,
+      reason: "No migration brief is approved yet, so drafts are made without a migration context." };
+    return { ...made.ref, text: made.text, reason: null };
+  }
+  contextText(hash: string): string {
+    const text = this.contexts.get(hash);
+    if (text === undefined) throw new ApiRequestError("not_found", "There is no migration context with that hash in this project.", 404);
+    return text;
+  }
+  private contexts = new Map<string, string>();
   explain(facts: Facts, id: string): ConsultExplanation {
     const q = this.question(id);
     const s = evaluateAll(facts, this.records).questions.get(q.id)!;

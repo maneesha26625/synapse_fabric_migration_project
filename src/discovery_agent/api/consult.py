@@ -18,6 +18,8 @@
     POST /api/consult/explain            {question} -> what the question means for this estate
     GET  /api/consult/questionnaire      ?format=md | json: the questions, to answer offline
     POST /api/consult/questionnaire      {answers: {id: value}}: a questionnaire's answers, proposed for a person to confirm
+    GET  /api/consult/context            MIGRATION_CONTEXT.md for the brief in force: what every LLM draft is sent
+    GET  /api/consult/context/{hash}     one that was, by its hash (each draft records the one it was made with)
 
 What a project's consultation keeps, in its store (``state.store``):
 
@@ -27,7 +29,8 @@ What a project's consultation keeps, in its store (``state.store``):
 * ``consult/briefs/<n>`` (documents): each submitted version, never changed, with its content hash;
 * ``consult/brief_events`` (stream): each version's lifecycle: submitted, approved, rejected, superseded;
 * ``consult/deviations`` (stream): plans confirmed although they differ from the brief, with the reason;
-* ``llm/spend`` (stream): what each LLM call cost, which the brief's budget is measured against.
+* ``llm/spend`` (stream): what each LLM call cost, which the brief's budget is measured against;
+* blobs: every ``MIGRATION_CONTEXT.md`` a draft was sent, by its content hash.
 
 **Consultation mode** (``MIGRATION_CONSULTATION``): ``required`` (the default) refuses a run without an approved
 brief that still fits the estate, and a run that differs from the brief without a reason; ``advisory`` records both
@@ -36,8 +39,13 @@ and refuses neither.
 **The LLM gate.** Every call to the model asks ``llm_gate`` first. Consent (D1) and the budget (D2) are what the
 approved brief says, with two exceptions that only ever make the gate stricter, and so take effect at once: a
 person's latest answer that withdraws consent or lowers the budget. The consultation's own help (reading answers
-from free text, explaining a question) sends only what a person typed, the questions and counts about the estate,
-never a definition: a person's own "yes" to D1 is enough for it, before any brief is approved.
+from free text, explaining a question) sends only what a person typed, the questions and counts about the estate:
+never a definition, and never a name from the estate. Before any brief is approved, a person's own "yes" to D1 is
+enough for that help; once one is, the approved brief decides, as it does for everything else.
+
+**Who writes.** Answers, skips, withdrawals, resolutions, submissions, approvals, confirmed proposals and deviations
+are a person's: anything else acting (the accelerator, the agent) is refused (``person_only``). The agent may only
+propose answers, which wait for a person like any other proposal.
 """
 
 from __future__ import annotations
@@ -67,13 +75,14 @@ from discovery_agent.api.migration import (
 from discovery_agent.api.service import ApiError
 from discovery_agent.consult import brief as briefs
 from discovery_agent.consult import catalog as catalogs
+from discovery_agent.consult import context_file as context_files
 from discovery_agent.consult import engine
 from discovery_agent.consult.catalog import Catalog, Question
 from discovery_agent.consult.facts import ENVIRONMENT, ESTATE, FACTS, fingerprint
-from discovery_agent.consult.policy import Policy, change_column
+from discovery_agent.consult.policy import Policy, change_column, major
 from discovery_agent.consult.settings import SETTINGS
 from discovery_agent.llm import claude_cli
-from discovery_agent.migration import capabilities, datafilter, fabric_git, storage_remap
+from discovery_agent.migration import capabilities, datafilter, fabric_git, storage_remap, warehouse_ddl
 from discovery_agent.migration.common import DATASET, NOTEBOOK, PIPELINE, SCRIPT, SPARKJOB
 from discovery_agent.migration.preflight import code_text, content_findings
 from discovery_agent.migration.runner import MIGRATABLE, warehouse_name_for
@@ -95,6 +104,8 @@ _FOLDER_KINDS = {NOTEBOOK: P0Artifact.NOTEBOOK, PIPELINE: P0Artifact.PIPELINE, S
 TOP_FOLDER = "folder:(top level)"
 #: SQL objects that belong to a schema, for the scope groups.
 _SCHEMA_TYPES = ("Table", "View", "Stored Procedure", "Function", "External Table")
+#: The SQL code a brief can bring across or leave for later (A3).
+_MODULE_TYPES = ("View", "Stored Procedure", "Function")
 #: How long the Fabric workspace's Git connection is taken as read.
 GIT_CHECK_SECONDS = 60.0
 #: Estates the catalog is checked against when it loads: accepting every recommendation must give a brief that can
@@ -103,11 +114,13 @@ SELF_CHECK_FACTS = (
     {"objects.total": 3, "pool.present": False, "waves.count": 1, "discovery.complete": True},
     {"objects.total": 40, "waves.count": 3, "pool.present": True, "pool.name": "sqlpool1", "pool.warehouseName": "sqlpool1",
      "pool.collation": "SQL_Latin1_General_CP1_CI_AS", "pool.caseInsensitive": True, "tables.count": 10,
-     "tables.withDateColumn": 5, "tables.withChangeColumn": 3, "tables.changeWithoutKeys": 0, "storage.locations": 2,
-     "security.principals": 4, "security.sqlUsers": 1, "security.sqlUserNames": ["app_user"],
-     "code.multiStatementFunctions": 1, "code.needsRewrite": 2, "code.serverlessObjects": 1, "linkedServices.count": 3,
-     "linkedServices.keyVault": 1, "manual.setupCount": 2, "scope.groups": ["schema:dbo"], "discovery.complete": True,
-     "target.gitConnected": True, "llm.available": True},
+     "tables.withDateColumn": 5, "tables.withChangeColumn": 3, "tables.changeWithoutKeys": 1, "tables.lossyTypes": 1,
+     "storage.locations": 2, "security.principals": 4, "security.sqlUsers": 1, "security.sqlUserNames": ["app_user"],
+     "code.sqlModules": 6, "code.unconvertibleSql": 1, "code.multiStatementFunctions": 1, "code.needsRewrite": 2,
+     "code.unsupportedPipelines": 1, "code.dotnetNotebooks": 1, "code.serverlessObjects": 1, "pipelines.count": 3,
+     "notebooks.count": 2, "linkedServices.count": 3, "linkedServices.keyVault": 1, "triggers.schedule": 1,
+     "manual.setupCount": 2, "scope.groups": ["schema:dbo"], "discovery.complete": True, "target.gitConnected": True,
+     "llm.available": True},
 )
 
 
@@ -145,6 +158,7 @@ class _Memory:
         self._lock = threading.RLock()
         self._docs: Dict[str, Any] = {}
         self._streams: Dict[str, List[Dict[str, Any]]] = {}
+        self._blobs: Dict[str, bytes] = {}
 
     def get(self, name: str, default: Any = None) -> Any:
         with self._lock:
@@ -172,6 +186,16 @@ class _Memory:
         if newest_first:
             found.reverse()
         return found[:limit] if limit is not None else found
+
+    def put_blob(self, data: bytes) -> str:
+        digest = hashlib.sha256(data).hexdigest()
+        with self._lock:
+            self._blobs[digest] = bytes(data)
+        return digest
+
+    def blob(self, digest: str) -> Optional[bytes]:
+        with self._lock:
+            return self._blobs.get(digest)
 
 
 # -- the facts ------------------------------------------------------------------------------------------
@@ -225,6 +249,13 @@ def estate_facts(job: Any, pool: Optional[str]) -> Tuple[Dict[str, Any], Estate]
 
     facts["objects.total"] = len(items)
     facts["objects.byType"] = dict(summary.get("byType") or {})
+    modules = [str(i.get("id")) for i in items if i.get("type") in _MODULE_TYPES]
+    facts["code.sqlModules"] = len(modules)
+    for oid in modules:
+        estate.flags.setdefault(oid, []).append("sqlModule")
+    kinds_of = [MIGRATABLE.get(str(i.get("type") or "")) for i in items]
+    facts["pipelines.count"] = sum(1 for k in kinds_of if k == PIPELINE)
+    facts["notebooks.count"] = sum(1 for k in kinds_of if k == NOTEBOOK)
     facts["objects.byClass"] = dict(summary.get("byClassification") or {})
     graph = getattr(job, "graph", None) or {}
     facts["waves.count"] = len(graph.get("waves") or []) or len({n.get("wave") for n in graph.get("nodes") or [] if n.get("wave")})
@@ -256,6 +287,14 @@ def estate_facts(job: Any, pool: Optional[str]) -> Tuple[Dict[str, Any], Estate]
     facts["tables.withKeys"] = keyed
     facts["tables.withoutKeys"] = len(internal) - keyed
     facts["tables.changeWithoutKeys"] = sum(1 for t in changing if not t.get("keyColumns"))
+    lossy = [t for t in internal if any(warehouse_ddl.loses(c) for c in t.columns)]
+    facts["tables.lossyTypes"] = len(lossy)
+    by_key = {(str(i.get("schema") or "").lower(), str(i.get("name") or "").split(".")[-1].lower()): str(i.get("id")) for i in items
+              if i.get("type") == "Table"}
+    for table in lossy:
+        oid = by_key.get((table.key.schema.lower(), table.key.name.lower()))
+        if oid:
+            estate.flags.setdefault(oid, []).append("lossy")
 
     # The code: what the rules cannot convert, what reads storage, what ran on the serverless pool.
     try:
@@ -273,13 +312,16 @@ def estate_facts(job: Any, pool: Optional[str]) -> Tuple[Dict[str, Any], Estate]
         rebuild = by_code.get("NEEDS_REWRITE", set())
         multi = {s.id for s in every if rewritable(s)}
         serverless = by_code.get("SERVERLESS_SQL", set())
+        unconvertible = by_code.get("SYNAPSE_TSQL", set())
         facts["code.multiStatementFunctions"] = len(multi)
+        facts["code.unconvertibleSql"] = len(unconvertible)
         facts["code.dotnetNotebooks"] = len(dotnet)
         facts["code.unsupportedPipelines"] = sum(1 for oid in rebuild if kinds.get(oid) == PIPELINE)
         facts["code.needsRewrite"] = len(rebuild)
         facts["code.serverlessObjects"] = len(serverless)
         facts["storage.locations"] = len(storage_remap.locations([code_text(s) for s in sources]))
-        for name, ids in (("serverless", serverless), ("multiStatement", multi), ("rebuild", rebuild)):
+        for name, ids in (("serverless", serverless), ("multiStatement", multi), ("rebuild", rebuild),
+                          ("unconvertible", unconvertible)):
             for oid in ids:
                 estate.flags.setdefault(oid, []).append(name)
     except Exception as exc:  # noqa: BLE001 - unknown, as above; the API's log says why
@@ -356,32 +398,49 @@ def estate_facts(job: Any, pool: Optional[str]) -> Tuple[Dict[str, Any], Estate]
 
 _YEARS = re.compile(r"\b(?:last|past|previous)\s+(\d{1,2})\s+years?\b", re.IGNORECASE)
 _SINCE = re.compile(r"\b(?:since|from|after)\s+(\d{4}-\d{2}-\d{2}|\d{4})\b", re.IGNORECASE)
+_CYCLES = re.compile(r"\b(?:parallel|side[- ]by[- ]side)\D{0,30}?(\d{1,2}) (?:cycles?|runs?)\b", re.IGNORECASE)
+_COPIES = re.compile(r"\b(\d{1,2}) (?:tables? )?(?:copies|loads|tables) (?:at a time|at once|in parallel)\b", re.IGNORECASE)
 _BUDGET = re.compile(r"(?:budget|spend|up to|at most|max(?:imum)?)\D{0,20}\$\s?(\d{1,5})|\$\s?(\d{1,5})\s*(?:budget|for ai|for the ai|on ai)",
                      re.IGNORECASE)
 #: (question, value, pattern): an answer the text gives, plainly. The first match for a question wins.
 _RULES: Tuple[Tuple[str, Any, re.Pattern], ...] = tuple((q, v, re.compile(p, re.IGNORECASE)) for q, v, p in (
-    ("A1", ["structure"], r"\b(structure|schema|tables?) only\b|\bno data\b|\bwithout (the )?data\b"),
-    ("A1", ["structure", "data"], r"\b(no|without|skip) (the )?(pipelines|orchestration|notebooks)\b"),
-    ("A5", "update", r"\b(update|overwrite) (what is |objects |items )?(already )?(there|in fabric|existing)\b|\bupdate in place\b"),
-    ("A5", "skip", r"\b(never|don'?t|do not) (overwrite|update)\b"),
+    ("A0", ["structure"], r"\b(structure|schema|tables?) only\b|\bno data\b|\bwithout (the )?data\b"),
+    ("A0", ["structure", "data"], r"\b(no|without|skip) (the )?(pipelines|orchestration|notebooks)\b"),
+    ("A1", "none", r"\b(leave|keep) (the )?(storage )?paths( as they are)?\b|\bno shortcuts\b"),
+    ("A1", "all", r"\b(use|through|via) (onelake )?shortcuts\b"),
+    ("A3", "leave_out", r"\b(tables|data) first\b|\b(views|procedures|procs) (later|in a later run)\b"),
+    ("A6", "signoff_each_wave", r"\b(sign[- ]off|approve) (each|every) wave\b|\bwave by wave\b"),
+    ("A6", "one_run", r"\b(one|a single|single) (run|cutover|go)\b|\bbig[- ]bang\b"),
+    ("A7", "update", r"\b(update|overwrite) (what is |objects |items )?(already )?(there|in fabric|existing)\b|\bupdate in place\b"),
+    ("A7", "skip", r"\b(never|don'?t|do not) (overwrite|update)\b"),
     ("B1", "case_sensitive", r"\bcase[- ]sensitive\b(?! *(?:is|was) not)"),
     ("B1", "case_insensitive", r"\bcase[- ]insensitive\b"),
-    ("C2", True, r"\b(keep (it |them |the tables )?in sync|incremental(ly)?|sync (it|them|the tables))\b"),
-    ("C2", False, r"\b(one[- ]off|one[- ]time|single) (load|copy|migration)\b"),
-    ("C4", "replace", r"\b(replace|truncate|reload) (the )?(rows|data|tables)\b"),
-    ("C5", "create", r"\b(only create|create only|don'?t run|do not run) (the )?(load )?pipelines\b"),
+    ("C1", True, r"\b(keep (it |them |the tables )?in sync|incremental(ly)?|sync (it|them|the tables))\b"),
+    ("C1", False, r"\b(one[- ]off|one[- ]time|single) (load|copy|migration)\b|\bfull reload\b"),
+    ("C4", "reload", r"\b(propagate|carry over|remove) (the )?delet\w*\b|\bdeletes? (must|should) (go|propagate)\b"),
+    ("C6", "replace", r"\b(replace|truncate|reload) (the )?(rows|data|tables)\b"),
+    ("C7", "create", r"\b(only create|create only|don'?t run|do not run) (the )?(load )?pipelines\b"),
     ("D1", False, r"\b(no (ai|llm|claude|gen ?ai)|don'?t send|do not send|never send|not (allowed|permitted) to send)\b"),
     ("D1", True, r"\b(ai|llm|claude) (is )?(fine|ok|okay|allowed|welcome)\b|\buse (ai|an llm|claude)\b"),
-    ("E1", False, r"\b(skip|no|without) (the )?(security|permissions|roles)\b"),
-    ("G1", False, r"\b(no|without|skip) (fabric )?git\b|\bdon'?t commit\b"),
-    ("G1", True, r"\bcommit (it |each run |every run )?to (fabric )?git\b"),
-    ("G3", "always", r"\b(sign[- ]off|approv\w*) (for |on |before )?(every|each|all) runs?\b|\balways (sign[- ]off|approve)\b"
+    ("D7", "scala", r"\b(rewrite|convert)\w* (\w+ )?(in|to) scala\b"),
+    ("D7", "pyspark", r"\b(rewrite|convert)\w* (\w+ )?(in|to) (pyspark|python)\b"),
+    ("E0", False, r"\b(no|without|skip) (fabric )?git\b|\bdon'?t commit\b"),
+    ("E0", True, r"\bcommit (it |each run |every run )?to (fabric )?git\b"),
+    ("E1", "prod", r"\b(target|fabric) (workspace )?is (the )?prod(uction)?\b|\bstraight (in)?to prod(uction)?\b"),
+    ("E1", "test", r"\b(target|fabric) (workspace )?is (the )?test\b"),
+    ("E2", "service_principal", r"\b(as|with|under) a service principal\b|\bservice principal (owns|should own)\b"),
+    ("E4", "always", r"\b(sign[- ]off|approv\w*) (for |on |before )?(every|each|all) runs?\b|\balways (sign[- ]off|approve)\b"
                      r"|\b(every|each) run (must|should|has to|needs to) be (signed[- ]off|approved)\b"),
-    ("G3", "never", r"\bno (sign[- ]off|approvals?)\b"),
-    ("G5", "dev_test_prod", r"\b(test and prod|dev,? test,? (and )?prod)\b"),
-    ("G5", "dev_test", r"\bdev and test\b"),
+    ("E4", "never", r"\bno (sign[- ]off|approvals?)\b"),
+    ("E5", "match", r"\b(switch|turn) (the )?schedules on\b|\bschedules (switched |turned )?on\b"),
+    ("E7", "dev_test_prod", r"\b(test and prod|dev,? test,? (and )?prod)\b"),
+    ("E7", "dev_test", r"\bdev and test\b"),
+    ("G1M", "mask", r"\bmask (the |those |these )?(pii|personal|sensitive)\b"),
+    ("G2", False, r"\b(skip|no|without) (the )?(security|permissions|roles)\b"),
     ("H1", "run", r"\b(run (the )?(pipelines|notebooks) (in|during|to) valid\w*|full validation)\b"),
     ("H1", "compare", r"\b(compare only|just compare)\b"),
+    ("H2", True, r"\b(parallel run|side[- ]by[- ]side|run both)\b"),
+    ("H4", "yes", r"\b(write|writes|writing) to (a )?prod(uction)?\b"),
 ))
 
 
@@ -402,15 +461,22 @@ def rule_proposals(text: str, today: Optional[_dt.date] = None) -> List[Dict[str
     years, since = _YEARS.search(text), _SINCE.search(text)
     if years:
         start = today.replace(year=today.year - int(years.group(1)), day=min(today.day, 28))
-        add("C1", "since", years)
-        add("C1D", start.isoformat(), years)
+        add("A5", "since", years)
+        add("A5D", start.isoformat(), years)
     elif since:
         raw = since.group(1)
-        add("C1", "since", since)
-        add("C1D", raw if len(raw) == 10 else f"{raw}-01-01", since)
+        add("A5", "since", since)
+        add("A5D", raw if len(raw) == 10 else f"{raw}-01-01", since)
     budget = _BUDGET.search(text)
     if budget:
         add("D2", int(budget.group(1) or budget.group(2)), budget)
+    cycles = _CYCLES.search(text)
+    if cycles:
+        add("H2", True, cycles)
+        add("H2A", int(cycles.group(1)), cycles)
+    copies = _COPIES.search(text)
+    if copies:
+        add("C8", int(copies.group(1)), copies)
     return list(out.values())
 
 
@@ -443,6 +509,8 @@ class ConsultService:
         self._facts_lock = threading.Lock()
         self._estate: Optional[Tuple[Tuple[Any, ...], Dict[str, Any], Estate]] = None
         self._git: Tuple[Optional[str], float, Optional[bool]] = (None, 0.0, None)
+        #: The migration contexts already kept in this project's store, by hash.
+        self._contexts: Set[str] = set()
         self.catalog = load_catalog()
 
     # -- the project ----------------------------------------------------------------------------------------
@@ -453,6 +521,7 @@ class ConsultService:
             self._records = records if records is not None else _Memory()
             self._estate = None
             self._git = (None, 0.0, None)
+            self._contexts = set()
 
     def busy(self) -> Optional[str]:
         return None
@@ -468,6 +537,7 @@ class ConsultService:
                 state = {}
         connected = state.get("status") == "connected"
         out = {"target.connected": connected, "target.workspace": state.get("workspaceName") if connected else None,
+               "target.workspaceId": state.get("workspaceId") if connected else None,
                "target.capacity": state.get("capacityAssigned") if connected else None,
                "target.gitConnected": self._git_connected(state.get("workspaceId")) if connected else None,
                "llm.available": claude_cli.switched_on() and claude_cli.executable() is not None}
@@ -506,7 +576,9 @@ class ConsultService:
     # -- the record ------------------------------------------------------------------------------------------
 
     def _answers(self) -> List[Dict[str, Any]]:
-        return self._records.records(ANSWERS)
+        """Every answer, skip, withdrawal and resolution, as this catalog reads them: one made against an earlier
+        version is under the question it answers now (``Catalog.translate``). The record itself is never changed."""
+        return [dict(self.catalog.translate(r)) for r in self._records.records(ANSWERS)]
 
     def _events(self) -> List[Dict[str, Any]]:
         return self._records.records(EVENTS)
@@ -540,6 +612,12 @@ class ConsultService:
     def _applicable(self, state: engine.State, q: Question) -> None:
         if not state.questions[q.id].applies:
             raise ApiError(409, "not_applicable", f"{q.id} does not apply to this estate as it is answered now.")
+
+    @staticmethod
+    def _person(what: str) -> None:
+        """Refuse a write that is a person's to make, when anything else (the accelerator, the agent) asks for it."""
+        if context.actor().kind != context.PERSON:
+            raise ApiError(403, "person_only", f"Only a person can {what}.")
 
     # -- reading ----------------------------------------------------------------------------------------------
 
@@ -598,7 +676,7 @@ class ConsultService:
         except ValueError as exc:
             raise ApiError(400, "invalid_answer", f"{q.id}: {exc}") from None
         if body.get("seq") not in (None, ""):
-            seen = int(body["seq"]) if str(body["seq"]).isdigit() else -1
+            seen = _whole(body["seq"], -1)
             moved = [r for r in records if r["seq"] > seen and r.get("question") == q.id]
             if moved:
                 raise ApiError(409, "answer_changed", f"{q.id} was answered on another page since this one read it. Read it again.")
@@ -606,6 +684,7 @@ class ConsultService:
                   "note": _text(body.get("note"), MAX_NOTE) or None, "facts": engine.evidence_of(q, facts), **self._base(facts)}
         if body.get("preview"):
             return {"question": q.id, "value": value, "preview": engine.preview(self.catalog, facts, records, record)}
+        self._person("answer a consultation question")
         self._write([record])
         self._audit("consult.answered", target={"type": "question", "id": q.id}, details={
             "question": q.id, "value": briefs.display(q, value), "source": engine.PERSON, "note": record["note"],
@@ -613,6 +692,7 @@ class ConsultService:
         return self.state()
 
     def skip(self, body: dict) -> dict:
+        self._person("skip a consultation question")
         facts, _ = self._facts()
         q = self._question(body.get("question"))
         self._applicable(self._state(facts), q)
@@ -621,6 +701,7 @@ class ConsultService:
         return self.state()
 
     def withdraw(self, body: dict) -> dict:
+        self._person("withdraw a consultation answer")
         facts, _ = self._facts()
         q = self._question(body.get("question"))
         answers, skips, _ = engine.fold(self._answers())
@@ -631,7 +712,9 @@ class ConsultService:
         return self.state()
 
     def accept(self, body: dict) -> dict:
-        """Accept the recommendations, as a person's answers (*Accept all recommendations*, or one section)."""
+        """Accept the recommendations, as a person's answers (*Accept all recommendations*, one section, or the
+        questions named)."""
+        self._person("accept recommendations as answers")
         facts, _ = self._facts()
         section = str(body.get("section") or "") or None
         if section is not None and section not in dict(self.catalog.sections):
@@ -657,6 +740,7 @@ class ConsultService:
         return {**self.state(), "accepted": accepted}
 
     def resolve(self, body: dict) -> dict:
+        self._person("resolve a contradiction")
         facts, _ = self._facts()
         conflict = self.catalog.conflict(str(body.get("conflict") or ""))
         if conflict is None:
@@ -733,12 +817,13 @@ class ConsultService:
                 facts, _ = self._facts()
             except ApiError:
                 facts = {}
-        return Policy(doc, facts, approval)
+        return Policy(doc, facts, approval, catalog_version=self.catalog.version)
 
-    @staticmethod
-    def _changes(before: Mapping[str, Any], after: Mapping[str, Any]) -> List[Dict[str, Any]]:
-        """The decisions that differ between two brief contents."""
-        old = {d["question"]: d for d in before.get("decisions") or []}
+    def _changes(self, before: Mapping[str, Any], after: Mapping[str, Any]) -> List[Dict[str, Any]]:
+        """The decisions that differ between two brief contents. A brief made against an earlier catalog is read under
+        this one's question ids, so a renamed question is not a decision removed and another added."""
+        names = self.catalog.renamed.get(str(before.get("catalogVersion") or ""), {})
+        old = {names.get(d["question"], d["question"]): d for d in before.get("decisions") or []}
         new = {d["question"]: d for d in after.get("decisions") or []}
         out = []
         for qid in list(old) + [q for q in new if q not in old]:
@@ -775,6 +860,7 @@ class ConsultService:
                 "blockers": st.blockers, "versions": self._versions(), "summary": self._brief_summary(facts, st)}
 
     def submit(self, body: dict) -> dict:
+        self._person("submit the migration brief")
         facts, _ = self._facts()
         st = self._state(facts)
         if not st.submittable:
@@ -831,6 +917,10 @@ class ConsultService:
                             details={"version": number, "hash": doc["hash"], "comment": comment})
                 return self.brief()
             content = doc.get("content") or {}
+            if major(content.get("catalogVersion")) != major(self.catalog.version):
+                raise ApiError(409, "brief_stale", f"The questions changed since version {number} was submitted (catalog "
+                               f"{content.get('catalogVersion') or '?'} to {self.catalog.version}). Review them in Consult, "
+                               "submit the brief again, then approve that version.")
             if content.get("factsFingerprint") != fingerprint(facts):
                 raise ApiError(409, "brief_stale", f"The estate changed since version {number} was submitted. Submit the brief "
                                                    "again, from the estate as it is now, then approve that version.")
@@ -843,12 +933,16 @@ class ConsultService:
             if previous is not None:
                 self._records.append(EVENTS, {"event": briefs.SUPERSEDED, "version": previous, "by": who.to_dict(), "at": now(),
                                               "supersededBy": number})
+            # The Fabric workspace that is the target as the person approves: what the brief says about the target (E1)
+            # is about this one, and the brief stops fitting once another is connected (``Policy.target_moved``).
+            pinned = ({"workspaceId": facts["target.workspaceId"], "workspaceName": facts.get("target.workspace")}
+                      if facts.get("target.workspaceId") else None)
             self._records.append(EVENTS, {"event": briefs.APPROVED, "version": number, "hash": doc["hash"], "by": who.to_dict(),
                                           "at": now(), "comment": comment, "selfApproved": self_approved,
-                                          "separateApprover": loosened})
+                                          "separateApprover": loosened, "target": pinned})
         self._audit("brief.approved", target={"type": "brief", "id": str(number)}, reason=comment, details={
             "version": number, "hash": doc["hash"], "comment": comment, "selfApproved": self_approved,
-            "separateApprover": loosened, "superseded": previous})
+            "separateApprover": loosened, "superseded": previous, "targetWorkspace": (pinned or {}).get("workspaceName")})
         return self.brief()
 
     def export(self, query: Mapping[str, str]) -> Tuple[bytes, str, str]:
@@ -862,7 +956,7 @@ class ConsultService:
             numbers = self._numbers()
             number = policy.version if policy else (numbers[-1] if numbers else None)
         else:
-            number = int(raw) if str(raw).isdigit() else None
+            number = _whole(raw, None)
         doc = self._version(number) if number is not None else None
         if doc is None:
             raise ApiError(404, "not_found", "There is no such brief version. Submit the brief first.")
@@ -899,6 +993,11 @@ class ConsultService:
             "excluded": self.excluded(policy, estate), "signoff": policy.signoff(),
             "names": dict(zip(("warehouse", "lakehouse"), policy.names())), "validate": policy.validate_runtime(),
             "signIn": policy.sign_in(), "sqlUserMap": policy.sql_user_map(),
+            # Taken by the run from the brief itself, as the names are: shown in Plan, never changed there.
+            "run": {"parallelCopies": policy.parallel_copies(), "schedules": policy.schedules(),
+                    "maskColumns": policy.mask_columns(), "targetRole": policy.target_role()},
+            "assistant": {"autonomy": policy.autonomy()},
+            "llmScope": policy.llm_scope(), "llmContext": policy.llm_context(),
         })
         return out
 
@@ -922,10 +1021,13 @@ class ConsultService:
                 "explained": bool(differences) and self._covering(policy, differences) is not None}
 
     def run_gate(self, entries: List[Mapping[str, Any]], options: Mapping[str, Any], job: Any, pool: Optional[str],
-                 reason: Optional[str] = None) -> Tuple[Dict[str, Any], Optional[Policy]]:
+                 reason: Optional[str] = None) -> Tuple[Dict[str, Any], Optional[Policy], Optional[str]]:
         """What a run starts under: the brief in force, and where the run differs from it, explained. Under a required
         consultation, refuses a run without an approved brief, with one that no longer fits the estate, and one that
-        differs from it with no reason given (``reason``, or one recorded when Plan was confirmed)."""
+        differs from it with no reason given (``reason``, or one recorded when Plan was confirmed).
+
+        Returns (what the run pins, the policy, a reason still to record): a reason given with the request is recorded
+        (``record_deviation``) by the caller once the run exists, so a run refused later leaves no deviation behind."""
         facts, estate = self.facts_of(job, pool)
         policy = self.in_force(facts)
         required = mode() == REQUIRED
@@ -933,24 +1035,47 @@ class ConsultService:
             if required:
                 raise ApiError(409, "brief_required", "No migration brief is approved yet. Answer the questions in Consult, "
                                                       "submit the brief and have it approved, then start the run.")
-            return {"mode": mode(), "version": None, "differences": []}, None
+            return {"mode": mode(), "version": None, "differences": []}, None, None
         if policy.stale and required:
-            shown = "; ".join(f"{c['description']}: {_shown(c['before'])} → {_shown(c['after'])}" for c in policy.changes[:3])
-            raise ApiError(409, "brief_stale", f"The estate changed since brief version {policy.version} was approved ({shown}). "
-                                               "Reconfirm it in Consult: submit the brief again and have it approved.")
+            raise ApiError(409, "brief_stale", self.stale_message(policy))
         differences = self.differences(policy, entries, options, estate)
-        deviation = None
+        deviation, pending = None, None
         if differences:
             deviation = self._covering(policy, differences)
-            if deviation is None and _text(reason, MAX_REASON):
-                deviation = self.record_deviation(policy, differences, _text(reason, MAX_REASON))
-            if deviation is None and required:
+            if deviation is None:
+                pending = _text(reason, MAX_REASON) or None
+            if deviation is None and pending is None and required:
                 shown = " ".join(d["message"] for d in differences[:3])
                 raise ApiError(409, "deviation_unexplained", f"The run differs from the approved brief (version {policy.version}): "
                                f"{shown} Confirm the plan with a reason, or change it to match the brief.")
+        if pending:
+            deviation = {"seq": None, "reason": pending, "by": context.actor().to_dict(), "at": now()}
         return {"mode": mode(), "version": policy.version, "hash": policy.hash, "approvedBy": policy.approved_by,
                 "approvedAt": policy.approved_at, "stale": policy.stale, "differences": differences,
-                "deviation": {k: deviation.get(k) for k in ("seq", "reason", "by", "at")} if deviation else None}, policy
+                "deviation": {k: deviation.get(k) for k in ("seq", "reason", "by", "at")} if deviation else None}, policy, pending
+
+    @staticmethod
+    def stale_message(policy: Policy) -> str:
+        shown = "; ".join(f"{c['description']}: {_shown(c['before'])} → {_shown(c['after'])}" for c in policy.changes[:3])
+        what = "The Fabric target changed" if policy.target_moved and len(policy.changes) == 1 else "The estate changed"
+        return (f"{what} since brief version {policy.version} was approved ({shown}). "
+                "Reconfirm it in Consult: submit the brief again and have it approved.")
+
+    def still_holds(self, pinned: Optional[Mapping[str, Any]]) -> Optional[str]:
+        """Why a run asked for under the brief it pinned may not start now, or None: under a required consultation, the
+        brief in force must still be the one the run was checked against, and still fit the estate. (A sign-off can come
+        long after the request: a brief approved, rejected or made stale in between would otherwise go unnoticed.)"""
+        if mode() != REQUIRED:
+            return None
+        policy = self.in_force()
+        if policy is None:
+            return "No migration brief is in force any more. Have one approved in Consult, then start the run again."
+        if policy.stale:
+            return self.stale_message(policy)
+        if not pinned or pinned.get("hash") != policy.hash:
+            return (f"The migration brief changed since this run was asked for: version {policy.version} is in force now. "
+                    "Decline this run and start it again, so it is checked against the brief in force.")
+        return None
 
     @staticmethod
     def _key(differences: Iterable[Mapping[str, Any]]) -> Set[str]:
@@ -975,6 +1100,7 @@ class ConsultService:
 
     def deviation(self, body: dict) -> dict:
         """A person confirms a plan that differs from the brief, and says why: what lets a required run start."""
+        self._person("confirm a plan that differs from the brief")
         plan = body.get("items")
         if not isinstance(plan, list) or not all(isinstance(p, dict) for p in plan):
             raise ApiError(400, "invalid_plan", "The migration plan is not in a valid format.")
@@ -992,6 +1118,39 @@ class ConsultService:
             raise ApiError(400, "reason_required", "Say why the plan differs from the approved brief.")
         record = self.record_deviation(policy, differences, reason)
         return {"differences": differences, "recorded": True, "seq": record.get("seq")}
+
+    # -- the migration context, sent with every LLM draft ---------------------------------------------------------
+
+    def context_file(self, policy: Optional[Policy] = None) -> Optional[context_files.ContextFile]:
+        """MIGRATION_CONTEXT.md for the brief in force (or ``policy``), kept in the project's store by its hash so the
+        one any draft was made with can be read back; None when no brief is approved."""
+        policy = policy if policy is not None else self.in_force()
+        if policy is None:
+            return None
+        made = context_files.render(policy)
+        if made.hash not in self._contexts:
+            try:
+                self._records.put_blob(made.text.encode("utf-8"))
+                self._contexts.add(made.hash)
+            except Exception as exc:  # noqa: BLE001 - the draft still goes with it; only reading it back later is lost
+                _log.warning("Could not keep the migration context %s: %s: %s", made.hash[:12], type(exc).__name__, exc)
+        return made
+
+    def context_view(self) -> dict:
+        """The migration context every LLM draft is sent now, as the page shows it."""
+        made = self.context_file()
+        if made is None:
+            return {"file": context_files.FILE_NAME, "hash": None, "decisionsHash": None, "briefVersion": None, "briefHash": None,
+                    "minimal": None, "text": None,
+                    "reason": "No migration brief is approved yet, so drafts are made without a migration context."}
+        return {**made.reference(), "text": made.text, "reason": None}
+
+    def context_export(self, digest: str) -> Tuple[bytes, str, str]:
+        """(body, media type, file name) of the migration context with this hash: the one a draft was made with."""
+        data = self._records.blob(digest) if re.fullmatch(r"[0-9a-f]{64}", digest or "") else None
+        if data is None:
+            raise ApiError(404, "not_found", "There is no migration context with that hash in this project.")
+        return data, "text/markdown; charset=utf-8", f"MIGRATION_CONTEXT-{digest[:12]}.md"
 
     # -- the LLM gate ------------------------------------------------------------------------------------------
 
@@ -1014,8 +1173,10 @@ class ConsultService:
         live_budget = answers.get("D2", {}).get("value") if "D2" in answers else None
         policy = self.in_force({})
         approved, budget = policy.llm() if policy is not None else (None, None)
-        if purpose == "consult" and live is not None:
-            approved = live  # the consultation's own help follows a person's latest answer to D1
+        if purpose == "consult" and live is not None and policy is None:
+            # Before any brief is approved, the consultation's own help follows a person's latest answer to D1. Once one
+            # is, the brief decides: a "yes" given since loosens nothing until a brief with it is approved.
+            approved = live
         if live_budget is not None and (budget is None or live_budget < budget):
             budget = float(live_budget)  # a lower budget holds at once; a higher one once a brief with it is approved
         if budget is None and approved:
@@ -1028,6 +1189,10 @@ class ConsultService:
         if live is False:
             return {**out, "allowed": False, "code": "llm_no_consent",
                     "reason": "D1 says object definitions may not be sent to Claude. Change the answer in Consult to use AI."}
+        if purpose == "assistant" and policy is None:
+            # The assistant's task loop reads the estate and proposes changes: only ever with an approved brief's consent.
+            return {**out, "allowed": False, "code": "llm_no_consent",
+                    "reason": "The assistant uses the model only with consent from an approved brief (D1)."}
         spent_all = None if budget is None or spent < budget else {
             **out, "allowed": False, "code": "llm_budget_reached",
             "reason": f"This project has spent ${spent:,.2f} of its ${budget:,.2f} AI budget (D2). Raise the budget in "
@@ -1071,6 +1236,16 @@ class ConsultService:
     def _summary_for_model(self, facts: Mapping[str, Any]) -> Dict[str, Any]:
         """What the model is told about the estate: counts and yes/no only, never a name or a definition."""
         return {n: v for n, v in facts.items() if n in FACTS and isinstance(v, (bool, int, float)) and not FACTS[n].informational}
+
+    @staticmethod
+    def _recommended_for_model(q: Question, s: engine.QuestionState) -> Any:
+        """The recommendation, as the model may see it: only a value that is one of the catalog's own (an option, yes or
+        no, a number). Never its reason, which quotes facts such as the pool's name, and never a value made of names
+        (a Warehouse name, the schemas in scope, a principal map)."""
+        value = (s.recommendation or {}).get("value")
+        if q.type in ("choice", "boolean", "number") or (q.type == "multi" and not q.options_from):
+            return value
+        return None
 
     def _questions_for_model(self, st: engine.State) -> List[Dict[str, Any]]:
         out = []
@@ -1138,7 +1313,7 @@ class ConsultService:
         """Proposals no person has decided on yet: the latest for each question that applies."""
         decided = set()
         latest: Dict[str, Dict[str, Any]] = {}
-        for r in self._records.records(PROPOSALS):
+        for r in (dict(self.catalog.translate(x)) for x in self._records.records(PROPOSALS)):
             if r.get("type") == "decision":
                 decided.add(r.get("id"))
             elif r.get("type") == "proposal":
@@ -1195,28 +1370,41 @@ class ConsultService:
         ids = body.get("ids")
         if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
             raise ApiError(400, "invalid_request", "Send the proposals' ids.")
+        self._person("decide on proposed answers")
         facts, _ = self._facts()
-        st = self._state(facts)
-        pending = {p["id"]: p for p in self._pending(st)}
-        missing = [i for i in ids if i not in pending]
-        if missing:
-            raise ApiError(409, "not_pending", f"Proposal {missing[0]} is not waiting for a decision any more. Read the page again.")
         answered = []
         with self._lock:
-            for pid in ids:
+            pending = {p["id"]: p for p in self._pending(self._state(facts))}
+            missing = [i for i in ids if i not in pending]
+            if missing:
+                raise ApiError(409, "not_pending", f"Proposal {missing[0]} is not waiting for a decision any more. Read the page again.")
+            # Every one is checked before anything is written, in order (confirming one can open or close the next):
+            # a batch is decided whole, or not at all.
+            planned: List[Tuple[str, Dict[str, Any], Question, Optional[Dict[str, Any]]]] = []
+            extra: List[Dict[str, Any]] = []
+            for pid in dict.fromkeys(ids):
                 p = pending[pid]
                 q = self._question(p["question"])
+                record = None
                 if decision == "confirm":
-                    self._applicable(self._state(facts), q)
-                    value = q.check(p["value"], facts)
+                    self._applicable(self._state(facts, extra), q)
+                    try:
+                        value = q.check(p["value"], facts)
+                    except ValueError as exc:
+                        raise ApiError(400, "invalid_answer", f"{q.id}: {exc}") from None
                     source = {"ai": engine.AI, "import": engine.IMPORT}.get(str(p.get("source")), engine.RULES)
-                    self._write([{"type": "answer", "question": q.id, "value": value, "source": source, "note": p.get("reason"),
-                                  "facts": engine.evidence_of(q, facts), "proposal": pid, **self._base(facts)}])
+                    record = {"type": "answer", "question": q.id, "value": value, "source": source, "note": p.get("reason"),
+                              "facts": engine.evidence_of(q, facts), "proposal": pid, **self._base(facts)}
+                    extra.append(record)
+                planned.append((pid, p, q, record))
+            for pid, p, q, record in planned:
+                if record is not None:
+                    self._write([record])
                     answered.append(q.id)
-                self._records.append(PROPOSALS, {"type": "decision", "id": pid, "decision": "confirmed" if decision == "confirm" else "rejected",
+                self._records.append(PROPOSALS, {"type": "decision", "id": pid, "decision": "confirmed" if record is not None else "rejected",
                                                  "by": context.actor().to_dict(), "at": now()})
                 details = {"proposal": pid, "question": q.id, "value": p.get("display"), "source": p.get("source")}
-                if decision == "confirm":
+                if record is not None:
                     self._audit("consult.proposal_confirmed", target={"type": "question", "id": q.id}, details=details)
                 else:
                     self._audit("consult.proposal_rejected", target={"type": "question", "id": q.id}, details=details)
@@ -1238,7 +1426,7 @@ class ConsultService:
                      "estate, what each choice would do, and what the recommendation rests on. Do not repeat the question."),
             "question": {"id": q.id, "text": q.text, "help": q.help, "options": [{"value": o.value, "label": o.label,
                                                                                     "description": o.description} for o in q.options],
-                         "recommendation": s.recommendation},
+                         "recommended": self._recommended_for_model(q, s)},
             "estate": self._summary_for_model(facts)}, ensure_ascii=False)
         try:
             reply = model.ask(prompt, EXPLAIN_SCHEMA, CONSULT_SYSTEM)
@@ -1325,6 +1513,17 @@ class ConsultService:
             "source": "import", "model": None, "count": len(stored), "questions": [p["question"] for p in stored],
             "textHash": None, "message": f"{len(rejected)} answer(s) could not be used" if rejected else None})
         return {**self.state(), "proposed": [p["id"] for p in stored], "rejected": rejected, "source": "import"}
+
+
+def _whole(value: Any, default: Any) -> Any:
+    """A whole number sent as a number or as plain ASCII digits, else ``default`` (``isdigit`` also takes digits such as
+    '²' or '٣', which ``int`` then refuses)."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value if value >= 0 else default
+    text = str(value if value is not None else "").strip()
+    return int(text) if re.fullmatch(r"[0-9]{1,12}", text) else default
 
 
 def _shown(value: Any) -> str:

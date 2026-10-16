@@ -204,12 +204,12 @@ def _discovery_notes(detail: Mapping[str, Any]) -> List[str]:
     return out
 
 
-def _dependencies(detail: Mapping[str, Any], records: Mapping[str, Any]) -> List[str]:
+def _dependencies(detail: Mapping[str, Any], records: Mapping[str, Any], columns_too: bool = True) -> List[str]:
     out: List[str] = []
     for dep in (detail.get("dependencies") or [])[:MAX_DEPENDENCIES]:
         line = f"`{dep.get('name')}` ({dep.get('type') or dep.get('kind')})"
         record = records.get(dep.get("objectId") or "")
-        columns = getattr(getattr(record, "content", None), "columns", None)
+        columns = getattr(getattr(record, "content", None), "columns", None) if columns_too else None
         if columns:
             shown = sorted(columns, key=lambda c: c.column_id)[:MAX_COLUMNS_PER_TABLE]
             line += ": " + ", ".join(f"{c.name} {_source_type(c)}" for c in shown)
@@ -220,9 +220,10 @@ def _dependencies(detail: Mapping[str, Any], records: Mapping[str, Any]) -> List
 
 
 def build(subject: Subject, source: Source, detail: Mapping[str, Any], target: Mapping[str, Any],
-          records: Mapping[str, Any], prompts_dir: Path, standards: str = "") -> str:
-    """The full prompt for one object, from the templates in ``prompts_dir``. ``standards``: the approved migration
-    brief's naming and coding standards (B3), added to the project requirements as they were written."""
+          records: Mapping[str, Any], prompts_dir: Path, migration: str = "", minimal: bool = False) -> str:
+    """The full prompt for one object, from the templates in ``prompts_dir``. ``migration``: the migration context
+    (``MIGRATION_CONTEXT.md``, made from the approved brief), fenced off as it is. ``minimal`` (the brief's G4): the
+    objects it depends on are named, without their columns."""
     context: Dict[str, Any] = {
         "object": {"id": source.id, "name": source.object_name or source.name, "type": source.type, "kind": subject.kind,
                    "schema": source.schema if subject.kind in (TABLE, VIEW, PROCEDURE, FUNCTION) else ""},
@@ -235,14 +236,24 @@ def build(subject: Subject, source: Source, detail: Mapping[str, Any], target: M
         "rules": {"output": subject.rule_output, "fence": _fence(subject.rule_output), "notes": subject.rule_notes,
                   "problems": subject.problems},
         "discovery": {"notes": _discovery_notes(detail)},
-        "dependencies": _dependencies(detail, records),
+        "dependencies": _dependencies(detail, records, columns_too=not minimal),
         "output": {"description": _OUTPUT[subject.kind]},
+        "migration": {"text": migration.strip(), "fence": _fence(migration)},
     }
     base = templates.read(prompts_dir / "base.md")
     if not base.strip():
         raise templates.TemplateError(f"The prompt template base.md is missing from {prompts_dir}.")
     context["type_instructions"] = templates.render(templates.read(prompts_dir / TEMPLATES[subject.kind]), context).strip()
     context["project"] = templates.render(templates.read(prompts_dir / "project.md"), context).strip()
-    if standards.strip():
-        context["project"] = (context["project"] + "\n\nStandards from the approved migration brief:\n" + standards.strip()).strip()
-    return templates.render(base, context)
+    prompt = templates.render(base, context)
+    if migration.strip() and "MIGRATION_CONTEXT.md" not in prompt:
+        # A base.md written before the migration context existed: the context still goes, at the end, never dropped.
+        prompt = prompt.rstrip() + "\n\n" + migration_section(context["migration"]) + "\n"
+    return prompt
+
+
+def migration_section(migration: Mapping[str, str]) -> str:
+    """The migration context as a prompt section: fenced, so nothing in it reads as part of the instructions around it."""
+    return (f"## The migration context (MIGRATION_CONTEXT.md)\n\nFrom the approved migration brief. Follow it wherever it "
+            f"applies; it wins over the project requirements where the two disagree.\n\n{migration['fence']}markdown\n"
+            f"{migration['text']}\n{migration['fence']}")

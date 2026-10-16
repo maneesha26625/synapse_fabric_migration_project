@@ -623,9 +623,12 @@ def test_retry_runs_only_the_failed_objects_again():
 
 
 def test_reset_forgets_a_finished_run_and_its_credentials():
+    from discovery_agent.state import context
+
     svc = service(fake_job())
-    svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}], "options": {"stages": ["notebooks"]},
-               "credentials": {"LS_Sql": {"authType": "Basic", "username": "u", "password": "p"}}})
+    with context.bound(actor=context.operator()):  # credentials come only with a person's request
+        svc.start({"items": [{"id": "synapse://notebook/LoadSales", "wave": 1}], "options": {"stages": ["notebooks"]},
+                   "credentials": {"LS_Sql": {"authType": "Basic", "username": "u", "password": "p"}}})
     assert wait_until(lambda: svc.state()["state"] == "completed")
     idle = svc.control({"action": "reset"})
     assert idle["state"] == "idle" and idle["items"] == [] and svc.state()["state"] == "idle"

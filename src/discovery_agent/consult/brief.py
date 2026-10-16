@@ -20,7 +20,7 @@ from discovery_agent.consult import conditions as cond
 from discovery_agent.consult.catalog import Catalog, Question
 from discovery_agent.consult.engine import ASSUMED, SKIPPED, State, settings_of
 from discovery_agent.consult.facts import FACTS, fingerprint, fingerprinted
-from discovery_agent.consult.settings import ENFORCED, NOTE, RECORDED, SETTINGS
+from discovery_agent.consult.settings import CONTEXT, ENFORCED, NOTE, RECORDED, SETTINGS
 
 SUBMITTED, APPROVED, REJECTED, SUPERSEDED = "submitted", "approved", "rejected", "superseded"
 
@@ -55,11 +55,15 @@ def draft(catalog: Catalog, facts: Mapping[str, Any], state: State) -> Dict[str,
         if not s.applies or s.value is None:
             continue
         assumed = s.status in (ASSUMED, SKIPPED)
+        rec = s.recommendation or {}
+        # A person's note, else the recommendation's reason, but only where the decision is that recommendation: an
+        # answer that turned it down never reads as resting on it.
+        reason = s.note if not assumed and s.note else rec.get("reason") if assumed or (rec and s.value == rec.get("value")) else None
         decisions.append({
             "question": q.id, "section": q.section, "sectionTitle": titles.get(q.section, q.section), "text": q.text,
             "value": s.value, "display": display(q, s.value), "assumed": assumed,
             "source": None if assumed else s.source, "by": None if assumed else s.by, "at": None if assumed else s.at,
-            "reason": s.note if not assumed and s.note else (s.recommendation or {}).get("reason"),
+            "reason": reason,
             "drives": [{"setting": name, "status": SETTINGS[name].status, "applies": SETTINGS[name].applies} for name in q.drives],
         })
     settings = settings_of(catalog, state)
@@ -77,6 +81,9 @@ def draft(catalog: Catalog, facts: Mapping[str, Any], state: State) -> Dict[str,
         "assumptions": [d["question"] for d in decisions if d["assumed"]],
         "recordedOnly": [{"setting": k, "value": v, "status": SETTINGS[k].status, "applies": SETTINGS[k].applies}
                          for k, v in settings.items() if SETTINGS[k].status in (RECORDED, NOTE)],
+        #: Decisions only the AI acts on: written into the migration context every draft is sent.
+        "contextOnly": [{"setting": k, "value": v, "status": SETTINGS[k].status, "applies": SETTINGS[k].applies}
+                        for k, v in settings.items() if SETTINGS[k].status == CONTEXT],
         "keptContradictions": [{"conflict": c.id, "message": c.message, "reason": c.reason, "by": c.by, "at": c.at}
                                for c in state.conflicts if c.status == "kept"],
         #: Decisions that loosen a safeguard: approved by someone other than the submitter, or recorded as self-approved.
@@ -158,6 +165,12 @@ def to_markdown(version: Mapping[str, Any], status: Optional[str], events: List[
     lines += ["", "## What the accelerator acts on", "", "| Setting | Value | Acted on by |", "|---|---|---|"]
     for name, value in (content.get("enforced") or {}).items():
         lines.append(f"| `{name}` | {_cell(_value_text(value))} | {_cell(SETTINGS[name].applies)} |")
+    lines += ["", "## Sent to the AI with each draft", "",
+              "Every LLM draft is sent the migration context (MIGRATION_CONTEXT.md), made from the approved brief: the "
+              "decisions above that shape code, and these, which only the AI acts on (a person reviews each draft)."]
+    sent = content.get("contextOnly") or []
+    if sent:
+        lines += [""] + [f"- `{s['setting']}`: {_value_text(s['value'])}." for s in sent]
     assumptions = content.get("assumptions") or []
     if assumptions:
         lines += ["", "## Assumptions", "", "Recommendations nobody confirmed: " + ", ".join(assumptions) + "."]

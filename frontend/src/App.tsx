@@ -6,6 +6,7 @@ import { Workspace } from "./pages/Workspace";
 import { AppStateProvider } from "./state/AppState";
 import { ConsultProvider } from "./state/ConsultState";
 import { MigrationStateProvider } from "./state/MigrationState";
+import { OrchestratorProvider } from "./state/OrchestratorState";
 
 /** The earlier one-page-per-step addresses open the same step in the migration journey. */
 function LegacyStep() {
@@ -19,6 +20,7 @@ export function App() {
     <AppStateProvider>
       <MigrationStateProvider>
         <ConsultProvider>
+        <OrchestratorProvider>
         <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
           <a href="#main" className="sr-only">Skip to content</a>
           <Routes>
@@ -34,6 +36,7 @@ export function App() {
             </Route>
           </Routes>
         </BrowserRouter>
+        </OrchestratorProvider>
         </ConsultProvider>
       </MigrationStateProvider>
     </AppStateProvider>

@@ -157,9 +157,10 @@ export function TransformQueue() {
     <div className="stack" style={{ gap: 20 }}>
       <Banner tone="info" title="Convert with an LLM">
         The rules convert most objects on their own. The ones they can't are listed first. Select them and generate drafts:
-        Claude (through Claude Code on the machine running the API) converts each one to your project requirements. Nothing is
-        deployed until you open the object, review its draft and accept it. Accepted code is used when the object is created
-        in Fabric, in <strong>step 5, Migrate</strong>. Plan and Migrate mark those objects <LlmBadge />.
+        Claude (through Claude Code on the machine running the API) converts each one as the approved brief's migration context
+        (MIGRATION_CONTEXT.md) and your project requirements say. Nothing is deployed until you open the object, review its draft
+        and accept it. Accepted code is used when the object is created in Fabric, in <strong>Migrate</strong>. Plan and Migrate
+        mark those objects <LlmBadge />.
       </Banner>
       {settings && !settings.enabled && <Banner tone="warning" title="Generation is switched off">{settings.disabledReason}</Banner>}
       {settings?.enabled && settings.consent && !settings.consent.allowed && <Banner tone="warning" title="The migration brief does not allow AI drafts now">{settings.consent.reason}</Banner>}
@@ -230,6 +231,7 @@ export function TransformQueue() {
                     <td>
                       <StatusBadge tone={st.tone} running={st.running}>{st.label}</StatusBadge>
                       {c.stale && <span className="faint"> (source changed)</span>}
+                      {c.contextStale && <span className="faint"> (made with an earlier migration context)</span>}
                       {c.state === "failed" && c.error && <div className="faint" style={{ fontSize: 13 }}>{c.error}</div>}
                     </td>
                     <td>{c.confidence ?? "—"}</td>

@@ -1,4 +1,4 @@
-import { ClipboardCheck, Download, FileUp, ShieldAlert, Sparkles } from "lucide-react";
+import { ClipboardCheck, Download, FileText, FileUp, ShieldAlert, Sparkles } from "lucide-react";
 import { useMemo, useRef, useState } from "react";
 import { useAppState } from "../../state/AppState";
 import { useConsult } from "../../state/ConsultState";
@@ -223,13 +223,14 @@ function BriefTab() {
                   <td style={{ whiteSpace: "normal" }}><strong>{d.display}</strong></td>
                   <td>{d.assumed ? <StatusBadge tone="neutral">Assumed</StatusBadge> : <span>{d.source ? SOURCE[d.source] : "answered"}{d.by ? ` · ${d.by.id}` : ""}</span>}</td>
                   <td className="muted" style={{ whiteSpace: "normal", maxWidth: 360 }}>{d.reason ?? "—"}</td>
-                  <td className="faint" style={{ whiteSpace: "normal", maxWidth: 260 }}>{d.drives.map((x) => `${x.applies}${x.status === "enforced" ? "" : ` (${x.status})`}`).join("; ")}</td>
+                  <td className="faint" style={{ whiteSpace: "normal", maxWidth: 260 }}>{d.drives.map((x) => `${x.applies}${x.status === "enforced" ? "" : x.status === "context" ? " (sent to the AI)" : ` (${x.status})`}`).join("; ")}</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
         {draft.keptContradictions.length > 0 && <p className="muted">Contradictions kept: {draft.keptContradictions.map((k) => `${k.conflict} (${k.reason})`).join("; ")}.</p>}
+        {(draft.contextOnly?.length ?? 0) > 0 && <p className="faint">Sent to the AI with each draft (MIGRATION_CONTEXT.md), which only the AI acts on: {draft.contextOnly!.map((r) => r.setting).join(", ")}.</p>}
         {draft.recordedOnly.length > 0 && <p className="faint">Recorded, not acted on: {draft.recordedOnly.map((r) => r.setting).join(", ")}.</p>}
       </Card>
       <Card eyebrow="Versions" title={brief.versions.length ? `${plural(brief.versions.length, "version")}` : "No version submitted yet"}
@@ -264,7 +265,8 @@ function ChangesTab() {
   return (
     <div className="stack">
       {b.factChanges.length > 0 ? (
-        <Banner tone="warning" title={`The estate changed since version ${b.approved} was approved`}>
+        <Banner tone="warning" title={b.factChanges.every((c) => c.fact === "target.workspace")
+          ? `The Fabric target changed since version ${b.approved} was approved` : `The estate changed since version ${b.approved} was approved`}>
           <ul className="reset-list" style={{ margin: 0 }}>{b.factChanges.map((c) => <li key={c.fact}>{c.description}: {changeText(c.before, c.after)}</li>)}</ul>
           A run under a required consultation is refused until the brief is submitted again and approved.
         </Banner>
@@ -277,6 +279,25 @@ function ChangesTab() {
         </Card>
       ) : <p className="muted">The answers make the same brief as version {b.approved}.</p>}
     </div>
+  );
+}
+
+/** MIGRATION_CONTEXT.md: the approved brief written for the model, sent with every LLM draft. */
+function ContextTab() {
+  const { api } = useAppState();
+  const { migrationContext, consult } = useConsult();
+  if (!consult) return null;
+  if (!migrationContext?.hash) {
+    return <p className="muted">{migrationContext?.reason ?? "No migration brief is approved yet, so drafts are made without a migration context."}</p>;
+  }
+  const get = async () => download(await api.exportMigrationContext(migrationContext.hash!), "text/markdown");
+  return (
+    <Card eyebrow="Sent with every LLM draft" title="MIGRATION_CONTEXT.md"
+      subtitle={`Made from brief version ${migrationContext.briefVersion}${migrationContext.minimal ? ", with only its decisions (G4)" : ""}. Each draft records the file it was sent, by this hash, and is flagged if a newer brief changes it.`}
+      actions={<Button size="small" onClick={() => void get()}><Download size={13} aria-hidden="true" />Download</Button>}>
+      <p className="faint" style={{ margin: 0 }}><FileText size={13} aria-hidden="true" /> <code>{migrationContext.hash.slice(0, 16)}</code></p>
+      <pre className="consult-context" aria-label="The migration context">{migrationContext.text}</pre>
+    </Card>
   );
 }
 
@@ -309,7 +330,7 @@ function HelpTab() {
       <Card eyebrow="Read answers from notes" title="Paste meeting notes or an email"
         subtitle="Answers the text gives plainly are proposed for you to confirm, one by one. Nothing is answered until you do.">
         <p className="faint" style={{ margin: 0 }}>
-          <Sparkles size={13} aria-hidden="true" /> {llm.allowed ? "Claude reads the notes: what you paste, the questions and counts about the estate are sent, never a name or a definition."
+          <Sparkles size={13} aria-hidden="true" /> {llm.allowed ? "Claude reads the notes: what you paste, the questions and counts about the estate are sent, never a name from the estate or a definition."
             : `The notes are read with the built-in rules. ${llm.reason ?? ""}`}
         </p>
         <textarea className="input consult-text" rows={5} aria-label="Meeting notes or an email" value={text} maxLength={8000}
@@ -335,7 +356,7 @@ function HelpTab() {
 /** The Consult step: the questions, the brief their answers make, and its approval. */
 export function ConsultPanel() {
   const { consult, loadError, actionError, clearActionError, brief, required } = useConsult();
-  const [tab, setTab] = useState<"questions" | "brief" | "changes" | "help">("questions");
+  const [tab, setTab] = useState<"questions" | "brief" | "changes" | "context" | "help">("questions");
   const [focus, setFocus] = useState<string | null>(null);
   if (!consult) {
     return loadError ? <Banner tone="warning" title="The consultation cannot be read yet">{loadError}</Banner>
@@ -358,17 +379,23 @@ export function ConsultPanel() {
             Answer what needs a person (or accept the recommendations), submit the brief, and have it approved. Plan then starts from it, and every run is checked against it.
           </Banner>
         : !b.approved && <Banner tone="info" title="Consultation is advisory here">Runs start without an approved brief; one that is approved is still pre-set in Plan and recorded with each run.</Banner>}
-      {b.stale && <Banner tone="warning" title="The estate changed since the brief was approved">See Changes since approval: confirm what changed, then submit the brief again.</Banner>}
+      {b.stale && (b.factChanges.some((c) => c.fact === "catalog.version")
+        ? <Banner tone="warning" title="The questions changed since the brief was approved">Your answers were kept, under the questions' new ids. Review the new questions (the Changes tab lists them), then submit the brief again and have it approved.</Banner>
+        : b.factChanges.length > 0 && b.factChanges.every((c) => c.fact === "target.workspace")
+        ? <Banner tone="warning" title="Another Fabric workspace is the target now">The brief was approved with {String(b.factChanges[0].before ?? "another workspace")} as the target, and {String(b.factChanges[0].after ?? "another")} is connected now. What it says about the target (what it is for, E1) is about the one it was approved for: submit the brief again with this one connected, and have it approved.</Banner>
+        : <Banner tone="warning" title="The estate changed since the brief was approved">See Changes since approval: confirm what changed, then submit the brief again.</Banner>)}
       {actionError && <Banner tone="error" title="That did not work" actions={<Button size="small" variant="ghost" onClick={clearActionError}>Dismiss</Button>}>{actionError}</Banner>}
       <Tabs label="Consultation sections" value={tab} onChange={setTab} tabs={[
         { id: "questions", label: "Questions", count: p.applicable },
         { id: "brief", label: "Brief", count: brief?.versions.length || undefined },
         { id: "changes", label: "Changes since approval", count: b.approved ? b.changes.length + b.factChanges.length : undefined },
+        { id: "context", label: "Migration context" },
         { id: "help", label: "Help" },
       ]} />
       {tab === "questions" && <QuestionsTab focus={focus} setFocus={setFocus} />}
       {tab === "brief" && <BriefTab />}
       {tab === "changes" && <ChangesTab />}
+      {tab === "context" && <ContextTab />}
       {tab === "help" && <HelpTab />}
     </div>
   );

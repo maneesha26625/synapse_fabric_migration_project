@@ -18,6 +18,11 @@ What this changes about the accelerator's principles, deliberately and only on r
 * A model's answer is never deployed as it comes. It is checked, shown to a person next to the
   source and the rule output, and used by a run only once that person accepts it, and only while
   the source still has the hash it had when the draft was generated.
+* Every draft is sent the migration context (``MIGRATION_CONTEXT.md``, made from the approved
+  brief) and records which one, by hash and brief version, with what the model says it applied.
+  A draft made with an earlier context is flagged, so a person knows to draft it again.
+* The brief decides which objects may be sent (D6: only those the rules cannot convert, or any)
+  and what goes with each (G4: the whole context, or only its decisions).
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from discovery_agent.api.migration import rewritable, sources_for
+from discovery_agent.api.migration import MULTI_STATEMENT_REASON, rewritable, sources_for
 from discovery_agent.api.service import ApiError
 from discovery_agent.diagnostics import record_unexpected, unexpected_message
 from discovery_agent.state import context as work_context  # not ``context``: that name is the LLM's subject builder
@@ -142,17 +147,62 @@ class TransformService:
         named = brief.names()[0] if brief is not None else None
         return {"workspace": workspace, "warehouse": named or warehouse_name_for(pool)}
 
-    def _prompt(self, source: Source, subject: context.Subject, job: Any, pool: Optional[str]) -> str:
+    def _context(self, brief: Any = None) -> Any:
+        """The migration context the brief in force gives every draft (``consult.context_file.ContextFile``), or None."""
+        if self._consult is None:
+            return None
+        brief = brief if brief is not None else self._brief()
+        if brief is None:
+            return None
+        try:
+            return self._consult.context_file(brief)
+        except Exception as exc:  # noqa: BLE001 - a context that cannot be made is said in the API's log; the draft goes without
+            record_unexpected("making the migration context", exc)
+            return None
+
+    def _prompt(self, source: Source, subject: context.Subject, job: Any, pool: Optional[str]) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """The prompt for one object, and the migration context it carries (what the draft records), or None."""
         try:
             detail = self._session.result(source.id)
         except ApiError:
             detail = {}
         brief = self._brief()
+        made = self._context(brief)
         try:
-            return context.build(subject, source, detail, self._target(pool, brief), getattr(job, "records_by_id", {}),
-                                 self._prompts, standards=brief.standards() if brief is not None else "")
+            text = context.build(subject, source, detail, self._target(pool, brief), getattr(job, "records_by_id", {}),
+                                 self._prompts, migration=made.text if made is not None else "",
+                                 minimal=brief is not None and brief.llm_context() == "minimal")
         except TemplateError as exc:
             raise ApiError(500, "prompt_template_error", str(exc)) from exc
+        return text, made.reference() if made is not None else None
+
+    def _current_context(self) -> Optional[Tuple[str, str]]:
+        """(hash, decisions hash) of the migration context a draft made now would carry, or None: a draft made with other
+        decisions is out of date. One made under a brief approved again with the same decisions is not."""
+        made = self._context()
+        return (made.hash, made.decisions_hash) if made is not None else None
+
+    @staticmethod
+    def needs_work(source: Source, subject: context.Subject) -> bool:
+        """The rules cannot convert it as it is: a multi-statement function, or problems they leave."""
+        return bool(subject.problems) or source.reason == MULTI_STATEMENT_REASON
+
+    def refusal(self, object_id: str) -> Optional[str]:
+        """Why no draft would be made for this object now (not a kind drafts are made for, nothing to send, or outside
+        what the brief sends, D6), or None. What the agent asks before it proposes a draft."""
+        try:
+            source, subject, _, _ = self._subject(object_id)
+        except ApiError as exc:
+            return exc.message
+        return self._scope_refusal(source, subject)
+
+    def _scope_refusal(self, source: Source, subject: context.Subject) -> Optional[str]:
+        """Why the brief does not let this object be sent for a draft (D6), or None."""
+        brief = self._brief()
+        if brief is None or brief.llm_scope() != "needs_work" or self.needs_work(source, subject):
+            return None
+        return (f"{source.name} converts with the rules as it is, and the approved brief sends only objects the rules "
+                "cannot convert to Claude (D6).")
 
     def _gate(self) -> Dict[str, Any]:
         """Whether a definition may be sent to the model now (``ConsultService.llm_gate``); allowed with no consultation."""
@@ -166,7 +216,8 @@ class TransformService:
 
     # -- the view of one object -----------------------------------------------------
 
-    def _view(self, object_id: str, record: Optional[Dict[str, Any]], current_hash: Optional[str]) -> Dict[str, Any]:
+    def _view(self, object_id: str, record: Optional[Dict[str, Any]], current_hash: Optional[str],
+              current_context: Optional[Tuple[str, str]] = None) -> Dict[str, Any]:
         with self._lock:
             job = dict(self._jobs.get(object_id) or {})
         draft = (record or {}).get("draft")
@@ -185,10 +236,20 @@ class TransformService:
                 return None
             return part.get("sourceHash") != current_hash
 
+        def made_with_other(part: Optional[Dict[str, Any]]) -> Optional[bool]:
+            """Made with decisions other than the ones in force (or with no migration context, now there is one). A draft
+            made before the decisions hash was kept is compared by the whole file."""
+            if not part or current_context is None:
+                return None
+            ref = part.get("context") or {}
+            if ref.get("decisionsHash"):
+                return ref["decisionsHash"] != current_context[1]
+            return ref.get("hash") != current_context[0]
+
         if draft:
-            draft = {**draft, "stale": stale(draft)}
+            draft = {**draft, "stale": stale(draft), "contextStale": made_with_other(draft)}
         if accepted:
-            accepted = {**accepted, "stale": stale(accepted)}
+            accepted = {**accepted, "stale": stale(accepted), "contextStale": made_with_other(accepted)}
         return {
             "objectId": object_id, "name": (record or {}).get("name"), "type": (record or {}).get("type"),
             "kind": (record or {}).get("kind"), "state": state, "error": job.get("error"), "startedAt": job.get("startedAt"),
@@ -199,7 +260,10 @@ class TransformService:
 
     def settings(self) -> dict:
         gate = self._gate()
+        made = self._context()
         return {
+            # The migration context every draft is sent now, by hash and brief version (GET /api/consult/context reads it).
+            "context": made.reference() if made is not None else None,
             "enabled": self.enabled(), **self._model.available(),
             "kinds": sorted(context.TRANSFORMABLE_KINDS),
             "promptsDir": str(self._prompts), "storeDir": str(self._store.directory),
@@ -212,19 +276,22 @@ class TransformService:
         with self._lock:
             job_ids = list(self._jobs)
         ids = {r["objectId"]: r for r in self._store.all()}
+        current = self._current_context()
         items = []
         for oid in sorted(set(ids) | set(job_ids)):
-            view = self._view(oid, ids.get(oid), None)
+            view = self._view(oid, ids.get(oid), None, current)
             for part in ("draft", "accepted"):
                 if view[part]:
-                    view[part] = {k: v for k, v in view[part].items() if k in ("confidence", "generatedAt", "acceptedAt", "edited")}
+                    view[part] = {k: v for k, v in view[part].items()
+                                  if k in ("confidence", "generatedAt", "acceptedAt", "edited", "context", "contextStale")}
             items.append(view)
         return {"items": items}
 
     def object(self, object_id: str) -> dict:
         source, subject, _, _ = self._subject(object_id)
-        view = self._view(object_id, self._store.get(object_id), subject.source_hash)
+        view = self._view(object_id, self._store.get(object_id), subject.source_hash, self._current_context())
         view.update({"name": view["name"] or source.name, "type": view["type"] or source.type, "kind": subject.kind})
+        view["needsWork"] = self.needs_work(source, subject)
         view["source"] = {"code": subject.code, "language": subject.language, "hash": subject.source_hash,
                           "ruleOutput": subject.rule_output, "ruleNotes": subject.rule_notes, "problems": subject.problems}
         return view
@@ -234,6 +301,7 @@ class TransformService:
         job, pool = self._session.migration_snapshot()
         plan = [{"id": i["id"], "wave": 1} for i in job.items if MIGRATABLE.get(str(i.get("type") or "")) in context.TRANSFORMABLE_KINDS]
         records = {r["objectId"]: r for r in self._store.all()}
+        current = self._current_context()
         items = []
         for source in sources_for(plan, job, pool):
             if rewritable(source):
@@ -251,10 +319,11 @@ class TransformService:
                 items.append({**base, "problems": [], "rulesChange": False, "state": "none", "error": None, "confidence": None,
                               "stale": None, "unavailable": str(exc)})
                 continue
-            view = self._view(source.id, records.get(source.id), subject.source_hash)
+            view = self._view(source.id, records.get(source.id), subject.source_hash, current)
             latest = view["draft"] or view["accepted"] or {}
             items.append({**base, "problems": problems + list(subject.problems), "rulesChange": bool(subject.rule_output), "state": view["state"],
-                          "error": view["error"], "confidence": latest.get("confidence"), "stale": latest.get("stale"), "unavailable": None})
+                          "error": view["error"], "confidence": latest.get("confidence"), "stale": latest.get("stale"),
+                          "contextStale": latest.get("contextStale"), "unavailable": None})
         items.sort(key=lambda i: (i["unavailable"] is not None, not i["problems"], i["name"].lower()))
         count = lambda f: sum(1 for i in items if f(i))  # noqa: E731
         return {"items": items, "summary": {
@@ -293,8 +362,8 @@ class TransformService:
 
     def prompt(self, object_id: str) -> dict:
         source, subject, job, pool = self._subject(object_id)
-        text = self._prompt(source, subject, job, pool)
-        return {"objectId": object_id, "prompt": text, "characters": len(text), "promptsDir": str(self._prompts)}
+        text, made = self._prompt(source, subject, job, pool)
+        return {"objectId": object_id, "prompt": text, "characters": len(text), "promptsDir": str(self._prompts), "context": made}
 
     def generate(self, body: dict) -> dict:
         if not self.enabled():
@@ -319,7 +388,10 @@ class TransformService:
                 continue
             try:
                 source, subject, job, pool = self._subject(oid)
-                prompt = self._prompt(source, subject, job, pool)
+                refused = self._scope_refusal(source, subject)
+                if refused:
+                    raise ApiError(403, "llm_scope", refused)
+                prompt, made = self._prompt(source, subject, job, pool)
             except ApiError as exc:
                 if len(ids) == 1:
                     raise
@@ -328,17 +400,18 @@ class TransformService:
             with self._lock:
                 self._jobs[oid] = {"state": QUEUED, "error": None, "startedAt": _now()}
             if self._synchronous:
-                self._work(source, subject, prompt)
+                self._work(source, subject, prompt, made)
             else:
-                self._pool.submit(work_context.carried(self._work), source, subject, prompt)
+                self._pool.submit(work_context.carried(self._work), source, subject, prompt, made)
             results.append({"objectId": oid, "state": QUEUED, "error": None})
         queued = [r["objectId"] for r in results if r["state"] == QUEUED]
         if queued:
+            current = self._current_context()
             self._audit("transform.requested", target={"type": "objects", "id": queued[0] if len(queued) == 1 else None},
-                        details={"objects": queued, "model": available.get("model")})
+                        details={"objects": queued, "model": available.get("model"), "contextHash": current[0] if current else None})
         return {"items": results}
 
-    def _work(self, source: Source, subject: context.Subject, prompt: str) -> None:
+    def _work(self, source: Source, subject: context.Subject, prompt: str, made: Optional[Dict[str, Any]] = None) -> None:
         oid = source.id
         with self._lock:
             self._jobs[oid] = {**self._jobs.get(oid, {}), "state": RUNNING}
@@ -358,6 +431,8 @@ class TransformService:
                 "code": answer.code, "notes": answer.notes, "unconverted": answer.unconverted, "confidence": answer.confidence,
                 "checks": found, "sourceHash": subject.source_hash, "generatedAt": _now(), "model": answer.model,
                 "costUsd": answer.cost_usd, "durationMs": answer.duration_ms,
+                # The migration context it was sent (by hash: GET /api/consult/context/{hash}), and what it applied.
+                "context": made, "contextApplied": list(answer.context),
             }
             self._store.put(record)
             if self._consult is not None:
@@ -380,14 +455,21 @@ class TransformService:
             self._jobs.pop(oid, None)
         self._audit("transform.drafted", target=target, actor=self._agent(answer.model),
                     details={"model": answer.model, "confidence": answer.confidence, "promptHash": _hash(prompt),
-                             "codeHash": _hash(answer.code), "checks": sorted({c.get("level") for c in found})})
+                             "codeHash": _hash(answer.code), "checks": sorted({c.get("level") for c in found}),
+                             "contextHash": (made or {}).get("hash"), "briefVersion": (made or {}).get("briefVersion")})
 
     @staticmethod
     def _agent(model: Optional[str]) -> Any:
         """The model as the trail names it: an agent, never the person who asked for the draft."""
         return work_context.Actor(work_context.AGENT, model or "llm")
 
+    @staticmethod
+    def _person(what: str) -> None:
+        if work_context.actor().kind != work_context.PERSON:
+            raise ApiError(403, "person_only", f"Only a person {what}: a draft is used only once a person has reviewed it.")
+
     def accept(self, body: dict) -> dict:
+        self._person("accepts a draft")
         oid = str(body.get("id") or "")
         source, subject, _, _ = self._subject(oid)
         record = self._store.get(oid) or {}
@@ -407,6 +489,7 @@ class TransformService:
             "code": code.strip(), "notes": draft.get("notes") or [], "unconverted": draft.get("unconverted") or [],
             "confidence": draft.get("confidence"), "checks": found, "sourceHash": subject.source_hash,
             "generatedAt": draft.get("generatedAt"), "acceptedAt": _now(), "edited": edited, "model": draft.get("model"),
+            "context": draft.get("context"), "contextApplied": draft.get("contextApplied") or [],
         }
         record["draft"] = None
         record.update({"name": source.name, "type": source.type, "kind": subject.kind})
@@ -416,6 +499,7 @@ class TransformService:
         return self.object(oid)
 
     def discard(self, body: dict) -> dict:
+        self._person("discards a draft or an accepted transform")
         oid = str(body.get("id") or "")
         scope = str(body.get("scope") or "draft")
         if scope not in ("draft", "all"):

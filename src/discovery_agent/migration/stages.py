@@ -468,7 +468,7 @@ class StageMixin:
         if existing:
             return existing, False
         target = datapipeline.WarehouseTarget(warehouse.artifact_id, warehouse.endpoint, warehouse.name, run.workspace_id)
-        content = datapipeline.definition(entries, connection_id, target)
+        content = datapipeline.definition(entries, connection_id, target, run.settings.get("parallelCopies"))
         created = self._client().create(f"/workspaces/{run.workspace_id}/dataPipelines", datapipeline.create_body(  # type: ignore[attr-defined]
             name, content, f"Loads wave tables from the Synapse pool into Warehouse {run.warehouse}"))
         self._forget("dataPipelines")  # type: ignore[attr-defined]

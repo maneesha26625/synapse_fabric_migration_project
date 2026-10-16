@@ -23,6 +23,13 @@ from discovery_agent.migration.preflight import content_findings
 from discovery_agent.sql.models import CatalogObjectType, DefinitionState, SqlModuleDefinition, SqlObjectKey, SqlProcedure
 
 from test_migration import FakeDb, FakeRest, by_name, notebook_payload, run_with, table, view
+from discovery_agent.state import context as work_context
+
+
+def as_person(call, body):
+    """What a person does on the page: the API binds who asked, and these tests call the service itself."""
+    with work_context.bound(actor=work_context.operator()):
+        return call(body)
 
 PROMPTS = REPO_ROOT / "prompts" / "transform"
 PROC_TEXT = ("CREATE PROCEDURE sales.LoadOrders AS\nBEGIN\n"
@@ -231,7 +238,7 @@ def test_a_draft_is_generated_checked_and_stored_but_not_used_until_accepted(ser
     svc.apply(sources)
     assert sources[0].override is None
 
-    accepted = svc.accept({"id": OID})
+    accepted = as_person(svc.accept, {"id": OID})
     assert accepted["state"] == "accepted" and accepted["draft"] is None and accepted["accepted"]["edited"] is False
     svc.apply(sources)
     assert sources[0].override["code"] == GOOD_PROC
@@ -264,9 +271,9 @@ def test_an_edited_draft_is_checked_again_before_it_is_accepted(service):
     svc = service()
     svc.generate({"ids": [OID]})
     with pytest.raises(ApiError) as err:
-        svc.accept({"id": OID, "code": "SELECT 1"})
+        as_person(svc.accept, {"id": OID, "code": "SELECT 1"})
     assert err.value.code == "checks_failed"
-    assert svc.accept({"id": OID, "code": GOOD_PROC + "\n-- reviewed"})["accepted"]["edited"] is True
+    assert as_person(svc.accept, {"id": OID, "code": GOOD_PROC + "\n-- reviewed"})["accepted"]["edited"] is True
 
 
 def test_a_failed_call_is_reported_on_the_object(service):
@@ -279,7 +286,7 @@ def test_a_failed_call_is_reported_on_the_object(service):
 def test_when_the_source_changes_the_transform_is_stale_and_the_run_uses_the_rules(service, tmp_path):
     svc = service()
     svc.generate({"ids": [OID]})
-    svc.accept({"id": OID})
+    as_person(svc.accept, {"id": OID})
     changed = FakeSession(proc_text=PROC_TEXT + "\n-- changed in Synapse")
     later = TransformService(changed, model=FakeModel(), store=TransformStore(tmp_path / "t"), prompts=PROMPTS, synchronous=True)
     assert later.object(OID)["accepted"]["stale"] is True
@@ -291,10 +298,10 @@ def test_when_the_source_changes_the_transform_is_stale_and_the_run_uses_the_rul
 def test_discard_drops_the_draft_or_everything(service):
     svc = service()
     svc.generate({"ids": [OID]})
-    svc.accept({"id": OID})
+    as_person(svc.accept, {"id": OID})
     svc.generate({"ids": [OID]})
-    assert svc.discard({"id": OID, "scope": "draft"})["state"] == "accepted"
-    assert svc.discard({"id": OID, "scope": "all"})["state"] == "none"
+    assert as_person(svc.discard, {"id": OID, "scope": "draft"})["state"] == "accepted"
+    assert as_person(svc.discard, {"id": OID, "scope": "all"})["state"] == "none"
     assert svc.list()["items"] == []
 
 
@@ -451,3 +458,15 @@ def test_a_run_item_says_it_came_from_an_accepted_transform():
     other, _, _, _ = run_with([plain], db=FakeDb())
     assert run.to_dict()["items"][0]["llm"] == {"acceptedAt": "2026-10-13T10:00:00+00:00", "edited": False}
     assert other.to_dict()["items"][0]["llm"] is None
+
+
+def test_only_a_person_accepts_or_discards_a_draft(service):
+    svc = service()
+    svc.generate({"ids": [OID]})
+    for actor in (work_context.Actor(work_context.AGENT, "orchestrator"), work_context.system()):
+        with work_context.bound(actor=actor):
+            for call in (svc.accept, svc.discard):
+                with pytest.raises(ApiError) as refused:
+                    call({"id": OID})
+                assert refused.value.code == "person_only"
+    assert svc.object(OID)["state"] == "draft"

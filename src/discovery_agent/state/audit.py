@@ -85,7 +85,7 @@ CATALOG: Dict[str, Tuple[str, FrozenSet[str]]] = {
     "brief.submitted": ("A migration brief version was submitted for approval", _fields(
         "version", "hash", "decisions", "assumptions", "kept", "catalogVersion", "factsFingerprint", "snapshot", "superseded")),
     "brief.approved": ("A migration brief version was approved: it is the policy in force", _fields(
-        "version", "hash", "comment", "selfApproved", "separateApprover", "superseded")),
+        "version", "hash", "comment", "selfApproved", "separateApprover", "superseded", "targetWorkspace")),
     "brief.rejected": ("A migration brief version was rejected", _fields("version", "hash", "comment")),
     "brief.exported": ("A migration brief version was exported", _fields("version", "format")),
     "plan.deviation": ("A plan that differs from the approved brief was confirmed, with a reason", _fields(
@@ -113,12 +113,31 @@ CATALOG: Dict[str, Tuple[str, FrozenSet[str]]] = {
     "validation.completed": ("Validation finished", _fields("summary", "message")),
     "git.commit_requested": ("A Fabric Git commit was asked for", _fields("comment")),
     "git.commit": ("A Fabric Git commit was made, or tried", _fields("state", "items", "branch", "commit", "others", "message")),
-    "transform.requested": ("LLM drafts were asked for", _fields("objects", "model")),
-    "transform.drafted": ("The model wrote a draft", _fields("model", "confidence", "checks", "promptHash", "codeHash", "message")),
+    "transform.requested": ("LLM drafts were asked for", _fields("objects", "model", "contextHash")),
+    "transform.drafted": ("The model wrote a draft", _fields(
+        "model", "confidence", "checks", "promptHash", "codeHash", "message", "contextHash", "briefVersion")),
     "transform.accepted": ("A person accepted a draft, which runs now use", _fields("edited", "codeHash", "sourceHash")),
     "transform.discarded": ("A draft, or an accepted transform, was dropped", _fields("scope")),
     "transform.requirements": ("The project requirements every prompt carries were changed", _fields("chars", "hash")),
     "journey.step_confirmed": ("A person confirmed a step of the journey", _fields("step", "note")),
+    "orchestrator.plan_built": ("A new version of the execution plan was built, from the brief, the plan and the estate", _fields(
+        "version", "hash", "briefVersion", "planVersion", "snapshot", "steps")),
+    "orchestrator.step_marked": ("A person marked a step of the execution plan done, or not done", _fields("step", "done", "note")),
+    "orchestrator.action_proposed": ("The agent proposed an action, for a person to confirm", _fields(
+        "action", "tool", "tier", "summary", "step", "task")),
+    "orchestrator.action_confirmed": ("A person confirmed a proposed action, which then ran as that person", _fields(
+        "action", "tool", "tier", "note", "outcome")),
+    "orchestrator.action_rejected": ("A person rejected a proposed action, with the reason", _fields("action", "tool", "reason")),
+    "orchestrator.action_taken": ("The agent acted on its own, as the brief's autonomy allows on a development workspace", _fields(
+        "action", "tool", "tier", "summary", "outcome")),
+    "orchestrator.action_expired": ("A proposed action lapsed: it no longer applied, or nobody decided in time", _fields(
+        "action", "tool", "reason")),
+    "orchestrator.paused": ("A person paused the agent: it proposes nothing and does nothing until resumed", _fields()),
+    "orchestrator.resumed": ("A person resumed the agent", _fields()),
+    "assistant.asked": ("A person asked the assistant a question", _fields("task", "chars", "source")),
+    "assistant.finished": ("The assistant finished with a question: answered, stopped at a limit, or cancelled", _fields(
+        "task", "turns", "actions", "outcome", "costUsd")),
+    "report.exported": ("The sign-off report was exported", _fields("format", "auditHead")),
     "audit.exported": ("The audit trail was exported", _fields("format", "records")),
 }
 
