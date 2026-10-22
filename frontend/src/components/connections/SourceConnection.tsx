@@ -1,19 +1,19 @@
-import { CheckCircle2, ChevronDown, ChevronRight, CircleSlash, FileArchive, FileJson, GitBranch, Info, Layers, X, XCircle } from "lucide-react";
+import { CheckCircle2, ChevronDown, ChevronRight, CircleSlash, FileArchive, FileJson, GitBranch, Layers, X, XCircle } from "lucide-react";
 import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import { useAppState } from "../../state/AppState";
-import { ApiRequestError } from "../../types";
-import type { AuthMethod, AzureSubscription, ConnectionConfig, ConnectionState, RepositoryConfig, RepositoryKind, WorkspaceGit, ZipUpload } from "../../types";
-import { Banner, Button, SelectField, StatusBadge, TextField, ConfirmDialog } from "../shared/Shared";
+import type { AuthMethod, AzureSubscription, ConnectionConfig, ConnectionState, RepositoryConfig, RepositoryKind, ZipUpload } from "../../types";
+import { Banner, Button, SelectField, TextField, ConfirmDialog } from "../shared/Shared";
 import { MethodTiles, MiniSteps, type MethodOption } from "./MethodTiles";
 
 /* ---- Methods ------------------------------------------------------------------------ */
 
-type SourceMethod = AuthMethod | "zip";
+type SourceMethod = AuthMethod | RepositoryKind;
 
-// One option for the workspace, whether its definitions are then read from its Git repository or the
-// live workspace: both start with the same sign-in and the same choice of workspace and SQL pool.
+// Three ways in: the live workspace, its Git repository by URL, or a ZIP export. The live workspace
+// can be added to either repository source, for the dedicated SQL pool.
 const METHODS: MethodOption<SourceMethod>[] = [
-  { id: "azure_cli", title: "Synapse workspace", desc: "Sign in and choose the workspace. Its Git repository is read when it has one", icon: Layers },
+  { id: "azure_cli", title: "Synapse workspace", desc: "Sign in and choose the workspace: its definitions are read live", icon: Layers },
+  { id: "git", title: "Git repository", desc: "Enter the URL of the workspace's Git repository", icon: GitBranch },
   { id: "zip", title: "Workspace export (ZIP)", desc: "Upload one environment's exported repository folder as a ZIP", icon: FileArchive },
 ];
 const METHOD_LABEL: Record<AuthMethod, string> = { azure_cli: "Azure CLI", interactive_browser: "Interactive browser" };
@@ -206,8 +206,6 @@ const EMPTY_REPO: RepoForm = { url: "", ref: "", rootFolder: "", environment: "D
 // Like the Azure form: kept in memory so it survives navigation, never in browser storage.
 let rememberedRepo: RepoForm = EMPTY_REPO;
 let lastRepositoryRequest: RepositoryConfig | null = null;
-/** The workspace (subscription/group/name) the remembered branch, folder and environment choices were made for. */
-let rememberedRepoKey = "";
 
 type RepoErrors = Partial<Record<"url" | "upload" | "environment" | "parameters" | "pool", string>>;
 
@@ -216,20 +214,21 @@ function environmentOf(f: RepoForm): string {
   return (f.environment === "Other" ? f.customEnvironment.trim() : f.environment) || "Dev";
 }
 
-/** `typed`: the Git repository is a URL typed by hand rather than the one found for the workspace. */
-function validateRepo(kind: RepositoryKind, f: RepoForm, config: ConnectionConfig, signedIn: boolean, typed: boolean): RepoErrors {
+function validateRepo(kind: RepositoryKind, f: RepoForm, config: ConnectionConfig, signedIn: boolean): RepoErrors {
   const e: RepoErrors = {};
   if (kind === "git") {
     const url = f.url.trim();
-    if (typed && !url) e.url = "Repository URL is required.";
-    else if (typed && !/^(https:\/\/|ssh:\/\/|git@)/.test(url)) e.url = "Use the repository's HTTPS or SSH URL.";
-    else if (typed && /^https:\/\/[^/@]+@/.test(url)) e.url = "Leave credentials out of the URL: git on this machine signs in with your own credential helper or SSH key.";
+    if (!url) e.url = "Repository URL is required.";
+    else if (!/^(https:\/\/|ssh:\/\/|git@)/.test(url)) e.url = "Use the repository's HTTPS or SSH URL.";
+    else if (/^https:\/\/[^/@]+@/.test(url)) e.url = "Leave credentials out of the URL: git on this machine signs in with your own credential helper or SSH key.";
   } else if (!f.upload) {
     e.upload = "Choose the ZIP to upload.";
   }
   if (f.environment === "Other" && !f.customEnvironment.trim()) e.environment = "Name the environment.";
-  if (kind === "zip" && f.withPool && !(signedIn && config.subscriptionId && config.resourceGroup && config.workspace && config.sqlPool)) {
-    e.pool = signedIn ? "Choose the subscription, resource group, workspace and SQL pool, or switch the SQL pool off." : "Sign in to Azure to add the SQL pool, or switch it off.";
+  if (f.withPool && !(signedIn && config.subscriptionId && config.resourceGroup && config.workspace && config.sqlPool)) {
+    e.pool = kind === "git"
+      ? (signedIn ? "Choose the subscription, resource group, workspace and SQL pool, or untick the live workspace." : "Sign in to Azure to connect the live workspace, or untick it.")
+      : (signedIn ? "Choose the subscription, resource group, workspace and SQL pool, or switch the SQL pool off." : "Sign in to Azure to add the SQL pool, or switch it off.");
   }
   return e;
 }
@@ -281,9 +280,9 @@ function ZipUploadField({ form, error, uploading, onUpload }: { form: RepoForm; 
  * Choices with sensible defaults, folded away: the branch and root folder (found for you), the
  * environment (Dev) and an environment's parameters file. The fold says what will be used.
  */
-function MoreOptions({ kind, form, setForm, errors, found, open, onToggle }: {
+function MoreOptions({ kind, form, setForm, errors, open, onToggle }: {
   kind: RepositoryKind; form: RepoForm; setForm: (p: Partial<RepoForm>) => void; errors: RepoErrors;
-  found?: WorkspaceGit | null; open: boolean; onToggle: (open: boolean) => void;
+  open: boolean; onToggle: (open: boolean) => void;
 }) {
   const [paramError, setParamError] = useState<string | null>(null);
   const pickParameters = async (file: File) => {
@@ -311,12 +310,12 @@ function MoreOptions({ kind, form, setForm, errors, found, open, onToggle }: {
       {open && (
         <div className="form-grid">
           {kind === "git" && (
-            <TextField label="Branch" optional value={form.ref} onChange={(e) => setForm({ ref: e.target.value })} placeholder={found?.branch || "main"}
-              hint={found?.branch ? `Empty: ${found.branch}, the workspace's collaboration branch. Name a release branch to read another environment.` : "Empty: the repository's default branch."} />
+            <TextField label="Branch" optional value={form.ref} onChange={(e) => setForm({ ref: e.target.value })} placeholder="main"
+              hint="Empty: the repository's default branch. Name a release branch to read another environment." />
           )}
           <TextField label="Root folder" optional value={form.rootFolder} onChange={(e) => setForm({ rootFolder: e.target.value })}
-            placeholder={kind === "git" ? (found ? found.rootFolder || "top level" : "synapse") : form.upload?.rootFolder || "synapse"}
-            hint={kind === "git" && found ? "Empty: the folder in the workspace's Git settings." : "Where the definitions are. Empty: found automatically."} />
+            placeholder={kind === "git" ? "synapse" : form.upload?.rootFolder || "synapse"}
+            hint="Where the definitions are. Empty: found automatically." />
           <SelectField label="Environment" value={form.environment} onChange={(v) => setForm({ environment: v })} options={ENVIRONMENTS} placeholder="Choose the environment"
             hint="Which environment these definitions are for. Shown with the connection and in the report." />
           {form.environment === "Other" && (
@@ -349,91 +348,12 @@ function RepositorySummary({ connection }: { connection: ConnectionState }) {
   );
 }
 
-/* ---- The Git repository found for the chosen workspace --------------------------------- */
-
-/** What reading a workspace's Git integration found, for the workspace (subscription/group/name) it was read for. */
-type Detected =
-  | { key: string; state: "loading" }
-  | { key: string; state: "found"; git: WorkspaceGit }
-  | { key: string; state: "none"; workspace: string }
-  | { key: string; state: "error"; workspace: string; message: string };
-
-const providerName = (p?: string) => (p === "AzureDevOps" ? "Azure DevOps" : p || "Git");
-
-/** "Azure DevOps · branch main · folder synapse/" */
-const gitWhere = (g: WorkspaceGit) =>
-  `${providerName(g.provider)} · branch ${g.branch || "default"} · ${g.rootFolder ? `folder ${g.rootFolder}/` : "top level"}`;
-
-function detectionError(e: unknown): string {
-  // An API started before this feature answers 404: say what to do rather than echo "No such list".
-  if (e instanceof ApiRequestError && e.status === 404) return "The accelerator's API is running older code. Restart the API, then try again.";
-  return e instanceof Error ? e.message : "The workspace's Git settings could not be read.";
-}
-
-type ReadFromChoice = "git" | "live";
-
-/**
- * Where the chosen workspace's definitions are read from: its Git repository when it has one
- * (recommended, and chosen for you), or the live workspace. A workspace without Git is simply read live.
- */
-function ReadFrom({ detection, readFrom, onReadFrom, typing, onTypeInstead, onUseFound, onRetry }: {
-  detection: Detected | null; readFrom: ReadFromChoice; onReadFrom: (v: ReadFromChoice) => void;
-  typing: boolean; onTypeInstead: () => void; onUseFound: () => void; onRetry: () => void;
-}) {
-  if (!detection) return null;
-  if (detection.state === "loading") {
-    return <p className="muted" role="status" style={{ margin: 0 }}><span className="spinner" aria-hidden="true" /> Checking whether the workspace is connected to Git…</p>;
-  }
-  if (detection.state === "none") {
-    return (
-      <p className="muted read-note" role="status">
-        <Info size={14} aria-hidden="true" /><span>{detection.workspace} isn't connected to Git, so its definitions are read from the live workspace.</span>
-      </p>
-    );
-  }
-  if (detection.state === "error") {
-    return (
-      <Banner tone="warning" title={`Couldn't check ${detection.workspace}'s Git settings`} actions={<Button size="small" onClick={onRetry}>Try again</Button>}>
-        {detection.message} Until then, its definitions are read from the live workspace.
-      </Banner>
-    );
-  }
-  const g = detection.git;
-  if (typing) {
-    return (
-      <p className="muted" style={{ margin: 0, overflowWrap: "anywhere" }}>
-        {g.workspace}'s own repository is {g.repositoryUrl}. <button type="button" className="link" onClick={onUseFound}>Use it instead</button>
-      </p>
-    );
-  }
-  // A long URL wraps at its slashes, never in the middle of a name.
-  const url = (g.repositoryUrl ?? "").split("/").flatMap((part, i) => (i ? [<wbr key={i} />, `/${part}`] : [part]));
-  return (
-    <fieldset className="read-from">
-      <legend>Read definitions from</legend>
-      <label className={`read-option${readFrom === "git" ? " selected" : ""}`}>
-        <input type="radio" name="read-from" checked={readFrom === "git"} onChange={() => onReadFrom("git")} />
-        <span className="read-option-text">
-          <span className="read-option-title"><strong>Git repository</strong><StatusBadge tone="success">Recommended</StatusBadge></span>
-          <span className="read-url">{url}</span>
-          <span className="muted">{gitWhere(g)}. Includes work merged but not yet published.</span>
-        </span>
-      </label>
-      <label className={`read-option${readFrom === "live" ? " selected" : ""}`}>
-        <input type="radio" name="read-from" checked={readFrom === "live"} onChange={() => onReadFrom("live")} />
-        <span className="read-option-text">
-          <strong>Live workspace</strong>
-          <span className="muted">What is published in {g.workspace} now.</span>
-        </span>
-      </label>
-      {readFrom === "git" && <button type="button" className="link read-other" onClick={onTypeInstead}>Use another repository</button>}
-    </fieldset>
-  );
-}
-
 /* ---- The source panel ---------------------------------------------------------------- */
 
-/** Connect Azure Synapse: choose how to sign in, sign in, choose the workspace, test. */
+const initialSource = (c: ConnectionState, method: AuthMethod): SourceMethod =>
+  c.sourceKind === "zip" || c.sourceKind === "git" ? c.sourceKind : method;
+
+/** Connect Azure Synapse: the live workspace, its Git repository, or a ZIP export. */
 export function SourceConnectionPanel() {
   const app = useAppState();
   const { connection, connectionBusy, connectionError, health, mode } = app;
@@ -442,21 +362,12 @@ export function SourceConnectionPanel() {
   const [changing, setChanging] = useState(false);
   const [confirmSignOut, setConfirmSignOut] = useState(false);
   // Where the definitions come from: an Azure sign-in method (the live workspace), or a repository.
-  const [source, setSource] = useState<SourceMethod>(() => (app.connection.sourceKind === "zip" ? "zip" : config.method));
+  const [source, setSource] = useState<SourceMethod>(() => initialSource(app.connection, config.method));
   const [repo, setRepoState] = useState<RepoForm>(rememberedRepo);
   const [repoErrors, setRepoErrors] = useState<RepoErrors>({});
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
-  // The Git repository found for the chosen workspace; typing a URL by hand is the exception.
-  const [detected, setDetected] = useState<Detected | null>(null);
-  const [readFrom, setReadFrom] = useState<ReadFromChoice>("git");
-  const [typing, setTyping] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
-  const [detectAgain, setDetectAgain] = useState(0);
-  // A workspace whose repository is already known (swapped in from the live summary) is not read again.
-  const seededKey = useRef("");
-  // A connected live workspace's Git integration, so it can be swapped for its repository.
-  const [liveGit, setLiveGit] = useState<WorkspaceGit | null>(null);
   const setRepo = (patch: Partial<RepoForm>) => {
     setRepoState((f) => { const next = { ...f, ...patch }; rememberedRepo = next; return next; });
     setRepoErrors({});
@@ -510,8 +421,8 @@ export function SourceConnectionPanel() {
     setRepoErrors({});
     app.clearConnectionError();
     setSource(method);
-    // The workspace chosen stays chosen when coming back from the ZIP tile; another sign-in method starts over.
-    if (method !== "zip" && method !== config.method) setConfig((c) => ({ ...c, method, resourceGroup: "", workspace: "", sqlPool: "" }));
+    // The workspace chosen stays chosen when moving between tiles; another sign-in method starts over.
+    if (method !== "zip" && method !== "git" && method !== config.method) setConfig((c) => ({ ...c, method, resourceGroup: "", workspace: "", sqlPool: "" }));
   };
 
   const upload = async (file: File) => {
@@ -527,93 +438,26 @@ export function SourceConnectionPanel() {
     }
   };
 
-  // Choosing the workspace is enough: its Git repository, branch and root folder are read from Azure.
-  const detectKey = source !== "zip" && signedInHere && config.subscriptionId && config.resourceGroup && config.workspace
-    ? `${config.subscriptionId}/${config.resourceGroup}/${config.workspace}` : "";
-  useEffect(() => {
-    if (!detectKey) { setDetected(null); return; }
-    if (seededKey.current === detectKey) { seededKey.current = ""; return; }
-    let current = true;
-    const workspace = config.workspace;
-    setDetected({ key: detectKey, state: "loading" });
-    app.azureLists.getWorkspaceGit(config.subscriptionId, config.resourceGroup, workspace).then(
-      (git) => { if (current) setDetected(git.configured && git.repositoryUrl ? { key: detectKey, state: "found", git } : { key: detectKey, state: "none", workspace }); },
-      (e) => { if (current) setDetected({ key: detectKey, state: "error", workspace, message: detectionError(e) }); },
-    );
-    return () => { current = false; };
-  }, [detectKey, detectAgain]); // eslint-disable-line react-hooks/exhaustive-deps
-  const detection = detected && detected.key === detectKey ? detected : null;
-  const found = detection?.state === "found" ? detection.git : null;
-  // A URL is typed only on request: without signing in, or to read another repository than the workspace's.
-  const typed = typing;
-  // Git when a URL is typed, or when the workspace has a repository and Git is the choice; otherwise the live workspace.
-  const gitChosen = typed || (!!found && readFrom === "git");
-
-  // Branch, folder and environment chosen for another workspace's repository do not carry over to this one.
-  const foundKey = found ? detectKey : "";
-  useEffect(() => {
-    if (!foundKey || foundKey === rememberedRepoKey) return;
-    rememberedRepoKey = foundKey;
-    setRepo({ ref: "", rootFolder: "", environment: "Dev", customEnvironment: "", parameters: "", parametersName: "" });
-  }, [foundKey]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Is the connected live workspace in Git? Asked once per workspace; an answer that cannot be had is not shown.
-  const liveKey = connected && !connection.repository && connection.subscriptionId && connection.resourceGroup && connection.workspace
-    ? `${connection.subscriptionId}/${connection.resourceGroup}/${connection.workspace}` : "";
-  useEffect(() => {
-    setLiveGit(null);
-    if (!liveKey) return;
-    let current = true;
-    app.azureLists.getWorkspaceGit(connection.subscriptionId!, connection.resourceGroup!, connection.workspace!)
-      .then((git) => { if (current) setLiveGit(git); }, () => undefined);
-    return () => { current = false; };
-  }, [liveKey]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  /** Swap the live workspace for its repository: the Git tab, its repository already found, with the same workspace and SQL pool. */
-  const switchToLiveGit = () => {
-    if (!liveGit) return;
-    const c = configFromConnection(connection);
-    const key = `${c.subscriptionId}/${c.resourceGroup}/${c.workspace}`;
-    seededKey.current = key;
-    setDetected({ key, state: "found", git: liveGit });
-    setConfig(c);
-    setReadFrom("git");
-    setTyping(false);
-    setErrors({});
-    app.clearConnectionError();
-    setSource("azure_cli");
-    setChanging(true);
-  };
-
-  /** Change a repository connection: the same choices it was made with, the workspace's repository found again. */
+  /** Change a repository connection: the same tile and choices it was made with. */
   const changeRepository = () => {
     const r = connection.repository!;
-    if (r.kind === "zip") { setSource("zip"); setChanging(true); return; }
-    setConfig(configFromConnection(connection));
-    setReadFrom("git");
-    // A repository connected without a workspace was a typed URL; it opens as one.
-    setTyping(!connection.subscriptionId);
-    setSource("azure_cli");
+    if (connection.subscriptionId) setConfig(configFromConnection(connection));
+    // After a reload only the connection is known: the repository and the live workspace come back from it.
+    if (r.kind === "git" && !repo.url.trim()) setRepo({ url: r.label, ref: r.ref ?? "", rootFolder: r.rootFolder, withPool: !!connection.sqlPool });
+    setSource(r.kind);
     setChanging(true);
   };
 
   const connectRepository = async (kind: RepositoryKind) => {
-    const git = kind === "git";
-    const problems = validateRepo(kind, repo, config, signedInHere, git && typed);
+    const problems = validateRepo(kind, repo, config, signedInHere);
     setRepoErrors(problems);
     if (problems.environment || problems.parameters) setMoreOpen(true);
-    if (Object.keys(problems).length || (git && !typed && !found)) return;
-    // The found repository unless a URL was typed; a branch or folder under More options overrides what was found.
-    const fromWorkspace = git && !typed ? found : null;
-    const ref = repo.ref.trim() || fromWorkspace?.branch || "";
-    const rootFolder = repo.rootFolder.trim() || fromWorkspace?.rootFolder || "";
-    // For Git the SQL pool is simply the one chosen in the list ("None" leaves it out); a ZIP asks with its checkbox.
-    const withPool = git ? !!(signedInHere && config.subscriptionId && config.resourceGroup && config.workspace && config.sqlPool) : repo.withPool;
+    if (Object.keys(problems).length) return;
     const request: RepositoryConfig = {
-      kind, environment: environmentOf(repo), rootFolder: rootFolder || undefined,
-      ...(git ? { repositoryUrl: fromWorkspace?.repositoryUrl ?? repo.url.trim(), ref: ref || undefined } : { uploadId: repo.upload!.uploadId, fileName: repo.upload!.fileName }),
+      kind, environment: environmentOf(repo), rootFolder: repo.rootFolder.trim() || undefined,
+      ...(kind === "git" ? { repositoryUrl: repo.url.trim(), ref: repo.ref.trim() || undefined } : { uploadId: repo.upload!.uploadId, fileName: repo.upload!.fileName }),
       ...(repo.parameters ? { parameters: repo.parameters, parametersName: repo.parametersName } : {}),
-      ...(withPool ? { subscriptionId: config.subscriptionId, resourceGroup: config.resourceGroup, workspace: config.workspace, sqlPool: config.sqlPool } : {}),
+      ...(repo.withPool ? { subscriptionId: config.subscriptionId, resourceGroup: config.resourceGroup, workspace: config.workspace, sqlPool: config.sqlPool } : {}),
     };
     lastRepositoryRequest = request;
     remembered = config;
@@ -659,20 +503,13 @@ export function SourceConnectionPanel() {
           ["Resource group", connection.resourceGroup],
           ["Subscription", connection.subscriptionName ?? connection.subscriptionId],
           ["Dedicated SQL pool", connection.sqlPool || "Not configured"],
-          ...(liveGit ? [["Git integration", liveGit.configured ? `${liveGit.repositoryUrl} · ${liveGit.branch || "default branch"}` : "None: definitions are read from the live workspace"] as [string, ReactNode]] : []),
           ["Signed in as", connection.account ?? methodLabel(connection.method)],
           ["Last tested", connection.testedAt ? new Date(connection.testedAt).toLocaleString() : "—"],
         ]} />
         <CheckFold checks={connection.checks} label="Source connection checks" />
         <div className="row conn-actions">
           <Button size="small" onClick={() => void app.testConnection(configFromConnection(connection))} loading={connectionBusy === "test"}>Test again</Button>
-          {liveGit?.configured && (
-            <Button size="small" onClick={switchToLiveGit} disabled={busy || app.discovery.state === "running"}
-              title={`Read the definitions from ${gitWhere(liveGit)} instead of the live workspace`}>
-              <GitBranch size={14} aria-hidden="true" />Use its Git repository instead
-            </Button>
-          )}
-          <Button size="small" onClick={() => { setConfig(configFromConnection(connection)); setChanging(true); }}>Change</Button>
+          <Button size="small" onClick={() => { setConfig(configFromConnection(connection)); setSource(authOf(connection.method)); setChanging(true); }}>Change</Button>
           <Button size="small" variant="ghost" onClick={() => (discovered ? setConfirmSignOut(true) : signOut())} disabled={busy || app.discovery.state === "running"}
             title={app.discovery.state === "running" ? "Discovery is running; wait for it to finish" : undefined}>Disconnect</Button>
         </div>
@@ -702,6 +539,50 @@ export function SourceConnectionPanel() {
       A Microsoft sign-in window has opened. Enter your email, password and any MFA prompt there; this page continues on its own.
     </Banner>
   );
+  // A repository holds definitions only; the live workspace adds its dedicated SQL pool. Sign in and choose it.
+  const liveAddon = (
+    <div className="stack pool-addon">
+      <div className="row">
+        <Button variant={signedInHere ? "default" : "primary"} size="small" onClick={() => void submit("authenticate")} loading={connectionBusy === "authenticate"} disabled={busy}>
+          {signedInHere ? "Sign in again" : "Sign in with Azure"}
+        </Button>
+        {signedInAs}
+      </div>
+      {waitingForSignIn}
+      {otherDirectories}
+      <ScopeSelectors config={config} errors={errors} set={set} signedIn={signedInHere} version={connection.subscriptionCount ?? 0} />
+      {repoErrors.pool && <p className="err">{repoErrors.pool}</p>}
+    </div>
+  );
+
+  if (source === "git") {
+    return (
+      <div className="stack conn-body">
+        <MethodTiles label="How to connect to Azure Synapse" options={METHODS} value={source} onChange={selectMethod} disabled={busy} />
+        <MiniSteps steps={["Repository URL", "Connect"]} current={repo.url.trim() ? 1 : 0} />
+
+        <div className="form-grid">
+          <TextField full label="Repository URL" value={repo.url} onChange={(e) => setRepo({ url: e.target.value })} error={repoErrors.url}
+            placeholder="https://dev.azure.com/contoso/Data/_git/synapse"
+            hint="Cloned by git on this machine with your own sign-in (credential helper or SSH key). No token is entered here." />
+        </div>
+
+        <label className="check-row">
+          <input type="checkbox" checked={repo.withPool} onChange={(e) => setRepo({ withPool: e.target.checked })} />
+          <span><strong>Also connect to the live Synapse workspace</strong><span className="muted"> — for its dedicated SQL pool: tables, data loads, date filters and row counts. The repository holds definitions only; without the workspace those stages are skipped.</span></span>
+        </label>
+        {repo.withPool && liveAddon}
+
+        <MoreOptions kind="git" form={repo} setForm={setRepo} errors={repoErrors} open={moreOpen} onToggle={setMoreOpen} />
+        {repositoryProblems}
+
+        <div className="row conn-actions">
+          <Button variant="primary" onClick={() => void connectRepository("git")} loading={connectionBusy === "test"} disabled={busy}>Connect repository</Button>
+          {changing && <Button variant="ghost" onClick={() => setChanging(false)}>Cancel</Button>}
+        </div>
+      </div>
+    );
+  }
 
   if (source === "zip") {
     return (
@@ -715,20 +596,7 @@ export function SourceConnectionPanel() {
           <input type="checkbox" checked={repo.withPool} onChange={(e) => setRepo({ withPool: e.target.checked })} />
           <span><strong>Also read the dedicated SQL pool</strong><span className="muted"> — for tables, data loads, date filters and row counts. The export holds definitions only; without the pool those stages are skipped.</span></span>
         </label>
-        {repo.withPool && (
-          <div className="stack pool-addon">
-            <div className="row">
-              <Button variant={signedInHere ? "default" : "primary"} size="small" onClick={() => void submit("authenticate")} loading={connectionBusy === "authenticate"} disabled={busy}>
-                {signedInHere ? "Sign in again" : "Sign in with Azure"}
-              </Button>
-              {signedInAs}
-            </div>
-            {waitingForSignIn}
-            {otherDirectories}
-            <ScopeSelectors config={config} errors={errors} set={set} signedIn={signedInHere} version={connection.subscriptionCount ?? 0} />
-            {repoErrors.pool && <p className="err">{repoErrors.pool}</p>}
-          </div>
-        )}
+        {repo.withPool && liveAddon}
 
         <MoreOptions kind="zip" form={repo} setForm={setRepo} errors={repoErrors} open={moreOpen} onToggle={setMoreOpen} />
         {repositoryProblems}
@@ -741,41 +609,26 @@ export function SourceConnectionPanel() {
     );
   }
 
-  // The workspace: sign in, choose it, connect. When it is connected to Git its repository is read
-  // (recommended, chosen for you); otherwise, or by choice, the live workspace. A typed URL needs no sign-in.
-  const detecting = detection?.state === "loading";
-  const urlOnly = typed && !signedInHere;
-  const step = urlOnly ? (repo.url.trim() ? 1 : 0) : signedInHere ? (config.workspace ? 2 : 1) : 0;
-  const connect = () => void (gitChosen ? connectRepository("git") : submit("test"));
+  // The live workspace: sign in, choose it, connect. Its definitions are read from what is published.
+  const step = signedInHere ? (config.workspace ? 2 : 1) : 0;
   return (
     <div className="stack conn-body">
       <MethodTiles label="How to connect to Azure Synapse" options={METHODS} value={source} onChange={selectMethod} disabled={busy} />
-      <MiniSteps steps={urlOnly ? ["Repository URL", "Connect"] : ["Sign in", "Choose workspace", "Connect"]} current={step} />
+      <MiniSteps steps={["Sign in", "Choose workspace", "Connect"]} current={step} />
 
       {!supported && (
         <Banner tone="warning" title="Not available in this backend">The running backend does not support {METHOD_LABEL[config.method]}. Restart it from the latest code.</Banner>
       )}
-      {!signedInHere && !typed && connectionBusy !== "authenticate" && (
-        <p className="muted" style={{ margin: 0 }}>Sign in with your Microsoft account and choose the workspace. If it is connected to Git, its repository is read: there is nothing to type.</p>
+      {!signedInHere && connectionBusy !== "authenticate" && (
+        <p className="muted" style={{ margin: 0 }}>Sign in with your Microsoft account and choose the workspace: there is nothing to type.</p>
       )}
       {signedInAs}
       {waitingForSignIn}
       {otherDirectories}
       <ScopeSelectors config={config} errors={errors} set={set} signedIn={signedInHere} version={connection.subscriptionCount ?? 0} />
 
-      <ReadFrom detection={detection} readFrom={readFrom} onReadFrom={setReadFrom} typing={typing}
-        onTypeInstead={() => setTyping(true)} onUseFound={() => setTyping(false)} onRetry={() => setDetectAgain((n) => n + 1)} />
-      {typed && (
-        <div className="form-grid">
-          <TextField full label="Repository URL" value={repo.url} onChange={(e) => setRepo({ url: e.target.value })} error={repoErrors.url}
-            placeholder="https://dev.azure.com/contoso/Data/_git/synapse"
-            hint="Cloned by git on this machine with your own sign-in (credential helper or SSH key). No token is entered here." />
-        </div>
-      )}
-      {gitChosen && <MoreOptions kind="git" form={repo} setForm={setRepo} errors={repoErrors} found={typed ? null : found} open={moreOpen} onToggle={setMoreOpen} />}
-
       {connectionError && (
-        <Banner tone="error" title={connectionError.title} actions={<><Button size="small" onClick={() => (signedInHere || typed ? connect() : void submit("authenticate"))} disabled={busy}>Retry</Button><Button size="small" onClick={app.clearConnectionError}>Dismiss</Button></>}>
+        <Banner tone="error" title={connectionError.title} actions={<><Button size="small" onClick={() => void submit(signedInHere ? "test" : "authenticate")} disabled={busy}>Retry</Button><Button size="small" onClick={app.clearConnectionError}>Dismiss</Button></>}>
           {connectionError.hint && <div>{connectionError.hint}</div>}
           <div className="faint" style={{ marginTop: 4 }}>{connectionError.message}</div>
         </Banner>
@@ -783,13 +636,12 @@ export function SourceConnectionPanel() {
       {!connectionError && connection.checks.length > 0 && !connected && <CheckList checks={connection.checks} label="Source connection checks" />}
 
       <div className="row conn-actions">
-        {(signedInHere || typed) && (
-          <Button variant="primary" onClick={connect} loading={connectionBusy === "test"} disabled={busy || detecting || (!typed && (!supported || !config.workspace))}>Connect</Button>
+        {signedInHere && (
+          <Button variant="primary" onClick={() => void submit("test")} loading={connectionBusy === "test"} disabled={busy || !supported || !config.workspace}>Connect</Button>
         )}
-        <Button variant={signedInHere || typed ? "default" : "primary"} onClick={() => void submit("authenticate")} loading={connectionBusy === "authenticate"} disabled={busy || !supported}>
+        <Button variant={signedInHere ? "default" : "primary"} onClick={() => void submit("authenticate")} loading={connectionBusy === "authenticate"} disabled={busy || !supported}>
           {signedInHere ? "Sign in again" : "Sign in with Azure"}
         </Button>
-        {!signedInHere && !typed && <Button variant="ghost" onClick={() => setTyping(true)}>Enter a repository URL instead</Button>}
         {changing && <Button variant="ghost" onClick={() => setChanging(false)}>Cancel</Button>}
       </div>
     </div>

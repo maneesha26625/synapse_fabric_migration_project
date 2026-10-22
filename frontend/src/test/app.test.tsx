@@ -263,22 +263,24 @@ describe("start page", () => {
     expect(stored("ma.route")).toEqual({ source: "synapse", destination: "fabric" });
   });
 
-  it("offers the workspace (read from its Git repository or live) and a ZIP export, each asking only what it needs", async () => {
+  it("offers the live workspace, a Git repository and a ZIP export, each asking only what it needs", async () => {
     const user = userEvent.setup();
     localStorage.setItem("ma.route", JSON.stringify({ source: "synapse", destination: "fabric" }));
     go("/");
     const source = await screen.findByRole("radiogroup", { name: "How to connect to Azure Synapse" });
-    // Two ways in: the workspace (its Git repository or the live workspace is a choice inside it), or a ZIP.
-    expect(within(source).getAllByRole("radio").map((r) => r.textContent?.match(/^(Synapse workspace|Workspace export \(ZIP\))/)?.[0]))
-      .toEqual(["Synapse workspace", "Workspace export (ZIP)"]);
+    // Three ways in: the live workspace, its Git repository by URL, or a ZIP.
+    expect(within(source).getAllByRole("radio").map((r) => r.textContent?.match(/^(Synapse workspace|Git repository|Workspace export \(ZIP\))/)?.[0]))
+      .toEqual(["Synapse workspace", "Git repository", "Workspace export (ZIP)"]);
     for (const r of within(source).getAllByRole("radio")) expect(r).not.toHaveAttribute("aria-disabled");
-    for (const gone of [/Interactive browser/, /^Azure CLI/, /^Git repository/]) expect(within(source).queryByRole("radio", { name: gone })).toBeNull();
+    for (const gone of [/Interactive browser/, /^Azure CLI/]) expect(within(source).queryByRole("radio", { name: gone })).toBeNull();
     expect(within(source).getByRole("radio", { name: /^Synapse workspace/ })).toHaveAttribute("aria-checked", "true");
-    // Nothing to type: sign in and choose the workspace, or enter a repository URL instead.
+    // The workspace asks for nothing typed and offers no repository.
     expect(screen.queryByLabelText(/Subscription ID|Tenant ID|Repository URL/)).toBeNull();
     expect(screen.getByRole("button", { name: "Sign in with Azure" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Enter a repository URL instead" }));
+    expect(screen.queryByRole("button", { name: /repository URL/ })).toBeNull();
+    await user.click(within(source).getByRole("radio", { name: /^Git repository/ }));
     expect(screen.getByLabelText("Repository URL")).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: /Also connect to the live Synapse workspace/ })).not.toBeChecked();
     await user.click(within(source).getByRole("radio", { name: /Workspace export \(ZIP\)/ }));
     expect(screen.getByLabelText("Workspace export (ZIP)")).toBeInTheDocument();
     await user.click(within(source).getByRole("radio", { name: /^Synapse workspace/ }));
@@ -298,11 +300,11 @@ describe("start page", () => {
     localStorage.setItem("ma.route", JSON.stringify({ source: "synapse", destination: "fabric" }));
     go("/");
     const card = await screen.findByRole("region", { name: /^Source connection/ });
-    await user.click(await within(card).findByRole("button", { name: "Enter a repository URL instead" }));
-    await user.click(within(card).getByRole("button", { name: "Connect" }));
+    await user.click(await within(card).findByRole("radio", { name: /^Git repository/ }));
+    await user.click(within(card).getByRole("button", { name: "Connect repository" }));
     expect(within(card).getByText("Repository URL is required.")).toBeInTheDocument();
     await user.type(within(card).getByLabelText("Repository URL"), "https://user:ghp_x@github.com/contoso/synapse-ws.git");
-    await user.click(within(card).getByRole("button", { name: "Connect" }));
+    await user.click(within(card).getByRole("button", { name: "Connect repository" }));
     expect(within(card).getByText(/Leave credentials out of the URL/)).toBeInTheDocument();
     await user.clear(within(card).getByLabelText("Repository URL"));
     await user.type(within(card).getByLabelText("Repository URL"), "https://github.com/contoso/synapse-ws.git");
@@ -313,7 +315,7 @@ describe("start page", () => {
     await user.type(within(card).getByLabelText(/^Branch/), "release/prod");
     await user.selectOptions(within(card).getByLabelText("Environment"), "Prod");
     expect(more).toHaveAccessibleName("More options · Prod environment · branch release/prod");
-    await user.click(within(card).getByRole("button", { name: "Connect" }));
+    await user.click(within(card).getByRole("button", { name: "Connect repository" }));
     expect(await within(card).findByText("release/prod · 3f9a1c2", {}, { timeout: 5000 })).toBeInTheDocument();
     expect(within(card).getByText("Prod")).toBeInTheDocument();
     expect(within(card).getByText(/Not added: tables, views, procedures and data are skipped/)).toBeInTheDocument();
@@ -412,10 +414,6 @@ describe("start page", () => {
     await user.selectOptions(ws, "demo-synapse-ws");
     // The workspace has a single dedicated SQL pool: it is chosen without asking.
     await waitFor(() => expect(within(source).getByLabelText(/Dedicated SQL pool/)).toHaveValue("TransportDW"));
-    // The workspace is connected to Git, so its repository is the choice made for you; read it live instead.
-    const viaGit = await within(source).findByRole("radio", { name: /^Git repository/ }, { timeout: 4000 });
-    expect(viaGit).toBeChecked();
-    await user.click(within(source).getByRole("radio", { name: /^Live workspace/ }));
     await user.click(within(source).getByRole("button", { name: "Connect" }));
     await within(source).findByText("demo-synapse-ws", { selector: "strong" }, { timeout: 8000 });
     expect(start()).toBeDisabled();
@@ -451,65 +449,57 @@ describe("start page", () => {
     await waitFor(async () => expect((await mockApi.getConnection()).status).not.toBe("connected"));
   }, 15000);
 
-  it("reads a workspace's Git repository when it has one, chosen for you, with nothing typed", async () => {
+  it("never offers Git options with the live workspace", async () => {
     const user = userEvent.setup();
     localStorage.setItem("ma.route", JSON.stringify({ source: "synapse", destination: "fabric" }));
     go("/");
     const card = await screen.findByRole("region", { name: /^Source connection/ });
-    // Nothing to type: the only thing asked first is the sign-in.
-    expect(within(card).queryByRole("textbox")).toBeNull();
     await user.click(await within(card).findByRole("button", { name: "Sign in with Azure" }));
     const subscription = await within(card).findByLabelText("Subscription", {}, { timeout: 4000 });
     await waitFor(() => expect(within(subscription).getAllByRole("option").length).toBeGreaterThan(1));
     await user.selectOptions(subscription, "Demo subscription");
     const group = within(card).getByLabelText("Resource group");
     await waitFor(() => expect(within(group).getAllByRole("option").length).toBeGreaterThan(1));
-
-    // A workspace without Git integration is simply read live: no choice, nothing to type.
-    await user.selectOptions(group, "rg-demo-analytics");
-    expect(await within(card).findByText("analytics-synapse-prod isn't connected to Git, so its definitions are read from the live workspace.", {}, { timeout: 4000 })).toBeInTheDocument();
-    expect(within(card).queryByRole("group", { name: "Read definitions from" })).toBeNull();
-    expect(within(card).queryByRole("textbox")).toBeNull();
-
-    // One that is: its repository is found and chosen for you; the live workspace is the alternative.
     await user.selectOptions(group, "rg-demo-migration");
     const ws = within(card).getByLabelText("Synapse workspace");
     await waitFor(() => expect(within(ws).getAllByRole("option").length).toBeGreaterThan(1));
     await user.selectOptions(ws, "demo-synapse-ws");
-    const readFrom = await within(card).findByRole("group", { name: "Read definitions from" }, { timeout: 4000 });
-    expect(within(readFrom).getByRole("radio", { name: /^Git repository/ })).toBeChecked();
-    expect(within(readFrom).getByRole("radio", { name: /^Live workspace/ })).not.toBeChecked();
-    expect(readFrom).toHaveTextContent("https://dev.azure.com/contoso/Synapse/_git/demo-synapse-ws");
-    expect(readFrom).toHaveTextContent("Azure DevOps · branch main · folder synapse/");
-    expect(within(card).queryByRole("textbox")).toBeNull();
-    expect(within(card).queryByRole("checkbox", { name: /dedicated SQL pool/ })).toBeNull();
-    expect(within(card).getByRole("button", { name: /^More options · Dev environment$/ })).toHaveAttribute("aria-expanded", "false");
-    // The workspace's only SQL pool is chosen with it, so tables come along.
+    // Even for a workspace connected to Git: no choice of where to read from, nothing to type.
     await waitFor(() => expect(within(card).getByLabelText(/Dedicated SQL pool/)).toHaveValue("TransportDW"));
-
+    expect(within(card).queryByRole("group", { name: "Read definitions from" })).toBeNull();
+    expect(within(card).queryByRole("textbox")).toBeNull();
     await user.click(within(card).getByRole("button", { name: "Connect" }));
-    expect(await within(card).findByText("main · 3f9a1c2", {}, { timeout: 5000 })).toBeInTheDocument();
-    expect(within(card).getByText("Dev")).toBeInTheDocument();
-    expect(within(card).getByText("synapse/")).toBeInTheDocument();
-    expect(within(card).getByText("TransportDW (demo-synapse-ws)")).toBeInTheDocument();
+    await within(card).findByText("demo-synapse-ws", { selector: "strong" }, { timeout: 8000 });
+    // Connected, it shows the workspace only: no Git integration row, no switch to its repository.
+    expect(within(card).queryByText("Git integration")).toBeNull();
+    expect(within(card).queryByRole("button", { name: /Git repository/ })).toBeNull();
   }, 40000);
 
-  it("offers a connected live workspace's Git repository in its place, already found", async () => {
-    resetDemo();
+  it("connects a Git repository by URL, with the live workspace added on request for its SQL pool", async () => {
     const user = userEvent.setup();
+    localStorage.setItem("ma.route", JSON.stringify({ source: "synapse", destination: "fabric" }));
     go("/");
     const card = await screen.findByRole("region", { name: /^Source connection/ });
-    expect(await within(card).findByText("https://dev.azure.com/contoso/Synapse/_git/demo-synapse-ws · main", {}, { timeout: 5000 })).toBeInTheDocument();
-    await user.click(within(card).getByRole("button", { name: "Use its Git repository instead" }));
-    // The repository is already known and chosen: nothing to type.
-    expect(within(card).getByRole("radio", { name: /^Git repository/ })).toBeChecked();
-    expect(within(card).queryByRole("textbox")).toBeNull();
-    // The same workspace and SQL pool stay chosen, so tables still come along.
-    await waitFor(() => expect(within(card).getByLabelText(/Dedicated SQL pool/)).toHaveValue("TransportDW"), { timeout: 4000 });
-    await user.click(within(card).getByRole("button", { name: "Connect" }));
-    expect(await within(card).findByText("main · 3f9a1c2", {}, { timeout: 5000 })).toBeInTheDocument();
-    expect(within(card).getByText("TransportDW (demo-synapse-ws)")).toBeInTheDocument();
-  }, 30000);
+    await user.click(await within(card).findByRole("radio", { name: /^Git repository/ }));
+    await user.type(within(card).getByLabelText("Repository URL"), "https://dev.azure.com/contoso/Synapse/_git/demo-synapse-ws");
+    // Ticking the live workspace asks for a sign-in before it can connect.
+    await user.click(within(card).getByRole("checkbox", { name: /Also connect to the live Synapse workspace/ }));
+    await user.click(within(card).getByRole("button", { name: "Connect repository" }));
+    expect(within(card).getByText("Sign in to Azure to connect the live workspace, or untick it.")).toBeInTheDocument();
+    await user.click(within(card).getByRole("button", { name: "Sign in with Azure" }));
+    const subscription = await within(card).findByLabelText("Subscription", {}, { timeout: 4000 });
+    await waitFor(() => expect(within(subscription).getAllByRole("option").length).toBeGreaterThan(1));
+    await user.selectOptions(subscription, "Demo subscription");
+    const group = within(card).getByLabelText("Resource group");
+    await waitFor(() => expect(within(group).getAllByRole("option").length).toBeGreaterThan(1));
+    await user.selectOptions(group, "rg-demo-migration");
+    const ws = within(card).getByLabelText("Synapse workspace");
+    await waitFor(() => expect(within(ws).getAllByRole("option").length).toBeGreaterThan(1));
+    await user.selectOptions(ws, "demo-synapse-ws");
+    await waitFor(() => expect(within(card).getByLabelText(/Dedicated SQL pool/)).toHaveValue("TransportDW"));
+    await user.click(within(card).getByRole("button", { name: "Connect repository" }));
+    expect(await within(card).findByText("TransportDW (demo-synapse-ws)", {}, { timeout: 5000 })).toBeInTheDocument();
+  }, 40000);
 });
 
 describe("migration journey", () => {
