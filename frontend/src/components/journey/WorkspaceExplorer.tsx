@@ -3,6 +3,7 @@ import {
   Layers, Link2, NotebookPen, Package, ShieldCheck, Sparkles, SquareFunction, Table2, TableProperties, Workflow, Zap, type LucideIcon,
 } from "lucide-react";
 import { useMemo, useState } from "react";
+import { AgentLaunch } from "../../agent/AgentMode";
 import { ObjectDetails } from "../discovery/ObjectDetails";
 import { useAppState } from "../../state/AppState";
 import { useMigration } from "../../state/MigrationState";
@@ -225,6 +226,7 @@ export function WorkspaceExplorer() {
           value={query} onChange={(e) => setQuery(e.target.value)} />
       )}
       <div className="explorer-tree">{body}</div>
+      <AgentLaunch />
       {selected && <ObjectDetails id={selected} onClose={() => setSelected(null)} onNavigate={setSelected} />}
     </aside>
   );

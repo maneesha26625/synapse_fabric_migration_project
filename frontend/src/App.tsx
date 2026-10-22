@@ -1,4 +1,5 @@
 import { BrowserRouter, Navigate, Route, Routes, useParams } from "react-router-dom";
+import { AgentProvider } from "./agent/AgentMode";
 import { LEGACY_STEP } from "./components/journey/steps";
 import { Layout } from "./components/layout/Layout";
 import { Setup } from "./pages/Setup";
@@ -17,6 +18,7 @@ export function App() {
   return (
     <AppStateProvider>
       <MigrationStateProvider>
+        <AgentProvider>
         <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
           <a href="#main" className="sr-only">Skip to content</a>
           <Routes>
@@ -32,6 +34,7 @@ export function App() {
             </Route>
           </Routes>
         </BrowserRouter>
+        </AgentProvider>
       </MigrationStateProvider>
     </AppStateProvider>
   );

@@ -1,6 +1,7 @@
 import { AlertTriangle, ArrowLeft, ArrowRight, Check, CheckCircle2, Circle, Download, Lock, PanelLeftClose, PanelLeftOpen, Pause, PartyPopper, PlugZap, ServerCrash, Settings2 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
+import { AGENT_VIEW_PARAM, AgentView, isAgentView } from "../agent/AgentMode";
 import { AssessPanel } from "../components/journey/panels/AssessPanel";
 import { DiscoverPanel } from "../components/journey/panels/DiscoverPanel";
 import { MigratePanel } from "../components/journey/panels/MigratePanel";
@@ -189,6 +190,8 @@ export function Workspace() {
   const [explorerOpen, setExplorerOpen] = useExplorerOpen();
 
   const requested = params.get("step") as StepKey | null;
+  // Agent mode (consultation, orchestrator) opens in place of the step panel; any step brings the steps back.
+  const agentView = params.get(AGENT_VIEW_PARAM);
   const selected = steps.find((s) => s.key === requested && !s.locked)?.key ?? current;
   const step = steps.find((s) => s.key === selected)!;
   const select = (key: StepKey) => {
@@ -277,6 +280,7 @@ export function Workspace() {
         {explorerOpen && <WorkspaceExplorer />}
         <div className="ws-main">
           <div ref={flow} className="journey-anchor"><JourneyFlow steps={steps} selected={selected} onSelect={select} /></div>
+          {isAgentView(agentView) ? <AgentView view={agentView} onBack={() => select(selected)} /> : (<>
           <ReleasePath stepsDone={done} stepsTotal={steps.length} />
 
           {finished && <CompletionCard />}
@@ -294,6 +298,7 @@ export function Workspace() {
             <div className="step-body" key={`${selected}-${resetNonce}`}>{PANELS[selected]()}</div>
             <NextBar step={step} steps={steps} onGo={select} />
           </section>
+          </>)}
         </div>
       </div>
     </div>
