@@ -1,9 +1,9 @@
 import type { RunOptions, ValidationRuntimeOptions } from "../types";
-import { QUESTIONS, TOPICS, answerLabel, type AnswerValue, type Answers, type Question, type Recommendation } from "./catalog";
+import { EFFECT_LABEL, QUESTIONS, TOPICS, answerLabel, type AnswerValue, type Answers, type Question, type Recommendation } from "./catalog";
 import type { Facts } from "./facts";
 
-/** Where an answer stands: given by a person, the recommendation taken as given, or still open. */
-export type AnswerSource = "person" | "recommendation" | "open";
+/** Where an answer stands: read from the configuration, given by a person, the recommendation taken as given, or still open. */
+export type AnswerSource = "config" | "person" | "recommendation" | "open";
 
 export interface Resolved {
   q: Question;
@@ -14,22 +14,24 @@ export interface Resolved {
   rec: Recommendation | null;
 }
 
-export interface BriefCounts { answered: number; assumed: number; needPerson: number; conflicts: number; applicable: number }
+export interface BriefCounts { answered: number; fromConfig: number; assumed: number; needPerson: number; conflicts: number; applicable: number }
 
 /**
- * Every question with the answer the brief uses: the person's, else the recommendation.
- * Questions are resolved in order, so a later `when` sees the earlier answers it depends on.
+ * Every question with the answer the brief uses: the configuration's, else the person's, else the
+ * recommendation. Questions are resolved in order, so a later `when` sees the earlier answers.
  */
 export function resolve(facts: Facts, given: Answers): Resolved[] {
   const effective: Answers = {};
   return QUESTIONS.map((q) => {
     const applies = q.when ? q.when(facts, effective) : true;
-    const rec = applies && q.recommend ? q.recommend(facts, effective) : null;
+    const config = applies && q.resolve ? q.resolve(facts) : null;
+    const rec = config ?? (applies && q.recommend ? q.recommend(facts, effective) : null);
     const mine = given[q.id];
-    const has = mine !== undefined && !(typeof mine === "string" && !mine.trim());
-    const value = has ? mine : rec?.value;
+    const has = !config && mine !== undefined && !(typeof mine === "string" && !mine.trim());
+    const value = config ? config.value : has ? mine : rec?.value;
     if (applies && value !== undefined) effective[q.id] = value;
-    return { q, applies, value: applies ? value : undefined, source: !applies ? "open" : has ? "person" : rec ? "recommendation" : "open", rec };
+    const source: AnswerSource = !applies ? "open" : config ? "config" : has ? "person" : rec ? "recommendation" : "open";
+    return { q, applies, value: applies ? value : undefined, source, rec };
   });
 }
 
@@ -45,53 +47,89 @@ export interface AgentSettings {
   planTypes: string[];
   /** Also put objects of types no stage moves (recorded as deferred). */
   includeUnstaged: boolean;
+  /** Only these dependency waves (a pilot moves the first); null for every wave. */
+  waves: number[] | null;
   options: Partial<RunOptions>;
   validation: ValidationRuntimeOptions;
   failures: "retry" | "stop" | "report";
   approval: boolean;
-  /** The run needs linked-service credentials a person types on the Plan step. */
+  /** Objects with no automatic route make the agent stop for approval before the run. */
+  approveUnsupported: boolean;
+  /** The run needs linked-service credentials a person types on the Plan tab. */
   needsCredentials: boolean;
+  /** Things an administrator sets up that the agent asks a person to confirm before the run. */
+  prerequisites: string[];
+  /** When validation finds mismatches: stop for a person (all, exceptions) or report (critical). */
+  validationGate: "all" | "exceptions" | "critical";
 }
+
+const REMOVE: Record<string, (a: Answers) => boolean> = {
+  warehouse: (a) => a["target.sql"] === "lakehouse",
+  data: (a) => !a["data.load"] || a["data.load"] === "none" || a["security.sensitive"] === "blocked" || a["target.sql"] === "lakehouse",
+  security: (a) => a["security.roles"] === "no" || a["target.sql"] === "lakehouse",
+  sql_scripts: (a) => a["target.sql"] === "lakehouse",
+  spark: (a) => a["spark.compute"] === "starter",
+  spark_jobs: (a) => a["spark.jobs"] === "skip",
+  pipelines: (a) => a["pipelines.migrate"] === "redesign",
+  schedules: (a) => a["pipelines.triggers"] === "skip" || a["pipelines.migrate"] === "redesign",
+  connections: (a) => a["security.credentials"] === "skip",
+  shortcuts: (a) => a["features.external"] === "copy",
+};
 
 export function settingsFrom(facts: Facts, rs: Resolved[]): AgentSettings {
   const a = effectiveAnswers(rs);
   const known = new Set(facts.stages.map((s) => s.key));
-  const stages = new Set<string>((Array.isArray(a["scope.stages"]) ? a["scope.stages"] : []).filter((k) => known.has(k)));
-  const dataRun = pick(a, "data.move", "none");
-  if (dataRun !== "none" && known.has("data") && facts.tables > 0) stages.add("data");
-  if (a["ops.schedules"] === "skip") stages.delete("schedules");
-  if (a["sec.roles"] === "no") stages.delete("security");
-  if (a["sec.credentials"] === "skip") stages.delete("connections");
+  const mode = pick(a, "scope.mode", "all");
+  const chosen = mode === "selected" && Array.isArray(a["scope.stages"]) ? a["scope.stages"] : facts.stagesWithObjects.map((s) => s.key).filter((k) => k !== "data");
+  const stages = new Set<string>(chosen.filter((k) => known.has(k)));
+  if (known.has("data") && facts.tables > 0) stages.add("data");
+  for (const [k, off] of Object.entries(REMOVE)) if (off(a)) stages.delete(k);
   const ordered = facts.stages.map((s) => s.key).filter((k) => stages.has(k));
   const planTypes = [...new Set(facts.stages.filter((s) => stages.has(s.key)).flatMap((s) => s.types))];
-  const scope = pick(a, "conv.unsupported", "automated") === "all" ? "all" : "automated";
-  const failures = pick(a, "val.retry", "retry") as AgentSettings["failures"];
-  const depth = pick(a, "val.depth", "probe");
+  const unsupported = pick(a, "sql.unsupported", "automated");
+  const scope = unsupported === "all" ? "all" : "automated";
+  const failures = pick(a, "validation.failures", "retry") as AgentSettings["failures"];
+  const depth = pick(a, "validation.depth", "probe");
+  const load = pick(a, "data.load", "none");
   const credentialStages = facts.stages.filter((s) => stages.has(s.key) && s.needsInput === "credentials").length > 0;
+  const prerequisites = [
+    ...(a["target.workspace"] === "new" ? ["A Fabric administrator creates the target workspace, and it is connected on the Connections page."] : []),
+    ...(facts.capacityAssigned !== true && a["target.capacity"] && a["target.capacity"] !== "assigned" ? ["The target workspace is assigned a Fabric capacity."] : []),
+    ...(a["pipelines.runtime"] === "gateway" ? ["An administrator installs and registers an on-premises data gateway for the systems behind the self-hosted integration runtime."] : []),
+    ...(a["security.network"] === "yes" || a["security.network"] === "unknown" ? ["Fabric can reach the source systems through the network (gateway or managed private endpoints), checked by an administrator."] : []),
+  ];
+  const options: Partial<RunOptions> = {
+    stages: ordered,
+    scope,
+    stopOnFailure: failures === "stop",
+    collation: pick(a, "target.collation", "match_synapse") as RunOptions["collation"],
+    existing: pick(a, "target.existing", "skip") as RunOptions["existing"],
+    dataRun: load === "create" ? "create" : "run",
+    dataMode: pick(a, "data.existingRows", "if_empty") as RunOptions["dataMode"],
+    syncOverlap: pick(a, "data.sync", "1h") as RunOptions["syncOverlap"],
+    gitCommit: pick(a, "target.gitCommit", "off") as RunOptions["gitCommit"],
+    // Keeping direct storage paths means routing nothing; otherwise the run's default routes apply.
+    ...(a["spark.storage"] === "direct" ? { storageRoutes: [] } : {}),
+  };
   return {
     stages: ordered,
     planTypes,
     includeUnstaged: scope === "all",
-    options: {
-      stages: ordered,
-      scope,
-      stopOnFailure: failures === "stop",
-      collation: pick(a, "target.collation", "match_synapse") as RunOptions["collation"],
-      existing: pick(a, "target.existing", "skip") as RunOptions["existing"],
-      dataRun: dataRun === "create" ? "create" : "run",
-      dataMode: pick(a, "data.existingRows", "if_empty") as RunOptions["dataMode"],
-      syncOverlap: pick(a, "data.sync", "1h") as RunOptions["syncOverlap"],
-      gitCommit: pick(a, "ops.gitCommit", "off") as RunOptions["gitCommit"],
-    },
+    waves: mode === "pilot" ? [1] : null,
+    options,
     validation: { probe: depth !== "compare", run: depth === "run" ? ["pipeline", "notebook"] : [], timeoutMinutes: 30 },
     failures,
-    approval: pick(a, "ops.approval", "ask") !== "auto",
+    approval: pick(a, "validation.approval", "ask") !== "auto" || unsupported === "block",
+    approveUnsupported: unsupported === "block",
     needsCredentials: credentialStages,
+    prerequisites,
+    validationGate: pick(a, "validation.gate", "exceptions") as AgentSettings["validationGate"],
   };
 }
 
-/** Answers that cannot all be carried out: a stage that needs another the brief leaves out. */
+/** Answers that cannot all be carried out together. */
 export function conflicts(facts: Facts, rs: Resolved[]): string[] {
+  const a = effectiveAnswers(rs);
   const s = settingsFrom(facts, rs);
   const on = new Set(s.stages);
   const withObjects = new Set(facts.stagesWithObjects.map((x) => x.key));
@@ -104,14 +142,22 @@ export function conflicts(facts: Facts, rs: Resolved[]): string[] {
       if (!on.has(need) && withObjects.has(need)) out.push(`${st.label} needs ${label(need)}, which the brief leaves out.`);
     }
   }
+  if (a["security.sensitive"] === "blocked" && a["data.load"] && a["data.load"] !== "none") {
+    out.push("Data movement is blocked pending approval, but the data load is set to copy rows: choose Schema only, or lift the restriction.");
+  }
+  if (a["data.load"] === "sync" && a["validation.parallel"] === "no" && a["scope.approach"] === "parallel") {
+    out.push("The approach is to run Synapse and Fabric in parallel, but the brief says they will not run in parallel before cutover.");
+  }
   return out;
 }
 
 export function counts(facts: Facts, rs: Resolved[]): BriefCounts {
   const live = rs.filter((r) => r.applies);
+  const fromConfig = live.filter((r) => r.source === "config").length;
   return {
     applicable: live.length,
-    answered: live.filter((r) => r.source === "person").length,
+    fromConfig,
+    answered: live.filter((r) => r.source === "person").length + fromConfig,
     assumed: live.filter((r) => r.source === "recommendation").length,
     needPerson: live.filter((r) => r.q.required && r.source === "open").length,
     conflicts: conflicts(facts, rs).length,
@@ -131,7 +177,7 @@ export function briefMarkdown(facts: Facts, rs: Resolved[], meta: { project: str
   const lines = [
     `# Migration brief: ${meta.project}`,
     "",
-    `Azure Synapse${facts.workspace ? ` (${facts.workspace})` : ""} to Microsoft Fabric. ${meta.version ? `Version ${meta.version}, ${meta.status}.` : "Draft, not yet submitted."}`,
+    `Azure Synapse${facts.workspace ? ` (${facts.workspace})` : ""} to Microsoft Fabric${facts.fabricWorkspace ? ` (${facts.fabricWorkspace})` : ""}. ${meta.version ? `Version ${meta.version}, ${meta.status}.` : "Draft, not yet submitted."}`,
     `Discovery: ${facts.total.toLocaleString()} objects${facts.waves ? ` in ${facts.waves} waves` : ""}.`,
     "",
   ];
@@ -140,12 +186,15 @@ export function briefMarkdown(facts: Facts, rs: Resolved[], meta: { project: str
     if (!items.length) continue;
     lines.push(`## ${t.title}`, "");
     for (const r of items) {
-      const how = r.source === "person" ? "" : r.source === "recommendation" ? " _(recommendation)_" : " _(open)_";
-      lines.push(`- **${r.q.text}**  `, `  ${answerLabel(r.q, facts, r.value)}${how}`);
+      const how = r.source === "config" ? " _(from the configuration)_" : r.source === "recommendation" ? " _(recommendation)_" : r.source === "open" ? " _(open)_" : "";
+      lines.push(`- **${r.q.text}**  `, `  ${answerLabel(r.q, facts, r.value)}${how} · ${EFFECT_LABEL[r.q.effect]}`);
     }
     lines.push("");
   }
+  const s = settingsFrom(facts, rs);
+  if (s.prerequisites.length) lines.push("## Prerequisites before the run", "", ...s.prerequisites.map((x) => `- ${x}`), "");
   const c = conflicts(facts, rs);
   if (c.length) lines.push("## Conflicts", "", ...c.map((x) => `- ${x}`), "");
+  if (facts.notRecorded.length) lines.push("## Not visible to discovery", "", `${facts.notRecorded.join(", ")}: questions about these were asked, never answered from discovery.`, "");
   return lines.join("\n");
 }

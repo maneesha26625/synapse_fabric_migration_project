@@ -20,6 +20,7 @@ import {
   type ResultsQuery,
   type ProjectRequirements,
   type TransformCandidates,
+  type ConsultFacts,
   type TransformObject,
   type TransformPrompt,
   type TransformQueued,
@@ -201,6 +202,7 @@ export const realApi: MigrationApi = {
   discardTransform: (id, scope) =>
     request<TransformObject>("/api/transform/discard", { method: "POST", body: JSON.stringify({ id, scope }) }),
   listTransformCandidates: () => request<TransformCandidates>("/api/transform/candidates"),
+  getConsultFacts: () => request<ConsultFacts>("/api/consult/facts"),
   getProjectRequirements: () => request<ProjectRequirements>("/api/transform/project"),
   saveProjectRequirements: (text) =>
     request<ProjectRequirements>("/api/transform/project", { method: "POST", body: JSON.stringify({ text }) }),

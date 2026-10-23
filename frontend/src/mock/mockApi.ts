@@ -17,6 +17,7 @@
 import {
   ApiRequestError,
   type Capabilities,
+  type ConsultFacts,
   type ConnectionConfig,
   type ConnectionCredentials,
   type ConnectionState,
@@ -1151,6 +1152,31 @@ export const mockApi: MigrationApi = {
     const { costUsd: _c, durationMs: _d, ...rest } = t.draft;
     transforms.set(id, { ...t, state: "accepted", draft: null, accepted: { ...rest, code: text, acceptedAt: new Date().toISOString(), edited: text !== t.draft.code.trim() } });
     return { ...current(o), source: demoSource(o) };
+  },
+  async getConsultFacts(): Promise<ConsultFacts> {
+    await sleep(120);
+    const objs = completedObjects();
+    if (!objs.length) throw new ApiRequestError("no_results", "There are no discovery results yet.", 409);
+    // Demo counts follow the demo estate's own objects, so the questions shown match what it holds.
+    const n = (type: string) => objs.filter((o) => o.type === type).length;
+    const part = (type: string, share: number) => Math.round(n(type) * share);
+    const tables = n("Table");
+    return {
+      facts: {
+        mssparkutilsNotebooks: part("Notebook", 0.35), notebooksWithSecrets: part("Notebook", 0.1), notebooksWithStoragePaths: part("Notebook", 0.5),
+        notebooksInstallingPackages: part("Notebook", 0.15), customLibraries: n("Spark Library"),
+        dynamicSqlObjects: part("Stored Procedure", 0.2), crossDatabaseObjects: part("View", 0.05),
+        distribution: tables ? { hash: Math.round(tables * 0.4), round_robin: Math.round(tables * 0.45), replicate: tables - Math.round(tables * 0.4) - Math.round(tables * 0.45) } : {},
+        columnstoreTables: Math.round(tables * 0.8), identityTables: Math.round(tables * 0.1), primaryKeyTables: Math.round(tables * 0.3),
+        externalTables: n("External Table"), externalSqlFeatures: part("SQL Script", 0.1), maskedColumns: n("Security Object") ? 4 : 0, columnGrants: n("Security Object") ? 2 : 0,
+        multiStatementFunctions: part("Function", 0.2), selfHostedRuntimes: n("Integration Runtime") ? 1 : 0, managedVnetRuntimes: 0,
+        linkedServicesOnSelfHostedRuntime: n("Integration Runtime") ? Math.min(2, n("Linked Service")) : 0, keyVaultLinkedServices: part("Linked Service", 0.3),
+        managedIdentityLinkedServices: part("Linked Service", 0.4), unsupportedActivities: { activities: part("Pipeline", 0.05), pipelines: part("Pipeline", 0.04) },
+        triggers: { schedule: part("Trigger", 0.7), tumblingWindow: part("Trigger", 0.2), event: n("Trigger") - part("Trigger", 0.7) - part("Trigger", 0.2), other: 0, started: part("Trigger", 0.6) },
+      },
+      unreadable: [],
+      notRecorded: ["materialized views", "sequences", "foreign keys", "row-level security policies", "managed private endpoints and firewall rules", "table row counts and sizes", "items already in the Fabric workspace"],
+    };
   },
   async listTransformCandidates() {
     await sleep(200);

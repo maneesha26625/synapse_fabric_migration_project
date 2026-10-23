@@ -19,6 +19,7 @@ web framework would be the first. The surface is small and fixed.
     GET    /api/dependencies              dependency graph + suggested waves
     GET    /api/mapping/components        Synapse -> Fabric component table
     GET    /api/discovery/export          the whole inventory, for download
+    GET    /api/consult/facts             features discovery found, for the consultation's questions
     GET    /api/azure/{subscriptions|resource-groups|workspaces|sql-pools}   pickers, from the Azure sign-in
     GET    /api/azure/workspace-git       the Git repository a Synapse workspace is integrated with
     GET    /api/fabric/connection         Fabric target state (never a token)
@@ -208,6 +209,8 @@ def make_handler(
                 self._dispatch(session.discovery_status)
             elif path == "/api/discovery/results":
                 self._dispatch(lambda: session.results(query))
+            elif path == "/api/consult/facts":
+                self._dispatch(session.consultation_facts)
             elif path == "/api/transform/settings":
                 self._dispatch(transforms.settings)
             elif path == "/api/transform/candidates":

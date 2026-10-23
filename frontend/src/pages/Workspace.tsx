@@ -1,47 +1,36 @@
 import { AlertTriangle, ArrowLeft, ArrowRight, Check, CheckCircle2, Circle, Download, Lock, PanelLeftClose, PanelLeftOpen, Pause, PartyPopper, PlugZap, ServerCrash, Settings2 } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { AGENT_VIEW_PARAM, AgentView, isAgentView } from "../agent/AgentMode";
+import { ConsultationView } from "../agent/ConsultationView";
+import { OrchestratorView } from "../agent/OrchestratorView";
 import { AssessPanel } from "../components/journey/panels/AssessPanel";
 import { DiscoverPanel } from "../components/journey/panels/DiscoverPanel";
-import { MigratePanel } from "../components/journey/panels/MigratePanel";
-import { PlanPanel } from "../components/journey/panels/PlanPanel";
-import { CompletionSummary, ValidatePanel } from "../components/journey/panels/ValidatePanel";
+import { CompletionSummary } from "../components/journey/panels/ValidatePanel";
 import { WavesPanel } from "../components/journey/panels/WavesPanel";
 import { WorkspaceExplorer } from "../components/journey/WorkspaceExplorer";
-import { ReleasePath } from "../components/journey/ReleasePath";
 import { downloadReport } from "../components/journey/report";
 import { ResetStepButton } from "../components/journey/ResetStep";
-import { useJourney, type StepStatus } from "../components/journey/useJourney";
+import { locate, usePhases, type DiscoverTab, type OrchestrateTab, type PhaseKey, type PhaseStatus } from "../components/journey/phases";
+import type { StepStatus } from "../components/journey/useJourney";
 import { PlatformMark } from "../components/setup/PlatformPicker";
 import { DESTINATIONS, SOURCES } from "../components/setup/platforms";
-import { Banner, Button, EmptyState, useDocumentTitle } from "../components/shared/Shared";
+import { Banner, Button, EmptyState, Tabs, useDocumentTitle } from "../components/shared/Shared";
 import { useAppState } from "../state/AppState";
-import { useMigration, type StepKey } from "../state/MigrationState";
+import { useMigration } from "../state/MigrationState";
 
-const PANELS: Record<StepKey, () => ReactNode> = {
-  discover: () => <DiscoverPanel />,
-  assess: () => <AssessPanel />,
-  waves: () => <WavesPanel />,
-  plan: () => <PlanPanel />,
-  migrate: () => <MigratePanel />,
-  validate: () => <ValidatePanel />,
-};
-
-/** The badge on a step's box: one word or two for where it stands. */
-function stateOf(s: StepStatus): { cls: string; label: string } {
+/** The badge on a phase's box: one word or two for where it stands. */
+function stateOf(s: PhaseStatus): { cls: string; label: string } {
   if (s.locked) return { cls: "locked", label: "Locked" };
   if (s.running) return { cls: "running", label: "Running" };
   if (s.paused) return { cls: "current attention", label: "Paused" };
-  if (s.stale) return { cls: "current attention", label: s.key === "plan" ? "Rebuild" : "Run again" };
+  if (s.stale) return { cls: "current attention", label: s.key === "consult" ? "Approve again" : "Run again" };
   if (s.confirmed) return { cls: s.attention ? "done attention" : "done", label: "Done" };
   if (s.complete) return { cls: s.attention ? "current attention" : "current", label: "Ready to confirm" };
   return { cls: s.attention ? "current attention" : "current", label: s.attention ? "Needs attention" : "To do" };
 }
 
-/** The six steps, left to right. Each box opens its step below; locked boxes open once the step before is confirmed. */
-function JourneyFlow({ steps, selected, onSelect }: { steps: StepStatus[]; selected: StepKey; onSelect: (k: StepKey) => void }) {
-  // On a narrow screen the strip scrolls sideways; keep the selected step in view.
+/** The three phases, left to right. Each box opens its phase below; a locked box opens once Discover is confirmed. */
+function JourneyFlow({ phases, selected, onSelect }: { phases: PhaseStatus[]; selected: PhaseKey; onSelect: (k: PhaseKey) => void }) {
   const list = useRef<HTMLOListElement>(null);
   useEffect(() => {
     const ol = list.current;
@@ -51,16 +40,16 @@ function JourneyFlow({ steps, selected, onSelect }: { steps: StepStatus[]; selec
   }, [selected]);
 
   return (
-    <nav className="journey" aria-label="Migration steps">
+    <nav className="journey phases" aria-label="Migration steps">
       <ol ref={list}>
-        {steps.map((s) => {
+        {phases.map((s) => {
           const st = stateOf(s);
           const Icon = s.icon;
           return (
             <li key={s.key} className={`jstep ${st.cls}${s.key === selected ? " selected" : ""}`}>
               <button type="button" disabled={s.locked} aria-current={s.key === selected ? "step" : undefined}
                 aria-label={`Step ${s.index + 1}: ${s.title}. ${st.label}${s.attention ? `, ${s.attention}` : ""}. ${s.metric}`}
-                onClick={() => onSelect(s.key)} title={s.locked ? "Finish and confirm the step before to open this one" : s.purpose}>
+                onClick={() => onSelect(s.key)} title={s.locked ? "Finish and confirm Discover to open this one" : s.purpose}>
                 <span className="jstep-top">
                   <span className="jstep-icon" aria-hidden="true">
                     {s.locked ? <Lock size={15} /> : s.running ? <span className="spinner" /> : s.paused ? <Pause size={15} /> : s.confirmed && !s.stale ? <Check size={16} /> : <Icon size={16} />}
@@ -80,45 +69,45 @@ function JourneyFlow({ steps, selected, onSelect }: { steps: StepStatus[]; selec
   );
 }
 
-/** Below every step: where it stands, and the way forward once it is good. */
-function NextBar({ step, steps, onGo }: { step: StepStatus; steps: StepStatus[]; onGo: (k: StepKey) => void }) {
+/** Below every phase: where it stands, and the way forward once it is good. */
+function NextBar({ phase, phases, onGo }: { phase: PhaseStatus; phases: PhaseStatus[]; onGo: (k: PhaseKey) => void }) {
   const { confirmStep } = useMigration();
-  const next = steps[step.index + 1];
-  const prev = steps[step.index - 1];
-  const confirm = () => { confirmStep(step.key); if (next) onGo(next.key); };
+  const next = phases[phase.index + 1];
+  const prev = phases[phase.index - 1];
+  const confirm = () => { for (const k of phase.steps) confirmStep(k); if (next) onGo(next.key); };
 
   let icon: ReactNode, title: string, detail: string, action: ReactNode;
-  // Work under way comes first: a confirmed step being run again is not "confirmed" until it finishes.
-  const busy = step.running || step.paused;
-  if (step.confirmed && !step.stale && !busy) {
+  const busy = phase.running || phase.paused;
+  if (phase.confirmed && !phase.stale && !busy) {
     icon = <CheckCircle2 size={20} className="tone-success" aria-hidden="true" />;
-    title = `${step.title} confirmed`;
-    detail = step.outcome || "Reviewed and confirmed.";
+    title = `${phase.title} ${phase.key === "consult" ? "approved" : "confirmed"}`;
+    detail = phase.outcome || "Reviewed and confirmed.";
     action = next ? <Button variant="primary" onClick={() => onGo(next.key)}>Go to {next.title}<ArrowRight size={15} aria-hidden="true" /></Button> : null;
-  } else if (step.complete && !busy) {
-    icon = step.attention ? <AlertTriangle size={20} className="tone-warning" aria-hidden="true" /> : <CheckCircle2 size={20} className="tone-success" aria-hidden="true" />;
-    title = step.attention ? `${step.title} finished · ${step.attention}` : `${step.title} finished`;
-    detail = step.attention
-      ? `${step.outcome} Review the issues above, or continue and come back to them.`
-      : `${step.outcome} If everything looks right, confirm it to move on.`;
+  } else if (phase.complete && !busy && phase.key !== "consult") {
+    icon = phase.attention ? <AlertTriangle size={20} className="tone-warning" aria-hidden="true" /> : <CheckCircle2 size={20} className="tone-success" aria-hidden="true" />;
+    title = phase.attention ? `${phase.title} finished · ${phase.attention}` : `${phase.title} finished`;
+    detail = phase.attention
+      ? `${phase.outcome} Review the issues above, or continue and come back to them.`
+      : `${phase.outcome} If everything looks right, confirm it to move on.`;
     action = (
       <Button variant="primary" onClick={confirm}>
-        {next ? (step.attention ? `Continue to ${next.title} anyway` : `Looks good, continue to ${next.title}`) : "Finish migration"}
+        {next ? (phase.attention ? `Continue to ${next.title} anyway` : `Looks good, continue to ${next.title}`) : "Finish migration"}
         <ArrowRight size={15} aria-hidden="true" />
       </Button>
     );
   } else {
-    icon = step.running ? <span className="spinner" aria-hidden="true" />
-      : step.paused || step.stale ? <AlertTriangle size={20} className="tone-warning" aria-hidden="true" />
+    icon = phase.running ? <span className="spinner" aria-hidden="true" />
+      : phase.paused || phase.stale ? <AlertTriangle size={20} className="tone-warning" aria-hidden="true" />
       : <Circle size={18} className="faint" aria-hidden="true" />;
-    title = step.running ? `${step.title} in progress`
-      : step.paused ? `${step.title} is paused`
-      : step.stale ? (step.key === "plan" ? "The plan needs rebuilding" : `${step.title} needs to run again`)
-      : `${step.title} is not finished`;
-    detail = step.stale
-      ? `Confirmed earlier, but ${step.lostReason.charAt(0).toLowerCase()}${step.lostReason.slice(1)} ${step.waiting}${next ? " The steps after it return once it is done again." : ""}`
-      : step.waiting;
-    action = <Button variant="primary" disabled title={step.waiting}>{next ? `Continue to ${next.title}` : "Finish migration"}<ArrowRight size={15} aria-hidden="true" /></Button>;
+    title = phase.running ? `${phase.title} in progress`
+      : phase.paused ? `${phase.title} is paused`
+      : phase.stale ? `${phase.title} needs to be done again`
+      : phase.key === "consult" ? "The brief is not approved yet" : `${phase.title} is not finished`;
+    detail = phase.stale ? `${phase.lostReason} ${phase.waiting}` : phase.waiting;
+    // The plan, run and validation can be worked by hand, so the consultation never shuts the way on.
+    action = phase.key === "consult" && next && !next.locked
+      ? <Button onClick={() => onGo(next.key)}>Continue without an approved brief<ArrowRight size={15} aria-hidden="true" /></Button>
+      : <Button variant="primary" disabled title={phase.waiting}>{next ? `Continue to ${next.title}` : "Finish migration"}<ArrowRight size={15} aria-hidden="true" /></Button>;
   }
 
   return (
@@ -132,6 +121,26 @@ function NextBar({ step, steps, onGo }: { step: StepStatus; steps: StepStatus[];
         {action}
       </div>
     </footer>
+  );
+}
+
+/** Discover: the inventory, how each object moves, and the waves it moves in, as tabs of one step. */
+function DiscoverPhase({ tab, onTab, steps }: { tab: DiscoverTab; onTab: (t: DiscoverTab) => void; steps: StepStatus[] }) {
+  const { graph } = useMigration();
+  const { discovery } = useAppState();
+  const discovered = discovery.state === "completed" || discovery.state === "completed_with_warnings";
+  const by = (k: string) => steps.find((s) => s.key === k)!;
+  return (
+    <div className="stack" style={{ gap: 16 }}>
+      <Tabs label="Discover sections" value={tab} onChange={onTab} tabs={[
+        { id: "objects", label: "Discovered objects", count: discovered ? discovery.summary?.total : undefined },
+        { id: "assessment", label: "Assessment" },
+        { id: "waves", label: "Dependency waves", count: graph ? graph.waves.length : undefined },
+      ]} />
+      {tab === "objects" && <DiscoverPanel />}
+      {tab === "assessment" && (by("assess").complete ? <AssessPanel /> : <p className="muted">{by("assess").waiting}</p>)}
+      {tab === "waves" && (discovered ? <WavesPanel /> : <p className="muted">{by("waves").waiting}</p>)}
+    </div>
   );
 }
 
@@ -153,7 +162,7 @@ function CompletionCard() {
             <h2 id="complete-title">Migration complete</h2>
             <p className="muted">
               Every step is confirmed.{" "}
-              {problems.length ? `${problems.join(" and ")}: open Migrate or Validate to deal with ${problems.length > 1 ? "them" : "it"}.` : "Objects left for a person are listed under Migrate, and the full comparison under Validate."}
+              {problems.length ? `${problems.join(" and ")}: open the Migration or Validation tab of the Agent orchestrator to deal with ${problems.length > 1 ? "them" : "it"}.` : "Objects left for a person are listed under Migration, and the full comparison under Validation."}
             </p>
           </div>
           <Button onClick={() => downloadReport({ run, validation, project: project.name, source: connection.workspace ?? null, target: fabric.workspaceName ?? null })}>
@@ -180,32 +189,36 @@ function useExplorerOpen(): [boolean, (open: boolean) => void] {
   return [open, set];
 }
 
+const DISCOVER_TABS: DiscoverTab[] = ["objects", "assessment", "waves"];
+const ORCHESTRATE_TABS: OrchestrateTab[] = ["agent", "plan", "migrate", "validate"];
+
 export function Workspace() {
   const navigate = useNavigate();
   const [params, setParams] = useSearchParams();
   const { isConnected, connection, discovery, mode, ready, backendError, reload } = useAppState();
   const { fabric, resetNonce } = useMigration();
-  const { steps, current, finished } = useJourney();
+  const { phases, current, steps, finished } = usePhases();
   const flow = useRef<HTMLDivElement>(null);
   const [explorerOpen, setExplorerOpen] = useExplorerOpen();
 
-  const requested = params.get("step") as StepKey | null;
-  // Agent mode (consultation, orchestrator) opens in place of the step panel; any step brings the steps back.
-  const agentView = params.get(AGENT_VIEW_PARAM);
-  const selected = steps.find((s) => s.key === requested && !s.locked)?.key ?? current;
-  const step = steps.find((s) => s.key === selected)!;
-  const select = (key: StepKey) => {
-    setParams({ step: key }, { replace: false });
-  };
-  useDocumentTitle(`${step.title} · Migration`);
-  // Pin the step being shown in the address once the page has loaded, so the view
-  // never moves on its own (say, to Validate the moment a run starts).
+  // ?step= names a phase, or one of the six steps (old links), which opens its phase on that tab.
+  const requested = params.get("step");
+  const where = locate(requested);
+  const selected = where && !phases.find((p) => p.key === where.phase)!.locked ? where.phase : current;
+  const phase = phases.find((p) => p.key === selected)!;
+  const rawTab = params.get("tab") ?? (where?.phase === selected ? where.tab : null);
+  const discoverTab: DiscoverTab = DISCOVER_TABS.includes(rawTab as DiscoverTab) ? (rawTab as DiscoverTab) : "objects";
+  // A phase whose step is still locked opens the agent's run instead.
+  const tabOpen = (t: string | null) => ORCHESTRATE_TABS.includes(t as OrchestrateTab) && (t === "agent" || !steps.find((s) => s.key === t)?.locked);
+  const orchestrateTab: OrchestrateTab = tabOpen(rawTab) ? (rawTab as OrchestrateTab) : "agent";
+  const select = (key: PhaseKey, tab?: string) => setParams(tab ? { step: key, tab } : { step: key }, { replace: false });
+  useDocumentTitle(`${phase.title} · Migration`);
+  // Pin the phase being shown in the address once the page has loaded, so the view never moves on its own.
   useEffect(() => {
     if (ready && !requested) setParams({ step: current }, { replace: true });
   }, [ready, requested, current]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Next sits at the foot of a long panel; when the step changes from there,
-  // bring the steps back into view (clear of the top bar) so the new step is read from its top.
+  // Next sits at the foot of a long panel; when the phase changes from there, bring the strip back into view.
   const shown = useRef(selected);
   useEffect(() => {
     if (shown.current === selected) return;
@@ -246,7 +259,15 @@ export function Workspace() {
     );
   }
 
-  const done = steps.filter((s) => s.confirmed && !s.stale).length;
+  const done = phases.filter((s) => s.confirmed && !s.stale).length;
+  const body = selected === "discover"
+    ? <DiscoverPhase tab={discoverTab} onTab={(t) => select("discover", t)} steps={steps} />
+    : selected === "consult"
+      ? <ConsultationView embedded onAgent={() => select("orchestrate")} />
+      : <OrchestratorView embedded tab={orchestrateTab} onTab={(t) => select("orchestrate", t)} steps={steps}
+          onConsult={() => select("consult")} onStep={(k) => { const w = locate(k)!; select(w.phase, w.tab ?? undefined); }} onConnections={() => navigate("/")} />;
+  const resetKey = selected === "discover" ? "discover" : selected === "orchestrate" && orchestrateTab !== "agent" ? orchestrateTab : null;
+
   return (
     <div className="workspace">
       <div className="ws-head">
@@ -258,10 +279,10 @@ export function Workspace() {
           <span><span className="eyebrow">To</span><strong>{fabric.workspaceName ?? "Microsoft Fabric"}</strong></span>
         </div>
         <span className="spacer" />
-        <div className="ws-progress" aria-label={`${done} of ${steps.length} steps done`}>
+        <div className="ws-progress" aria-label={`${done} of ${phases.length} steps done`}>
           <span className="muted">Steps done</span>
-          <span className="ws-meter"><span style={{ width: `${(done / steps.length) * 100}%` }} /></span>
-          <strong>{done}/{steps.length}</strong>
+          <span className="ws-meter"><span style={{ width: `${(done / phases.length) * 100}%` }} /></span>
+          <strong>{done}/{phases.length}</strong>
         </div>
         <Button size="small" variant="ghost" aria-pressed={explorerOpen} onClick={() => setExplorerOpen(!explorerOpen)}>
           {explorerOpen ? <PanelLeftClose size={14} aria-hidden="true" /> : <PanelLeftOpen size={14} aria-hidden="true" />}{explorerOpen ? "Hide explorer" : "Show explorer"}
@@ -279,26 +300,22 @@ export function Workspace() {
       <div className={`ws-body${explorerOpen ? " with-explorer" : ""}`}>
         {explorerOpen && <WorkspaceExplorer />}
         <div className="ws-main">
-          <div ref={flow} className="journey-anchor"><JourneyFlow steps={steps} selected={selected} onSelect={select} /></div>
-          {isAgentView(agentView) ? <AgentView view={agentView} onBack={() => select(selected)} /> : (<>
-          <ReleasePath stepsDone={done} stepsTotal={steps.length} />
-
+          <div ref={flow} className="journey-anchor"><JourneyFlow phases={phases} selected={selected} onSelect={(k) => select(k)} /></div>
           {finished && <CompletionCard />}
 
           <section className="step-panel" aria-labelledby="step-title">
             <header className="step-head">
-              <span className="step-head-icon" aria-hidden="true"><step.icon size={20} /></span>
+              <span className="step-head-icon" aria-hidden="true"><phase.icon size={20} /></span>
               <div className="step-head-text">
-                <span className="eyebrow">Step {step.index + 1} of {steps.length}{mode === "mock" ? " · demo data" : ""}</span>
-                <h2 id="step-title">{step.title}</h2>
-                <p className="muted">{step.purpose}.</p>
+                <span className="eyebrow">Step {phase.index + 1} of {phases.length}{mode === "mock" ? " · demo data" : ""}</span>
+                <h2 id="step-title">{phase.title}</h2>
+                <p className="muted">{phase.purpose}.</p>
               </div>
-              <ResetStepButton step={selected} />
+              {resetKey && <ResetStepButton step={resetKey} />}
             </header>
-            <div className="step-body" key={`${selected}-${resetNonce}`}>{PANELS[selected]()}</div>
-            <NextBar step={step} steps={steps} onGo={select} />
+            <div className="step-body" key={`${selected}-${resetNonce}`}>{body}</div>
+            <NextBar phase={phase} phases={phases} onGo={(k) => select(k)} />
           </section>
-          </>)}
         </div>
       </div>
     </div>

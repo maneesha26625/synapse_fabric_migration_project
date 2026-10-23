@@ -1,6 +1,11 @@
-import { AlertTriangle, Bot, Check, CircleDashed, Hand, Play, RotateCcw, Send, SkipForward, Square, X, XCircle } from "lucide-react";
-import { useEffect, useState } from "react";
+import { AlertTriangle, ArrowRight, Bot, Check, CheckCircle2, CircleDashed, Hand, Play, RotateCcw, Send, SkipForward, Square, X, XCircle } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useMigration, type StepKey } from "../state/MigrationState";
+import type { OrchestrateTab } from "../components/journey/phases";
+import { MigratePanel } from "../components/journey/panels/MigratePanel";
+import { PlanPanel } from "../components/journey/panels/PlanPanel";
+import { ValidatePanel } from "../components/journey/panels/ValidatePanel";
+import type { StepStatus } from "../components/journey/useJourney";
 import { Banner, Button, ConfirmDialog, StatusBadge } from "../components/shared/Shared";
 import { useConsult } from "./ConsultState";
 import { AGENT_STAGES, useAgent, type AgentStageKey, type AgentStageStatus, type GateOption } from "./OrchestratorState";
@@ -37,8 +42,73 @@ function duration(a?: string | null, b?: string | null) {
  * run and validation. Pick a stage to see what it is doing or did; when the agent needs a person it
  * asks at the stage where it stopped.
  */
-export function OrchestratorView({ onConsult, onStep, onConnections, onClose }: {
-  onConsult: () => void; onStep: (k: StepKey) => void; onConnections: () => void; onClose: () => void;
+export function OrchestratorView({ onConsult, onStep, onConnections, onClose, embedded, tab = "agent", onTab, steps = [] }: {
+  onConsult: () => void; onStep: (k: StepKey) => void; onConnections: () => void; onClose?: () => void;
+  /** Shown as a step of the journey: the step's header stands in for this view's own. */
+  embedded?: boolean;
+  /** The agent's run, or one of the phases it works through (also open to a person). */
+  tab?: OrchestrateTab;
+  onTab?: (t: OrchestrateTab) => void;
+  steps?: StepStatus[];
+}) {
+  const setTab = (t: OrchestrateTab) => onTab?.(t);
+  const phaseTabs: { id: OrchestrateTab; label: string; step?: StepStatus }[] = [
+    { id: "agent", label: "Agent run" },
+    { id: "plan", label: "Plan", step: steps.find((s) => s.key === "plan") },
+    { id: "migrate", label: "Migration", step: steps.find((s) => s.key === "migrate") },
+    { id: "validate", label: "Validation", step: steps.find((s) => s.key === "validate") },
+  ];
+  const tabs = onTab && (
+    <div className="tabs panel-tabs ag-phase-tabs" role="tablist" aria-label="Agent orchestrator phases">
+      {phaseTabs.map((t) => (
+        <button key={t.id} type="button" role="tab" className="tab" aria-selected={tab === t.id} disabled={t.step?.locked}
+          title={t.step?.locked ? "Opens once the phase before it is confirmed (the agent confirms them as it goes)" : t.step?.purpose}
+          onClick={() => setTab(t.id)}>
+          {t.step?.confirmed && !t.step.stale ? <Check size={13} aria-hidden="true" /> : t.step?.running ? <span className="spinner" aria-hidden="true" /> : null}
+          {t.label}
+        </button>
+      ))}
+    </div>
+  );
+  if (tab !== "agent") {
+    const step = phaseTabs.find((t) => t.id === tab)!.step;
+    return (
+      <section className="ag-view" aria-label={`Agent orchestrator: ${tab}`}>
+        {tabs}
+        {tab === "plan" ? <PlanPanel /> : tab === "migrate" ? <MigratePanel /> : <ValidatePanel />}
+        {step && <PhaseFooter step={step} next={phaseTabs[phaseTabs.findIndex((t) => t.id === tab) + 1]?.id} onTab={setTab} />}
+      </section>
+    );
+  }
+  return <AgentRun {...{ onConsult, onStep, onConnections, onClose, embedded, tabs, onTab: setTab }} />;
+}
+
+/** Under a phase worked by hand: where it stands, and confirming it so the next one opens. */
+function PhaseFooter({ step, next, onTab }: { step: StepStatus; next?: OrchestrateTab; onTab: (t: OrchestrateTab) => void }) {
+  const { confirmStep } = useMigration();
+  const label = step.title;
+  if (step.confirmed && !step.stale) {
+    return (
+      <div className="ag-phase-foot done" role="status">
+        <CheckCircle2 size={18} className="tone-success" aria-hidden="true" />
+        <span><strong>{label} confirmed.</strong> <span className="muted">{step.outcome}</span></span>
+        {next && <Button size="small" onClick={() => onTab(next)}>Go to {next === "migrate" ? "Migration" : "Validation"}<ArrowRight size={14} aria-hidden="true" /></Button>}
+      </div>
+    );
+  }
+  return (
+    <div className="ag-phase-foot" role="status">
+      {step.complete ? <CheckCircle2 size={18} className={step.attention ? "tone-warning" : "tone-success"} aria-hidden="true" /> : <CircleDashed size={18} className="faint" aria-hidden="true" />}
+      <span><strong>{step.complete ? `${label} finished${step.attention ? ` · ${step.attention}` : ""}` : `${label} is not finished`}</strong> <span className="muted">{step.complete ? step.outcome : step.waiting}</span></span>
+      {step.complete && <Button size="small" variant="primary" onClick={() => { confirmStep(step.key); if (next) onTab(next); }}>Confirm {label.toLowerCase()}{next ? ", continue" : ""}</Button>}
+    </div>
+  );
+}
+
+const STAGE_TAB: Partial<Record<AgentStageKey, OrchestrateTab>> = { plan: "plan", readiness: "plan", run: "migrate", validate: "validate" };
+
+function AgentRun({ onConsult, onStep, onConnections, onClose, embedded, tabs, onTab }: {
+  onConsult: () => void; onStep: (k: StepKey) => void; onConnections: () => void; onClose?: () => void; embedded?: boolean; tabs: ReactNode; onTab: (t: OrchestrateTab) => void;
 }) {
   const { data, activeStage, start, stop, reset, choose, ask } = useAgent();
   const c = useConsult();
@@ -47,7 +117,6 @@ export function OrchestratorView({ onConsult, onStep, onConnections, onClose }: 
   const [picked, setPicked] = useState<AgentStageKey>(activeStage ?? "brief");
   const [text, setText] = useState("");
   const [confirmStop, setConfirmStop] = useState(false);
-  const [logFilter, setLogFilter] = useState<"all" | "problems" | "agent" | "you">("all");
   useEffect(() => { if (follow && activeStage) setPicked(activeStage); }, [follow, activeStage]);
 
   const stage = AGENT_STAGES.find((s) => s.key === picked)!;
@@ -65,22 +134,25 @@ export function OrchestratorView({ onConsult, onStep, onConnections, onClose }: 
     choose(picked, o.id);
   };
   const send = () => { if (!text.trim()) return; ask(text); setText(""); };
-  const lines = data.log.filter((l) => logFilter === "all" || (logFilter === "problems" ? l.kind === "warn" || l.kind === "error" : logFilter === "you" ? l.kind === "you" : l.kind !== "you")).slice().reverse();
-  const problems = data.log.filter((l) => l.kind === "error").length;
+  // The latest exchanges with the agent, beside the box they came from; everything is in the Activity panel.
+  const recent = data.log.slice(-4);
 
   const mainLabel = data.status === "idle" ? "Start the agent" : data.status === "done" ? "Run the agent again" : "Resume";
 
   return (
-    <section className="ag-view" aria-labelledby="ag-orch-title">
-      <header className="ag-head">
-        <span className="step-head-icon" aria-hidden="true"><Bot size={20} /></span>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <span className="eyebrow">Agent mode · preview</span>
-          <h2 id="ag-orch-title">Agent orchestrator</h2>
-          <p className="muted">Everything after the consultation, done in order by the agent: from the discovery snapshot to the migration run and validation. Pick any stage to see what it is doing or did. When the agent needs you, it asks at the stage where it stopped.</p>
-        </div>
-        <Button size="small" variant="ghost" onClick={onClose}><X size={14} aria-hidden="true" />Back to the steps</Button>
-      </header>
+    <section className="ag-view" aria-label="Agent orchestrator">
+      {!embedded && (
+        <header className="ag-head">
+          <span className="step-head-icon" aria-hidden="true"><Bot size={20} /></span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <h2>Agent orchestrator</h2>
+            <p className="muted">Everything after the consultation, done in order by the agent.</p>
+          </div>
+          {onClose && <Button size="small" variant="ghost" onClick={onClose}><X size={14} aria-hidden="true" />Close</Button>}
+        </header>
+      )}
+      {tabs}
+      <p className="muted" style={{ margin: 0 }}>Everything after the consultation, done in order by the agent: the plan, the migration run and validation. Pick any stage to see what it is doing or did; when the agent needs you, it asks at the stage where it stopped. The Plan, Migration and Validation tabs show the same work in full, and can be worked by hand.</p>
 
       <div className="row ag-controls">
         <label className="check-row" style={{ margin: 0 }}>
@@ -107,7 +179,7 @@ export function OrchestratorView({ onConsult, onStep, onConnections, onClose }: 
           <div style={{ flex: 1, minWidth: 0 }}>
             <span className="eyebrow">Now</span>{" "}
             <strong>{now ? now.title : data.status === "done" ? "Finished" : "—"}</strong>
-            <p className="muted" style={{ margin: 0 }}>{now ? data.stages[now.key].message : data.status === "done" ? data.stages.handover.message : "The agent has not started."}</p>
+            <p className="muted" style={{ margin: 0 }}>{now ? data.stages[now.key].message : data.status === "done" ? data.stages.validate.message : "The agent has not started."}</p>
           </div>
           <strong className="ag-pct">{pct}%</strong>
         </div>
@@ -183,6 +255,11 @@ export function OrchestratorView({ onConsult, onStep, onConnections, onClose }: 
               <Button variant="primary" size="small" onClick={start}><RotateCcw size={14} aria-hidden="true" />Try this stage again</Button>
             </div>
           )}
+          {STAGE_TAB[picked] && (
+            <button type="button" className="link" style={{ alignSelf: "flex-start" }} onClick={() => onTab(STAGE_TAB[picked]!)}>
+              Open the {STAGE_TAB[picked] === "plan" ? "Plan" : STAGE_TAB[picked] === "migrate" ? "Migration" : "Validation"} tab<ArrowRight size={13} aria-hidden="true" style={{ verticalAlign: "-2px", marginLeft: 4 }} />
+            </button>
+          )}
         </section>
       </div>
 
@@ -193,36 +270,16 @@ export function OrchestratorView({ onConsult, onStep, onConnections, onClose }: 
           <StatusBadge tone="neutral">AI off</StatusBadge>
         </div>
         <p className="muted" style={{ margin: 0 }}>For example: "status", "why did it fail", "retry", "mismatches", "stop". Type ? for everything it understands.</p>
+        {recent.length > 0 && (
+          <ul className="ag-notes" aria-label="Latest from the agent">
+            {recent.map((l, i) => <li key={`${l.at}-${i}`} className={l.kind === "you" ? "you" : ""}><span className="ag-note-kind">{l.kind === "you" ? "You" : "Agent"}</span>{l.text}</li>)}
+          </ul>
+        )}
         <div className="ag-compose">
           <input className="input" aria-label="Ask the orchestrator" placeholder="Ask or tell the agent…" value={text}
             onChange={(e) => setText(e.target.value)} onKeyDown={(e) => { if (e.key === "Enter") send(); }} />
           <Button variant="primary" onClick={send} disabled={!text.trim()}><Send size={14} aria-hidden="true" />Do it</Button>
         </div>
-      </section>
-
-      <section className="card ag-activity" aria-labelledby="ag-activity-title">
-        <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-          <h3 id="ag-activity-title" style={{ margin: 0 }}>Activity</h3>
-          {problems > 0 && <StatusBadge tone="error">{problems} error{problems === 1 ? "" : "s"}</StatusBadge>}
-          <span className="spacer" />
-          <div className="tabs panel-tabs" role="tablist" aria-label="Filter the activity">
-            {(["all", "problems", "agent", "you"] as const).map((f) => (
-              <button key={f} type="button" role="tab" className="tab" aria-selected={logFilter === f} onClick={() => setLogFilter(f)}>
-                {f === "all" ? "All" : f === "problems" ? "Problems" : f === "agent" ? "Agent" : "You"}
-              </button>
-            ))}
-          </div>
-        </div>
-        <ul className="ag-log">
-          {lines.slice(0, 80).map((l, i) => (
-            <li key={`${l.at}-${i}`} className={l.kind}>
-              <span className="ag-log-time">{time(l.at)}</span>
-              <span className="ag-log-who">{l.kind === "you" ? "You" : "Agent"}</span>
-              <span>{l.text}</span>
-            </li>
-          ))}
-          {!lines.length && <li className="faint">Nothing yet.</li>}
-        </ul>
       </section>
 
       {confirmStop && (

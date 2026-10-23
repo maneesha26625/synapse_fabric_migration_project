@@ -11,7 +11,8 @@ const MAX_NODES = 250;
 
 export function WavesPanel() {
   const { graph, graphError, graphLoading, reloadGraph, addToPlan, inPlan } = useMigration();
-  const [tab, setTab] = useState<"waves" | "graph">("waves");
+  // The graph first: what depends on what is the reason the waves exist.
+  const [tab, setTab] = useState<"waves" | "graph">("graph");
   const [search, setSearch] = useState("");
   const [type, setType] = useState("");
   const [cls, setCls] = useState("");
@@ -49,7 +50,7 @@ export function WavesPanel() {
         { label: "With dependencies", value: graph.nodes.filter((n) => n.dependsOn + n.dependedOnBy > 0).length.toLocaleString() },
       ]} />
 
-      <Tabs label="Waves sections" value={tab} onChange={setTab} tabs={[{ id: "waves", label: "Waves", count: graph.waves.length }, { id: "graph", label: "Dependency graph" }]} />
+      <Tabs label="Waves sections" value={tab} onChange={setTab} tabs={[{ id: "graph", label: "Dependency graph" }, { id: "waves", label: "Waves", count: graph.waves.length }]} />
 
       {tab === "waves" ? (
         <ol className="wave-list" aria-label="Migration waves">

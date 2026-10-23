@@ -508,32 +508,35 @@ describe("migration journey", () => {
     expect(await screen.findByText("Connect both sides first")).toBeInTheDocument();
   });
 
-  it("shows the six steps left to right, locks the ones after the open step, and Next unlocks the following one", async () => {
+  it("shows the three steps left to right, locks the ones after Discover, and Next unlocks them", async () => {
     resetDemo();
     const user = userEvent.setup();
     go("/migration");
     expect(await stepHeading("Discover")).toBeInTheDocument();
     const nav = screen.getByRole("navigation", { name: "Migration steps" });
     const boxes = within(nav).getAllByRole("button");
-    expect(boxes.map((b) => b.getAttribute("aria-label")?.match(/^Step \d: (\w+)/)?.[1])).toEqual(["Discover", "Assess", "Waves", "Plan", "Migrate", "Validate"]);
+    expect(boxes.map((b) => b.getAttribute("aria-label")?.match(/^Step \d: ([\w ]+?)\./)?.[1])).toEqual(["Discover", "Consultation", "Agent orchestrator"]);
     expect(boxes[0]).toHaveAttribute("aria-current", "step");
     for (const b of boxes.slice(1)) expect(b).toBeDisabled();
     expect(document.title).toBe("Discover · Migration · Migration Accelerator");
+    // The assessment and the dependency waves are part of Discover.
+    expect(screen.getByRole("tab", { name: "Assessment" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /^Dependency waves/ })).toBeInTheDocument();
 
     // Discovery is already done in the demo, so the step can be confirmed.
-    await user.click(await screen.findByRole("button", { name: "Looks good, continue to Assess" }, { timeout: 5000 }));
-    expect(await stepHeading("Assess")).toBeInTheDocument();
-    expect(stepBox(2)).toBeEnabled();
+    await user.click(await screen.findByRole("button", { name: "Looks good, continue to Consultation" }, { timeout: 5000 }));
+    expect(await stepHeading("Consultation")).toBeInTheDocument();
     expect(stepBox(2)).toHaveAttribute("aria-current", "step");
-    expect(stepBox(3)).toBeDisabled();
-    expect(window.location.search).toBe("?step=assess");
-    expect(stored(JOURNEY)).toEqual(["discover"]);
+    // The plan, run and validation can be worked by hand, so the orchestrator opens without a brief.
+    expect(stepBox(3)).toBeEnabled();
+    expect(window.location.search).toBe("?step=consult");
+    expect(stored(JOURNEY)).toEqual(["discover", "assess", "waves"]);
 
     // Back returns to a confirmed step, which then offers the way forward again.
     await user.click(screen.getByRole("button", { name: "Discover" }));
     expect(await stepHeading("Discover")).toBeInTheDocument();
     expect(screen.getByText("Discover confirmed")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Go to Assess" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Go to Consultation" })).toBeInTheDocument();
   }, 20000);
 
   it("opens any unlocked step by clicking its box, and falls back to the open step for a locked one", async () => {
@@ -541,24 +544,27 @@ describe("migration journey", () => {
     unlockTo("waves");
     const user = userEvent.setup();
     go("/migration?step=validate");
-    // Validate is locked, so the open step (Waves) is shown instead.
-    expect(await stepHeading("Waves")).toBeInTheDocument();
+    // Discover is not confirmed yet (its waves are not), so the orchestrator is locked and Discover is shown.
+    expect(await stepHeading("Discover")).toBeInTheDocument();
+    expect(stepBox(3)).toBeDisabled();
+    await user.click(await screen.findByRole("button", { name: /continue to Consultation/ }, { timeout: 5000 }));
+    await user.click(stepBox(3));
+    expect(await stepHeading("Agent orchestrator")).toBeInTheDocument();
+    // Validation waits for the plan and the run: its tab is shut, and a link to it opens the agent's run.
+    expect(screen.getByRole("tab", { name: /Validation/ })).toBeDisabled();
+    expect(screen.getByRole("tab", { name: /Agent run/ })).toHaveAttribute("aria-selected", "true");
     await user.click(stepBox(1));
     expect(await stepHeading("Discover")).toBeInTheDocument();
-    await user.click(stepBox(2));
-    expect(await stepHeading("Assess")).toBeInTheDocument();
-    expect(stepBox(4)).toBeDisabled();
   }, 15000);
 
-  it("marks a confirmed step whose results are gone as Run again, and keeps the steps after it locked", async () => {
+  it("marks a confirmed step whose results are gone as Run again", async () => {
     resetDemo();
     await seedPlan();
     unlockTo("validate"); // Migrate is confirmed, but there is no run (as after a reload of Demo data)
     go("/migration");
-    expect(await stepHeading("Migrate")).toBeInTheDocument();
-    await waitFor(() => expect(stepBox(5)).toHaveAccessibleName(/Run again/));
-    expect(stepBox(6)).toBeDisabled();
-    expect(screen.getByText("Migrate needs to run again")).toBeInTheDocument();
+    expect(await stepHeading("Agent orchestrator")).toBeInTheDocument();
+    await waitFor(() => expect(stepBox(3)).toHaveAccessibleName(/Run again/));
+    expect(screen.getByText("Agent orchestrator needs to be done again")).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Migration complete" })).toBeNull();
     // The confirmation itself is kept: once the run exists again, the journey comes back.
     expect(stored(JOURNEY)).toContain("migrate");
@@ -576,16 +582,17 @@ describe("migration journey", () => {
   }, 15000);
 
   it.each([
-    ["/discovery", "Discover"],
-    ["/assessment", "Assess"],
-    ["/dependencies", "Waves"],
-    ["/execute", "Migrate"],
-  ])("sends the old %s URL to its step", async (path, title) => {
+    ["/discovery", "Discover", /^Discovered objects/],
+    ["/assessment", "Discover", /^Assessment/],
+    ["/dependencies", "Discover", /^Dependency waves/],
+    ["/execute", "Agent orchestrator", /^Migration/],
+  ])("sends the old %s URL to its step and tab", async (path, title, tab) => {
     resetDemo();
     await seedPlan();
     unlockTo("validate");
     go(path);
     expect(await stepHeading(title)).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: tab, selected: true })).toBeInTheDocument();
   });
 
   it.each(["/synapse", "/fabric", "/connections", "/nowhere/at/all"])("sends %s to the start page", async (path) => {
@@ -601,7 +608,8 @@ describe("resetting a step", () => {
     unlockTo("migrate"); // Discover to Plan confirmed
     const user = userEvent.setup();
     go("/migration?step=plan");
-    expect(await stepHeading("Plan")).toBeInTheDocument();
+    expect(await stepHeading("Agent orchestrator")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Plan/, selected: true })).toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: "Reset step" })).toBeEnabled());
     await user.click(screen.getByRole("button", { name: "Reset step" }));
     let dialog = screen.getByRole("dialog", { name: "Reset Plan?" });
@@ -645,7 +653,8 @@ describe("resetting a step", () => {
     unlockTo("validate");
     const user = userEvent.setup();
     go("/migration?step=migrate");
-    expect(await stepHeading("Migrate")).toBeInTheDocument();
+    expect(await stepHeading("Agent orchestrator")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Migration/, selected: true })).toBeInTheDocument();
     await waitFor(() => expect(screen.getByRole("button", { name: "Reset step" })).toBeEnabled());
     await user.click(screen.getByRole("button", { name: "Reset step" }));
     const dialog = screen.getByRole("dialog", { name: "Reset Migrate?" });
@@ -792,8 +801,9 @@ describe("plan step", () => {
     const summary = await screen.findByLabelText("Plan summary", {}, { timeout: 5000 });
     expect(within(summary).getByText("Readiness")).toBeInTheDocument();
     expect(await screen.findByRole("list", { name: "Migration risks" })).toBeInTheDocument();
-    // The Fabric target is not connected in this test, so the planner blocks and Next stays shut.
-    expect(screen.getByRole("button", { name: /Continue to Migrate/ })).toBeDisabled();
+    // The Fabric target is not connected in this test, so the planner blocks and the plan cannot be confirmed.
+    expect(screen.getByText("Plan is not finished")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Confirm plan/ })).toBeNull();
 
     await user.click(screen.getByRole("tab", { name: "Strategy by type" }));
     expect(screen.getByRole("table", { name: "Migration strategy by object type" })).toBeInTheDocument();
@@ -995,73 +1005,6 @@ describe("workspace explorer", () => {
   }, 30000);
 });
 
-describe("release path", () => {
-  it("shows where the migration sits on the way to Prod, below the six steps, with a checklist kept per project", async () => {
-    await discovered();
-    unlockTo("assess");
-    const user = userEvent.setup();
-    const first = go("/migration?step=discover");
-    const path = await screen.findByRole("region", { name: "Release path" }, { timeout: 5000 });
-    const stages = within(path).getByRole("list", { name: "From the source to production" });
-    expect(within(stages).getAllByRole("listitem").map((li) => li.querySelector(".release-label")?.textContent))
-      .toEqual(["Synapse workspace", "This migration", "Fabric Dev", "Fabric Git", "Fabric Test", "Fabric Prod"]);
-    // The six steps are unchanged.
-    expect(within(screen.getByRole("navigation", { name: "Migration steps" })).getAllByRole("listitem")).toHaveLength(6);
-    await user.click(within(path).getByRole("button", { name: /What comes next · 0\/6/ }));
-    expect(within(path).getByText(/Getting them to Test and Prod is not a second migration/)).toBeInTheDocument();
-    await user.click(within(path).getByRole("checkbox", { name: /Connect the Fabric workspace to Git/ }));
-    expect(within(stages).getByText(/Fabric Git/).closest("li")).toHaveClass("done");
-    first.unmount();
-    go("/migration?step=discover");
-    const again = await screen.findByRole("region", { name: "Release path" }, { timeout: 5000 });
-    expect(within(again).getByRole("button", { name: /What comes next · 1\/6/ })).toBeInTheDocument();
-  }, 30000);
-
-  it("follows a repository source's environment: Prod definitions have nothing left to promote", async () => {
-    await mockApi.connectRepository({ kind: "git", repositoryUrl: "https://github.com/contoso/synapse-ws.git", ref: "release/prod", environment: "Prod" });
-    await mockApi.startDiscovery();
-    await new Promise((r) => setTimeout(r, 3700));
-    unlockTo("assess");
-    const user = userEvent.setup();
-    go("/migration?step=discover");
-    const path = await screen.findByRole("region", { name: "Release path" }, { timeout: 5000 });
-    const labels = [...path.querySelectorAll(".release-label")].map((e) => e.textContent);
-    expect(labels).toEqual(["Synapse Prod", "This migration", "Fabric Prod", "Fabric Git"]);
-    expect(within(path).getByText("Git · release/prod")).toBeInTheDocument();
-    await user.click(within(path).getByRole("button", { name: /What comes next/ }));
-    expect(within(path).getByText(/nothing to promote after it/)).toBeInTheDocument();
-  }, 30000);
-
-  it("reads Fabric Git from the target workspace: its branch, what waits to be committed, and the pull request", async () => {
-    resetDemo();
-    unlockTo("assess");
-    const user = userEvent.setup();
-    go("/migration?step=discover");
-    const path = await screen.findByRole("region", { name: "Release path" }, { timeout: 5000 });
-    const detail = await within(path).findByText(/^dev @ [0-9a-f]{7} · 0 uncommitted$/, {}, { timeout: 5000 });
-    expect(detail.closest("li")).toHaveClass("done");
-    expect(within(path).getByRole("link", { name: "Pull request dev → main" }))
-      .toHaveAttribute("href", "https://dev.azure.com/contoso/Migration/_git/fabric-migration/pullrequestcreate?sourceRef=dev&targetRef=main");
-    // The checklist's Git row follows Fabric: ticked, and not a box to tick by hand.
-    await user.click(within(path).getByRole("button", { name: /What comes next · 1\/6/ }));
-    const row = within(path).getByRole("checkbox", { name: /Connect the Fabric workspace to Git/ });
-    expect(row).toBeChecked();
-    expect(row).toBeDisabled();
-    expect(within(path).getByText(/Connected: Fabric_demo commits to dev in fabric-migration, folder fabric\./)).toBeInTheDocument();
-  }, 20000);
-
-  it("says what to do when the target workspace is not connected to Git", async () => {
-    resetDemo();
-    await mockApi.testFabric({ method: "azure_cli", workspaceId: "9b1d5e22-0c3a-4f7e-8d11-6a4c2e9f0b33", workspaceName: "My workspace" });
-    unlockTo("assess");
-    go("/migration?step=discover");
-    const path = await screen.findByRole("region", { name: "Release path" }, { timeout: 5000 });
-    const detail = await within(path).findByText("Not connected: connect the Dev workspace to Git in Fabric", {}, { timeout: 5000 });
-    expect(detail.closest("li")).toHaveClass("todo");
-    expect(within(path).queryByRole("link", { name: /Pull request/ })).toBeNull();
-  }, 20000);
-});
-
 describe("migrate step", () => {
   it("offers to run every stage or a single one, here and not in Plan", async () => {
     resetDemo();
@@ -1162,7 +1105,8 @@ describe("validate step", () => {
     unlockTo("validate");
     const user = userEvent.setup();
     go("/migration?step=validate");
-    expect(await stepHeading("Validate")).toBeInTheDocument();
+    expect(await stepHeading("Agent orchestrator")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /Validation/, selected: true })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Finish migration/ })).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "Run validation" }));
     const table = await screen.findByRole("table", { name: "Validation results" }, { timeout: 5000 });
@@ -1248,7 +1192,31 @@ describe("LLM transformation queue (demo)", () => {
     await waitFor(async () => expect((await mockApi.listTransformCandidates()).summary.drafts).toBe(2), { timeout: 5000 });
     await user.click(screen.getByRole("tab", { name: /Drafts to review/ }));
     await waitFor(() => expect(within(screen.getByRole("table", { name: "Objects a draft can be made for" })).getAllByText("Draft to review")).toHaveLength(2), { timeout: 6000 });
+
+    // One by one: each draft opens beside its source, to be accepted there.
+    await user.click(screen.getByRole("tab", { name: "Review one by one" }));
+    expect(screen.getAllByRole("button", { name: /^Review / })).toHaveLength(2);
+
+    // In one go: every draft waiting for review, selected and accepted together.
+    await user.click(screen.getByRole("tab", { name: /^Accept drafts/ }));
+    await user.click(screen.getByRole("button", { name: "Select all 2" }));
+    await user.click(screen.getByRole("button", { name: "Accept drafts (2)" }));
+    await user.click(within(screen.getByRole("dialog", { name: "Accept 2 drafts?" })).getByRole("button", { name: "Accept drafts" }));
+    expect(await screen.findByText(/2 drafts accepted/)).toBeInTheDocument();
+    expect((await mockApi.listTransformCandidates()).summary.accepted).toBe(2);
+    expect(screen.getByText("No drafts waiting for review")).toBeInTheDocument();
   }, 30000);
+
+  it("selects every object the filters match for drafts, beyond the rows shown", async () => {
+    await discovered();
+    const user = userEvent.setup();
+    render(<AppStateProvider><TransformQueue /></AppStateProvider>);
+    await screen.findByRole("table", { name: "Objects a draft can be made for" }, { timeout: 5000 });
+    const needs = (await mockApi.listTransformCandidates()).items.filter((c) => c.problems.length && !c.unavailable).length;
+    await user.click(screen.getByRole("button", { name: `Select all ${needs.toLocaleString()}` }));
+    expect(screen.getByRole("button", { name: `Generate drafts (${needs})` })).toBeEnabled();
+    expect(screen.getByText(`${needs} selected`)).toBeInTheDocument();
+  }, 20000);
 
   it("edits and saves the project requirements every prompt carries", async () => {
     await discovered();
@@ -1292,7 +1260,7 @@ describe("validate step: runs in Fabric (demo)", () => {
     unlockTo("validate");
     const user = userEvent.setup();
     go("/migration?step=validate");
-    expect(await stepHeading("Validate")).toBeInTheDocument();
+    expect(await stepHeading("Agent orchestrator")).toBeInTheDocument();
     expect(screen.getByRole("checkbox", { name: /Check that SQL objects work/ })).toBeChecked();
     expect(screen.queryByText("These are real runs")).toBeNull();
     await user.click(screen.getByRole("checkbox", { name: "Run notebooks now" }));

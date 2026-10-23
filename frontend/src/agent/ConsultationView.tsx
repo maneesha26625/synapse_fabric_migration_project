@@ -2,8 +2,8 @@ import { ArrowLeft, ArrowRight, Bot, Check, CheckCircle2, ChevronDown, ChevronRi
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMigration } from "../state/MigrationState";
 import { Banner, Button, StatusBadge } from "../components/shared/Shared";
-import { briefMarkdown, type Resolved } from "./brief";
-import { TOPICS, answerLabel, type AnswerValue, type Option, type Question, type TopicId } from "./catalog";
+import { briefMarkdown, settingsFrom, type Resolved } from "./brief";
+import { EFFECT_LABEL, TOPICS, answerLabel, type AnswerValue, type Option, type Question, type TopicId } from "./catalog";
 import { useConsult } from "./ConsultState";
 import { useAgent } from "./OrchestratorState";
 
@@ -19,6 +19,7 @@ function download(name: string, text: string, type: string) {
 }
 
 const SOURCE_BADGE: Record<Resolved["source"], { tone: "success" | "info" | "warning"; label: string }> = {
+  config: { tone: "success", label: "From configuration" },
   person: { tone: "success", label: "Answered" },
   recommendation: { tone: "info", label: "Recommendation assumed" },
   open: { tone: "warning", label: "Needs a person" },
@@ -148,8 +149,8 @@ function AnswerTab({ focus, onFocus }: { focus: string; onFocus: (id: string) =>
           {TOPICS.map((t) => {
             const items = live.filter((x) => x.q.topic === t.id);
             if (!items.length) return null;
-            const complete = items.every((x) => x.source === "person" || (!x.q.required && x.source === "recommendation"));
-            const answered = items.filter((x) => x.source === "person").length;
+            const complete = items.every((x) => x.source === "person" || x.source === "config" || (!x.q.required && x.source === "recommendation"));
+            const answered = items.filter((x) => x.source === "person" || x.source === "config").length;
             const open = openTopic === t.id;
             return (
               <li key={t.id}>
@@ -165,7 +166,7 @@ function AnswerTab({ focus, onFocus }: { focus: string; onFocus: (id: string) =>
                     {items.map((x) => (
                       <li key={x.q.id}>
                         <button type="button" className={x.q.id === r.q.id ? "current" : ""} onClick={() => onFocus(x.q.id)} title={x.q.text}>
-                          {x.source === "person" ? <Check size={13} className="tone-success" aria-label="answered" /> : x.source === "recommendation" ? <Lightbulb size={13} className="tone-info" aria-label="recommendation assumed" /> : <Circle size={11} className="tone-warning" aria-label="open" />}
+                          {x.source === "person" || x.source === "config" ? <Check size={13} className="tone-success" aria-label={x.source === "config" ? "from configuration" : "answered"} /> : x.source === "recommendation" ? <Lightbulb size={13} className="tone-info" aria-label="recommendation assumed" /> : <Circle size={11} className="tone-warning" aria-label="open" />}
                           <span>{x.q.text}</span>
                         </button>
                       </li>
@@ -186,13 +187,23 @@ function AnswerTab({ focus, onFocus }: { focus: string; onFocus: (id: string) =>
             <Button size="small" variant="ghost" onClick={() => go(1)} disabled={idx === live.length - 1}>Next<ArrowRight size={14} aria-hidden="true" /></Button>
           </div>
           <h3 id="ag-q-text">{r.q.text}</h3>
-          <div className="row" style={{ gap: 8 }}>
-            {r.q.required && <StatusBadge tone="error">Required</StatusBadge>}
+          <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
+            {r.q.required && r.source !== "config" && <StatusBadge tone="error">Required</StatusBadge>}
             <StatusBadge tone={SOURCE_BADGE[r.source].tone}>{SOURCE_BADGE[r.source].label}</StatusBadge>
+            <span className={`ag-effect ${r.q.effect}`} title="What the answer does">{EFFECT_LABEL[r.q.effect]}</span>
           </div>
           <p className="muted">{r.q.help}</p>
 
-          {r.rec && (
+          {r.source === "config" && r.rec ? (
+            <div className="ag-rec config">
+              <CheckCircle2 size={16} aria-hidden="true" />
+              <div style={{ flex: 1 }}>
+                <strong>{answerLabel(r.q, c.facts, r.value)}</strong>
+                <span className="muted">{r.rec.reason} Not asked: change it on the Connections page.</span>
+              </div>
+            </div>
+          ) : null}
+          {r.source !== "config" && r.rec && (
             <div className="ag-rec">
               <Lightbulb size={16} aria-hidden="true" />
               <div style={{ flex: 1 }}>
@@ -211,12 +222,15 @@ function AnswerTab({ focus, onFocus }: { focus: string; onFocus: (id: string) =>
             </div>
           )}
 
-          <AnswerInput q={r.q} options={options} value={draft} onChange={setDraft} />
-
-          <div className="row" style={{ gap: 8 }}>
-            <Button variant="primary" onClick={save} disabled={empty || (!changed && r.source === "person")}><Check size={15} aria-hidden="true" />Save answer</Button>
-            {r.source === "person" && <Button variant="ghost" onClick={() => c.clearAnswer(r.q.id)}>Clear answer</Button>}
-          </div>
+          {r.source !== "config" && (
+            <>
+              <AnswerInput q={r.q} options={options} value={draft} onChange={setDraft} />
+              <div className="row" style={{ gap: 8 }}>
+                <Button variant="primary" onClick={save} disabled={empty || (!changed && r.source === "person")}><Check size={15} aria-hidden="true" />Save answer</Button>
+                {r.source === "person" && <Button variant="ghost" onClick={() => c.clearAnswer(r.q.id)}>Clear answer</Button>}
+              </div>
+            </>
+          )}
           <p className="faint ag-applies">Changes: {r.q.applies}</p>
         </section>
 
@@ -255,6 +269,7 @@ function ReviewTab({ onFocus, onAgent }: { onFocus: (id: string) => void; onAgen
   const file = useRef<HTMLInputElement>(null);
   const blockers = c.counts.needPerson + c.counts.conflicts;
   const live = c.resolved.filter((r) => r.applies);
+  const prerequisites = useMemo(() => settingsFrom(c.facts, c.resolved).prerequisites, [c.facts, c.resolved]);
 
   const exportQuestionnaire = () => {
     const questions = live.map((r) => ({
@@ -297,6 +312,18 @@ function ReviewTab({ onFocus, onAgent }: { onFocus: (id: string) => void; onAgen
         </div>
 
         {c.conflicts.map((x) => <Banner key={x} tone="error" title="Conflict">{x}</Banner>)}
+        {prerequisites.length > 0 && (
+          <Banner tone="warning" title="Prerequisites before the run">
+            An administrator sets these up; the agent asks a person to confirm them before it starts the run, and never does them itself.
+            <ul className="ag-details">{prerequisites.map((p) => <li key={p}>{p}</li>)}</ul>
+          </Banner>
+        )}
+        {c.facts.notRecorded.length > 0 && (
+          <p className="faint" style={{ margin: 0 }}>
+            Discovery cannot see {c.facts.notRecorded.join(", ")}: questions about these are asked, never answered from discovery.
+            {c.counts.fromConfig ? ` ${c.counts.fromConfig} answer${c.counts.fromConfig === 1 ? " is" : "s are"} read from the configuration.` : ""}
+          </p>
+        )}
         {c.counts.needPerson > 0 && (
           <Banner tone="warning" title={`${c.counts.needPerson} question${c.counts.needPerson === 1 ? "" : "s"} only a person can answer`}
             actions={<Button size="small" onClick={() => onFocus(live.find((r) => r.q.required && r.source === "open")!.q.id)}>Answer it</Button>}>
@@ -305,7 +332,9 @@ function ReviewTab({ onFocus, onAgent }: { onFocus: (id: string) => void; onAgen
         )}
 
         <div className="row" style={{ gap: 8, flexWrap: "wrap" }}>
-          {c.state === "draft" && <Button variant="primary" onClick={c.submit} disabled={blockers > 0} title={blockers ? "Answer the open questions and resolve the conflicts first" : undefined}>Submit for approval</Button>}
+          {c.state === "draft" && c.counts.assumed > 0 && <Button onClick={() => c.acceptRecommendations()}><Wand2 size={14} aria-hidden="true" />Accept all recommendations</Button>}
+          {c.state === "draft" && <Button variant="primary" onClick={c.submit} disabled={blockers > 0 || !c.featuresReady}
+            title={!c.featuresReady ? "Still reading what discovery found" : blockers ? "Answer the open questions and resolve the conflicts first" : undefined}>Submit for approval</Button>}
           {c.state === "submitted" && (
             <>
               <input className="input ag-approver" aria-label="Approved by" placeholder="Approved by (name)" value={approver} onChange={(e) => setApprover(e.target.value)} />
@@ -318,7 +347,6 @@ function ReviewTab({ onFocus, onAgent }: { onFocus: (id: string) => void; onAgen
         )}
 
         <div className="ag-links">
-          <button type="button" className="link" onClick={() => c.acceptRecommendations()} disabled={!c.counts.assumed}><Wand2 size={14} aria-hidden="true" />Accept remaining recommendations</button>
           <button type="button" className="link" onClick={() => download(`migration-brief-${project.name.replace(/\W+/g, "-").toLowerCase()}.md`, briefMarkdown(c.facts, c.resolved, { project: project.name, version: c.current?.version ?? null, status: c.state }), "text/markdown")}>
             <Download size={14} aria-hidden="true" />Download brief
           </button>
@@ -333,7 +361,7 @@ function ReviewTab({ onFocus, onAgent }: { onFocus: (id: string) => void; onAgen
       {TOPICS.map((t) => {
         const items = live.filter((r) => r.q.topic === t.id);
         if (!items.length) return null;
-        const answered = items.filter((r) => r.source === "person").length;
+        const answered = items.filter((r) => r.source === "person" || r.source === "config").length;
         const isOpen = open.has(t.id);
         const complete = items.every((r) => r.source !== "open" || !r.q.required);
         return (
@@ -374,26 +402,41 @@ function ReviewTab({ onFocus, onAgent }: { onFocus: (id: string) => void; onAgen
 }
 
 /** Agree with the client how the migration is done, question by question, before the agent acts. */
-export function ConsultationView({ onAgent, onClose }: { onAgent: () => void; onClose: () => void }) {
+export function ConsultationView({ onAgent, onClose, embedded }: { onAgent: () => void; onClose?: () => void; embedded?: boolean }) {
   const c = useConsult();
   const [tab, setTab] = useState<Tab>("answer");
   const live = c.resolved.filter((r) => r.applies);
   // Start at the first question a person has not answered yet, so the questions are met in order.
-  const [focus, setFocus] = useState<string>(() => (live.find((r) => r.source !== "person") ?? live[0])?.q.id ?? "");
+  const [focus, setFocus] = useState<string>(() => (live.find((r) => r.source !== "person" && r.source !== "config") ?? live[0])?.q.id ?? "");
   const show = (id: string) => { setFocus(id); setTab("answer"); };
   return (
-    <section className="ag-view" aria-labelledby="ag-consult-title">
-      <header className="ag-head">
-        <span className="step-head-icon" aria-hidden="true"><MessageSquare size={20} /></span>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <span className="eyebrow">Agent mode · preview</span>
-          <h2 id="ag-consult-title">Consultation</h2>
-          <p className="muted">Agree with the client how the migration is done. Every question comes with a recommendation based on what discovery found{c.facts.total ? ` (${c.facts.total.toLocaleString()} objects)` : ""}. The approved answers drive the agent orchestrator.</p>
-        </div>
-        <Button size="small" variant="ghost" onClick={onClose}><X size={14} aria-hidden="true" />Back to the steps</Button>
-      </header>
+    <section className="ag-view" aria-label="Consultation">
+      {!embedded && (
+        <header className="ag-head">
+          <span className="step-head-icon" aria-hidden="true"><MessageSquare size={20} /></span>
+          <div style={{ flex: 1, minWidth: 0 }}><h2>Consultation</h2></div>
+          {onClose && <Button size="small" variant="ghost" onClick={onClose}><X size={14} aria-hidden="true" />Close</Button>}
+        </header>
+      )}
+      <p className="muted" style={{ margin: 0 }}>Every question comes with a recommendation based on what discovery found{c.facts.total ? ` (${c.facts.total.toLocaleString()} objects)` : ""}. The approved answers become the brief the agent orchestrator carries out.</p>
       {!c.facts.discovered && <Banner tone="warning" title="Discovery has not finished">The questions and recommendations follow what discovery finds. Run Discover first.</Banner>}
+      {c.facts.discovered && !c.featuresReady && <p className="muted" role="status" style={{ margin: 0 }}><span className="spinner" aria-hidden="true" /> Reading what discovery found in the code and table definitions…</p>}
+      {c.featuresReady && !c.facts.features && c.facts.discovered && (
+        <Banner tone="info" title="Feature questions are left out">The API could not say which features discovery found (it may be older than this page), so questions about specific features are not asked.</Banner>
+      )}
       <StepCards tab={tab} onTab={setTab} onAgent={onAgent} />
+      {tab === "answer" && (
+        <div className="ag-bulk" role="group" aria-label="Recommendations">
+          <Lightbulb size={16} className="tone-info" aria-hidden="true" />
+          <span>
+            <strong>{c.counts.assumed ? `${c.counts.assumed} question${c.counts.assumed === 1 ? "" : "s"} still on their recommendation` : "Every question with a recommendation is answered"}</strong>
+            <span className="muted"> · accepting records each recommendation as the answer; questions only a person can answer stay open.</span>
+          </span>
+          <Button variant="primary" size="small" onClick={() => c.acceptRecommendations()} disabled={!c.counts.assumed}>
+            <Wand2 size={14} aria-hidden="true" />Accept all recommendations
+          </Button>
+        </div>
+      )}
       {tab === "answer" ? <AnswerTab focus={focus} onFocus={setFocus} /> : <ReviewTab onFocus={show} onAgent={onAgent} />}
       {tab === "answer" && (
         <div className="row" style={{ justifyContent: "flex-end" }}>

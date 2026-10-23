@@ -907,3 +907,18 @@ a.release-toggle:hover { text-decoration: underline; }
 
 /* An object created from an accepted LLM-assisted transform. */
 .llm-badge { display: inline-flex; align-items: center; gap: 3px; margin-left: 6px; padding: 0 7px; border-radius: 999px; font-size: 11.5px; font-weight: 600; letter-spacing: .02em; color: var(--info); background: var(--info-soft); vertical-align: middle; cursor: help; }
+
+/* ---- Activity: one log for the whole application, at the foot of every page ---- */
+.activity-panel { margin-top: 24px; display: flex; flex-direction: column; gap: 10px; padding: 14px 18px; }
+.activity-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; }
+.activity-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 0; border: 0; background: none; color: var(--text-muted); font: inherit; cursor: pointer; }
+.activity-latest { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13.5px; }
+.activity-log { list-style: none; margin: 0; padding: 0; max-height: 320px; overflow: auto; border: 1px solid var(--border); border-radius: 10px; }
+.activity-log li { display: grid; grid-template-columns: 84px 84px minmax(0, 1fr); gap: 8px; padding: 7px 10px; border-top: 1px solid var(--border); font-size: 13.5px; }
+.activity-log li:first-child { border-top: 0; }
+.activity-log li.warn { background: var(--warning-soft); }
+.activity-log li.error { background: var(--error-soft); }
+.activity-log li.faint { display: block; }
+.activity-time { font-family: var(--mono); font-size: 12.5px; color: var(--text-faint); }
+.activity-who { display: inline-flex; align-items: center; gap: 4px; font-weight: 600; color: var(--text-muted); }
+.activity-text { overflow-wrap: anywhere; }

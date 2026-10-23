@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { useAppState } from "../state/AppState";
-import { STEP_KEYS, useMigration, type StepKey } from "../state/MigrationState";
+import { useMigration, type StepKey } from "../state/MigrationState";
 import { useConsult } from "./ConsultState";
 
 /**
@@ -13,7 +13,7 @@ import { useConsult } from "./ConsultState";
  * Fabric), and Resume picks up from the first stage that is not done.
  */
 
-export type AgentStageKey = "brief" | "snapshot" | "dependencies" | "plan" | "readiness" | "approval" | "run" | "validate" | "handover";
+export type AgentStageKey = "brief" | "snapshot" | "dependencies" | "plan" | "readiness" | "approval" | "run" | "validate";
 export type AgentStageStatus = "pending" | "running" | "waiting" | "done" | "failed" | "skipped";
 
 export interface GateOption {
@@ -47,6 +47,8 @@ interface AgentData {
   /** The run the agent started, so it can tell its own run from one already on record. */
   runId: string | null;
   retried: boolean;
+  /** A person confirmed the brief's prerequisites (gateway, capacity, network) are in place. */
+  prereqConfirmed?: boolean;
   startedAt: string | null;
   finishedAt: string | null;
 }
@@ -60,8 +62,15 @@ export const AGENT_STAGES: { key: AgentStageKey; title: string; blurb: string; g
   { key: "approval", title: "Approval", blurb: "A person approves before anything is written to Fabric, when the brief asks for it.", group: "Build" },
   { key: "run", title: "Migration run", blurb: "Creates the objects in Fabric and loads the data, wave by wave; failed objects are retried as the brief says.", group: "Deploy and load" },
   { key: "validate", title: "Validation", blurb: "Compares every migrated object with Synapse, with the checks the brief asks for.", group: "Deploy and load" },
-  { key: "handover", title: "Hand-over", blurb: "Confirms the journey's steps and lists what is left for a person.", group: "Hand over" },
 ];
+
+/** The journey steps a finished stage confirms. */
+const CONFIRMS: Partial<Record<AgentStageKey, StepKey[]>> = {
+  dependencies: ["discover", "assess", "waves"],
+  readiness: ["plan"],
+  run: ["migrate"],
+  validate: ["validate"],
+};
 
 const fresh = (): Record<AgentStageKey, AgentStage> =>
   Object.fromEntries(AGENT_STAGES.map((s) => [s.key, { status: "pending", message: "Not started" }])) as Record<AgentStageKey, AgentStage>;
@@ -189,7 +198,10 @@ export function OrchestratorProvider({ children }: { children: ReactNode }) {
       if (!settings || !m.graph) return { fail: "The brief or the dependency graph is missing; resume from the start." };
       const staged = new Set(c.facts.stages.flatMap((s) => s.types));
       const types = new Set(settings.planTypes);
-      const ids = m.graph.nodes.filter((n) => types.has(n.type) || (settings.includeUnstaged && !staged.has(n.type))).map((n) => n.id);
+      // A pilot moves the first dependency wave only.
+      const firstWave = Math.min(...m.graph.nodes.map((n) => n.wave));
+      const inWave = (w: number) => !settings.waves || settings.waves.map((x) => x - 1 + firstWave).includes(w);
+      const ids = m.graph.nodes.filter((n) => (types.has(n.type) || (settings.includeUnstaged && !staged.has(n.type))) && inWave(n.wave)).map((n) => n.id);
       if (!ids.length) return { fail: "The brief's scope holds none of the discovered objects. Widen the scope in the consultation." };
       m.clearPlan();
       m.addToPlan(ids);
@@ -199,11 +211,16 @@ export function OrchestratorProvider({ children }: { children: ReactNode }) {
       const ok = await waitFor(() => live.current.mig.plan.length === ids.length && same(live.current.mig.options.stages, settings.stages));
       if (!ok) return { fail: "The plan did not take the brief's scope. Open the Plan step to see why." };
       const waves = new Set(live.current.mig.plan.map((p) => p.wave)).size;
-      return { done: `${ids.length.toLocaleString()} objects in ${waves} wave${waves === 1 ? "" : "s"}, ${settings.stages.length} stages. It replaces the plan in the Plan step.` };
+      return { done: `${ids.length.toLocaleString()} objects in ${waves} wave${waves === 1 ? "" : "s"}${settings.waves ? " (a pilot: the first wave)" : ""}, ${settings.stages.length} stages. It replaces the plan in the Plan tab.` };
     },
 
     readiness: async () => {
       const m0 = live.current.mig;
+      // What an administrator sets up is confirmed by a person; the agent never does it itself.
+      const prerequisites = live.current.consult.approved?.settings.prerequisites ?? [];
+      if (prerequisites.length && !dataRef.current.prereqConfirmed) {
+        return { message: "Waiting for prerequisites to be confirmed", wait: { title: "Confirm the prerequisites", why: "The brief names things an administrator sets up before the run. Confirm they are in place; the agent does not set them up or work around them.", items: prerequisites, options: [{ id: "prereqs-ok", label: "They are in place, continue", primary: true }, { id: "open", label: "Open Connections", navigate: { connections: true } }] } };
+      }
       if (live.current.mig.fabric.status !== "connected") {
         return { message: "Microsoft Fabric is not connected", wait: { title: "Connect Microsoft Fabric", why: "The run writes to a Fabric workspace; connect one on the Connections page.", options: [{ id: "recheck", label: "Check again" }, { id: "open", label: "Open Connections", primary: true, navigate: { connections: true } }] } };
       }
@@ -239,12 +256,17 @@ export function OrchestratorProvider({ children }: { children: ReactNode }) {
       if (!c.approved?.settings.approval) return { skipped: "The brief lets the agent start the run without asking." };
       if (dataRef.current.stages.approval.message.startsWith("Approved")) return { done: dataRef.current.stages.approval.message };
       const labels = m.options.stages.map((k) => m.capabilities?.stages.find((s) => s.key === k)?.label ?? k);
+      // With "stop for approval", the objects no rule can convert are named here, before anything is written.
+      const planned = new Set(m.plan.map((p) => p.id));
+      const unconvertible = c.approved.settings.approveUnsupported
+        ? (m.graph?.nodes ?? []).filter((n) => planned.has(n.id) && (n.classification === "MANUAL" || n.classification === "NOT SUPPORTED"))
+        : [];
       return {
         message: "Waiting for a person to approve",
         wait: {
           title: `Approve writing to ${m.fabric.workspaceName ?? "the Fabric workspace"}`,
-          why: `The agent is about to migrate ${m.plan.length.toLocaleString()} objects with these stages. Nothing has been written to Fabric yet.`,
-          items: labels,
+          why: `The agent is about to migrate ${m.plan.length.toLocaleString()} objects with these stages. Nothing has been written to Fabric yet.${unconvertible.length ? ` ${unconvertible.length} of them have no automatic route; the run defers them for a person.` : ""}`,
+          items: [...labels, ...unconvertible.slice(0, 10).map((n) => `No automatic route: ${n.name} (${n.type})`)],
           options: [{ id: "approve", label: `Approve and start the run`, primary: true }, { id: "open", label: "Review the plan", navigate: { step: "plan" } }],
         },
       };
@@ -306,24 +328,26 @@ export function OrchestratorProvider({ children }: { children: ReactNode }) {
       }
       const n = (s: string) => validation.filter((r) => r.status === s).length;
       const mism = validation.filter((r) => r.status === "MISMATCH");
+      // The brief says whether a mismatch stops the migration for a person, or is only reported.
+      const gate = settings?.validationGate ?? "critical";
+      if (mism.length && gate !== "critical") {
+        const options: GateOption[] = [{ id: "recheck", label: "Run validation again", primary: true }, { id: "open", label: "Open the Validation tab", navigate: { step: "validate" } }];
+        if (gate === "exceptions") options.push({ id: "accept-exceptions", label: `Approve ${mism.length === 1 ? "this exception" : `these ${mism.length} exceptions`}` });
+        return {
+          message: `${mism.length} mismatch${mism.length === 1 ? "" : "es"}: waiting for a person`,
+          wait: {
+            title: "Validation found mismatches",
+            why: gate === "all" ? "The brief says every object must pass before cutover. Fix them (the Validation tab shows each), then run validation again." : "The brief allows approved exceptions. Review each one; approve them, or fix them and run validation again.",
+            items: mism.slice(0, 10).map((r) => `${r.object} (${r.category}): ${r.detail ?? `${r.source} vs ${r.target}`}`),
+            options,
+          },
+        };
+      }
       return {
         done: `${validation.length.toLocaleString()} checks: ${n("MATCH").toLocaleString()} match, ${n("REVIEW").toLocaleString()} to review, ${mism.length.toLocaleString()} mismatched.`,
         attention: mism.length > 0,
         details: mism.slice(0, 8).map((r) => `${r.object} (${r.category}): ${r.detail ?? `${r.source} vs ${r.target}`}`),
       };
-    },
-
-    handover: async () => {
-      const m = live.current.mig;
-      for (const k of STEP_KEYS) m.confirmStep(k);
-      const x = m.execution;
-      const mism = (m.validation ?? []).filter((r) => r.status === "MISMATCH").length;
-      const left = [
-        x.deferred ? `${x.deferred} object${x.deferred === 1 ? "" : "s"} left for a person (see Migrate)` : "",
-        x.failed ? `${x.failed} failed object${x.failed === 1 ? "" : "s"}` : "",
-        mism ? `${mism} validation mismatch${mism === 1 ? "" : "es"}` : "",
-      ].filter(Boolean);
-      return { done: left.length ? `Done, with ${left.join(", ")}. The six steps are confirmed; the report is on the migration page.` : "Done. Every object in scope migrated and validated; the six steps are confirmed.", attention: left.length > 0 };
     },
   };
 
@@ -344,6 +368,8 @@ export function OrchestratorProvider({ children }: { children: ReactNode }) {
         if (t.stopped) return;
         if ("done" in out) {
           patchStage(s.key, { status: "done", message: out.done, details: out.details, attention: out.attention, finishedAt: now() });
+          // The journey's steps follow the agent, so their tabs open as it reaches them.
+          for (const k of CONFIRMS[s.key] ?? []) live.current.mig.confirmStep(k);
           log(s.key, `${s.title}: ${out.done}`, out.attention ? "warn" : "agent");
         } else if ("skipped" in out) {
           patchStage(s.key, { status: "skipped", message: out.skipped, finishedAt: now() });
@@ -380,7 +406,7 @@ export function OrchestratorProvider({ children }: { children: ReactNode }) {
   const start = useCallback(() => {
     const d = dataRef.current;
     // A failed stage is tried again; a finished agent starts over from the brief.
-    if (d.status === "done") setData((x) => ({ ...x, stages: fresh(), runId: null, retried: false, startedAt: null }));
+    if (d.status === "done") setData((x) => ({ ...x, stages: fresh(), runId: null, retried: false, prereqConfirmed: false, startedAt: null }));
     else setData((x) => ({ ...x, stages: Object.fromEntries(Object.entries(x.stages).map(([k, s]) => [k, s.status === "failed" || s.status === "waiting" ? { ...s, status: "pending", gate: null } : s])) as AgentData["stages"] }));
     log(null, d.status === "idle" || d.status === "done" ? "Agent started." : "Agent resumed.", "you");
     void drive();
@@ -410,6 +436,16 @@ export function OrchestratorProvider({ children }: { children: ReactNode }) {
     log(stage, label, "you");
     switch (optionId) {
       case "recheck": return resume();
+      case "prereqs-ok":
+        setData((d) => ({ ...d, prereqConfirmed: true }));
+        return resume();
+      case "accept-exceptions": {
+        const mism = (m.validation ?? []).filter((r) => r.status === "MISMATCH").length;
+        patchStage(stage, { status: "done", gate: null, attention: true, message: `${mism} mismatch${mism === 1 ? "" : "es"} approved as exceptions by a person.`, finishedAt: now() });
+        m.confirmStep("validate");
+        void drive();
+        return;
+      }
       case "approve":
         patchStage(stage, { status: "done", gate: null, message: `Approved at ${new Date().toLocaleTimeString()}.`, finishedAt: now() });
         void drive();
@@ -417,7 +453,7 @@ export function OrchestratorProvider({ children }: { children: ReactNode }) {
       case "drop-credential-stages": {
         const needing = new Set((m.capabilities?.stages ?? []).filter((s) => s.needsInput === "credentials").map((s) => s.key));
         m.setOptions({ stages: m.options.stages.filter((k) => !needing.has(k)) });
-        log(stage, `Left out: ${[...needing].join(", ")}. The brief still says otherwise; the hand-over lists what was not moved.`, "warn");
+        log(stage, `Left out: ${[...needing].join(", ")}. The brief still says otherwise; the migration report lists what was not moved.`, "warn");
         return resume();
       }
       case "new-run":

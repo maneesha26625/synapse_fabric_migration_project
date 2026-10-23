@@ -891,6 +891,8 @@ export interface MigrationApi {
   discardTransform(id: string, scope: "draft" | "all"): Promise<TransformObject>;
   /** Every object a draft can be made for, those the rules cannot convert first. */
   listTransformCandidates(): Promise<TransformCandidates>;
+  /** Features the latest discovery found, for the consultation's conditional questions. */
+  getConsultFacts(): Promise<ConsultFacts>;
   /** The project requirements every prompt carries (prompts/transform/project.md on the server). */
   getProjectRequirements(): Promise<ProjectRequirements>;
   saveProjectRequirements(text: string): Promise<ProjectRequirements>;
@@ -931,3 +933,38 @@ export const WORKSTREAMS = [
   "Security & Governance",
   "Unassigned",
 ] as const;
+
+/** What discovery recorded beyond counts by type: constructs in code, table properties, runtimes. Counts, never guesses. */
+export interface ConsultFeatureFacts {
+  mssparkutilsNotebooks: number;
+  notebooksWithSecrets: number;
+  notebooksWithStoragePaths: number;
+  notebooksInstallingPackages: number;
+  customLibraries: number;
+  dynamicSqlObjects: number;
+  crossDatabaseObjects: number;
+  /** Dedicated pool tables by distribution (hash, round_robin, replicate). */
+  distribution: Record<string, number>;
+  columnstoreTables: number;
+  identityTables: number;
+  primaryKeyTables: number;
+  externalTables: number;
+  externalSqlFeatures: number;
+  maskedColumns: number;
+  columnGrants: number;
+  multiStatementFunctions: number;
+  selfHostedRuntimes: number;
+  managedVnetRuntimes: number;
+  linkedServicesOnSelfHostedRuntime: number;
+  keyVaultLinkedServices: number;
+  managedIdentityLinkedServices: number;
+  unsupportedActivities: { activities: number; pipelines: number };
+  triggers: { schedule: number; tumblingWindow: number; event: number; other: number; started: number };
+}
+export interface ConsultFacts {
+  facts: Partial<ConsultFeatureFacts>;
+  /** Facts that could not be read from this discovery. */
+  unreadable: string[];
+  /** What discovery cannot see at all, so questions about it are asked, never answered for you. */
+  notRecorded: string[];
+}

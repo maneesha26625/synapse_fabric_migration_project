@@ -1,4 +1,4 @@
-import { Save, Sparkles } from "lucide-react";
+import { CheckCircle2, Save, Sparkles } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAppState } from "../../state/AppState";
 import { ApiRequestError, type ProjectRequirements, type TransformCandidate, type TransformCandidates, type TransformSettings } from "../../types";
@@ -69,11 +69,23 @@ function ProjectEditor() {
   );
 }
 
+/**
+ * Three ways through the LLM transforms: generate drafts for many objects at once, accept many
+ * reviewed drafts at once, or open each object and review its draft side by side before accepting.
+ */
+type Mode = "generate" | "accept" | "review";
+const MODES: { id: Mode; label: string }[] = [
+  { id: "generate", label: "Generate drafts" },
+  { id: "accept", label: "Accept drafts" },
+  { id: "review", label: "Review one by one" },
+];
+
 export function TransformQueue() {
   const { api } = useAppState();
   const [data, setData] = useState<TransformCandidates | null>(null);
   const [settings, setSettings] = useState<TransformSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [mode, setModeState] = useState<Mode>("generate");
   const [filter, setFilter] = useState<Filter>("needs");
   const [type, setType] = useState("");
   const [search, setSearch] = useState("");
@@ -111,16 +123,20 @@ export function TransformQueue() {
   }, [working, load]);
 
   const rows = useMemo(() => {
-    const test = FILTERS.find((f) => f.id === filter)!.test;
+    // Accepting works on the drafts waiting for review, whatever the filter says.
+    const test = mode === "accept" ? (c: TransformCandidate) => c.state === "draft" : FILTERS.find((f) => f.id === filter)!.test;
     const q = search.trim().toLowerCase();
     return (data?.items ?? []).filter((c) => test(c) && (!type || c.type === type) && (!q || c.name.toLowerCase().includes(q)));
-  }, [data, filter, type, search]);
+  }, [data, mode, filter, type, search]);
   const types = useMemo(() => [...new Set((data?.items ?? []).map((c) => c.type))].sort(), [data]);
 
   if (error) return <Banner tone="error" title="Could not load the objects" actions={<Button size="small" onClick={() => void load()}>Retry</Button>}>{error}</Banner>;
   if (!data) return <div className="stack"><Skeleton height={18} width="40%" /><Skeleton /><Skeleton /></div>;
 
-  const selectable = (c: TransformCandidate) => !c.unavailable && c.state !== "queued" && c.state !== "running";
+  // A stale draft (the source changed since) must be generated again before it can be accepted.
+  const selectable = (c: TransformCandidate) => mode === "accept" ? c.state === "draft" && !c.stale
+    : !c.unavailable && c.state !== "queued" && c.state !== "running";
+  const setMode = (m: Mode) => { setModeState(m); setSelected(new Set()); setNotice(null); setShown(PAGE); };
   const visible = rows.slice(0, shown);
   const allVisibleSelected = visible.filter(selectable).length > 0 && visible.filter(selectable).every((c) => selected.has(c.objectId));
   const toggle = (id: string) => setSelected((s) => { const n = new Set(s); if (n.has(id)) n.delete(id); else n.add(id); return n; });
@@ -129,7 +145,24 @@ export function TransformQueue() {
     for (const c of visible.filter(selectable)) { if (allVisibleSelected) n.delete(c.objectId); else n.add(c.objectId); }
     return n;
   });
+  // Everything the filters match, not only the rows shown on this page.
+  const everything = rows.filter(selectable);
+  const allSelected = everything.length > 0 && everything.every((c) => selected.has(c.objectId));
+  const selectEverything = () => setSelected(allSelected ? new Set() : new Set(everything.map((c) => c.objectId)));
   const canGenerate = !!settings?.enabled && !!settings?.available;
+
+  const acceptSelected = async () => {
+    setBusy(true); setNotice(null);
+    let accepted = 0;
+    const failed: string[] = [];
+    for (const id of selected) {
+      try { await api.acceptTransform(id); accepted += 1; } catch (e) { failed.push(e instanceof Error ? e.message : id); }
+    }
+    setNotice(`${accepted} draft${accepted === 1 ? "" : "s"} accepted: the next migration run uses ${accepted === 1 ? "it" : "them"}.${failed.length ? ` ${failed.length} could not be accepted: ${failed.slice(0, 3).join(" ")}` : ""}`);
+    setSelected(new Set());
+    setBusy(false); setConfirm(false);
+    await load();
+  };
 
   const generate = async () => {
     setBusy(true); setNotice(null);
@@ -174,34 +207,60 @@ export function TransformQueue() {
 
       <Collapsible summary="Project requirements (sent with every prompt)"><ProjectEditor /></Collapsible>
 
+      <div className="tabs panel-tabs" role="tablist" aria-label="LLM transforms">
+        {MODES.map((m) => (
+          <button key={m.id} type="button" role="tab" className="tab" aria-selected={mode === m.id} onClick={() => setMode(m.id)}>
+            {m.label}{m.id === "accept" && <span className="tab-count">{s.drafts.toLocaleString()}</span>}
+          </button>
+        ))}
+      </div>
+      <p className="muted" style={{ margin: 0 }}>
+        {mode === "generate" ? "Select the objects to convert (or every one the filters match) and generate their drafts in one go."
+          : mode === "accept" ? "Every draft waiting for review. Select the ones to accept (or all of them) and accept them in one go; the next migration run uses them."
+          : "Open an object to see its source, the rule-based conversion and the LLM draft side by side, edit the draft if needed, and accept it there."}
+      </p>
+
       <div className="row">
-        <div className="tabs tabs-pill" role="tablist" aria-label="Show">
-          {FILTERS.map((f) => (
-            <button key={f.id} type="button" role="tab" className="tab" aria-selected={filter === f.id} onClick={() => { setFilter(f.id); setShown(PAGE); }}>
-              {f.label}<span className="tab-count">{data.items.filter(f.test).length.toLocaleString()}</span>
-            </button>
-          ))}
-        </div>
+        {mode !== "accept" && (
+          <div className="tabs tabs-pill" role="tablist" aria-label="Show">
+            {FILTERS.map((f) => (
+              <button key={f.id} type="button" role="tab" className="tab" aria-selected={filter === f.id} onClick={() => { setFilter(f.id); setShown(PAGE); }}>
+                {f.label}<span className="tab-count">{data.items.filter(f.test).length.toLocaleString()}</span>
+              </button>
+            ))}
+          </div>
+        )}
         <select className="select" aria-label="Object type" value={type} onChange={(e) => { setType(e.target.value); setShown(PAGE); }}>
           <option value="">All types</option>{types.map((t) => <option key={t} value={t}>{t}</option>)}
         </select>
         <input className="input" type="search" aria-label="Search by name" placeholder="Search by name" value={search} onChange={(e) => { setSearch(e.target.value); setShown(PAGE); }} />
       </div>
 
-      <div className="row" style={{ justifyContent: "space-between" }}>
-        <span className="muted">{selected.size ? `${selected.size} selected` : `${rows.length.toLocaleString()} object${rows.length === 1 ? "" : "s"}`}</span>
-        <div className="row">
-          {selected.size > 0 && <Button size="small" onClick={() => setSelected(new Set())}>Clear selection</Button>}
-          <Button size="small" variant="primary" disabled={!selected.size || !canGenerate || busy} onClick={() => setConfirm(true)}>
-            <Sparkles size={14} aria-hidden="true" />Generate drafts{selected.size ? ` (${selected.size})` : ""}
-          </Button>
+      {mode !== "review" && (
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <span className="muted">{selected.size ? `${selected.size} selected` : `${rows.length.toLocaleString()} ${mode === "accept" ? "draft" : "object"}${rows.length === 1 ? "" : "s"}`}</span>
+          <div className="row">
+            <Button size="small" onClick={selectEverything} disabled={!everything.length}>
+              {allSelected ? "Clear selection" : `Select all ${everything.length.toLocaleString()}`}
+            </Button>
+            {mode === "generate" ? (
+              <Button size="small" variant="primary" disabled={!selected.size || !canGenerate || busy} onClick={() => setConfirm(true)}>
+                <Sparkles size={14} aria-hidden="true" />Generate drafts{selected.size ? ` (${selected.size})` : ""}
+              </Button>
+            ) : (
+              <Button size="small" variant="primary" disabled={!selected.size || busy} onClick={() => setConfirm(true)}>
+                <CheckCircle2 size={14} aria-hidden="true" />Accept drafts{selected.size ? ` (${selected.size})` : ""}
+              </Button>
+            )}
+          </div>
         </div>
-      </div>
+      )}
       {notice && <Banner tone="info">{notice}</Banner>}
 
       {rows.length === 0 ? (
-        <EmptyState title={filter === "needs" ? "The rules convert everything here" : "Nothing to show"}>
-          {filter === "needs" ? "No object has something the rules can't convert. You can still generate a draft for any object under All." : "Change the filters to see more."}
+        <EmptyState title={mode === "accept" ? "No drafts waiting for review" : filter === "needs" ? "The rules convert everything here" : "Nothing to show"}>
+          {mode === "accept" ? "Generate drafts first; they appear here once Claude has written them."
+            : filter === "needs" ? "No object has something the rules can't convert. You can still generate a draft for any object under All." : "Change the filters to see more."}
         </EmptyState>
       ) : (
         <div className="table-wrap">
@@ -209,8 +268,8 @@ export function TransformQueue() {
             <caption className="sr-only">Objects a draft can be made for</caption>
             <thead>
               <tr>
-                <th scope="col" className="static"><input type="checkbox" aria-label="Select all shown" checked={allVisibleSelected} onChange={toggleAll} /></th>
-                {["Object", "Type", "What the rules leave", "Status", "Confidence"].map((h) => <th key={h} scope="col" className="static">{h}</th>)}
+                {mode !== "review" && <th scope="col" className="static"><input type="checkbox" aria-label="Select all shown" checked={allVisibleSelected} onChange={toggleAll} /></th>}
+                {["Object", "Type", "What the rules leave", "Status", "Confidence", ...(mode === "review" ? ["Review"] : [])].map((h) => <th key={h} scope="col" className="static">{h}</th>)}
               </tr>
             </thead>
             <tbody>
@@ -218,7 +277,7 @@ export function TransformQueue() {
                 const st = STATE[c.state];
                 return (
                   <tr key={c.objectId}>
-                    <td><input type="checkbox" aria-label={`Select ${c.name}`} disabled={!selectable(c)} checked={selected.has(c.objectId)} onChange={() => toggle(c.objectId)} /></td>
+                    {mode !== "review" && <td><input type="checkbox" aria-label={`Select ${c.name}`} disabled={!selectable(c)} checked={selected.has(c.objectId)} onChange={() => toggle(c.objectId)} /></td>}
                     <td className="name"><button type="button" className="link-button" onClick={() => setOpen(c.objectId)}>{c.name}</button></td>
                     <td>{c.type}</td>
                     <td title={c.unavailable ?? c.problems.join("\n")} style={{ whiteSpace: "normal", minWidth: 240 }}>
@@ -232,6 +291,9 @@ export function TransformQueue() {
                       {c.state === "failed" && c.error && <div className="faint" style={{ fontSize: 13 }}>{c.error}</div>}
                     </td>
                     <td>{c.confidence ?? "—"}</td>
+                    {mode === "review" && (
+                      <td><Button size="small" onClick={() => setOpen(c.objectId)} aria-label={`Review ${c.name}`}>{c.state === "draft" ? "Review & accept" : "Open"}</Button></td>
+                    )}
                   </tr>
                 );
               })}
@@ -241,7 +303,14 @@ export function TransformQueue() {
       )}
       {rows.length > shown && <Button size="small" onClick={() => setShown((n) => n + PAGE)}>Show {Math.min(PAGE, rows.length - shown)} more</Button>}
 
-      {confirm && (
+      {confirm && mode === "accept" && (
+        <ConfirmDialog title={`Accept ${selected.size} draft${selected.size === 1 ? "" : "s"}?`} confirmLabel="Accept drafts" danger={false} busy={busy}
+          onCancel={() => setConfirm(false)} onConfirm={() => void acceptSelected()}>
+          Each accepted draft replaces the rule-based conversion when its object is created in Fabric by the next migration run.
+          Accept only drafts you have reviewed (Review one by one shows each draft beside its source). An accepted draft can be discarded later from its object.
+        </ConfirmDialog>
+      )}
+      {confirm && mode === "generate" && (
         <ConfirmDialog title={`Generate ${selected.size} draft${selected.size === 1 ? "" : "s"}?`} confirmLabel="Generate drafts" danger={false} busy={busy}
           onCancel={() => setConfirm(false)} onConfirm={() => void generate()}>
           The definition of each selected object, its rule-based conversion, its dependencies' names and column types, and your project

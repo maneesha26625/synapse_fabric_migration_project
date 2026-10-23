@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from discovery_agent import discovery
-from discovery_agent.api import mapping, repository_source
+from discovery_agent.api import consult_facts, mapping, repository_source
 from discovery_agent.api.repository_source import RepositoryError, RepositorySpec
 from discovery_agent.api.persist import StateStore
 from discovery_agent.config import DEFAULT_OUTPUT_DIR, DiscoveryConfig
@@ -1224,6 +1224,10 @@ class Session:
             },
             "discoveredAt": job.finished_at,
         }
+
+    def consultation_facts(self) -> dict:
+        """Features the latest discovery found (constructs in code, table properties, runtimes), for the consultation."""
+        return consult_facts.collect(self._completed_job())
 
     def _completed_job(self) -> _Job:
         with self._lock:

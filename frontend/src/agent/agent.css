@@ -2,16 +2,13 @@
 
 .tone-info { color: var(--info); }
 
-/* ---- Entry points at the foot of the explorer ---- */
-.ag-launch { display: flex; flex-direction: column; gap: 6px; padding-top: 10px; border-top: 1px solid var(--border); flex: none; }
-.ag-launch-item { display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); font: inherit; text-align: left; cursor: pointer; }
-.ag-launch-item:hover:not(:disabled) { border-color: var(--accent); }
-.ag-launch-item.active { border-color: var(--accent); background: var(--accent-soft); }
-.ag-launch-item.attention .ag-launch-icon { background: var(--warning-soft); color: var(--warning); }
-.ag-launch-item:disabled { opacity: .55; cursor: not-allowed; }
-.ag-launch-icon { width: 28px; height: 28px; flex: none; border-radius: 8px; display: grid; place-items: center; color: var(--accent); background: var(--accent-soft); }
-.ag-launch-text { display: flex; flex-direction: column; min-width: 0; flex: 1; font-size: 13.5px; line-height: 1.3; }
-.ag-launch-text .faint { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ---- The journey as three phases ---- */
+.journey.phases ol { grid-template-columns: repeat(3, minmax(180px, 1fr)); }
+.ag-phase-tabs .tab { display: inline-flex; align-items: center; gap: 6px; }
+.ag-phase-tabs .tab:disabled { opacity: .5; cursor: not-allowed; }
+.ag-phase-foot { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); }
+.ag-phase-foot > span { flex: 1; min-width: 220px; }
+.ag-phase-foot.done { border-color: color-mix(in srgb, var(--success) 40%, transparent); background: var(--success-soft); }
 
 /* ---- Shared ---- */
 .ag-view { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
@@ -35,6 +32,8 @@
 .ag-step-num { width: 30px; height: 30px; flex: none; border-radius: 50%; display: grid; place-items: center; font-weight: 700; font-size: 13.5px; background: var(--surface-3); color: var(--text-muted); }
 .ag-step-num.done { background: var(--success-soft); color: var(--success); }
 
+.ag-bulk { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 14px; border-radius: 12px; border: 1px solid color-mix(in srgb, var(--info) 30%, transparent); background: var(--info-soft); }
+.ag-bulk > span { flex: 1; min-width: 240px; font-size: 14px; }
 .ag-answer { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 16px; align-items: start; }
 .ag-topics { position: sticky; top: calc(var(--header-h) + 16px); padding: 14px 10px !important; }
 .ag-topics > .eyebrow { padding: 0 8px; }
@@ -57,6 +56,10 @@
 .ag-q-nav .eyebrow { text-align: center; }
 .ag-rec { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: 10px; border: 1px solid color-mix(in srgb, var(--info) 35%, transparent); background: var(--info-soft); color: var(--info); }
 .ag-rec > div { display: flex; flex-direction: column; gap: 2px; color: var(--text); }
+.ag-rec.config { border-color: color-mix(in srgb, var(--success) 35%, transparent); background: var(--success-soft); color: var(--success); }
+.ag-effect { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; border: 1px solid var(--border-strong); color: var(--text-muted); background: var(--surface-2); }
+.ag-effect.run { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, transparent); background: var(--accent-soft); }
+.ag-effect.gate { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent); background: var(--warning-soft); }
 .ag-rec.proposal { border-color: color-mix(in srgb, var(--accent) 40%, transparent); background: var(--accent-soft); color: var(--accent); }
 .ag-options { display: flex; flex-direction: column; gap: 8px; }
 .ag-option { display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-2); cursor: pointer; }

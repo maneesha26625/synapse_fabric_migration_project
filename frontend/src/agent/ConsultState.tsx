@@ -4,6 +4,7 @@ import { useMigration } from "../state/MigrationState";
 import { counts as countBrief, conflicts as briefConflicts, effectiveAnswers, fingerprint, resolve, settingsFrom, type AgentSettings, type BriefCounts, type Resolved } from "./brief";
 import { QUESTION_BY_ID, type AnswerValue, type Answers } from "./catalog";
 import { readFacts, type Facts } from "./facts";
+import type { ConsultFacts } from "../types";
 
 /** One line of the consultation's conversation: what was decided, said or asked. */
 export interface ConsultNote { at: string; kind: "note" | "you" | "system"; text: string }
@@ -24,6 +25,8 @@ export type BriefState = "draft" | "submitted" | "approved";
 
 interface ConsultValue {
   facts: Facts;
+  /** The features discovery found have been read (or could not be): the questions will not change under a submission. */
+  featuresReady: boolean;
   resolved: Resolved[];
   counts: BriefCounts;
   conflicts: string[];
@@ -67,8 +70,21 @@ function load(key: string): ConsultData {
 const now = () => new Date().toISOString();
 
 export function ConsultProvider({ children }: { children: ReactNode }) {
-  const { mode, discovery, connection } = useAppState();
+  const { mode, discovery, connection, api } = useAppState();
   const { project, graph, capabilities, fabric, fabricGit } = useMigration();
+  // What discovery found in code and table definitions, read once per completed discovery.
+  const [consultFacts, setConsultFacts] = useState<ConsultFacts | null>(null);
+  const [featuresReady, setFeaturesReady] = useState(false);
+  const discovered = discovery.state === "completed" || discovery.state === "completed_with_warnings";
+  useEffect(() => {
+    setFeaturesReady(false);
+    if (!discovered) { setConsultFacts(null); return; }
+    let live = true;
+    // An API without the endpoint (older backend) leaves the feature questions out rather than guessing.
+    api.getConsultFacts().then((f) => { if (live) setConsultFacts(f); }, () => { if (live) setConsultFacts(null); })
+      .finally(() => { if (live) setFeaturesReady(true); });
+    return () => { live = false; };
+  }, [api, discovered, discovery.finishedAt]);
   // Per data mode and project, like the plan: demo answers never leak into a live project.
   const key = `${KEY}.${mode}.${project.id}`;
   const [data, setData] = useState<ConsultData>(() => load(key));
@@ -77,8 +93,8 @@ export function ConsultProvider({ children }: { children: ReactNode }) {
     try { localStorage.setItem(key, JSON.stringify(data)); } catch { /* storage unavailable: kept for this visit */ }
   }, [key, data]);
 
-  const facts = useMemo(() => readFacts({ discovery, connection, graph, capabilities, fabricConnected: fabric.status === "connected", fabricGit }),
-    [discovery, connection, graph, capabilities, fabric.status, fabricGit]);
+  const facts = useMemo(() => readFacts({ discovery, connection, graph, capabilities, fabricConnected: fabric.status === "connected", fabricGit, fabric, consultFacts }),
+    [discovery, connection, graph, capabilities, fabric, fabricGit, consultFacts]);
   const resolved = useMemo(() => resolve(facts, data.answers), [facts, data.answers]);
   const fp = useMemo(() => fingerprint(resolved), [resolved]);
   const conflicts = useMemo(() => briefConflicts(facts, resolved), [facts, resolved]);
@@ -127,7 +143,7 @@ export function ConsultProvider({ children }: { children: ReactNode }) {
   const resetConsultation = useCallback(() => setData(EMPTY), []);
 
   const value: ConsultValue = {
-    facts, resolved, counts, conflicts, notes: data.notes, versions: data.versions, state, current, changedSinceApproval, approved,
+    facts, featuresReady, resolved, counts, conflicts, notes: data.notes, versions: data.versions, state, current, changedSinceApproval, approved,
     setAnswer, clearAnswer, acceptRecommendations, addNote, submit, approve, importAnswers, resetConsultation,
   };
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

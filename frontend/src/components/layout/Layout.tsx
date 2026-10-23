@@ -5,6 +5,7 @@ import { useAppState } from "../../state/AppState";
 import { useMigration } from "../../state/MigrationState";
 import { notify, TOAST_EVENT } from "../shared/notify";
 import { Button, ConfirmDialog, Modal, TextField } from "../shared/Shared";
+import { ActivityPanel } from "./ActivityPanel";
 import { AssistantLauncher, AssistantPanel } from "./Assistant";
 
 /** A side's live state, in the bar: green when connected. */
@@ -221,7 +222,7 @@ export function Layout() {
       {mode === "mock" && <div className="demo-bar" role="note">DEMO DATA · generated sample content, not a real Synapse workspace</div>}
       <BackendBar />
       <div className="shell-body">
-        <main className="main" id="main"><Outlet /></main>
+        <main className="main" id="main"><Outlet /><ActivityPanel /></main>
         {assistant && <AssistantPanel onClose={() => setAssistant(false)} />}
       </div>
       {!assistant && <AssistantLauncher onOpen={() => setAssistant(true)} />}
