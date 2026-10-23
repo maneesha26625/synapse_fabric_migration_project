@@ -11,6 +11,9 @@ that could not be made is reported as REVIEW with the reason, never as a match.
 With ``runtime`` options, each object Fabric can run is also checked for whether it *runs*
 (``runtime_checks``), and the verdict takes that into account: a failed run or query makes the row a
 MISMATCH; an object that matches but has never run in Fabric is REVIEW, because nothing proves it works yet.
+
+With ``target="lakehouse"`` the SQL side is the Lakehouse's SQL analytics endpoint: tables are compared with the
+types it shows for Delta columns, and each stored procedure is looked for as the notebook it became.
 """
 
 from __future__ import annotations
@@ -20,7 +23,9 @@ import json
 import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from discovery_agent.migration import datacopy, datafilter, environments, jobs, notebooks, pipelines, runtime_checks, warehouse_ddl
+from discovery_agent.migration import (
+    datacopy, datafilter, environments, jobs, lakehouse_ddl, notebooks, pipelines, runtime_checks, spark_sql, warehouse_ddl,
+)
 from discovery_agent.migration import security as security_sql
 from discovery_agent.migration.common import (
     CONNECTION, DATA, DATASET, DEFERRED, ENVIRONMENT, FUNCTION, MISSING, NOTEBOOK, PIPELINE, POOL, PROCEDURE, SCHEDULE, SCHEMA,
@@ -57,6 +62,11 @@ def _norm(text: str) -> str:
     text = re.sub(r"--[^\n]*", "", text or "")
     text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
     return re.sub(r"\s+", " ", text).strip().lower().rstrip(";").strip()
+
+
+def _base(type_name: str) -> str:
+    """``varchar(8000)`` -> ``varchar``; other types as they are."""
+    return re.sub(r"^(varchar|varbinary|char|binary)\(.*\)$", r"\1", type_name)
 
 
 def actual_type(name: str, max_length: int, precision: int, scale: int) -> str:
@@ -108,9 +118,13 @@ class Validator:
         progress: Callable[[str], None] = lambda text: None,
         sleep: Optional[Callable[[float], None]] = None,
         clock: Optional[Callable[[], float]] = None,
+        target: str = "warehouse",
     ) -> None:
         self.rest, self.wid, self.workspace_name = rest, workspace_id, workspace_name
         self.warehouse_name = warehouse_name
+        #: Where the SQL pool went: "warehouse", or "lakehouse" (its SQL analytics endpoint is read instead).
+        self.lakehouse = target == "lakehouse"
+        self.label = "Lakehouse" if self.lakehouse else "Warehouse"
         self._sql_factory, self._source_factory = sql_factory, source_factory
         self.artifacts = artifacts or {}
         self._ids: Dict[str, Dict[str, str]] = {}
@@ -151,13 +165,17 @@ class Validator:
         """Schemas, objects, columns and module text from the Warehouse, or {'error': why}."""
         if self._wh:
             return self._wh
-        found = self.find("warehouses", self.warehouse_name)
+        collection = "lakehouses" if self.lakehouse else "warehouses"
+        found = self.find(collection, self.warehouse_name)
         if not found:
-            self._wh = {"error": f"The Warehouse '{self.warehouse_name}' does not exist in {self.workspace_name}."}
+            self._wh = {"error": f"The {self.label} '{self.warehouse_name}' does not exist in {self.workspace_name}."}
             return self._wh
         try:
-            detail = self.rest.get(f"/workspaces/{self.wid}/warehouses/{found}")
-            host = str((detail.get("properties") or {}).get("connectionString") or "").replace("tcp:", "").split(",")[0].strip()
+            detail = self.rest.get(f"/workspaces/{self.wid}/{collection}/{found}")
+            props = detail.get("properties") or {}
+            if self.lakehouse:
+                props = props.get("sqlEndpointProperties") or {}
+            host = str(props.get("connectionString") or "").replace("tcp:", "").split(",")[0].strip()
             self._sql = self._sql_factory(host, self.warehouse_name)
             try:
                 self._sql.timeout = runtime_checks.SQL_TIMEOUT_SECONDS  # pyodbc: per-statement timeout for the run checks
@@ -188,7 +206,7 @@ class Validator:
             except Exception:  # noqa: BLE001 - reported on the tables that have masks
                 self._wh["masks"] = None
         except Exception as exc:  # noqa: BLE001 - driver, token or network failure
-            self._wh = {"error": f"Could not read the Warehouse: {type(exc).__name__}: {str(exc)[:200]}"}
+            self._wh = {"error": f"Could not read the {self.label}: {type(exc).__name__}: {str(exc)[:200]}"}
         return self._wh
 
     def target_rows(self, schema: str, name: str) -> Optional[int]:
@@ -246,6 +264,11 @@ class Validator:
         """Attach the run check for one object to its first row (see ``runtime_checks``)."""
         opts = self.runtime
         assert opts is not None
+        if self.lakehouse and s.kind == PROCEDURE:
+            item_id = self.find("notebooks", spark_sql.notebook_name(s.schema or "dbo", s.object_name or s.name))
+            if item_id:
+                apply_runtime(r, runtime_checks.last_run(self.rest, self.wid, item_id))
+            return
         if s.kind in (TABLE, VIEW, PROCEDURE):
             if not opts.probe and s.kind not in opts.run:
                 return
@@ -271,14 +294,16 @@ class Validator:
     def _sql_gate(self, s: Source) -> Optional[List[Dict[str, str]]]:
         wh = self.warehouse()
         if "error" in wh:
-            return [row(s, MISMATCH, s.type, "Warehouse not readable", wh["error"])]
+            return [row(s, MISMATCH, s.type, f"{self.label} not readable", wh["error"])]
         return None
 
     def _check_pool(self, s: Source) -> List[Dict[str, str]]:
         wh = self.warehouse()
         if "error" in wh:
             return [row(s, MISMATCH, "SQL pool", "not found", wh["error"])]
-        return [row(s, MATCH, "SQL pool", f"Warehouse {self.warehouse_name}", "The Warehouse exists and is readable.")]
+        detail = ("The Lakehouse exists and its SQL analytics endpoint is readable." if self.lakehouse
+                  else "The Warehouse exists and is readable.")
+        return [row(s, MATCH, "SQL pool", f"{self.label} {self.warehouse_name}", detail)]
 
     def _check_schema(self, s: Source) -> List[Dict[str, str]]:
         if (gate := self._sql_gate(s)):
@@ -293,10 +318,15 @@ class Validator:
         key = (schema.lower(), name.lower())
         wh = self.warehouse()
         if key not in wh["objects"]:
-            return [row(s, MISMATCH, f"{len(s.payload.columns)} columns", "missing", "The table is not in the Warehouse.")]
+            return [row(s, MISMATCH, f"{len(s.payload.columns)} columns", "missing", f"The table is not in the {self.label}.")]
         shown = {c.name.lower(): c.name for c in s.payload.columns}  # report columns as the source spells them
-        expected = {c.name.lower(): warehouse_ddl.map_type(c)[0].lower() for c in s.payload.columns}
-        actual = {str(r[3]).lower(): actual_type(r[4], r[5], r[6], r[7]) for r in wh["columns"].get(key, [])}
+        if self.lakehouse:
+            # Text and binary lengths are the endpoint's to choose; the base type is what is compared.
+            expected = {c.name.lower(): _base(lakehouse_ddl.endpoint_type(c)) for c in s.payload.columns}
+            actual = {str(r[3]).lower(): _base(actual_type(r[4], r[5], r[6], r[7])) for r in wh["columns"].get(key, [])}
+        else:
+            expected = {c.name.lower(): warehouse_ddl.map_type(c)[0].lower() for c in s.payload.columns}
+            actual = {str(r[3]).lower(): actual_type(r[4], r[5], r[6], r[7]) for r in wh["columns"].get(key, [])}
         missing = sorted(set(expected) - set(actual))
         extra = sorted(set(actual) - set(expected))
         shown.update({k: k for k in extra})
@@ -315,9 +345,10 @@ class Validator:
             if unmasked:
                 return [row(s, MISMATCH, label_s, label_t, f"Dynamic data mask missing in Fabric on: {', '.join(unmasked[:5])}. "
                             "Those columns are visible unmasked to users without UNMASK.")]
-        converted = [c for c in s.payload.columns if warehouse_ddl.map_type(c)[1]]
+        mapper = lakehouse_ddl.map_type if self.lakehouse else warehouse_ddl.map_type
+        converted = [c for c in s.payload.columns if mapper(c)[1]]
         if converted:
-            return [row(s, REVIEW, label_s, label_t, f"{len(converted)} column type(s) converted by design (e.g. {warehouse_ddl.map_type(converted[0])[1]}).")]
+            return [row(s, REVIEW, label_s, label_t, f"{len(converted)} column type(s) converted by design (e.g. {mapper(converted[0])[1]}).")]
         return [row(s, MATCH, label_s, label_t, "Column names and types agree.")]
 
     def _check_data(self, s: Source) -> List[Dict[str, str]]:
@@ -325,7 +356,7 @@ class Validator:
             return gate
         schema, name = (s.schema or "dbo"), (s.object_name or s.name)
         if (schema.lower(), name.lower()) not in self.warehouse()["objects"]:
-            return [row(s, MISMATCH, "rows", "no table", "The table is not in the Warehouse.", "Data Count")]
+            return [row(s, MISMATCH, "rows", "no table", f"The table is not in the {self.label}.", "Data Count")]
         label = s.name.replace(" (data)", "")
         if s.data_filter is not None:
             return [{**self._check_filtered(s, schema, name), "object": label}]
@@ -389,7 +420,7 @@ class Validator:
         key = ((s.schema or "dbo").lower(), (s.object_name or s.name).lower())
         wh = self.warehouse()
         if key not in wh["objects"]:
-            return [row(s, MISMATCH, f"1 {kind}", "missing", f"The {kind} is not in the Warehouse.")]
+            return [row(s, MISMATCH, f"1 {kind}", "missing", f"The {kind} is not in the {self.label}.")]
         text = getattr(getattr(s.payload, "definition", None), "text", "") or ""
         if wh["modules"] is None:
             return [row(s, REVIEW, f"1 {kind}", f"1 {kind}", "Exists; the definition could not be read to compare.")]
@@ -400,6 +431,12 @@ class Validator:
         return self._module(s, "view")
 
     def _check_procedure(self, s: Source) -> List[Dict[str, str]]:
+        if self.lakehouse:
+            notebook = spark_sql.notebook_name(s.schema or "dbo", s.object_name or s.name)
+            ok = bool(self.find("notebooks", notebook))
+            return [row(s, REVIEW if ok else MISMATCH, "1 procedure", f"notebook {notebook}" if ok else "missing",
+                        "Converted to a Spark notebook: compare what it does with the procedure before relying on it."
+                        if ok else f"The notebook '{notebook}' the procedure becomes is not in the Fabric workspace.")]
         return self._module(s, "procedure")
 
     def _check_function(self, s: Source) -> List[Dict[str, str]]:
@@ -464,8 +501,10 @@ class Validator:
         return [row(s, MATCH if got == cells else MISMATCH, f"{cells} cells", f"{got} cells", "Cell counts agree." if got == cells else "The cell counts differ.")]
 
     def _check_script(self, s: Source) -> List[Dict[str, str]]:
-        return [row(s, MATCH if self.find("notebooks", s.name) else MISMATCH, "1 script", "1 notebook" if self.find("notebooks", s.name) else "missing",
-                    "Created as a T-SQL notebook." if self.find("notebooks", s.name) else "The notebook is not in the Fabric workspace.")]
+        ok = bool(self.find("notebooks", s.name))
+        made = "Created as a notebook." if self.lakehouse else "Created as a T-SQL notebook."
+        return [row(s, MATCH if ok else MISMATCH, "1 script", "1 notebook" if ok else "missing",
+                    made if ok else "The notebook is not in the Fabric workspace.")]
 
     def _check_environment(self, s: Source) -> List[Dict[str, str]]:
         meta = s.payload if isinstance(s.payload, dict) else {}
@@ -542,7 +581,7 @@ class Validator:
         return [row(s, MATCH if ok else MISMATCH, f"{len(bodies)} schedule(s)", f"{len(bodies)} schedule(s)" if ok else "missing", "Schedules exist (created switched off)." if ok else "; ".join(results))]
 
     def _check_shortcut(self, s: Source) -> List[Dict[str, str]]:
-        lake = self.find("lakehouses", f"{self.warehouse_name}_lakehouse")
+        lake = self.find("lakehouses", self.warehouse_name if self.lakehouse else f"{self.warehouse_name}_lakehouse")
         if not lake:
             return [row(s, MISMATCH, "1 external table", "no Lakehouse", "The Lakehouse for shortcuts does not exist.")]
         name = (s.object_name or s.name).lower()

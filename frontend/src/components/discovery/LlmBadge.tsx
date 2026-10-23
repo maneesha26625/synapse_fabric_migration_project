@@ -1,6 +1,7 @@
 import { Sparkles } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useAppState } from "../../state/AppState";
+import { useSqlTarget } from "../../state/MigrationState";
 
 /** Marks an object that is created from an accepted LLM-assisted transform, not the rule-based conversion. */
 export function LlmBadge({ edited, acceptedAt }: { edited?: boolean; acceptedAt?: string | null }) {
@@ -17,10 +18,11 @@ export interface AcceptedTransform { edited: boolean; acceptedAt: string | null 
 /** Objects with an accepted transform, by id. Empty while loading or when the backend has none. */
 export function useAcceptedTransforms(): Map<string, AcceptedTransform> {
   const { api } = useAppState();
+  const target = useSqlTarget();  // only what the run will use: transforms accepted for its target
   const [accepted, setAccepted] = useState<Map<string, AcceptedTransform>>(new Map());
   useEffect(() => {
     let cancelled = false;
-    api.listTransforms().then(
+    api.listTransforms(target).then(
       (items) => {
         if (cancelled) return;
         setAccepted(new Map(items.filter((t) => t.accepted).map((t) => [t.objectId, { edited: !!t.accepted?.edited, acceptedAt: t.accepted?.acceptedAt ?? null }])));
@@ -28,6 +30,6 @@ export function useAcceptedTransforms(): Map<string, AcceptedTransform> {
       () => { /* no transforms available: show nothing */ },
     );
     return () => { cancelled = true; };
-  }, [api]);
+  }, [api, target]);
   return accepted;
 }

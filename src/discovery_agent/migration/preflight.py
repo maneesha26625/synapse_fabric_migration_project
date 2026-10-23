@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 
 from discovery_agent.migration import storage_remap
 from discovery_agent.migration import datacopy, datafilter, environments, fabric_connections, jobs, notebooks, pipelines, tsql_rules, warehouse_ddl
+from discovery_agent.migration import lakehouse_ddl, spark_sql
 from discovery_agent.migration import security as security_sql
 from discovery_agent.migration.common import (
     CONNECTION, DATA, DEFERRED, ENVIRONMENT, FUNCTION, NOTEBOOK, PIPELINE, PROCEDURE, SCHEDULE, SCRIPT, SECURITY, SPARKJOB, TABLE,
@@ -213,11 +214,113 @@ _CHECKS = {TABLE: _table, VIEW: _module, PROCEDURE: _module, FUNCTION: _module, 
            SECURITY: _security, DEFERRED: _deferred}
 
 
+# -- a Lakehouse as the SQL target -------------------------------------------------------------------
+
+
+def _lh_table(source: Source) -> List[Finding]:
+    unsupported = [m for m in source.masks if security_sql.mask_clause(m) is None]
+    if unsupported:
+        return _table(source)  # the same blocking finding: the masks could not be applied
+    try:
+        _, notes = lakehouse_ddl.create_table(source.payload)
+    except lakehouse_ddl.UnsupportedColumn as exc:
+        return [Finding(source.id, "UNSUPPORTED_TYPE", BLOCKING, f"{source.name}: {exc} It cannot be recreated.")]
+    except Exception as exc:  # noqa: BLE001 - a malformed record is a finding, not a crash
+        return [Finding(source.id, "DEFINITION_UNREADABLE", HIGH, f"{source.name}: the table definition could not be read ({type(exc).__name__}).")]
+    found: List[Finding] = []
+    if source.masks:
+        found.append(Finding(source.id, "MASKS_ENDPOINT_ONLY", MEDIUM,
+                             f"{source.name}: its dynamic data masks are applied on the SQL analytics endpoint only. Spark and "
+                             "OneLake read the Delta table unmasked, so anyone with workspace access sees the values."))
+    if notes:
+        severity = MEDIUM if any("IDENTITY not kept" in n for n in notes) else LOW
+        shown = "; ".join(notes[:3]) + (f"; and {len(notes) - 3} more" if len(notes) > 3 else "")
+        found.append(Finding(source.id, "TYPE_CONVERSION", severity, f"{source.name} changes on the way to a Delta table: {shown}."))
+    return found
+
+
+def _converted(source: Source, converted: "spark_sql.Converted", what: str) -> List[Finding]:
+    if converted.review:
+        shown = "; ".join(converted.review[:3]) + (f"; and {len(converted.review) - 3} more" if len(converted.review) > 3 else "")
+        return [Finding(source.id, "NOTEBOOK_REVIEW", MEDIUM,
+                        f"{source.name} becomes a Spark notebook (a Lakehouse cannot hold {what}); finish by hand before it runs: {shown}.")]
+    return [Finding(source.id, "CONVERTED_TO_NOTEBOOK", LOW,
+                    f"{source.name} becomes a Spark notebook (a Lakehouse cannot hold {what}). Compare it with the original before "
+                    "relying on it.")]
+
+
+def _lh_procedure(source: Source) -> List[Finding]:
+    definition = getattr(source.payload, "definition", None)
+    text = getattr(definition, "text", None)
+    if not text or not getattr(definition, "is_readable", False):
+        return _module(source)
+    try:
+        converted = spark_sql.procedure_notebook(text, name=source.name, lakehouse_id="preflight", lakehouse="preflight",
+                                                 workspace_id="preflight")
+    except Exception as exc:  # noqa: BLE001 - text the converter cannot follow is a finding, not a crash
+        return [Finding(source.id, "NEEDS_REWRITE", HIGH, f"{source.name}: the procedure could not be converted to a notebook "
+                        f"({type(exc).__name__}); rewrite it as one by hand.")]
+    return _converted(source, converted, "a stored procedure that changes data")
+
+
+def _lh_script(source: Source) -> List[Finding]:
+    query = str(((source.payload or {}).get("properties") or {}).get("content", {}).get("query") or "")
+    if not spark_sql.changes_data(query):
+        return _script(source)
+    try:
+        converted = spark_sql.script_notebook(query, name=source.name, lakehouse_id="preflight", lakehouse="preflight",
+                                              workspace_id="preflight")
+    except Exception as exc:  # noqa: BLE001
+        return [Finding(source.id, "NEEDS_REWRITE", HIGH, f"{source.name}: the script could not be converted ({type(exc).__name__}).")]
+    return _converted(source, converted, "T-SQL that changes data")
+
+
+def _lh_data(source: Source) -> List[Finding]:
+    found = [f for f in _data(source) if f.code != "SYNC_APPEND_ONLY"]
+    if source.data_filter is not None and getattr(source.data_filter, "sync", False):
+        found.append(Finding(source.id, "SYNC_NOT_AVAILABLE", MEDIUM,
+                             f"{source.name}: keeping a table in sync is not available with a Lakehouse target. It is loaded "
+                             "once within its filter; refresh it by running its wave's pipeline with 'Replace it'."))
+    return found
+
+
+def _lh_pipeline(source: Source) -> List[Finding]:
+    bundle = source.payload
+    if not isinstance(bundle, dict) or not bundle.get("resource"):
+        return _pipeline(source)
+    context = pipelines.Context(
+        datasets=bundle.get("datasets", {}), linked_services=bundle.get("linkedServices", {}), connections=_Always(),
+        notebooks=_Always(), pipelines=_Always(), spark_jobs=_Always(), workspace_id="preflight", warehouse=None, pool_name="",
+        lakehouse=pipelines.Lakehouse("preflight", "preflight", "preflight"), procedure_notebooks=_Always())
+    converted = pipelines.convert(bundle["resource"], context)
+    found: List[Finding] = []
+    if converted.unsupported:
+        found.append(Finding(source.id, "NEEDS_REWRITE", HIGH,
+                             f"{source.name} has activities a Lakehouse target cannot carry ({'; '.join(converted.unsupported[:4])}), "
+                             "so it will not be created."))
+    unresolved = [m for m in converted.missing if m.startswith("dataset")]
+    if unresolved:
+        found.append(Finding(source.id, "DEPENDENCY_UNRESOLVED", HIGH, f"{source.name} uses {', '.join(unresolved[:3])}, which discovery did not capture."))
+    return found
+
+
+def _lh_security(source: Source) -> List[Finding]:
+    return _security(source) + [Finding(source.id, "SECURITY_ENDPOINT_ONLY", LOW,
+                                        f"{source.name}: its permissions apply to T-SQL reads through the Lakehouse's SQL analytics "
+                                        "endpoint only; Spark and OneLake access follow workspace roles and OneLake security.")]
+
+
+_LAKEHOUSE_CHECKS = {**_CHECKS, TABLE: _lh_table, PROCEDURE: _lh_procedure, SCRIPT: _lh_script, DATA: _lh_data,
+                     PIPELINE: _lh_pipeline, SECURITY: _lh_security}
+
+
 def content_findings(sources: Sequence[Source], credential_names: Optional[Set[str]] = None, pool: str = "",
-                     storage_routes: Optional[Sequence[Dict[str, Any]]] = None) -> List[Finding]:
+                     storage_routes: Optional[Sequence[Dict[str, Any]]] = None, target: str = "warehouse") -> List[Finding]:
     """Findings for every object whose own content predicts trouble. ``pool`` is the SQL pool being migrated;
-    ``storage_routes`` the storage locations the run sends through OneLake shortcuts (run option ``storageRoutes``)."""
+    ``storage_routes`` the storage locations the run sends through OneLake shortcuts (run option ``storageRoutes``);
+    ``target`` where the pool goes (run option ``target``: a Lakehouse takes different roads for some objects)."""
     names = credential_names or set()
+    checks = _LAKEHOUSE_CHECKS if target == "lakehouse" else _CHECKS
     routes = planned_routes(storage_routes)
     out: List[Finding] = []
     direct: Set[str] = set()
@@ -227,9 +330,9 @@ def content_findings(sources: Sequence[Source], credential_names: Optional[Set[s
             continue
         first = len(out)
         if source.override:
-            out.extend(_override(source))
+            out.extend(_override(source, target))
         else:
-            check = _CHECKS.get(source.kind)
+            check = checks.get(source.kind)
             if check is not None:
                 out.extend(check(source))
         storage = _external_storage(source, routes)
@@ -389,12 +492,28 @@ def _depends_on_storage(sources: Sequence[Source], direct: Set[str]) -> List[Fin
                                  "with them. Route their storage through a OneLake shortcut."))
     return found
 
-def _override(source: Source) -> List[Finding]:
+def _override(source: Source, target: str = "warehouse") -> List[Finding]:
     """An object with an accepted LLM-assisted transform: check the code the run will use, not the original."""
     code = str((source.override or {}).get("code") or "")
     found = [Finding(source.id, "LLM_TRANSFORM", LOW,
                      f"{source.name}: uses the LLM-assisted transform accepted on {(source.override or {}).get('acceptedAt') or 'an earlier date'}, "
                      "not the rule-based conversion.")]
+    if target == "lakehouse" and source.kind in (PROCEDURE, SCRIPT, TABLE):
+        # A Lakehouse transform of these is a Spark notebook (cells JSON) or a Delta CREATE TABLE, not T-SQL.
+        from discovery_agent.llm import checks  # noqa: PLC0415 - llm.context imports this module
+
+        problems = checks.run(source.kind, code, [], None, target)
+        errors = [c["message"] for c in problems if c["level"] == "error"]
+        if errors:
+            found.append(Finding(source.id, "TRANSFORM_INVALID", HIGH, f"{source.name}: the accepted transform " + " ".join(errors)))
+        return found
+    if target == "lakehouse" and source.kind == PIPELINE:
+        try:
+            resource = json.loads(code)
+        except ValueError:
+            return found + [Finding(source.id, "DEFINITION_UNREADABLE", HIGH, f"{source.name}: the accepted transform is not valid JSON.")]
+        bundle = {**(source.payload if isinstance(source.payload, dict) else {}), "resource": resource}
+        return found + _lh_pipeline(dataclasses.replace(source, payload=bundle, override=None))
     if source.kind in (VIEW, PROCEDURE, FUNCTION, SCRIPT):
         found.extend(f for f in _sql_findings(source, code) if f.code != "TSQL_CONVERTED")
     elif source.kind == PIPELINE:

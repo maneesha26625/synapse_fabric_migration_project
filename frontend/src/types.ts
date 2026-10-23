@@ -503,6 +503,9 @@ export interface RunOptions {
   dataRun: "run" | "create";
   /** Warehouse: the collation it is created with (it cannot change afterwards). */
   collation: "match_synapse" | "case_insensitive" | "case_sensitive";
+  /** Where the SQL pool goes: a Warehouse (T-SQL as it is), or a Lakehouse (Delta tables; views and functions on its
+   *  SQL analytics endpoint; stored procedures converted to Spark notebooks). Undefined: a Warehouse. */
+  target?: SqlTarget;
   /** An object already in Fabric: left as it is, or updated in place (views/procedures by CREATE OR ALTER,
    *  notebooks, pipelines, scripts and Spark jobs by replacing their definition). Tables are never replaced. */
   existing?: "skip" | "update";
@@ -767,8 +770,13 @@ export interface TransformAccepted extends Omit<TransformDraft, "costUsd" | "dur
   edited: boolean;
 }
 
+/** Where the SQL pool goes (run option `target`): the same object converts differently for each. */
+export type SqlTarget = "warehouse" | "lakehouse";
+
 export interface TransformObject {
   objectId: string;
+  /** The target this draft and accepted transform are for (each target keeps its own). */
+  target?: SqlTarget;
   name: string | null;
   type: string | null;
   kind: TransformKind | null;
@@ -785,6 +793,8 @@ export interface TransformObject {
     ruleOutput: string;
     ruleNotes: string[];
     problems: string[];
+    /** The language of the rule output and of a draft: `json` for a Lakehouse procedure's notebook. */
+    outputLanguage?: "sql" | "json";
   };
 }
 
@@ -877,20 +887,21 @@ export interface MigrationApi {
   /** `reset` forgets the run's record so the next run starts fresh; refused while the run is working. */
   controlExecution(action: RunControl): Promise<ExecutionRun>;
   /** Compares Synapse with Fabric. With no items, every discovered object is checked. */
-  runValidation(items?: PlanItem[], options?: Pick<RunOptions, "dataFilters">, runtime?: ValidationRuntimeOptions,
+  runValidation(items?: PlanItem[], options?: Pick<RunOptions, "dataFilters" | "target">, runtime?: ValidationRuntimeOptions,
     onProgress?: (text: string) => void): Promise<ValidationRow[]>;
   // LLM-assisted transformation, through Claude Code on the machine running the API.
   getTransformSettings(): Promise<TransformSettings>;
-  listTransforms(): Promise<TransformObject[]>;
-  getTransform(id: string): Promise<TransformObject>;
-  getTransformPrompt(id: string): Promise<TransformPrompt>;
-  generateTransforms(ids: string[]): Promise<TransformQueued[]>;
+  // Every transform call names the SQL target: a draft for a Warehouse is not one for a Lakehouse.
+  listTransforms(target?: SqlTarget): Promise<TransformObject[]>;
+  getTransform(id: string, target?: SqlTarget): Promise<TransformObject>;
+  getTransformPrompt(id: string, target?: SqlTarget): Promise<TransformPrompt>;
+  generateTransforms(ids: string[], target?: SqlTarget): Promise<TransformQueued[]>;
   /** Accept the draft; with `code`, an edited version of it. */
-  acceptTransform(id: string, code?: string): Promise<TransformObject>;
+  acceptTransform(id: string, code?: string, target?: SqlTarget): Promise<TransformObject>;
   /** `draft` drops the draft only; `all` goes back to the rule-based conversion. */
-  discardTransform(id: string, scope: "draft" | "all"): Promise<TransformObject>;
+  discardTransform(id: string, scope: "draft" | "all", target?: SqlTarget): Promise<TransformObject>;
   /** Every object a draft can be made for, those the rules cannot convert first. */
-  listTransformCandidates(): Promise<TransformCandidates>;
+  listTransformCandidates(target?: SqlTarget): Promise<TransformCandidates>;
   /** Features the latest discovery found, for the consultation's conditional questions. */
   getConsultFacts(): Promise<ConsultFacts>;
   /** The project requirements every prompt carries (prompts/transform/project.md on the server). */

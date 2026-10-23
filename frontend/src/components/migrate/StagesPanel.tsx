@@ -131,7 +131,8 @@ export function StagesPanel() {
               <p className="muted">{s.summary}</p>
               <p className="faint" style={{ margin: 0 }}>Creates: {s.creates}</p>
 
-              {s.options.map((o) => {
+              {s.options.filter((o) => !(o.key === "collation" && options.target === "lakehouse")).map((o) => {
+                // A Lakehouse has no collation to choose: Spark and its SQL endpoint compare text by its bytes.
                 const value = optionValue(o.key, o.default);
                 return (
                   <div key={o.key} className="stage-option">

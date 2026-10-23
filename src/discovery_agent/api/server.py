@@ -41,6 +41,7 @@ web framework would be the first. The surface is small and fixed.
     GET    /api/transform/objects/{id}    one object: source, rule output, draft, accepted code
     GET    /api/transform/prompt/{id}     the exact prompt a draft is generated from
     GET    /api/transform/candidates      objects a draft can be made for, those the rules cannot convert first
+                                          (every transform route takes the SQL target: ?target= or "target")
     GET    /api/transform/project         the project requirements every prompt carries
     POST   /api/transform/project         replace the project requirements
     POST   /api/transform/generate        queue drafts for objects (background)
@@ -214,17 +215,17 @@ def make_handler(
             elif path == "/api/transform/settings":
                 self._dispatch(transforms.settings)
             elif path == "/api/transform/candidates":
-                self._dispatch(transforms.candidates)
+                self._dispatch(lambda: transforms.candidates(query))
             elif path == "/api/transform/project":
                 self._dispatch(transforms.project)
             elif path == "/api/transform":
-                self._dispatch(transforms.list)
+                self._dispatch(lambda: transforms.list(query))
             elif path.startswith(TRANSFORM_OBJECT_PREFIX):
                 object_id = unquote(path[len(TRANSFORM_OBJECT_PREFIX):])
-                self._dispatch(lambda: transforms.object(object_id))
+                self._dispatch(lambda: transforms.object(object_id, query))
             elif path.startswith(TRANSFORM_PROMPT_PREFIX):
                 object_id = unquote(path[len(TRANSFORM_PROMPT_PREFIX):])
-                self._dispatch(lambda: transforms.prompt(object_id))
+                self._dispatch(lambda: transforms.prompt(object_id, query))
             elif path.startswith(RESULTS_PREFIX):
                 object_id = unquote(path[len(RESULTS_PREFIX):])
                 self._dispatch(lambda: session.result(object_id))

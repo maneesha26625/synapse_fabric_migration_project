@@ -28,7 +28,8 @@ from discovery_agent.migration import capabilities, datafilter, datapipeline, fa
 from discovery_agent.migration.onelake import OneLakeFiles
 from discovery_agent.migration.runtime_checks import RuntimeOptions
 from discovery_agent.migration.validation import Validator, summarize
-from discovery_agent.migration.common import lakehouse_name
+from discovery_agent.migration.common import TARGETS, is_lakehouse, lakehouse_name
+from discovery_agent.migration import lakehouse_ddl, spark_sql
 from discovery_agent.migration.runner import (
     COMPLETED,
     CONNECTION,
@@ -112,6 +113,9 @@ def parse_options(body: dict) -> dict:
     collation = str(options.get("collation") or "match_synapse")
     if collation not in COLLATIONS:
         raise ApiError(400, "invalid_options", "Choose a Warehouse collation: same as Synapse, case-insensitive or case-sensitive.")
+    target = str(options.get("target") or "warehouse")
+    if target not in TARGETS:
+        raise ApiError(400, "invalid_options", "Choose where the SQL pool goes: a Fabric Warehouse or a Fabric Lakehouse.")
     existing = str(options.get("existing") or "skip")
     if existing not in EXISTING:
         raise ApiError(400, "invalid_options", "Choose to skip or update objects that are already in Fabric.")
@@ -124,7 +128,7 @@ def parse_options(body: dict) -> dict:
         raise ApiError(400, "invalid_options", "Choose to commit to Fabric Git after the run (auto) or not (off).")
     return {"scope": scope, "stopOnFailure": bool(options.get("stopOnFailure")), "stages": list(dict.fromkeys(stages)),
             "dataMode": mode, "dataRun": data_run, "collation": collation, "syncOverlap": overlap, "existing": existing,
-            "storageRoutes": routes, "gitCommit": git_commit,
+            "storageRoutes": routes, "gitCommit": git_commit, "target": target,
             "dataFilters": parse_data_filters(options.get("dataFilters"))}
 
 
@@ -252,19 +256,32 @@ def git_items(run: MigrationRun) -> Set[Tuple[str, str]]:
 
     Schemas, tables, views, procedures, functions and roles change the Warehouse item. External-table shortcuts,
     storage routed through OneLake, and a Spark job's default Lakehouse change the run's Lakehouse. Connections,
-    data loads and schedules are not items Fabric keeps in Git."""
+    data loads and schedules are not items Fabric keeps in Git.
+
+    When the SQL target is a Lakehouse, the pool's objects change the Lakehouse instead, and each stored
+    procedure is a notebook of its own (as is the notebook that created the tables)."""
     with run.lock:
         done = [i.source for i in run.items if i.status == COMPLETED]
     items: Set[Tuple[str, str]] = set()
     lakehouse = False
+    target_lakehouse = is_lakehouse(run.settings)
     for source in done:
-        if source.kind in _GIT_ITEM_TYPES:
+        if target_lakehouse and source.kind == PROCEDURE:
+            items.add(("Notebook", spark_sql.notebook_name(source.schema or "dbo", source.object_name or source.name)))
+            lakehouse = True
+        elif target_lakehouse and source.kind in (SCHEMA, TABLE):
+            items.add(("Notebook", lakehouse_ddl.notebook_name(run.warehouse)))
+            lakehouse = True
+        elif source.kind in _GIT_ITEM_TYPES:
             items.add((_GIT_ITEM_TYPES[source.kind], source.name))
         elif source.kind in _WAREHOUSE_KINDS:
-            items.add(("Warehouse", run.warehouse))
+            if target_lakehouse:
+                lakehouse = True
+            else:
+                items.add(("Warehouse", run.warehouse))
         lakehouse = lakehouse or source.kind in (SHORTCUT, SPARKJOB)
     if lakehouse or (items and run.settings.get("storageRoutes")):
-        items.add(("Lakehouse", lakehouse_name(run.warehouse)))
+        items.add(("Lakehouse", lakehouse_name(run.warehouse, run.settings)))
     return items
 
 
@@ -579,7 +596,7 @@ class MigrationService:
         stages = set(options["stages"])
         sources = apply_stages(every, {**options, "scope": "automated"})
         if self._transforms is not None:
-            self._transforms.apply(sources)
+            self._transforms.apply(sources, options["target"])
         objects = plan_objects(plan, job, every, stages)
         # Asked only when the plan has table data to load or external tables: the Table data and External tables
         # stages are on by default, and a source connected without a SQL pool has nothing for them to read.
@@ -587,7 +604,8 @@ class MigrationService:
                                     source_connected=self._source_available() if needs_synapse_source(sources) else None)
         # A connection already in Fabric is reused by the run (skipped), so it needs no credentials either.
         names = set(credential_names) | set(self._credentials) | self._existing_connection_names()
-        return planning.analyze(objects, content_findings(sources, names, pool or "", options["storageRoutes"]), checks), sources
+        return planning.analyze(objects, content_findings(sources, names, pool or "", options["storageRoutes"], target=options["target"]),
+                                checks), sources
 
     def analyze(self, body: dict) -> dict:
         """The planner's strategy, risks, effort and checks for a plan. Reads, never writes."""
@@ -675,18 +693,19 @@ class MigrationService:
             sources = apply_stages(sources_for(plan, job, pool), options)
             if not [s for s in sources if s.kind not in (DEFERRED, MISSING)]:
                 raise ApiError(400, "nothing_to_migrate", "No object in the plan can be created by this build. Choose scope All to see them listed as deferred.")
-            transform_log = self._transforms.apply(sources) if self._transforms is not None else []
+            transform_log = self._transforms.apply(sources, options["target"]) if self._transforms is not None else []
             run = MigrationRun(f"{self._counter:03d}", sources, workspace_id, workspace_name, warehouse_name_for(pool))
             via = "Azure CLI" if method == "azure_cli" else "Fabric CLI"
             run.scope, run.stop_on_failure = scope, stop_on_failure
             run.stages, run.pool_name = list(options["stages"]), pool or ""
             run.settings = {"dataMode": options["dataMode"], "dataRun": options["dataRun"], "collation": options["collation"],
                             "existing": options["existing"], "storageRoutes": options["storageRoutes"],
-                            "syncOverlap": options["syncOverlap"], "gitCommit": options["gitCommit"]}
+                            "syncOverlap": options["syncOverlap"], "gitCommit": options["gitCommit"], "target": options["target"]}
             self._describe_source(run, job, pool)
             if credentials:
                 self._credentials = credentials
-            run.log("RUN", "run", f"{len(sources)} objects, workspace {workspace_name}, warehouse {run.warehouse}, signed in with {via}")
+            where = f"lakehouse {run.warehouse}" if is_lakehouse(run.settings) else f"warehouse {run.warehouse}"
+            run.log("RUN", "run", f"{len(sources)} objects, workspace {workspace_name}, {where}, signed in with {via}")
             reviewed = sum(1 for s in sources if s.override)
             if reviewed:
                 run.log("NOTE", "run", f"{reviewed} object{'s' if reviewed != 1 else ''} use{'s' if reviewed == 1 else ''} an accepted LLM-assisted transform")
@@ -805,8 +824,9 @@ class MigrationService:
                                {"stages": list(capabilities.STAGE_KEYS), "scope": "all", "dataFilters": filters})
         factory = self._source_factory or getattr(self._session, "source_sql_factory", lambda: None)()
         warehouse = warehouse_name_for(pool)
+        target = str(given.get("target") or "warehouse")
         validator = Validator(
-            self._rest_factory(), workspace_id, workspace_name, warehouse, self._sql_factory, factory,
+            self._rest_factory(), workspace_id, workspace_name, warehouse, self._sql_factory, factory, target=target if target in TARGETS else "warehouse",
             artifacts={"pipelines": _artifacts(job).get(P0Artifact.PIPELINE, {})},
             runtime=RuntimeOptions.parse(body["runtime"]) if isinstance(body.get("runtime"), dict) else None,
             progress=progress or (lambda text: None))
@@ -856,7 +876,8 @@ class MigrationService:
     def _spawn(self, run: MigrationRun) -> None:
         factory = self._source_factory or getattr(self._session, "source_sql_factory", lambda: None)()
         files = None
-        if run.settings.get("storageRoutes"):
+        # OneLake files: copies of Spark job main files, and (Lakehouse target) the table notebook's report.
+        if run.settings.get("storageRoutes") or is_lakehouse(run.settings):
             try:
                 files = OneLakeFiles(self._fabric.storage_token_provider())
             except Exception:  # noqa: BLE001 - only Spark job main files need it; without it they are reported, not copied

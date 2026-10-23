@@ -189,19 +189,21 @@ export const QUESTIONS: Question[] = [
     id: "target.sql", topic: "target", kind: "single", required: true, effect: "run",
     when: (f) => hasSql(f) && !!stage(f, "warehouse"),
     text: "Which Fabric destination should host the dedicated SQL pool workload?",
-    help: "A Fabric Warehouse runs T-SQL tables, views, functions and procedures (this tool creates it). A Lakehouse suits lake-oriented, Spark-heavy work; its SQL analytics endpoint is read-only, so procedures that write must be redesigned. This tool does not convert SQL objects to a Lakehouse.",
+    help: "A Fabric Warehouse runs T-SQL tables, views, functions and procedures as they are. A Lakehouse suits lake-oriented, Spark-heavy work: the run creates its tables as Delta tables and puts views and functions on its SQL analytics endpoint, but that endpoint is read-only, so each stored procedure is converted to a Spark notebook (pipelines run the notebook instead) and must be reviewed. A Lakehouse keeps no IDENTITY, keys or table sync.",
     options: () => [
-      { value: "warehouse", label: "Fabric Warehouse", description: "Created by the run." },
+      { value: "warehouse", label: "Fabric Warehouse", description: "Created by the run; T-SQL objects run as they are." },
       { value: "split", label: "Split: Warehouse for SQL objects, Lakehouse redesign for lake-oriented data", description: "The Warehouse is created; the redesign is recorded for a person." },
-      { value: "lakehouse", label: "Lakehouse redesign", description: "Not automated: the SQL objects are left out of the run." },
+      { value: "lakehouse", label: "Fabric Lakehouse", description: "Created by the run: Delta tables, views and functions on its SQL endpoint, stored procedures converted to Spark notebooks." },
     ],
     recommend: (f) => {
+      const procedures = count(f, "Stored Procedure");
       const code = count(f, "Stored Procedure", "View", "Function");
+      if (procedures > 0) return { value: "warehouse", reason: `${plural(procedures, "stored procedure")}: the Warehouse runs them as they are, where a Lakehouse needs each converted to a notebook and reviewed.` };
       return code > 0
-        ? { value: "warehouse", reason: `${plural(code, "procedure, view or function", "procedures, views and functions")}: a SQL-centric workload the Warehouse runs as it is.` }
+        ? { value: "warehouse", reason: `${plural(code, "view or function", "views and functions")}: a SQL-centric workload the Warehouse runs as it is.` }
         : { value: "split", reason: "Tables without SQL code: the Warehouse holds them; lake-oriented use can move to a Lakehouse later." };
     },
-    applies: "Whether the Warehouse & schema stage (and what depends on it) runs.",
+    applies: "Run option: where the Warehouse & schema stage puts the SQL pool (a Warehouse, or a Lakehouse).",
   },
   {
     id: "target.collation", topic: "target", kind: "single", required: true, effect: "run",
@@ -280,7 +282,7 @@ export const QUESTIONS: Question[] = [
   // ---- C. Data migration and loading ---------------------------------------------------------
   {
     id: "data.load", topic: "data", kind: "single", required: true, effect: "run",
-    when: (f, a) => f.tables > 0 && a["target.sql"] !== "lakehouse",
+    when: (f) => f.tables > 0,
     text: "How should the table data be loaded?",
     help: "Rows are copied by Fabric data pipelines reading the SQL pool. A dedicated SQL pool has no change data capture or change tracking, so keeping tables current works through a date/time change column (chosen per table on the Plan tab); tables without one are reloaded.",
     options: () => [
@@ -368,9 +370,9 @@ export const QUESTIONS: Question[] = [
   // ---- SQL pool and SQL objects (only when discovered) -------------------------------------
   {
     id: "sql.distribution", topic: "sql", kind: "single", required: false, effect: "record",
-    when: (f, a) => distributed(f) > 0 && a["target.sql"] !== "lakehouse",
+    when: (f) => distributed(f) > 0,
     text: "Distribution and index settings: how should they be treated?",
-    help: "A Fabric Warehouse has no distribution or index options: it manages storage itself, so the run drops DISTRIBUTION, CLUSTERED COLUMNSTORE and partition clauses. The only choice is whether to review performance-sensitive tables.",
+    help: "A Fabric Warehouse or Lakehouse has no distribution or index options: Fabric manages storage itself, so the run drops DISTRIBUTION, CLUSTERED COLUMNSTORE and partition clauses. The only choice is whether to review performance-sensitive tables.",
     options: (f) => [
       { value: "automatic", label: "Rely on Fabric's automatic optimisation", description: "What the run does." },
       { value: "review", label: `Also flag the ${plural(f.features?.distribution?.hash ?? 0, "hash-distributed table")} for a performance review` },
@@ -429,6 +431,32 @@ export const QUESTIONS: Question[] = [
     ],
     recommend: () => ({ value: "accept", reason: "Existing key values are kept exactly; only new values follow Fabric's own sequence." }),
     applies: "The brief.",
+  },
+  {
+    id: "sql.keysLakehouse", topic: "sql", kind: "single", required: false, effect: "record",
+    when: (f, a) => (feature(f, "identityTables") > 0 || feature(f, "primaryKeyTables") > 0) && a["target.sql"] === "lakehouse",
+    text: "A Lakehouse keeps no IDENTITY columns or keys: is that acceptable?",
+    help: "Delta tables do not generate key values and hold no primary key or unique constraint. Loaded rows keep the values Synapse gave them; new rows need their keys made by the code that writes them, and relationships move to the semantic model.",
+    options: (f) => [
+      { value: "accept", label: "Yes: keys come from the loading code and the semantic model", description: `${plural(feature(f, "identityTables"), "table")} with IDENTITY, ${plural(feature(f, "primaryKeyTables"), "table")} with a primary key.` },
+      { value: "review", label: "Review the tables whose new rows need generated keys" },
+    ],
+    recommend: (f) => feature(f, "identityTables") > 0
+      ? { value: "review", reason: `${plural(feature(f, "identityTables"), "table")} relied on IDENTITY for new rows; whatever writes them now must make the keys.` }
+      : { value: "accept", reason: "No table generated its own keys." },
+    applies: "The brief.",
+  },
+  {
+    id: "sql.procedureNotebooks", topic: "sql", kind: "single", required: true, effect: "record",
+    when: (f, a) => has(f, "Stored Procedure") && a["target.sql"] === "lakehouse",
+    text: "Stored procedures become Spark notebooks in a Lakehouse. Who checks them?",
+    help: "The run converts each procedure's T-SQL to Spark SQL in a notebook (parameters, variables, IF/WHILE, TRY/CATCH, temp tables, UPDATE … FROM as MERGE) and marks what it could not convert, such as dynamic SQL, with REVIEW. Pipelines that called a procedure run its notebook instead. Delta has no multi-statement transactions, so a failure part-way leaves earlier statements committed.",
+    options: (f) => [
+      { value: "review", label: "A developer reviews every converted notebook before it runs", description: `${plural(count(f, "Stored Procedure"), "notebook")} to review.` },
+      { value: "flagged", label: "Review only the notebooks with REVIEW markers" },
+    ],
+    recommend: () => ({ value: "review", reason: "The conversion is mechanical: logic that relied on T-SQL behaviour (transactions, case-insensitive text) needs a person's eye." }),
+    applies: "The brief (the notebooks are created either way).",
   },
   {
     id: "sql.sla", topic: "sql", kind: "single", required: false, effect: "record",
@@ -730,9 +758,9 @@ export const QUESTIONS: Question[] = [
   },
   {
     id: "features.materializedViews", topic: "features", kind: "single", required: false, effect: "record",
-    when: (f, a) => hasSql(f) && a["target.sql"] !== "lakehouse",
+    when: (f) => hasSql(f),
     text: "Does the SQL pool use materialized views?",
-    help: "Discovery cannot see materialized views, and a Fabric Warehouse has none. If the pool has them, they become plain views or tables a pipeline refreshes.",
+    help: "Discovery cannot see materialized views, and a Fabric Warehouse or Lakehouse SQL endpoint has none. If the pool has them, they become plain views or tables a pipeline refreshes.",
     options: () => [
       { value: "none", label: "No" },
       { value: "views", label: "Yes: recreate them as plain views" },

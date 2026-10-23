@@ -53,7 +53,7 @@ import {
 import { generateObjects } from "./mockData";
 import { RUN_KIND, applyDemoRuntime } from "./mockRuntime";
 import { DEMO_PROJECT, KIND_OF_TYPE, demoNeedsWork, demoPrompt, demoSource, demoTransformSettings } from "./mockTransform";
-import type { TransformObject } from "../types";
+import type { SqlTarget, TransformObject } from "../types";
 import { mockComponents } from "./mockMapping";
 
 const STEP_MS = 700;
@@ -345,7 +345,43 @@ function demoDateColumns(name: string): { dateColumns: { name: string; type: str
   return { dateColumns: dates, keyColumns: h % 4 === 0 ? [] : [`${table.replace(/^(Dim|Fact)/, "")}Id`] };
 }
 
+/** A Lakehouse as the SQL target: Delta tables, procedures as Spark notebooks (like the real run's ``stages_lakehouse``). */
+function lakehouseOutcome(i: SimItem, h: number): { step: string; target: string | null; notes: string[] } | null {
+  const ws = fabric.workspaceName ?? "Fabric_demo";
+  const [schema, name] = i.name.includes(".") ? i.name.split(".") : ["dbo", i.name];
+  switch (i.type) {
+    case "Dedicated SQL Pool": return { step: "Fabric Lakehouse created (with schemas)", target: `${ws} / ${WAREHOUSE}`, notes: [
+      "Tables become Delta tables (created by a Spark notebook); views and functions are created on its SQL analytics endpoint; stored procedures become Spark notebooks that pipelines run.",
+      "String comparisons are case-sensitive in Spark and on the SQL analytics endpoint (Latin1_General_100_BIN2_UTF8), unlike the Synapse pool: check filters and joins on text that relied on case-insensitive matching."] };
+    case "Table": return { step: "Table created as a Delta table (empty: the Table data stage loads it with a pipeline)", target: `${WAREHOUSE}.${i.name}`,
+      notes: [`Notebook 'ddl_${WAREHOUSE}' ran the CREATE statements (demo).`, ...(h % 5 === 0 ? [`${name.replace(/^(Dim|Fact)/, "")}Key: IDENTITY not kept (a Lakehouse table does not generate keys); loaded rows keep their Synapse values, new rows need their keys made by the code that writes them`] : []),
+        ...(h % 3 === 0 ? ["Primary key / unique constraint not kept: a Lakehouse table has no key constraints. Define relationships in the semantic model."] : [])] };
+    case "Stored Procedure": {
+      const review = h % 3 === 0 ? ["Dynamic SQL is built as T-SQL text at run time: rewrite the text it builds as Spark SQL"] : [];
+      return { step: `Converted to a Spark notebook${review.length ? "; 1 item to review before it runs" : ""}`, target: `${ws} / sp_${schema}_${name}`, notes: [
+        `A Lakehouse's SQL analytics endpoint is read-only, so the procedure became the Spark notebook 'sp_${schema}_${name}', attached to Lakehouse ${WAREHOUSE}. Pipelines that called it run the notebook instead.`,
+        "Transactions removed: each Spark statement commits on its own (Delta has no multi-statement transaction). A failure part-way leaves the statements before it committed.",
+        ...review.map((r) => `Review: ${r}`)] };
+    }
+    case "Table data": {
+      const rows = Math.round((1000 + (h % 900000)) * (i.filter?.column ? 0.4 : 1)).toLocaleString();
+      return { step: `Loaded ${rows} rows by pipeline; counts match${i.filter?.column ? " within the filter" : ""}`, target: `${WAREHOUSE}.${i.table}`,
+        notes: [`Pipeline 'load_${WAREHOUSE}_lakehouse_wave_${i.wave}' created and run (demo).`,
+          ...(i.filter?.sync ? ["Keeping a table in sync is not available when the target is a Lakehouse (the sync pipeline merges changes with T-SQL in a Warehouse). It was loaded once, within its filter; schedule its wave's pipeline with 'Replace it' to refresh it."] : [])] };
+    }
+    case "SQL Script": return h % 2
+      ? { step: "Created as a T-SQL notebook on the SQL analytics endpoint", target: `${ws} / ${i.name}`, notes: ["It only reads, so it stays T-SQL in a notebook bound to the Lakehouse's SQL analytics endpoint."] }
+      : { step: "Converted to a Spark notebook", target: `${ws} / ${i.name}`, notes: [`It changes data, which the read-only SQL analytics endpoint cannot do, so it was converted to a Spark notebook attached to Lakehouse ${WAREHOUSE}.`] };
+    case "External Table": return { step: "Created as a OneLake shortcut", target: `${WAREHOUSE}/Files/${i.name}`, notes: [] };
+    default: return null;
+  }
+}
+
 function outcome(i: SimItem, h: number): { step: string; target: string | null; notes: string[] } {
+  if (execSim?.options?.target === "lakehouse") {
+    const lakehouse = lakehouseOutcome(i, h);
+    if (lakehouse) return lakehouse;
+  }
   const ws = fabric.workspaceName ?? "Fabric_demo";
   const wave = `load_${WAREHOUSE}_wave_${i.wave}`;
   switch (i.type) {
@@ -397,10 +433,10 @@ function runNow(): ExecutionRun {
   const started = Date.now() - elapsed;
   const at = (ms: number) => new Date(started + ms).toISOString();
   const line = (ms: number, level: string, name: string, text: string) => `${at(ms)}  ${level.padEnd(11)}${name}: ${text}`;
-  const logs: string[] = [line(0, "RUN", "run", `${sim.items.length} objects, workspace ${fabric.workspaceName ?? "Fabric_demo"}, warehouse ${WAREHOUSE} (demo)`)];
+  const logs: string[] = [line(0, "RUN", "run", `${sim.items.length} objects, workspace ${fabric.workspaceName ?? "Fabric_demo"}, ${sim.options?.target === "lakehouse" ? "lakehouse" : "warehouse"} ${WAREHOUSE} (demo)`)];
   let slot = 0;
   const items: ExecItem[] = sim.items.map((si) => {
-    const accepted = transforms.get(si.id)?.accepted;
+    const accepted = transforms.get(tkey(si.id, sim.options?.target ?? "warehouse"))?.accepted;
     const base: ExecItem = { id: si.id, name: si.name, type: si.type, wave: si.wave, step: "Waiting", status: "PENDING", startedAt: null, completedAt: null, error: null,
       llm: accepted ? { acceptedAt: accepted.acceptedAt, edited: accepted.edited } : null };
     // Like the real backend: what this build does not create is listed, with the reason.
@@ -590,7 +626,7 @@ function demoAnalysis(items: PlanItem[], record: boolean, options?: RunOptions):
 }
 
 const DEMO_STAGES: Capabilities["stages"] = [
-  { key: "warehouse", label: "Warehouse & schema", summary: "The SQL pool becomes a Fabric Warehouse; its schemas, tables (empty, with their keys and dynamic data masks), functions, views and stored procedures are created in it. Synapse-only T-SQL in functions, views and procedures is converted first.", types: ["Dedicated SQL Pool", "Schema", "Table", "Function", "View", "Stored Procedure"], needs: [], needsInput: null, creates: "Warehouse, schemas, tables, functions, views, procedures", options: [{ key: "collation", label: "Warehouse collation (set once, when it is created)", default: "match_synapse", choices: [{ value: "match_synapse", label: "Same as Synapse", description: "Case-sensitive only if the Synapse pool was; Synapse's default is case-insensitive." }, { value: "case_insensitive", label: "Case-insensitive", description: "'ABC' equals 'abc' in comparisons and object names, as in most Synapse pools." }, { value: "case_sensitive", label: "Case-sensitive", description: "Fabric's own default: 'ABC' and 'abc' are different." }] }] },
+  { key: "warehouse", label: "Warehouse & schema", summary: "The SQL pool becomes a Fabric Warehouse; its schemas, tables (empty, with their keys and dynamic data masks), functions, views and stored procedures are created in it. Synapse-only T-SQL in functions, views and procedures is converted first.", types: ["Dedicated SQL Pool", "Schema", "Table", "Function", "View", "Stored Procedure"], needs: [], needsInput: null, creates: "Warehouse, schemas, tables, functions, views, procedures", options: [{ key: "target", label: "Where the SQL pool goes", default: "warehouse", choices: [{ value: "warehouse", label: "Fabric Warehouse", description: "T-SQL as it is: tables, views, functions and stored procedures run in the Warehouse, which can change data with T-SQL." }, { value: "lakehouse", label: "Fabric Lakehouse", description: "Delta tables created by Spark. Its SQL analytics endpoint is read-only, so views and functions go there but each stored procedure becomes a Spark notebook (review it), and pipelines run those notebooks instead. No IDENTITY, keys or table sync." }] }, { key: "collation", label: "Warehouse collation (set once, when it is created)", default: "match_synapse", choices: [{ value: "match_synapse", label: "Same as Synapse", description: "Case-sensitive only if the Synapse pool was; Synapse's default is case-insensitive." }, { value: "case_insensitive", label: "Case-insensitive", description: "'ABC' equals 'abc' in comparisons and object names, as in most Synapse pools." }, { value: "case_sensitive", label: "Case-sensitive", description: "Fabric's own default: 'ABC' and 'abc' are different." }] }] },
   { key: "data", label: "Table data", summary: "Loads the rows of each migrated table with Fabric data pipelines: one pipeline per wave, reading the Synapse pool through a Fabric connection and writing the Warehouse. The run then compares row counts.", types: ["Table"], needs: ["warehouse"], needsInput: "credentials", creates: "Data pipelines; rows in the Warehouse tables", options: [{ key: "dataRun", label: "What the stage does", default: "run", choices: [{ value: "run", label: "Create and run", description: "Creates each wave's pipeline, runs it, waits for it, and compares row counts." }, { value: "create", label: "Create only", description: "Creates the pipelines; you run them from Fabric (or a schedule) when you choose." }] }, { key: "dataMode", label: "If a table already has rows", default: "if_empty", choices: [{ value: "if_empty", label: "Skip it (safe)", description: "Never touches data that is already there, so re-runs are safe." }, { value: "replace", label: "Replace it", description: "The pipeline empties the table (TRUNCATE) before loading it again." }] }, { key: "syncOverlap", label: "Re-read window for tables kept in sync", default: "1h", choices: [{ value: "1h", label: "One hour", description: "Each sync also re-reads the hour before the last one, catching rows committed late. Re-read rows replace themselves, so nothing doubles." }, { value: "1d", label: "One day", description: "Re-reads the day before the last sync: for sources that write rows with older timestamps, or a date-only change column." }, { value: "none", label: "None", description: "Reads only from the last sync onwards. Tables without key columns always work this way." }] }] },
   { key: "security", label: "Roles & permissions", summary: "Database roles are recreated in the Warehouse with their members, and GRANT / DENY permissions are applied to roles and Microsoft Entra users (Fabric creates each user on its first grant). SQL users are listed for a person: Fabric has no SQL authentication. Masks travel with their tables.", types: ["Security Object"], needs: ["warehouse"], needsInput: null, creates: "Roles, role members, permissions", options: [] },
   { key: "spark", label: "Spark pool & environment", summary: "A Spark pool becomes a custom Fabric Spark pool plus a published Environment.", types: ["Spark Pool"], needs: [], needsInput: null, creates: "Spark pool, Environment", options: [] },
@@ -965,7 +1001,7 @@ export const mockApi: MigrationApi = {
       const [schema, name] = o.name.includes(".") ? o.name.split(".", 2) : ["dbo", o.name];
       return { id: o.id, schema, name, key: o.name.toLowerCase(), ...demoDateColumns(o.name) };
     });
-    return { stages: DEMO_STAGES, defaults: { dataMode: "if_empty", dataRun: "run", collation: "match_synapse", syncOverlap: "1h" }, linkedServices: [pool, ...linked], dataTables };
+    return { stages: DEMO_STAGES, defaults: { dataMode: "if_empty", dataRun: "run", collation: "match_synapse", target: "warehouse", syncOverlap: "1h" }, linkedServices: [pool, ...linked], dataTables };
   },
 
   async analyzePlan(items: PlanItem[], record?: boolean, options?: RunOptions, credentialNames?: string[]) {
@@ -1106,30 +1142,30 @@ export const mockApi: MigrationApi = {
     await sleep(60);
     return demoTransformSettings;
   },
-  async listTransforms() {
-    return [...transforms.values()].map((t) => ({ ...t }));
+  async listTransforms(target = "warehouse") {
+    return [...transforms.entries()].filter(([k]) => k.endsWith(`@${target}`)).map(([, t]) => ({ ...t }));
   },
-  async getTransform(id) {
+  async getTransform(id, target = "warehouse") {
     await sleep(80);
     const o = transformable(id);
-    return { ...current(o), source: demoSource(o) };
+    return { ...current(o, target), source: demoSource(o) };
   },
   async getTransformPrompt(id) {
     await sleep(80);
     const prompt = demoPrompt(transformable(id));
     return { objectId: id, prompt, characters: prompt.length, promptsDir: demoTransformSettings.promptsDir };
   },
-  async generateTransforms(ids) {
+  async generateTransforms(ids, target = "warehouse") {
     await sleep(120);
     return ids.map((id) => {
       const o = completedObjects().find((x) => x.id === id);
       if (!o || !KIND_OF_TYPE[o.type]) return { objectId: id, state: "rejected" as const, error: "Drafts are not available for this type of object yet." };
-      const t = current(o);
-      transforms.set(id, { ...t, state: "running", error: null, startedAt: new Date().toISOString() });
+      const t = current(o, target);
+      transforms.set(tkey(id, target), { ...t, state: "running", error: null, startedAt: new Date().toISOString() });
       setTimeout(() => {
         const src = demoSource(o);
-        const now = transforms.get(id) ?? t;
-        transforms.set(id, {
+        const now = transforms.get(tkey(id, target)) ?? t;
+        transforms.set(tkey(id, target), {
           ...now, state: "draft", error: null,
           draft: {
             code: src.draft, notes: src.notes, unconverted: src.unconverted, confidence: src.unconverted.length ? "medium" : "high",
@@ -1142,16 +1178,16 @@ export const mockApi: MigrationApi = {
       return { objectId: id, state: "queued" as const, error: null };
     });
   },
-  async acceptTransform(id, code) {
+  async acceptTransform(id, code, target = "warehouse") {
     await sleep(150);
     const o = transformable(id);
-    const t = current(o);
+    const t = current(o, target);
     if (!t.draft) throw new ApiRequestError("no_draft", "There is no draft to accept. Generate one first.", 409);
     const text = (code ?? t.draft.code).trim();
     if (!text) throw new ApiRequestError("invalid_request", "The code to accept is empty.", 400);
     const { costUsd: _c, durationMs: _d, ...rest } = t.draft;
-    transforms.set(id, { ...t, state: "accepted", draft: null, accepted: { ...rest, code: text, acceptedAt: new Date().toISOString(), edited: text !== t.draft.code.trim() } });
-    return { ...current(o), source: demoSource(o) };
+    transforms.set(tkey(id, target), { ...t, state: "accepted", draft: null, accepted: { ...rest, code: text, acceptedAt: new Date().toISOString(), edited: text !== t.draft.code.trim() } });
+    return { ...current(o, target), source: demoSource(o) };
   },
   async getConsultFacts(): Promise<ConsultFacts> {
     await sleep(120);
@@ -1178,10 +1214,10 @@ export const mockApi: MigrationApi = {
       notRecorded: ["materialized views", "sequences", "foreign keys", "row-level security policies", "managed private endpoints and firewall rules", "table row counts and sizes", "items already in the Fabric workspace"],
     };
   },
-  async listTransformCandidates() {
+  async listTransformCandidates(target = "warehouse") {
     await sleep(200);
     const items = completedObjects().filter((o) => KIND_OF_TYPE[o.type]).map((o) => {
-      const t = current(o);
+      const t = current(o, target);
       const problems = demoNeedsWork(o) ? demoSource(o).problems : [];
       const latest = t.draft ?? t.accepted;
       return { objectId: o.id, name: o.name, type: o.type, kind: KIND_OF_TYPE[o.type], problems, rulesChange: !problems.length,
@@ -1202,17 +1238,19 @@ export const mockApi: MigrationApi = {
     projectText = text.split("\r\n").join("\n");
     return this.getProjectRequirements();
   },
-  async discardTransform(id, scope) {
+  async discardTransform(id, scope, target = "warehouse") {
     await sleep(100);
     const o = transformable(id);
-    const t = current(o);
-    if (scope === "all" || !t.accepted) transforms.delete(id);
-    else transforms.set(id, { ...t, state: "accepted", draft: null });
-    return { ...current(o), source: demoSource(o) };
+    const t = current(o, target);
+    if (scope === "all" || !t.accepted) transforms.delete(tkey(id, target));
+    else transforms.set(tkey(id, target), { ...t, state: "accepted", draft: null });
+    return { ...current(o, target), source: demoSource(o) };
   },
 };
 
+/** Demo drafts and accepted transforms, one per object and SQL target (like the server's per-target slots). */
 const transforms = new Map<string, TransformObject>();
+const tkey = (id: string, target: SqlTarget = "warehouse") => `${id}@${target}`;
 let projectText = DEMO_PROJECT;
 
 function transformable(id: string) {
@@ -1222,7 +1260,7 @@ function transformable(id: string) {
   return o;
 }
 
-function current(o: { id: string; name: string; type: string }): TransformObject {
-  return transforms.get(o.id) ?? { objectId: o.id, name: o.name, type: o.type, kind: KIND_OF_TYPE[o.type] ?? null, state: "none", error: null, startedAt: null, draft: null, accepted: null };
+function current(o: { id: string; name: string; type: string }, target: SqlTarget = "warehouse"): TransformObject {
+  return transforms.get(tkey(o.id, target)) ?? { objectId: o.id, target, name: o.name, type: o.type, kind: KIND_OF_TYPE[o.type] ?? null, state: "none", error: null, startedAt: null, draft: null, accepted: null };
 }
 

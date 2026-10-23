@@ -230,6 +230,78 @@ def definition(entries: List[Mapping[str, str]], connection_id: str, warehouse: 
     }}
 
 
+# -- Lakehouse target: the same pipeline shape, writing Delta tables ----------------------------------------
+
+
+@dataclass(frozen=True)
+class LakehouseTarget:
+    artifact_id: str
+    name: str
+    workspace_id: str
+
+
+def lakehouse_pipeline_name(lakehouse: str, wave: int) -> str:
+    """A wave's pipeline when the SQL target is a Lakehouse: never the same item as a Warehouse run's pipeline."""
+    base = re.sub(r"[^A-Za-z0-9_]", "_", lakehouse) or "lakehouse"
+    return f"load_{base}_lakehouse_wave_{wave}"[:120]
+
+
+def lakehouse_entry(table: SqlTable, replace: bool, query: str = "") -> Dict[str, str]:
+    """One element of a Lakehouse pipeline's ``tables`` parameter. A Delta table is appended to, or overwritten
+    when the run replaces rows; it has no IDENTITY, so key values are copied as they are."""
+    return {
+        "schema": table.key.schema,
+        "table": table.key.name,
+        "query": query or datacopy.select_sql(table),
+        "tableAction": "Overwrite" if replace else "Append",
+    }
+
+
+def lakehouse_definition(entries: List[Mapping[str, str]], connection_id: str, lakehouse: LakehouseTarget) -> Dict[str, Any]:
+    """The ``pipeline-content.json`` of one wave's data pipeline into a Lakehouse's Delta tables."""
+    copy = {
+        "name": "Copy table",
+        "type": "Copy",
+        "dependsOn": [],
+        "policy": dict(_POLICY),
+        "typeProperties": {
+            "source": _pool_source(_expression("@item().query"), connection_id),
+            "sink": {
+                "type": "LakehouseTableSink",
+                "tableActionOption": _expression("@item().tableAction"),
+                "datasetSettings": {
+                    "annotations": [],
+                    "type": "LakehouseTable",
+                    "schema": [],
+                    "typeProperties": {"schema": _expression("@item().schema"), "table": _expression("@item().table")},
+                    "linkedService": {"name": lakehouse.name, "properties": {
+                        "annotations": [], "type": "Lakehouse",
+                        "typeProperties": {"workspaceId": lakehouse.workspace_id, "artifactId": lakehouse.artifact_id,
+                                           "rootFolder": "Tables"}}},
+                },
+            },
+            "enableStaging": False,
+            "translator": {"type": "TabularTranslator", "typeConversion": True,
+                           "typeConversionSettings": {"allowDataTruncation": True, "treatBooleanAsNumber": False}},
+        },
+    }
+    return {"properties": {
+        "parameters": {"tables": {"type": "array", "defaultValue": [dict(e) for e in entries]}},
+        "activities": [{
+            "name": "For each table",
+            "type": "ForEach",
+            "dependsOn": [],
+            "typeProperties": {
+                "items": _expression("@pipeline().parameters.tables"),
+                "isSequential": False,
+                "batchCount": PARALLEL_COPIES,
+                "activities": [copy],
+            },
+        }],
+        "annotations": [],
+    }}
+
+
 def sync_name(warehouse: str) -> str:
     """The one sync pipeline of a Warehouse: it serves every table registered for sync."""
     base = re.sub(r"[^A-Za-z0-9_]", "_", warehouse) or "warehouse"

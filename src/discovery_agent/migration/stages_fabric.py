@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from discovery_agent.migration import fabric_connections, jobs, onelake, pipelines, storage_remap
 from discovery_agent.migration.common import (
-    COMPLETED, DEFERRED_STATUS, SKIPPED, MigrationError, Source, lakehouse_name, override_note,
+    COMPLETED, DEFERRED_STATUS, SKIPPED, MigrationError, Source, is_lakehouse, lakehouse_name, override_note,
 )
 from discovery_agent.migration.fabric_rest import FabricApiError
 
@@ -38,14 +38,20 @@ class FabricStageMixin:
     # -- the Lakehouse, and storage routed through its shortcuts ------------------------------
 
     def _lakehouse(self) -> Tuple[str, str]:
-        """(name, id) of the run's Lakehouse, created on first use. It holds the OneLake shortcuts."""
+        """(name, id) of the run's Lakehouse, created on first use. It holds the OneLake shortcuts, and when the
+        run's SQL target is a Lakehouse, the pool's schemas and tables too (so it is created with schemas)."""
         wid, client = self.run.workspace_id, self._client()  # type: ignore[attr-defined]
-        name = lakehouse_name(self.run.warehouse)
+        target = is_lakehouse(getattr(self.run, "settings", None))
+        name = lakehouse_name(self.run.warehouse, getattr(self.run, "settings", None))
         lakehouse = self._find(self._ids("lakehouses"), name)
         if not lakehouse:
-            created = client.create(f"/workspaces/{wid}/lakehouses",
-                                    {"displayName": name, "description": "OneLake shortcuts for migrated storage paths and external tables"})
+            body: Dict[str, Any] = {"displayName": name, "description": "OneLake shortcuts for migrated storage paths and external tables"}
+            if target:
+                body = {"displayName": name, "description": "Migrated from an Azure Synapse dedicated SQL pool",
+                        "creationPayload": {"enableSchemas": True}}
+            created = client.create(f"/workspaces/{wid}/lakehouses", body)
             self._forget("lakehouses")
+            self.__dict__["_lakehouse_created"] = True
             lakehouse = str(created.get("id") or "") or self._find(self._ids("lakehouses"), name) or ""
         if not lakehouse:
             raise MigrationError("The Lakehouse was created but Fabric did not return its id. Retry in a minute.")
@@ -209,6 +215,11 @@ class FabricStageMixin:
             pool = getattr(self.run, "pool_name", "") or ""
             if source.uses and all(pipelines.points_at_pool(source.payload or {}, pool, use) for use in source.uses):
                 # Every pipeline points it at the pool being migrated, and those now use the Warehouse instead.
+                if is_lakehouse(getattr(self.run, "settings", None)):
+                    return COMPLETED, "Replaced by the migrated Lakehouse", self.run.warehouse, [
+                        f"Every pipeline uses '{plan.name}' to reach the SQL pool '{pool}', which is now the Fabric Lakehouse "
+                        f"'{self.run.warehouse}'. The pipelines read and write its tables and run the notebooks its procedures "
+                        "became, so no Fabric connection is needed."]
                 return COMPLETED, "Replaced by the migrated Warehouse", self.run.warehouse, [
                     f"Every pipeline uses '{plan.name}' to reach the SQL pool '{pool}', which is now the Fabric Warehouse "
                     f"'{self.run.warehouse}'. The pipelines were pointed at the Warehouse, so no Fabric connection is needed."]
@@ -243,11 +254,18 @@ class FabricStageMixin:
         if existing_id and not self._updating():
             return SKIPPED, "Already in the Fabric workspace; left unchanged", target, []
         bundle = source.payload or {}
+        lakehouse, procedures = None, {}
+        if is_lakehouse(getattr(self.run, "settings", None)):
+            lakehouse = self._lakehouse_info()  # type: ignore[attr-defined]
+            names, _ = self._procedure_catalog()  # type: ignore[attr-defined]
+            procedures = {key: notebook_id for key, notebook in names.items()
+                          for notebook_id in [self._find(self._ids("notebooks"), notebook)] if notebook_id}
         context = pipelines.Context(
             datasets=bundle.get("datasets", {}), linked_services=bundle.get("linkedServices", {}),
             connections={n: str(c.get("id")) for n, c in self._connections().items() if c.get("id")},
             notebooks=self._ids("notebooks"), pipelines=existing, spark_jobs=self._ids("sparkJobDefinitions"),
-            workspace_id=wid, warehouse=self._warehouse_info(), pool_name=getattr(self.run, "pool_name", "") or "")
+            workspace_id=wid, warehouse=None if lakehouse else self._warehouse_info(), pool_name=getattr(self.run, "pool_name", "") or "",
+            lakehouse=lakehouse, procedure_notebooks=procedures)
         resource = bundle.get("resource") or {}
         if source.override:
             # The accepted transform is a Synapse-shaped pipeline: the converter still embeds datasets and resolves ids.
@@ -264,7 +282,7 @@ class FabricStageMixin:
                 "These activities have no Fabric equivalent, so the pipeline was not created: " + "; ".join(converted.unsupported) + "."]
         if converted.missing:
             raise MigrationError("It needs these in Fabric first: " + ", ".join(converted.missing)
-                                 + ". Run the stages that create them (Connections, Notebooks, Warehouse) and retry.")
+                                 + ". Run the stages that create them (Connections, Notebooks, Warehouse & schema) and retry.")
         description = str((resource.get("properties") or {}).get("description") or "Migrated from Azure Synapse")
         if existing_id:
             # Its id stays the same, so pipelines that call it and its schedules keep pointing at it.

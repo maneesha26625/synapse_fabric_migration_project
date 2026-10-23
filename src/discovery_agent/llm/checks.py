@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from discovery_agent.llm.context import synapse_only, unsupported_activities
 from discovery_agent.migration import notebooks, tsql_rules
-from discovery_agent.migration.common import FUNCTION, NOTEBOOK, PIPELINE, PROCEDURE, SCRIPT, TABLE, VIEW
+from discovery_agent.migration.common import FUNCTION, LAKEHOUSE_TARGET, NOTEBOOK, PIPELINE, PROCEDURE, SCRIPT, TABLE, VIEW, WAREHOUSE_TARGET
 
 _CREATE = {
     VIEW: re.compile(r"^\s*(?:--[^\n]*\n|/\*.*?\*/|\s)*CREATE\s+(?:OR\s+ALTER\s+)?VIEW\b", re.I | re.S),
@@ -87,9 +87,64 @@ def _notebook(code: str, original: Optional[Dict[str, Any]]) -> List[Dict[str, s
     return out
 
 
-def run(kind: str, code: str, unconverted: List[Any], original: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
-    """``original`` is the Synapse resource, needed for notebooks (their transform carries only the cells)."""
-    if kind == PIPELINE:
+def _cell_text(cell: Dict[str, Any]) -> str:
+    source = cell.get("source")
+    return source if isinstance(source, str) else "".join(source or [])
+
+
+def _spark_notebook(code: str) -> List[Dict[str, str]]:
+    """A Lakehouse procedure or script: a PySpark notebook as cells JSON, whose code cells must be valid Python."""
+    try:
+        document = json.loads(code)
+    except ValueError as exc:
+        return [_check("error", f"It is not valid JSON ({exc.msg} at line {exc.lineno}); it must be the notebook's cells.")]
+    cells = document.get("cells") if isinstance(document, dict) else None
+    if not isinstance(cells, list) or not cells:
+        return [_check("error", 'It has no "cells" list, so it is not a notebook.')]
+    out: List[Dict[str, str]] = []
+    code_cells = [c for c in cells if isinstance(c, dict) and c.get("cell_type", "code") == "code"]
+    for n, cell in enumerate(code_cells, 1):
+        # Magics (%run, %pip) and shell lines are not Python; everything else must compile.
+        lines = [line for line in _cell_text(cell).splitlines() if not line.lstrip().startswith(("%", "!"))]
+        try:
+            compile("\n".join(lines), f"cell {n}", "exec")
+        except SyntaxError as exc:
+            out.append(_check("error", f"Code cell {n} is not valid Python (line {exc.lineno}: {exc.msg})."))
+    if not any("parameters" in (c.get("tags") or []) for c in code_cells):
+        out.append(_check("warning", 'No cell is tagged "parameters": a pipeline cannot pass the procedure\'s parameters to it.'))
+    joined = "\n".join(_cell_text(c) for c in code_cells)
+    if re.search(r"\bBEGIN\s+TRAN|\bsp_executesql\b|\bIDENTITY_INSERT\b|\[dbo\]", joined, re.I):
+        out.append(_check("warning", "It still contains T-SQL (BEGIN TRAN, sp_executesql, IDENTITY_INSERT or [brackets]), which Spark rejects."))
+    if "# REVIEW" in joined:
+        out.append(_check("warning", "It still has # REVIEW markers: something is left for a person to finish."))
+    return out
+
+
+def _delta_table(code: str) -> List[Dict[str, str]]:
+    """A Lakehouse table: a Spark SQL CREATE TABLE for a Delta table, without T-SQL table syntax."""
+    out: List[Dict[str, str]] = []
+    if not _CREATE[TABLE].match(code):
+        out.append(_check("error", "It does not start with CREATE TABLE, so the run could not create it."))
+    if not re.search(r"\bUSING\s+DELTA\b", code, re.I):
+        out.append(_check("warning", "It has no USING DELTA: a Lakehouse table must be a Delta table."))
+    if re.search(r"\bIDENTITY\b|\bPRIMARY\s+KEY\b|\bFOREIGN\s+KEY\b|\bDISTRIBUTION\s*=|\bCLUSTERED\b|\[[^\]]+\]", code, re.I):
+        out.append(_check("error", "It still uses T-SQL table syntax (IDENTITY, keys, DISTRIBUTION, CLUSTERED or [brackets]), "
+                                   "which Spark rejects for a Delta table."))
+    if not _balanced(code):
+        out.append(_check("error", "Its parentheses do not balance."))
+    return out
+
+
+def run(kind: str, code: str, unconverted: List[Any], original: Optional[Dict[str, Any]] = None,
+        target: str = WAREHOUSE_TARGET) -> List[Dict[str, str]]:
+    """``original`` is the Synapse resource, needed for notebooks (their transform carries only the cells).
+    ``target``: a Lakehouse draft of a procedure or script is a Spark notebook, and of a table a Delta CREATE TABLE."""
+    lakehouse = target == LAKEHOUSE_TARGET
+    if lakehouse and kind in (PROCEDURE, SCRIPT):
+        found = _spark_notebook(code)
+    elif lakehouse and kind == TABLE:
+        found = _delta_table(code)
+    elif kind == PIPELINE:
         found = _pipeline(code)
     elif kind == NOTEBOOK:
         found = _notebook(code, original)

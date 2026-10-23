@@ -1,6 +1,7 @@
 import { AlertTriangle, CheckCircle2, Eye, RotateCcw, Sparkles, Trash2, XCircle } from "lucide-react";
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useAppState } from "../../state/AppState";
+import { TARGET_LABEL, useSqlTarget } from "../../state/MigrationState";
 import { ApiRequestError, type ObjectDetail, type TransformCheck, type TransformObject, type TransformSettings } from "../../types";
 import { Banner, Button, Collapsible, ConfirmDialog, Skeleton, StatusBadge, Tabs, type Tone } from "../shared/Shared";
 
@@ -60,6 +61,8 @@ function Section({ title, actions, children }: { title: string; actions?: ReactN
 
 export function TransformPanel({ object }: { object: ObjectDetail }) {
   const { api } = useAppState();
+  // Drafts are made, and accepted, for the run's SQL target: a Warehouse and a Lakehouse each keep their own.
+  const target = useSqlTarget();
   const [settings, setSettings] = useState<TransformSettings | null>(null);
   const [t, setT] = useState<TransformObject | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -73,7 +76,7 @@ export function TransformPanel({ object }: { object: ObjectDetail }) {
 
   const load = useCallback(async () => {
     try {
-      const next = await api.getTransform(object.id);
+      const next = await api.getTransform(object.id, target);
       setT(next);
       setError(null);
       // A new draft replaces any unsaved edits of the previous one.
@@ -90,7 +93,7 @@ export function TransformPanel({ object }: { object: ObjectDetail }) {
         setError(e instanceof Error ? e.message : "The transformation state could not be loaded.");
       }
     }
-  }, [api, object.id]);
+  }, [api, object.id, target]);
 
   useEffect(() => {
     let cancelled = false;
@@ -120,14 +123,14 @@ export function TransformPanel({ object }: { object: ObjectDetail }) {
   };
 
   const generate = () => act("generate", async () => {
-    const [queued] = await api.generateTransforms([object.id]);
+    const [queued] = await api.generateTransforms([object.id], target);
     if (queued?.state === "rejected") throw new Error(queued.error ?? "This object cannot be sent for a draft.");
     setPane("draft");
   });
   const showPrompt = async () => {
     if (prompt !== null) { setPrompt(null); return; }
     try {
-      setPrompt((await api.getTransformPrompt(object.id)).prompt);
+      setPrompt((await api.getTransformPrompt(object.id, target)).prompt);
     } catch (e) {
       setActionError(e instanceof Error ? e.message : "The prompt could not be built.");
     }
@@ -150,6 +153,13 @@ export function TransformPanel({ object }: { object: ObjectDetail }) {
         (<code>prompts/transform/project.md</code>) to Claude, using the Claude Code CLI on the machine running the API.
         A draft is never deployed as it is: you review it here, and only what you accept is used by the next migration run.
       </Banner>
+      <p className="muted" style={{ margin: 0 }}>
+        Converting for a <strong>{TARGET_LABEL[target]}</strong>, the SQL target chosen in Plan (Warehouse &amp; schema stage).
+        {target === "lakehouse"
+          ? " A procedure or script becomes a Spark notebook and a table a Delta table; views and functions go to the Lakehouse's SQL analytics endpoint."
+          : " Procedures, views, functions and tables stay T-SQL."}{" "}
+        Each target keeps its own draft and accepted code; a run uses only those made for its target.
+      </p>
       {settings && !settings.enabled && <Banner tone="warning" title="Generation is switched off">{settings.disabledReason}</Banner>}
       {settings && settings.enabled && !settings.available && <Banner tone="warning" title="Claude Code is not available">{settings.message}</Banner>}
 
@@ -191,11 +201,11 @@ export function TransformPanel({ object }: { object: ObjectDetail }) {
               onChange={(e) => setEdited(e.target.value)} style={{ width: "100%", minHeight: 300, resize: "vertical", color: "var(--text)" }} />
             <div className="row">
               <Button variant="primary" size="small" loading={busy === "accept"} disabled={!!draft.stale || working}
-                onClick={() => void act("accept", () => api.acceptTransform(object.id, isEdited ? code : undefined))}>
+                onClick={() => void act("accept", () => api.acceptTransform(object.id, isEdited ? code : undefined, target))}>
                 <CheckCircle2 size={14} aria-hidden="true" />{isEdited ? "Accept edited version" : "Accept draft"}
               </Button>
               {isEdited && <Button size="small" onClick={() => setEdited(null)}><RotateCcw size={14} aria-hidden="true" />Undo edits</Button>}
-              <Button size="small" loading={busy === "discard"} disabled={working} onClick={() => void act("discard", () => api.discardTransform(object.id, "draft"))}>
+              <Button size="small" loading={busy === "discard"} disabled={working} onClick={() => void act("discard", () => api.discardTransform(object.id, "draft", target))}>
                 <Trash2 size={14} aria-hidden="true" />Discard draft
               </Button>
             </div>
@@ -235,7 +245,7 @@ export function TransformPanel({ object }: { object: ObjectDetail }) {
       {confirmReset && (
         <ConfirmDialog title="Go back to the rule-based conversion?" confirmLabel="Go back to the rules" busy={busy === "discard"}
           onCancel={() => setConfirmReset(false)}
-          onConfirm={() => { void act("discard", () => api.discardTransform(object.id, "all")).then(() => setConfirmReset(false)); }}>
+          onConfirm={() => { void act("discard", () => api.discardTransform(object.id, "all", target)).then(() => setConfirmReset(false)); }}>
           The accepted transform and any draft for {object.name} are deleted. The next run uses the rule-based output.
         </ConfirmDialog>
       )}

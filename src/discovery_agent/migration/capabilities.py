@@ -48,10 +48,19 @@ class Stage:
 STAGES: Tuple[Stage, ...] = (
     Stage("warehouse", "Warehouse & schema", "The SQL pool becomes a Fabric Warehouse; its schemas, tables (empty, with their keys and "
           "dynamic data masks), functions, views and stored procedures are created in it. "
-          "Synapse-only T-SQL in functions, views and procedures is converted first.",
+          "Synapse-only T-SQL in functions, views and procedures is converted first. "
+          "With a Lakehouse as the target, tables become Delta tables, views and functions go to its SQL analytics endpoint, "
+          "and stored procedures are converted to Spark notebooks.",
           ("Dedicated SQL Pool", "Schema", "Table", "Function", "View", "Stored Procedure"), (POOL, SCHEMA, TABLE, FUNCTION, VIEW, PROCEDURE),
-          creates="Warehouse, schemas, tables, functions, views, procedures",
+          creates="Warehouse or Lakehouse, schemas, tables, functions, views, procedures (or their notebooks)",
           options=(
+              Option("target", "Where the SQL pool goes", (
+                  ("warehouse", "Fabric Warehouse", "T-SQL as it is: tables, views, functions and stored procedures run in the "
+                   "Warehouse, which can change data with T-SQL."),
+                  ("lakehouse", "Fabric Lakehouse", "Delta tables created by Spark. Its SQL analytics endpoint is read-only, so views "
+                   "and functions go there but each stored procedure becomes a Spark notebook (review it), and pipelines run "
+                   "those notebooks instead. No IDENTITY, keys or table sync."),
+              ), "warehouse"),
               Option("collation", "Warehouse collation (set once, when it is created)", (
                   ("match_synapse", "Same as Synapse", "Case-sensitive only if the Synapse pool was; Synapse's default is case-insensitive."),
                   ("case_insensitive", "Case-insensitive", "'ABC' equals 'abc' in comparisons and object names, as in most Synapse pools."),
@@ -59,7 +68,7 @@ STAGES: Tuple[Stage, ...] = (
               ), "match_synapse"),
           )),
     Stage("data", "Table data", "Loads the rows of each migrated table with Fabric data pipelines: one pipeline per wave, reading the Synapse pool "
-          "through a Fabric connection and writing the Warehouse. The run then compares row counts.",
+          "through a Fabric connection and writing the Warehouse (or the Lakehouse's Delta tables). The run then compares row counts.",
           ("Table",), (DATA,), needs=("warehouse",), needs_input="credentials", creates="Data pipelines; rows in the Warehouse tables",
           options=(
               Option("dataRun", "What the stage does", (
@@ -90,7 +99,9 @@ STAGES: Tuple[Stage, ...] = (
           ("Pipeline", "Dataset"), (PIPELINE, DATASET), needs=("connections", "notebooks", "warehouse"), creates="Data pipelines"),
     Stage("spark_jobs", "Spark job definitions", "Spark job definitions are recreated as Fabric Spark job definitions.",
           ("Spark Job Definition",), (SPARKJOB,), creates="Spark job definitions"),
-    Stage("sql_scripts", "SQL scripts", "Each SQL script becomes a notebook with a T-SQL cell, bound to the Warehouse. Review them before running.",
+    Stage("sql_scripts", "SQL scripts", "Each SQL script becomes a notebook with a T-SQL cell, bound to the Warehouse. With a Lakehouse "
+          "target, scripts that only read are bound to its SQL analytics endpoint and scripts that change data become Spark "
+          "notebooks. Review them before running.",
           ("SQL Script",), (SCRIPT,), needs=("warehouse",), creates="Notebooks (T-SQL)"),
     Stage("schedules", "Schedules", "Triggers become pipeline schedules, created switched off so nothing runs before you are ready.",
           ("Trigger",), (SCHEDULE,), needs=("pipelines",), creates="Pipeline schedules"),

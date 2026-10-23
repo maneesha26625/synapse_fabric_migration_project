@@ -933,7 +933,9 @@ def test_the_service_exposes_the_stages_and_the_linked_services_that_need_creden
     assert [o["key"] for o in data["options"]] == ["dataRun", "dataMode", "syncOverlap"] and data["needsInput"] == "credentials"
     assert {c["value"] for c in data["options"][1]["choices"]} == {"if_empty", "replace"} and all(c["label"] for c in data["options"][1]["choices"])
     warehouse = next(s for s in caps["stages"] if s["key"] == "warehouse")
-    assert {c["value"] for c in warehouse["options"][0]["choices"]} == {"match_synapse", "case_insensitive", "case_sensitive"}
+    options = {o["key"]: o for o in warehouse["options"]}
+    assert {c["value"] for c in options["collation"]["choices"]} == {"match_synapse", "case_insensitive", "case_sensitive"}
+    assert {c["value"] for c in options["target"]["choices"]} == {"warehouse", "lakehouse"} and options["target"]["default"] == "warehouse"
     assert {l["name"] for l in caps["linkedServices"]} == {"ls_sql", "ls_adls"}
     assert {l["stage"] for l in caps["linkedServices"]} == {"connections"}
     assert next(l for l in caps["linkedServices"] if l["name"] == "ls_adls")["needsPath"] is True

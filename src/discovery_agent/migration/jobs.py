@@ -68,8 +68,14 @@ def spark_job_body(name: str, content: Mapping[str, Any], description: str = "")
 # ---- SQL scripts -> notebooks --------------------------------------------------------
 
 
-def sql_script_notebook(payload: Mapping[str, Any], warehouse_id: Optional[str], warehouse_name: str) -> Tuple[Dict[str, Any], List[str]]:
-    """(ipynb document, notes): the script in one T-SQL cell, bound to the Warehouse."""
+#: How a T-SQL notebook names what it is bound to: a Warehouse, or a Lakehouse's SQL analytics endpoint.
+WAREHOUSE, SQL_ENDPOINT = "Datawarehouse", "Lakewarehouse"
+
+
+def sql_script_notebook(payload: Mapping[str, Any], warehouse_id: Optional[str], warehouse_name: str,
+                        kind: str = WAREHOUSE) -> Tuple[Dict[str, Any], List[str]]:
+    """(ipynb document, notes): the script in one T-SQL cell, bound to the Warehouse (or, with ``kind=SQL_ENDPOINT``,
+    to a Lakehouse's SQL analytics endpoint, whose id ``warehouse_id`` then is)."""
     props = payload.get("properties") or {}
     content = props.get("content") or {}
     query = str(content.get("query") or "")
@@ -80,11 +86,12 @@ def sql_script_notebook(payload: Mapping[str, Any], warehouse_id: Optional[str],
         raise NotConvertible(f"The script is {language}, not SQL.")
     converted = tsql_rules.rewrite(query)
     query = converted.text
-    notes = ["Review before running: the script ran on the Synapse pool and may use T-SQL a Fabric Warehouse does not support."]
+    what = "Warehouse" if kind == WAREHOUSE else "Lakehouse SQL analytics endpoint"
+    notes = [f"Review before running: the script ran on the Synapse pool and may use T-SQL a Fabric {what} does not support."]
     notes.extend(converted.notes)
     pool = (content.get("currentConnection") or {}).get("poolName") or (content.get("currentConnection") or {}).get("databaseName")
     if pool:
-        notes.append(f"It was written against '{pool}'; it is bound to the Warehouse '{warehouse_name}'.")
+        notes.append(f"It was written against '{pool}'; it is bound to the {what} '{warehouse_name}'.")
     # The T-SQL kernel. Without it Fabric runs the notebook on Spark, which reads the cell as Spark SQL and fails on
     # T-SQL ("System cancelled the Spark session due to statement execution failures"), although the SQL is fine.
     metadata: Dict[str, Any] = {"kernel_info": {"name": "sqldatawarehouse"},
@@ -92,7 +99,7 @@ def sql_script_notebook(payload: Mapping[str, Any], warehouse_id: Optional[str],
                                 "language_info": {"name": "sql"}}
     if warehouse_id:
         metadata["dependencies"] = {"warehouse": {"default_warehouse": warehouse_id,
-                                                  "known_warehouses": [{"id": warehouse_id, "type": "Datawarehouse"}]}}
+                                                  "known_warehouses": [{"id": warehouse_id, "type": kind}]}}
     document = {
         "nbformat": 4, "nbformat_minor": 5, "metadata": metadata,
         "cells": [{"cell_type": "code", "source": query.splitlines(keepends=True), "outputs": [], "execution_count": None,

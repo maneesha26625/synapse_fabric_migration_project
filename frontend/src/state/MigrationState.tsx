@@ -21,6 +21,7 @@ import {
   type PlanItem,
   type PlanStatus,
   type RunOptions,
+  type SqlTarget,
   type ValidationRow,
   type ValidationRuntimeOptions,
 } from "../types";
@@ -58,7 +59,7 @@ function save(key: string, value: unknown) {
 
 const DEFAULT_PROJECT: Project = { id: "default", name: "Synapse to Fabric migration", createdAt: new Date(0).toISOString() };
 
-const DEFAULT_OPTIONS: RunOptions = { scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", dataRun: "run", collation: "match_synapse", syncOverlap: "1h", existing: "skip", dataFilters: {}, gitCommit: "auto" };
+const DEFAULT_OPTIONS: RunOptions = { scope: "automated", stopOnFailure: false, stages: [], dataMode: "if_empty", dataRun: "run", collation: "match_synapse", target: "warehouse", syncOverlap: "1h", existing: "skip", dataFilters: {}, gitCommit: "auto" };
 
 const EMPTY_RUN: ExecutionRun = { runId: "", state: "idle", total: 0, completed: 0, inProgress: 0, failed: 0, pending: 0, skipped: 0, deferred: 0, items: [], logs: [] };
 
@@ -153,6 +154,20 @@ interface MigrationStateValue {
 }
 
 const Ctx = createContext<MigrationStateValue | null>(null);
+
+/** Where the run puts the SQL pool (Plan, Warehouse & schema stage): what code conversions are made for.
+ *  A Warehouse outside a migration (a component shown on its own). */
+/** The migration state, or null outside its provider (for small widgets that also render on their own). */
+export function useMigrationOptional(): MigrationStateValue | null {
+  return useContext(Ctx);
+}
+
+export function useSqlTarget(): SqlTarget {
+  return useContext(Ctx)?.options.target ?? "warehouse";
+}
+
+/** How the SQL target is named on screen. */
+export const TARGET_LABEL: Record<SqlTarget, string> = { warehouse: "Fabric Warehouse", lakehouse: "Fabric Lakehouse" };
 
 export function useMigration(): MigrationStateValue {
   const v = useContext(Ctx);
@@ -447,9 +462,10 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
     setValidationError(null);
     setValidationProgress(null);
     try {
-      setValidation(await api.runValidation([...plan].sort((a, b) => a.wave - b.wave), { dataFilters: options.dataFilters }, validationRuntime, setValidationProgress));
+      setValidation(await api.runValidation([...plan].sort((a, b) => a.wave - b.wave), { dataFilters: options.dataFilters, target: options.target },
+        validationRuntime, setValidationProgress));
     } catch (e) { setValidationError(messageOf(e)); } finally { setValidationBusy(false); setValidationProgress(null); }
-  }, [api, plan, options.dataFilters, validationRuntime]);
+  }, [api, plan, options.dataFilters, options.target, validationRuntime]);
 
   // ---- plan status
   const dependsOn = useMemo(() => {

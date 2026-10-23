@@ -130,11 +130,13 @@ describe("consultation and agent orchestrator", () => {
     expect(s.planTypes).not.toContain("Pipeline");
     expect(s.prerequisites).toEqual([expect.stringMatching(/on-premises data gateway/)]);
     expect(s.validationGate).toBe("all");
-    // A pilot moves the first wave only; a Lakehouse redesign leaves the Warehouse (and the data load) out.
+    // A pilot moves the first wave only; a Lakehouse keeps the SQL stages and sets the run's target, which
+    // makes Delta tables and turns stored procedures into notebooks.
     expect(settingsFrom(facts, resolve(facts, { "scope.mode": "pilot" })).waves).toEqual([1]);
+    expect(s.options.target).toBe("warehouse");
     const lake = settingsFrom(facts, resolve(facts, { "target.sql": "lakehouse" }));
-    expect(lake.stages).not.toContain("warehouse");
-    expect(lake.stages).not.toContain("data");
+    expect(lake.stages).toContain("warehouse");
+    expect(lake.options.target).toBe("lakehouse");
   });
 
   it("runs the approved brief end to end: plan, approval, run, validation", async () => {

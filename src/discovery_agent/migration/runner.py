@@ -14,6 +14,10 @@ What this build migrates:
 * **Roles and users** -> Warehouse roles, members and GRANT/DENY permissions (``security``);
   dynamic data masks are written into each table's CREATE TABLE.
 
+With the run option ``target: lakehouse`` the pool becomes a Fabric Lakehouse instead, and its objects
+take the roads ``stages_lakehouse`` describes: Delta tables created by Spark, views, functions and
+permissions on the SQL analytics endpoint, stored procedures converted to Spark notebooks.
+
 Everything else in the plan is marked DEFERRED with the reason, so a run never
 pretends to have moved what it cannot move yet. An object that already exists
 in Fabric is SKIPPED, never overwritten, which makes a re-run safe.
@@ -39,6 +43,7 @@ from discovery_agent.migration.common import (  # noqa: F401 - re-exported: test
 )
 from discovery_agent.migration.stages import StageMixin
 from discovery_agent.migration.stages_fabric import FabricStageMixin
+from discovery_agent.migration.stages_lakehouse import LakehouseStageMixin
 from discovery_agent.migration.fabric_rest import FabricApiError, FabricRestClient
 
 #: The UI types this build can migrate, and the kind each becomes.
@@ -185,7 +190,7 @@ class MigrationRun:
             }
 
 
-class Migrator(StageMixin, FabricStageMixin):
+class Migrator(StageMixin, FabricStageMixin, LakehouseStageMixin):
     """One pass over a run's PENDING items. A retry is a new pass."""
 
     def __init__(
@@ -282,6 +287,13 @@ class Migrator(StageMixin, FabricStageMixin):
                 DATA: self._data, CONNECTION: self._connection, DATASET: self._dataset, PIPELINE: self._pipeline,
                 SPARKJOB: self._sparkjob, SCRIPT: self._script, SCHEDULE: self._schedule, SHORTCUT: self._shortcut,
             }.get(source.kind)
+            if self._lakehouse_target():
+                # A Lakehouse: Spark creates the tables, procedures become notebooks, and T-SQL objects go to the
+                # SQL analytics endpoint once it has picked up the tables they read.
+                handler = {POOL: self._lh_pool, SCHEMA: self._lh_ddl, TABLE: self._lh_ddl, PROCEDURE: self._lh_procedure,
+                           SCRIPT: self._lh_script}.get(source.kind, handler)
+                if source.kind in (VIEW, FUNCTION, SECURITY):
+                    self._refresh_endpoint()
             if handler is None:
                 raise MigrationError(source.reason or "This object is not in the current discovery results. Run discovery again.")
             status, step, target, notes = handler(source)
@@ -318,7 +330,12 @@ class Migrator(StageMixin, FabricStageMixin):
             raise MigrationError("The notebook's definition was not kept by discovery. Run discovery again.")
         try:
             payload = notebooks.with_cells(source.payload, source.override["code"]) if source.override else source.payload
-            document, notes = notebooks.to_fabric_ipynb(payload, pool_name=self.run.pool_name, warehouse=self.run.warehouse)
+            lakehouse = None
+            if self._lakehouse_target() and self.run.pool_name and "synapsesql" in str(payload):
+                name, lakehouse_id = self._lakehouse()
+                lakehouse = (lakehouse_id, name, self.run.workspace_id)
+            document, notes = notebooks.to_fabric_ipynb(payload, pool_name=self.run.pool_name, warehouse=self.run.warehouse,
+                                                        lakehouse=lakehouse)
         except notebooks.NotebookNotMigratable as exc:
             if source.override:
                 raise MigrationError(str(exc)) from exc
@@ -432,6 +449,8 @@ class Migrator(StageMixin, FabricStageMixin):
         return None
 
     def _open_warehouse(self) -> Any:
+        if self._lakehouse_target():
+            return self._open_sql_endpoint()
         run, client = self.run, self._client()
         warehouse = self._find_warehouse()
         if warehouse is None:
@@ -590,7 +609,11 @@ class Migrator(StageMixin, FabricStageMixin):
             step = f"{len(plan.permissions)} permission(s) applied (Fabric creates the user on its first GRANT or DENY)"
         else:
             step = "Nothing granted directly: this principal's access comes from its role memberships"
-        if total:
+        if total and self._lakehouse_target():
+            notes.append("These permissions govern T-SQL reads through the Lakehouse's SQL analytics endpoint only: Spark and "
+                         "OneLake access follow workspace roles and OneLake security. Give these principals Read on the Lakehouse "
+                         "(without ReadAll) in Fabric.")
+        elif total:
             notes.append("Workspace roles and item permissions still decide who can connect: give these principals "
                          "Read on the Warehouse in Fabric.")
         return COMPLETED, step, target, notes
@@ -639,7 +662,7 @@ class Migrator(StageMixin, FabricStageMixin):
         try:
             cursor.execute(statement)
         except Exception as exc:  # noqa: BLE001 - the driver's message is the useful part
-            raise MigrationError(f"Fabric Warehouse rejected the {what}: {str(exc)[:400]}. Review it by hand.") from exc
+            raise MigrationError(f"Fabric rejected the {what}: {str(exc)[:400]}. Review it by hand.") from exc
 
     def _close(self) -> None:
         if self._source is not None:

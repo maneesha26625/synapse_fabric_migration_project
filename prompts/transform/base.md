@@ -18,6 +18,7 @@ a draft for a person to review: it is not run until they accept it.
 {{#if object.schema}}| Schema | `{{object.schema}}` |
 {{/if}}{{#if target.workspace}}| Fabric workspace | {{target.workspace}} |
 {{/if}}{{#if target.warehouse}}| Fabric Warehouse | `{{target.warehouse}}` |
+{{/if}}{{#if target.lakehouse}}| Fabric Lakehouse | `{{target.lakehouse}}` |
 {{/if}}
 
 ## Source ({{source.platform}})
@@ -32,7 +33,7 @@ a draft for a person to review: it is not run until they accept it.
 This is what the accelerator would deploy without you. Start from it. Do not
 undo anything it already fixed.
 
-{{rules.fence}}{{source.language}}
+{{rules.fence}}{{rules.language}}
 {{rules.output}}
 {{rules.fence}}
 
@@ -83,7 +84,7 @@ wherever the two disagree.
 2. **Do not invent.** Do not add objects, columns, parameters or connections that are not in the
    source or the requirements. If a name in Fabric is unknown, keep the Synapse name and say so in `notes`.
 3. **Mark every change.** Where you changed or removed something, leave a short comment in the code
-   (`-- Fabric:` in SQL, a `"description"` in JSON) and a line in `notes`.
+   (`-- Fabric:` in SQL, `# Fabric:` in Python, a `"description"` in JSON) and a line in `notes`.
 4. **Write for this target only.** Only use syntax and features that {{target.component}}
    supports today. If you are not sure something is supported, say so in `notes` and give a lower `confidence`.
 

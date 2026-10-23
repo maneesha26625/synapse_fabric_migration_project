@@ -9,7 +9,10 @@ differences this module handles:
 * **Fabric items are referenced by id.** A notebook, Spark job or pipeline an
   activity runs is named by its Fabric id, so those must exist first.
 * **The SQL pool is gone.** Anything that read or wrote the Synapse pool is
-  pointed at the migrated Warehouse instead.
+  pointed at the migrated Warehouse instead, or, when the run's SQL target is a
+  Lakehouse, at its Delta tables: a stored procedure call then runs the notebook
+  the procedure became (``spark_sql``), and SQL that ran on the pool (a Script
+  activity, a query in a Copy or Lookup) has no place to run and needs a rewrite.
 
 An activity this module does not know is never guessed at: the pipeline is
 reported as needing a rewrite, with the activity names, and not created.
@@ -47,6 +50,15 @@ class Warehouse:
 
 
 @dataclass
+class Lakehouse:
+    """The run's Lakehouse, when the SQL target is a Lakehouse."""
+
+    artifact_id: str
+    name: str
+    workspace_id: str
+
+
+@dataclass
 class Context:
     """Everything a pipeline refers to, resolved to Fabric where it exists."""
 
@@ -59,6 +71,10 @@ class Context:
     workspace_id: str
     warehouse: Optional[Warehouse]
     pool_name: str = ""
+    #: Set when the SQL target is a Lakehouse (``warehouse`` is then None).
+    lakehouse: Optional[Lakehouse] = None
+    #: Lakehouse target: stored procedure (``schema.name`` and ``name``, lower-cased) -> the Fabric id of its notebook.
+    procedure_notebooks: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -170,6 +186,13 @@ def _warehouse_ref(ctx: Context) -> Dict[str, Any]:
             "typeProperties": {"endpoint": w.endpoint, "artifactId": w.artifact_id, "workspaceId": ctx.workspace_id}}}
 
 
+def _lakehouse_ref(ctx: Context) -> Dict[str, Any]:
+    lh = ctx.lakehouse
+    assert lh is not None
+    return {"name": lh.name, "properties": {"type": "Lakehouse", "annotations": [],
+            "typeProperties": {"workspaceId": lh.workspace_id, "artifactId": lh.artifact_id, "rootFolder": "Tables"}}}
+
+
 def dataset_linked_service_values(ds: Mapping[str, Any], ref: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
     """The parameter values a dataset passes its linked service, ``@dataset().x`` filled from ``ref``.
 
@@ -196,6 +219,13 @@ def dataset_settings(ref: Mapping[str, Any], ctx: Context, out: Converted) -> Tu
     ls_values = dataset_linked_service_values(ds, ref)
     typeprops = _substitute(copy.deepcopy(props.get("typeProperties") or {}), params)
     schema = props.get("schema") or []
+    if ls is not None and ctx.lakehouse is not None and _is_pool_service(ls, ctx, ls_values):
+        table = typeprops.get("table") or typeprops.get("tableName")
+        settings = {"annotations": [], "type": "LakehouseTable", "schema": schema,
+                    "typeProperties": {k: v for k, v in {"schema": typeprops.get("schema") or "dbo", "table": table}.items() if v},
+                    "linkedService": _lakehouse_ref(ctx)}
+        out.notes.append(f"Dataset {name} now reads and writes the Delta tables of Lakehouse '{ctx.lakehouse.name}', not the Synapse pool.")
+        return settings, True
     if ls is not None and ctx.warehouse is not None and _is_pool_service(ls, ctx, ls_values):
         table = typeprops.get("table") or typeprops.get("tableName")
         settings = {"annotations": [], "type": "DataWarehouseTable", "schema": schema,
@@ -233,7 +263,9 @@ def _copy(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, Any
             settings, retargeted = dataset_settings(refs[0], ctx, out)
             if settings is not None:
                 node["datasetSettings"] = settings
-                if retargeted and node.get("type") in _SOURCE_SINK_MAP:
+                if retargeted and ctx.lakehouse is not None:
+                    node = _lakehouse_side(act, side, node, out)
+                elif retargeted and node.get("type") in _SOURCE_SINK_MAP:
                     node["type"] = _SOURCE_SINK_MAP[node["type"]]
         tp[side] = node
     if tp.pop("enableStaging", False):
@@ -252,6 +284,31 @@ def _copy(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, Any
     return result
 
 
+def _lakehouse_side(act: Mapping[str, Any], side: str, node: Dict[str, Any], out: Converted) -> Dict[str, Any]:
+    """A Copy or Lookup source / sink that used the pool, reading or writing a Lakehouse table instead.
+
+    A Lakehouse table is read whole and written by appending or overwriting: there is no SQL on the way in or out,
+    so a query or a pre-copy script other than emptying the table cannot be carried and is reported."""
+    name = str(act.get("name") or act.get("type"))
+    settings = node.get("datasetSettings")
+    if side == "source":
+        query = node.get("sqlReaderQuery") or node.get("sqlReaderStoredProcedureName")
+        if query:
+            out.unsupported.append(f"{name} (reads the pool with a query or procedure; a Lakehouse table is read whole: "
+                                   "use a notebook, or a Copy of the table)")
+        return {"type": "LakehouseTableSource", "datasetSettings": settings}
+    pre = node.get("preCopyScript")
+    action = "Append"
+    if pre:
+        text = pre.get("value") if isinstance(pre, Mapping) else pre
+        if isinstance(text, str) and re.fullmatch(r"\s*(TRUNCATE\s+TABLE|DELETE\s+FROM)\s+[\w\[\]\.\s]+;?\s*", text, re.I):
+            action = "Overwrite"
+            out.notes.append(f"Copy '{name}': its pre-copy script emptied the table; the Lakehouse table is overwritten instead.")
+        else:
+            out.unsupported.append(f"{name} (runs a pre-copy script on the pool; a Lakehouse table takes no SQL: move it to a notebook)")
+    return {"type": "LakehouseTableSink", "tableActionOption": action, "datasetSettings": settings}
+
+
 def _holder(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, Any]:
     """Lookup / GetMetadata / Delete / Validation: ``dataset`` becomes ``datasetSettings``."""
     result = _base(act)
@@ -264,7 +321,11 @@ def _holder(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, A
             tp["datasetSettings"] = settings
     for key in ("source",):
         node = tp.get(key)
-        if isinstance(node, dict) and node.get("type") in _SOURCE_SINK_MAP and isinstance(tp.get("datasetSettings"), dict) \
+        if isinstance(node, dict) and isinstance(tp.get("datasetSettings"), dict) and tp["datasetSettings"].get("type") == "LakehouseTable":
+            source = _lakehouse_side(act, "source", {**node, "datasetSettings": tp["datasetSettings"]}, out)
+            source.pop("datasetSettings", None)
+            tp[key] = source
+        elif isinstance(node, dict) and node.get("type") in _SOURCE_SINK_MAP and isinstance(tp.get("datasetSettings"), dict) \
                 and tp["datasetSettings"].get("type") == "DataWarehouseTable":
             node["type"] = _SOURCE_SINK_MAP[node["type"]]
     result["typeProperties"] = tp
@@ -314,7 +375,37 @@ def _sparkjob(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str,
     return result
 
 
+def procedure_key(name: Any) -> str:
+    """``[dbo].[usp_x]`` / ``dbo.usp_x`` / ``usp_x`` -> ``dbo.usp_x`` / ``usp_x`` (lower-cased, without brackets or a database)."""
+    text = _expr(name)
+    parts = [p.strip().strip("[]\"").lower() for p in re.split(r"\.(?![^\[]*\])", text) if p.strip()]
+    return ".".join(parts[-2:])
+
+
+def _procedure_notebook(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, Any]:
+    """Lakehouse target: a call of a pool procedure runs the notebook the procedure became, with the same parameter values."""
+    from discovery_agent.migration.spark_sql import notebook_parameters  # noqa: PLC0415 - spark_sql imports nothing from here
+
+    result = _base(act)
+    result["type"] = "TridentNotebook"
+    tp = act.get("typeProperties") or {}
+    raw = tp.get("storedProcedureName")
+    key = procedure_key(raw)
+    if isinstance(raw, Mapping) and str(raw.get("value") or "").startswith("@"):
+        out.unsupported.append(f"{act.get('name')} (calls a procedure chosen at run time by an expression; pick the notebook by hand)")
+    notebook_id = ctx.procedure_notebooks.get(key) or ctx.procedure_notebooks.get(key.split(".")[-1])
+    if not notebook_id:
+        out.missing.append(f"the notebook for stored procedure {key or '(unnamed)'} (run the Warehouse & schema stage)")
+    result["typeProperties"] = {"notebookId": notebook_id or "", "workspaceId": ctx.workspace_id,
+                                "parameters": notebook_parameters(tp.get("storedProcedureParameters") or {})}
+    lakehouse = ctx.lakehouse.name if ctx.lakehouse else ""
+    out.notes.append(f"Stored procedure '{act.get('name')}' now runs the notebook it was converted to, in Lakehouse '{lakehouse}'.")
+    return result
+
+
 def _stored_procedure(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, Any]:
+    if ctx.lakehouse is not None:
+        return _procedure_notebook(act, ctx, out)
     result = _base(act)
     result["type"] = "SqlServerStoredProcedure"
     tp = copy.deepcopy(act.get("typeProperties") or {})
@@ -358,6 +449,10 @@ def _script(act: Mapping[str, Any], ctx: Context, out: Converted) -> Dict[str, A
     ref = act.get("linkedServiceName") or {}
     ls_name = str(ref.get("referenceName") or "")
     ls = ctx.linked_services.get(ls_name)
+    if ls is not None and ctx.lakehouse is not None and (_is_pool_service(ls, ctx, ref.get("parameters")) or is_serverless_service(ls)):
+        out.unsupported.append(f"{act.get('name')} (a Script activity runs T-SQL on the pool; the Lakehouse's SQL analytics endpoint "
+                               "is read-only and pipelines cannot reach it: move the script into a notebook)")
+        return result
     if ls is not None and ctx.warehouse is not None and _is_pool_service(ls, ctx, ref.get("parameters")):
         result["linkedService"] = _warehouse_ref(ctx)
     elif ls is not None and ctx.warehouse is not None and is_serverless_service(ls):

@@ -64,10 +64,8 @@ export interface AgentSettings {
 }
 
 const REMOVE: Record<string, (a: Answers) => boolean> = {
-  warehouse: (a) => a["target.sql"] === "lakehouse",
-  data: (a) => !a["data.load"] || a["data.load"] === "none" || a["security.sensitive"] === "blocked" || a["target.sql"] === "lakehouse",
-  security: (a) => a["security.roles"] === "no" || a["target.sql"] === "lakehouse",
-  sql_scripts: (a) => a["target.sql"] === "lakehouse",
+  data: (a) => !a["data.load"] || a["data.load"] === "none" || a["security.sensitive"] === "blocked",
+  security: (a) => a["security.roles"] === "no",
   spark: (a) => a["spark.compute"] === "starter",
   spark_jobs: (a) => a["spark.jobs"] === "skip",
   pipelines: (a) => a["pipelines.migrate"] === "redesign",
@@ -103,6 +101,8 @@ export function settingsFrom(facts: Facts, rs: Resolved[]): AgentSettings {
     scope,
     stopOnFailure: failures === "stop",
     collation: pick(a, "target.collation", "match_synapse") as RunOptions["collation"],
+    // A Lakehouse is a run option of the Warehouse & schema stage: Delta tables, procedures as notebooks.
+    target: a["target.sql"] === "lakehouse" ? "lakehouse" : "warehouse",
     existing: pick(a, "target.existing", "skip") as RunOptions["existing"],
     dataRun: load === "create" ? "create" : "run",
     dataMode: pick(a, "data.existingRows", "if_empty") as RunOptions["dataMode"],

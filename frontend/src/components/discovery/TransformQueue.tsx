@@ -1,6 +1,8 @@
 import { CheckCircle2, Save, Sparkles } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useAppState } from "../../state/AppState";
+import { TARGET_LABEL, useSqlTarget } from "../../state/MigrationState";
+import { SqlTargetPicker } from "./SqlTargetPicker";
 import { ApiRequestError, type ProjectRequirements, type TransformCandidate, type TransformCandidates, type TransformSettings } from "../../types";
 import { Banner, Button, Collapsible, ConfirmDialog, EmptyState, Skeleton, StatusBadge, type Tone } from "../shared/Shared";
 import { LlmBadge } from "./LlmBadge";
@@ -82,6 +84,7 @@ const MODES: { id: Mode; label: string }[] = [
 
 export function TransformQueue() {
   const { api } = useAppState();
+  const target = useSqlTarget();
   const [data, setData] = useState<TransformCandidates | null>(null);
   const [settings, setSettings] = useState<TransformSettings | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -98,7 +101,7 @@ export function TransformQueue() {
 
   const load = useCallback(async () => {
     try {
-      setData(await api.listTransformCandidates());
+      setData(await api.listTransformCandidates(target));
       setError(null);
     } catch (e) {
       if (e instanceof ApiRequestError && e.code === "no_results") {
@@ -109,7 +112,7 @@ export function TransformQueue() {
         setError(e instanceof Error ? e.message : "The objects could not be loaded.");
       }
     }
-  }, [api]);
+  }, [api, target]);
 
   useEffect(() => {
     void load();
@@ -156,7 +159,7 @@ export function TransformQueue() {
     let accepted = 0;
     const failed: string[] = [];
     for (const id of selected) {
-      try { await api.acceptTransform(id); accepted += 1; } catch (e) { failed.push(e instanceof Error ? e.message : id); }
+      try { await api.acceptTransform(id, undefined, target); accepted += 1; } catch (e) { failed.push(e instanceof Error ? e.message : id); }
     }
     setNotice(`${accepted} draft${accepted === 1 ? "" : "s"} accepted: the next migration run uses ${accepted === 1 ? "it" : "them"}.${failed.length ? ` ${failed.length} could not be accepted: ${failed.slice(0, 3).join(" ")}` : ""}`);
     setSelected(new Set());
@@ -171,7 +174,7 @@ export function TransformQueue() {
     const rejected: string[] = [];
     try {
       for (let i = 0; i < ids.length; i += BATCH) {
-        for (const r of await api.generateTransforms(ids.slice(i, i + BATCH))) {
+        for (const r of await api.generateTransforms(ids.slice(i, i + BATCH), target)) {
           if (r.state === "queued") queued += 1; else rejected.push(r.error ?? r.objectId);
         }
       }
@@ -193,7 +196,9 @@ export function TransformQueue() {
         Claude (through Claude Code on the machine running the API) converts each one to your project requirements. Nothing is
         deployed until you open the object, review its draft and accept it. Accepted code is used when the object is created
         in Fabric, in <strong>step 5, Migrate</strong>. Plan and Migrate mark those objects <LlmBadge />.
+        Drafts are made for the SQL target: now a <strong>{TARGET_LABEL[target]}</strong>.
       </Banner>
+      <SqlTargetPicker id="transform-target" />
       {settings && !settings.enabled && <Banner tone="warning" title="Generation is switched off">{settings.disabledReason}</Banner>}
       {settings && settings.enabled && !settings.available && <Banner tone="warning" title="Claude Code is not available">{settings.message}</Banner>}
 

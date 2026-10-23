@@ -103,6 +103,8 @@ class StageMixin:
             run.log("NOTE", item.source.name, note)
 
     def _load_wave(self, wave: int, sources: List[Source]) -> Dict[str, Result]:
+        if self._lakehouse_target():  # type: ignore[attr-defined]
+            return self._load_wave_lakehouse(wave, sources)  # type: ignore[attr-defined]
         run = self.run
         results: Dict[str, Result] = {}
         replace = run.settings.get("dataMode", "if_empty") == "replace"

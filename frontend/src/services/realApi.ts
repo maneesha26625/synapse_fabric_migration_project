@@ -25,6 +25,7 @@ import {
   type TransformPrompt,
   type TransformQueued,
   type TransformSettings,
+  type SqlTarget,
   type ValidationRow,
   type ZipUpload,
 } from "../types";
@@ -107,6 +108,9 @@ function toQueryString(q: ResultsQuery): string {
   return p.toString();
 }
 
+/** `?target=lakehouse`, or nothing for a Warehouse (the server's default). */
+const targetQuery = (target?: SqlTarget) => (target && target !== "warehouse" ? `?target=${target}` : "");
+
 export const realApi: MigrationApi = {
   mode: "real",
   health: () => request<Health>("/api/health"),
@@ -179,7 +183,8 @@ export const realApi: MigrationApi = {
     await request<ValidationState>("/api/migration/validate", { method: "POST", body: JSON.stringify({
       ...(items?.length ? { items } : {}),
       // Date filters decide which Synapse rows a table should hold, so the counts compare like with like.
-      ...(options?.dataFilters ? { options: { dataFilters: options.dataFilters } } : {}),
+      // ... and the SQL target says where the pool's objects are (a Warehouse, or a Lakehouse's SQL endpoint and notebooks).
+      ...(options?.dataFilters || options?.target ? { options: { dataFilters: options.dataFilters, target: options.target } } : {}),
       ...(runtime ? { runtime } : {}),
     }) });
     for (;;) {
@@ -192,16 +197,17 @@ export const realApi: MigrationApi = {
     }
   },
   getTransformSettings: () => request<TransformSettings>("/api/transform/settings"),
-  listTransforms: async () => (await request<{ items: TransformObject[] }>("/api/transform")).items,
-  getTransform: (id) => request<TransformObject>(`/api/transform/objects/${encodeURIComponent(id)}`),
-  getTransformPrompt: (id) => request<TransformPrompt>(`/api/transform/prompt/${encodeURIComponent(id)}`),
-  generateTransforms: async (ids) =>
-    (await request<{ items: TransformQueued[] }>("/api/transform/generate", { method: "POST", body: JSON.stringify({ ids }) })).items,
-  acceptTransform: (id, code) =>
-    request<TransformObject>("/api/transform/accept", { method: "POST", body: JSON.stringify(code === undefined ? { id } : { id, code }) }),
-  discardTransform: (id, scope) =>
-    request<TransformObject>("/api/transform/discard", { method: "POST", body: JSON.stringify({ id, scope }) }),
-  listTransformCandidates: () => request<TransformCandidates>("/api/transform/candidates"),
+  // The SQL target travels with every transform call (?target= on a read, "target" in a body).
+  listTransforms: async (target) => (await request<{ items: TransformObject[] }>(`/api/transform${targetQuery(target)}`)).items,
+  getTransform: (id, target) => request<TransformObject>(`/api/transform/objects/${encodeURIComponent(id)}${targetQuery(target)}`),
+  getTransformPrompt: (id, target) => request<TransformPrompt>(`/api/transform/prompt/${encodeURIComponent(id)}${targetQuery(target)}`),
+  generateTransforms: async (ids, target) =>
+    (await request<{ items: TransformQueued[] }>("/api/transform/generate", { method: "POST", body: JSON.stringify({ ids, target }) })).items,
+  acceptTransform: (id, code, target) =>
+    request<TransformObject>("/api/transform/accept", { method: "POST", body: JSON.stringify(code === undefined ? { id, target } : { id, code, target }) }),
+  discardTransform: (id, scope, target) =>
+    request<TransformObject>("/api/transform/discard", { method: "POST", body: JSON.stringify({ id, scope, target }) }),
+  listTransformCandidates: (target) => request<TransformCandidates>(`/api/transform/candidates${targetQuery(target)}`),
   getConsultFacts: () => request<ConsultFacts>("/api/consult/facts"),
   getProjectRequirements: () => request<ProjectRequirements>("/api/transform/project"),
   saveProjectRequirements: (text) =>

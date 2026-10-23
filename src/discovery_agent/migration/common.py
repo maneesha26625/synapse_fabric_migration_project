@@ -61,9 +61,20 @@ class Source:
     masks: Tuple[Any, ...] = ()
 
 
-def lakehouse_name(warehouse: str) -> str:
-    """The Lakehouse a run creates beside its Warehouse, for OneLake shortcuts and storage routed through them."""
-    return f"{warehouse}_lakehouse"
+#: Where a run puts the SQL pool's schemas, tables, views and procedures (run option ``target``).
+WAREHOUSE_TARGET, LAKEHOUSE_TARGET = "warehouse", "lakehouse"
+TARGETS = (WAREHOUSE_TARGET, LAKEHOUSE_TARGET)
+
+
+def is_lakehouse(settings: Optional[Dict[str, Any]]) -> bool:
+    """Whether a run's SQL target is a Lakehouse rather than a Warehouse."""
+    return (settings or {}).get("target") == LAKEHOUSE_TARGET
+
+
+def lakehouse_name(warehouse: str, settings: Optional[Dict[str, Any]] = None) -> str:
+    """The run's Lakehouse. Beside a Warehouse it holds OneLake shortcuts and storage routed through them;
+    when the SQL target is a Lakehouse, it is that Lakehouse, named like the pool, and holds those too."""
+    return warehouse if is_lakehouse(settings) else f"{warehouse}_lakehouse"
 
 
 def override_note(source: Source) -> str:

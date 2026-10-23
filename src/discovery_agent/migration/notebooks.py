@@ -20,7 +20,7 @@ from __future__ import annotations
 import base64
 import json
 import re
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 #: Synapse language names -> the language_info name a Fabric notebook uses.
 _LANGUAGES = {
@@ -48,8 +48,11 @@ _READ_SYNAPSESQL = re.compile(r"(\.read\b[^\n]*?\.synapsesql\(\s*)([\"'])([^\"'.
 _PYTHON = {"python", "pyspark"}
 
 
-def rewrite_python(code: str, pool_name: str = "", warehouse: str = "") -> Tuple[str, List[str]]:
-    """Mechanical Synapse -> Fabric rewrites for one Python cell, and what changed."""
+def rewrite_python(code: str, pool_name: str = "", warehouse: str = "", lakehouse: bool = False) -> Tuple[str, List[str]]:
+    """Mechanical Synapse -> Fabric rewrites for one Python cell, and what changed.
+
+    ``lakehouse``: the pool's tables are Delta tables in the notebook's default Lakehouse, so a
+    ``spark.read.synapsesql("pool.schema.table")`` read becomes ``spark.read.table("schema.table")``."""
     notes: List[str] = []
     code, n = _IMPORT_MSSPARKUTILS.subn("# notebookutils is built into Fabric notebooks", code)
     renamed = len(_MSSPARKUTILS.findall(code))
@@ -59,6 +62,19 @@ def rewrite_python(code: str, pool_name: str = "", warehouse: str = "") -> Tuple
     code, imports = _SQLANALYTICS.subn("com.microsoft.spark.fabric", code)
     if imports:
         notes.append("Synapse SQL connector import -> Fabric connector (com.microsoft.spark.fabric)")
+    if lakehouse and pool_name:
+        changed: List[int] = []
+
+        def table(m: "re.Match[str]") -> str:
+            if m.group(3).strip("[]").lower() != pool_name.lower():
+                return m.group(0)
+            changed.append(1)
+            return f".read.table({m.group(2)}{m.group(4)}{m.group(2)}"
+
+        code = _READ_SYNAPSESQL.sub(table, code)
+        if changed:
+            notes.append(f"synapsesql reads of pool '{pool_name}' -> spark.read.table on the Lakehouse's Delta tables")
+        return code, notes
     if pool_name and warehouse and pool_name.lower() != warehouse.lower():
         changed: List[int] = []
 
@@ -96,10 +112,13 @@ def _language(properties: Mapping[str, Any]) -> str:
     return _LANGUAGES.get(raw, "python")
 
 
-def to_fabric_ipynb(payload: Mapping[str, Any], pool_name: str = "", warehouse: str = "") -> Tuple[Dict[str, Any], List[str]]:
+def to_fabric_ipynb(payload: Mapping[str, Any], pool_name: str = "", warehouse: str = "",
+                    lakehouse: Optional[Tuple[str, str, str]] = None) -> Tuple[Dict[str, Any], List[str]]:
     """The Fabric ipynb document for one Synapse notebook resource, and what changed.
 
-    ``pool_name`` and ``warehouse`` let reads of the migrated pool be pointed at the Warehouse."""
+    ``pool_name`` and ``warehouse`` let reads of the migrated pool be pointed at the Warehouse. ``lakehouse``
+    ((id, name, workspace id), when the SQL target is a Lakehouse) points them at its tables instead, and makes
+    it the notebook's default Lakehouse when the notebook reads the pool."""
     properties = payload.get("properties") or {}
     language = _language(properties)
     notes: List[str] = []
@@ -130,7 +149,7 @@ def to_fabric_ipynb(payload: Mapping[str, Any], pool_name: str = "", warehouse: 
             out["execution_count"] = None
             cell_language = str(language_override or language).lower()
             if cell_language in _PYTHON:
-                new_text, changes = rewrite_python("".join(source), pool_name, warehouse)
+                new_text, changes = rewrite_python("".join(source), pool_name, warehouse, lakehouse=lakehouse is not None)
                 if changes:
                     out["source"] = source = new_text.splitlines(keepends=True)
                     rewritten.extend(c for c in changes if c not in rewritten)
@@ -157,6 +176,11 @@ def to_fabric_ipynb(payload: Mapping[str, Any], pool_name: str = "", warehouse: 
         },
         "cells": cells,
     }
+    if lakehouse is not None and any("spark.read.table" in c for c in rewritten):
+        lakehouse_id, name, workspace_id = lakehouse
+        document["metadata"]["dependencies"] = {"lakehouse": {
+            "default_lakehouse": lakehouse_id, "default_lakehouse_name": name, "default_lakehouse_workspace_id": workspace_id}}
+        notes.append(f"Default Lakehouse: {name} (the notebook reads its tables by name).")
     return document, notes
 
 
