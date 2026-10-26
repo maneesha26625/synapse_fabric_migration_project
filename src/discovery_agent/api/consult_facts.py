@@ -220,7 +220,33 @@ def _triggers(job: Any) -> Dict[str, int]:
     return out
 
 
+def _estate(job: Any) -> Any:
+    cat = _catalog(job)
+    return getattr(cat, "estate", None) if cat is not None else None
+
+
+def _estate_part(readable: str, value: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    """A fact from the estate: None without a SQL pool, an error (reported unreadable) when that part could not be read."""
+    def read(job: Any) -> Any:
+        e = _estate(job)
+        if e is None:
+            return None
+        if not getattr(e, readable):
+            raise LookupError(readable)
+        return value(e)
+    return read
+
+
 FACTS: Dict[str, Callable[[Any], Any]] = {
+    "securityPolicies": _estate_part("policies_readable", lambda e: len(e.policies)),
+    "blockPredicates": _estate_part("policies_readable", lambda e: sum(len(p.blocks) for p in e.policies)),
+    "externalDataSources": _estate_part("external_readable", lambda e: len(e.data_sources)),
+    "dataGb": _estate_part("sizes_readable", lambda e: round(e.total_kb / 1024 / 1024, 2)),
+    "dataRows": _estate_part("sizes_readable", lambda e: e.total_rows),
+    "largeTables": _estate_part("sizes_readable", lambda e: sum(1 for s in e.sizes if s.reserved_kb >= 100 * 1024 * 1024)),
+    "peakConcurrency": _estate_part("workload_readable", lambda e: e.workload.peak_concurrency),
+    "replayableQueries": _estate_part("workload_readable", lambda e: sum(1 for q in e.workload.samples if q.replayable)),
+    "lakeDatabases": lambda job: sum(1 for _ in _extras(job, "Lake Database")),
     "mssparkutilsNotebooks": _mssparkutils,
     "notebooksWithSecrets": _notebook_secrets,
     "notebooksWithStoragePaths": _notebook_storage,
@@ -248,8 +274,8 @@ FACTS: Dict[str, Callable[[Any], Any]] = {
 
 #: What the consultation may ask about but discovery cannot see, so it is never inferred.
 NOT_RECORDED = [
-    "materialized views", "sequences", "foreign keys", "row-level security policies",
-    "managed private endpoints and firewall rules", "table row counts and sizes", "items already in the Fabric workspace",
+    "materialized views", "sequences", "foreign keys",
+    "managed private endpoints and firewall rules", "items already in the Fabric workspace",
 ]
 
 

@@ -49,6 +49,7 @@ from discovery_agent.sql.mapping import (
 )
 from discovery_agent.sql.queries import CatalogQuery
 from discovery_agent.sql.result import SqlCatalogDiscovery
+from discovery_agent.sql import estate as estate_sql
 from discovery_agent.sql.security import SqlSecurity, build_security
 from discovery_agent.sql.source import SQL_SOURCE_FORMAT, CatalogRow, CatalogSource
 
@@ -463,6 +464,32 @@ class DedicatedPoolSource(CatalogSource):
             permissions_readable=permissions_ok, masks_readable=masks_ok, issues=issues,
         )
 
+    def discover_estate(self, tables: Sequence[Any] = (), database: Optional[str] = None) -> "estate_sql.SqlEstate":
+        """Data volume, row-level security, external sources and formats, and the recent workload.
+
+        Never raises: each part is read on its own, and one that cannot be read (most need
+        VIEW DATABASE STATE) is recorded as unknown, with an issue.
+        """
+        name = database or self.config.database
+        issues: List[ExtractionIssue] = []
+        replicated = [(t.key.schema, t.key.name) for t in tables if str(getattr(t.distribution, "value", "")).lower() == "replicate"]
+        size_rows, sizes_ok = self._optional_rows(queries.TABLE_SIZES, issues, f"{name}.table_sizes")
+        policy_rows, policies_ok = self._optional_rows(queries.SECURITY_POLICIES, issues, f"{name}.security_policies")
+        source_rows, sources_ok = self._optional_rows(queries.EXTERNAL_DATA_SOURCES, issues, f"{name}.external_data_sources")
+        format_rows, formats_ok = self._optional_rows(queries.EXTERNAL_FILE_FORMATS, issues, f"{name}.external_file_formats")
+        sample_rows, samples_ok = self._optional_rows(queries.QUERY_HISTORY, issues, f"{name}.query_history")
+        request_rows, requests_ok = self._optional_rows(queries.REQUEST_WINDOW, issues, f"{name}.request_window")
+        workload_ok = samples_ok and requests_ok
+        return estate_sql.SqlEstate(
+            sizes=estate_sql.build_sizes(size_rows, replicated) if sizes_ok else (),
+            policies=estate_sql.build_policies(policy_rows) if policies_ok else (),
+            data_sources=estate_sql.build_data_sources(source_rows) if sources_ok else (),
+            file_formats=estate_sql.build_file_formats(format_rows) if formats_ok else (),
+            workload=estate_sql.build_workload(sample_rows, request_rows) if workload_ok else None,
+            sizes_readable=sizes_ok, policies_readable=policies_ok, external_readable=sources_ok and formats_ok,
+            workload_readable=workload_ok, issues=tuple(issues),
+        )
+
     def discover(self) -> SqlCatalogDiscovery:
         """Every SQL object in this database: tables, views, procedures, functions and security.
 
@@ -523,8 +550,9 @@ class DedicatedPoolSource(CatalogSource):
             )
 
         security = self.discover_security(discovery.database.name)
+        estate = self.discover_estate(discovery.tables, discovery.database.name)
 
         return replace(
             discovery, views=views, procedures=procedures, functions=functions,
-            security=security, issues=tuple(issues)
+            security=security, estate=estate, issues=tuple(issues)
         )

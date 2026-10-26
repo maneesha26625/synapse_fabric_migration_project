@@ -41,7 +41,7 @@ from discovery_agent.errors import (
     SynapseConnectionError,
 )
 from discovery_agent.extractors.models import SourceType
-from discovery_agent.synapse.api import MAX_PAGES, triggers_url, workspace_url
+from discovery_agent.synapse.api import MAX_PAGES, lake_databases_url, triggers_url, workspace_url
 from discovery_agent.synapse.client import ArtifactsClient, HttpArtifactsClient
 from discovery_agent.synapse.models import SynapseWorkspaceDiscovery
 from discovery_agent.synapse.source import SynapseArtifactSource, unavailable_discovery
@@ -142,7 +142,14 @@ class SynapseArtifactsConnection:
         never sent anywhere else. Raises ``SynapseConnectionError`` when the
         listing cannot be read, so a caller reports a gap rather than "none".
         """
-        url: Optional[str] = triggers_url(self.endpoint)
+        return self._list(triggers_url(self.endpoint), "triggers")
+
+    def list_lake_databases(self) -> list:
+        """The workspace's lake databases, as the service returns them. Same paging and limits as triggers."""
+        return self._list(lake_databases_url(self.endpoint), "lake databases")
+
+    def _list(self, first: str, what: str) -> list:
+        url: Optional[str] = first
         items: list = []
         for _ in range(MAX_PAGES):
             if not url:
@@ -152,11 +159,11 @@ class SynapseArtifactsConnection:
             response = self.client().get(url)
             if not response.ok:
                 raise SynapseConnectionError(
-                    f"triggers could not be listed: {response.message()} (HTTP {response.status_code})"
+                    f"{what} could not be listed: {response.message()} (HTTP {response.status_code})"
                 )
             items.extend(response.payload.get("value") or [])
             url = response.payload.get("nextLink")
-        raise SynapseConnectionError("the trigger listing did not end")
+        raise SynapseConnectionError(f"the {what} listing did not end")
 
     # -- validation --------------------------------------------------------
 

@@ -176,6 +176,15 @@ def triggers_url(endpoint: str) -> str:
     return f"{endpoint.rstrip('/')}/{TRIGGERS_PATH}?api-version={ARTIFACTS_API_VERSION}"
 
 
+#: Lake databases (Spark databases and database templates) are listed by the data plane's database route.
+LAKE_DATABASES_API_VERSION = "2021-04-01"
+
+
+def lake_databases_url(endpoint: str) -> str:
+    """The data-plane URL that lists the workspace's lake databases."""
+    return f"{endpoint.rstrip('/')}/databases?api-version={LAKE_DATABASES_API_VERSION}"
+
+
 def workspace_url(endpoint: str) -> str:
     """The data-plane URL of the workspace itself, for a reachability probe."""
     return (

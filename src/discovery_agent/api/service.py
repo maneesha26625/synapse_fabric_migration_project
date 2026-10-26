@@ -1030,11 +1030,16 @@ class Session:
                 if isinstance(e.metadata, dict) and "_from" in e.metadata:
                     e.metadata["_from"] = "Git repository" if conn.source_kind == "git" else "ZIP export"
                 extras.append(e)
+            databases, tables = repository_source.lake_databases(conn.repository.path)
+            for e in mapping.lake_database_extras(databases, tables):
+                e.metadata["_from"] = "Git repository" if conn.source_kind == "git" else "ZIP export"
+                extras.append(e)
             if conn.manager is None:
                 extras.extend(mapping.schema_extras(records))
                 extras.extend(mapping.storage_extras(records))
                 extras.extend(mapping.function_extras(catalog))
                 extras.extend(mapping.security_extras(catalog))
+                extras.extend(mapping.estate_extras(catalog))
                 return extras, failures
         workspace_id = conn.manager.settings.synapse.workspace_resource_id(conn.subscription_id)
 
@@ -1053,11 +1058,13 @@ class Session:
         if conn.repository is None:
             attempt("Integration runtimes", arm("integrationRuntimes"), mapping.runtime_extras)
             attempt("Triggers", lambda: conn.manager.synapse_artifacts().list_triggers(), mapping.trigger_extras)
+            attempt("Lake databases", lambda: conn.manager.synapse_artifacts().list_lake_databases(), mapping.lake_database_extras)
         extras.extend(mapping.schema_extras(records))
         extras.extend(mapping.storage_extras(records))
         # From the SQL pool's catalog, when one was read: functions, and the roles and users that carry access.
         extras.extend(mapping.function_extras(catalog))
         extras.extend(mapping.security_extras(catalog))
+        extras.extend(mapping.estate_extras(catalog))
         return extras, failures
 
     def _fail(self, job: _Job, message: str) -> None:

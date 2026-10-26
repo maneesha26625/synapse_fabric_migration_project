@@ -455,7 +455,10 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   const [validationBusy, setValidationBusy] = useState(false);
   const [validationProgress, setValidationProgress] = useState<string | null>(null);
   // Read-only run checks are on by default; real runs in Fabric only when the operator ticks them.
-  const [validationRuntime, setValidationRuntime] = useState<ValidationRuntimeOptions>({ probe: true, run: [], timeoutMinutes: 30 });
+  // Value profiles of tables whose row counts agree are on by default, compared exactly.
+  const [validationRuntime, setValidationRuntime] = useState<ValidationRuntimeOptions>({
+    probe: true, run: [], timeoutMinutes: 30, reconcile: { profile: true, views: false, procedures: true, tolerancePct: 0, differences: "mismatch" },
+    access: true, performance: { enabled: false, thresholdPct: 50, limit: 10, strict: false } });
   useEffect(() => { setValidation(null); setValidationError(null); }, [api]);
   const runValidation = useCallback(async () => {
     setValidationBusy(true);

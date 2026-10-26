@@ -1,16 +1,17 @@
 import { PlayCircle, ShieldCheck } from "lucide-react";
 import { useMemo, useState } from "react";
+import { CutoverPanel } from "../../migrate/CutoverPanel";
 import { StatStrip } from "../../shared/Metrics";
 import { Banner, Button, Collapsible, StatusBadge, type Tone } from "../../shared/Shared";
 import { useAppState } from "../../../state/AppState";
 import { useMigration } from "../../../state/MigrationState";
-import type { RunnableKind, RuntimeStatus, ValidationStatus } from "../../../types";
+import type { ReconcileOptions, RunnableKind, RuntimeStatus, ValidationStatus } from "../../../types";
 
 const TONE: Record<ValidationStatus, Tone> = { MATCH: "success", REVIEW: "warning", MISMATCH: "error" };
 const MARK: Record<ValidationStatus, string> = { MATCH: "✓", REVIEW: "⚠", MISMATCH: "✕" };
 const RUN_TONE: Record<RuntimeStatus, Tone> = { PASS: "success", FAIL: "error", "NOT RUN": "warning", "NOT CHECKED": "neutral" };
 const RUN_LABEL: Record<RuntimeStatus, string> = { PASS: "Runs", FAIL: "Fails", "NOT RUN": "Never run", "NOT CHECKED": "Not checked" };
-const CATEGORIES = ["Warehouse", "Schema", "Tables", "Columns", "Data Count", "Data Types", "Functions", "Views", "Stored Procedures", "Spark", "Notebooks", "Connections", "Pipelines", "Spark Jobs", "SQL Scripts", "Schedules", "Shortcuts", "Security", "Dependencies", "Manual"];
+const CATEGORIES = ["Warehouse", "Schema", "Tables", "Columns", "Data Count", "Data Profile", "Data Types", "Functions", "Views", "View Results", "Stored Procedures", "Procedure Results", "Spark", "Notebooks", "Connections", "Pipelines", "Spark Jobs", "SQL Scripts", "Schedules", "Shortcuts", "Access", "Performance", "Security", "Dependencies", "Manual"];
 const RUNNABLE: { kind: RunnableKind; label: string }[] = [
   { kind: "pipeline", label: "Pipelines" },
   { kind: "notebook", label: "Notebooks" },
@@ -18,6 +19,90 @@ const RUNNABLE: { kind: RunnableKind; label: string }[] = [
   { kind: "sparkjob", label: "Spark job definitions" },
   { kind: "procedure", label: "Stored procedures with no required parameters (in a transaction that is rolled back)" },
 ];
+
+const TOLERANCES = [0, 0.01, 0.1, 1];
+const PERF = { enabled: false, thresholdPct: 50, limit: 10, strict: false };
+const NO_PROFILE: ReconcileOptions = { profile: false, tolerancePct: 0, differences: "mismatch" };
+
+/** Data reconciliation beyond row counts: the value profile, and how strictly it is compared. */
+function ReconcileForm() {
+  const { validationRuntime: rt, setValidationRuntime, validationBusy } = useMigration();
+  const r = rt.reconcile ?? NO_PROFILE;
+  const set = (patch: Partial<ReconcileOptions>) => setValidationRuntime({ ...rt, reconcile: { ...r, ...patch } });
+  return (
+    <fieldset className="stack" style={{ gap: 8, border: 0, padding: 0, margin: 0 }} disabled={validationBusy}>
+      <legend className="sr-only">Data reconciliation</legend>
+      <label className="row" style={{ gap: 8 }}>
+        <input type="checkbox" checked={r.profile} onChange={(e) => set({ profile: e.target.checked })} />
+        <span><strong>Compare the data, not only the row counts</strong> <span className="muted">(read-only): for each table whose counts
+          agree, NULLs per column, exact sums, earliest and latest dates, text lengths and duplicate keys, read from both sides. It reads
+          each table once on each side.</span></span>
+      </label>
+      {r.profile && (
+        <div className="row" style={{ gap: 8, paddingLeft: 24, flexWrap: "wrap" }}>
+          <label className="row" style={{ gap: 6 }}>
+            <span className="muted">Tolerance</span>
+            <select className="input" value={r.tolerancePct} onChange={(e) => set({ tolerancePct: Number(e.target.value) })} aria-label="Reconciliation tolerance">
+              {TOLERANCES.map((t) => <option key={t} value={t}>{t ? `${t}%` : "Exact"}</option>)}
+            </select>
+          </label>
+          <label className="row" style={{ gap: 6 }}>
+            <span className="muted">A difference is</span>
+            <select className="input" value={r.differences} onChange={(e) => set({ differences: e.target.value as ReconcileOptions["differences"] })} aria-label="How a difference is reported">
+              <option value="mismatch">a mismatch</option>
+              <option value="review">left for a person to judge</option>
+            </select>
+          </label>
+          <span className="faint">Dates and duplicate keys are always compared exactly.</span>
+        </div>
+      )}
+      <label className="row" style={{ gap: 8 }}>
+        <input type="checkbox" checked={!!r.views} onChange={(e) => set({ views: e.target.checked })} />
+        <span><strong>Compare what views return</strong> <span className="muted">(read-only): rows, NULLs, sums, dates and text lengths of each
+          view on both sides. Reads everything each view reads.</span></span>
+      </label>
+      <label className="row" style={{ gap: 8 }}>
+        <input type="checkbox" checked={!!r.procedures} onChange={(e) => set({ procedures: e.target.checked })} />
+        <span><strong>Compare what procedures return</strong> <span className="muted">: the first result set's columns and types on both sides,
+          described without running them.</span></span>
+      </label>
+      <label className="row" style={{ gap: 8 }}>
+        <input type="checkbox" checked={!!rt.access} onChange={(e) => setValidationRuntime({ ...rt, access: e.target.checked })} />
+        <span><strong>Prove storage access</strong> <span className="muted">: read every OneLake shortcut through its connection, so a missing
+          permission shows now, not when a notebook runs.</span></span>
+      </label>
+      <label className="row" style={{ gap: 8 }}>
+        <input type="checkbox" checked={!!rt.performance?.enabled}
+          onChange={(e) => setValidationRuntime({ ...rt, performance: { ...PERF, ...rt.performance, enabled: e.target.checked } })} />
+        <span><strong>Benchmark against Synapse</strong> <span className="muted">: run the most demanding recent Synapse SELECTs in Fabric and
+          compare their times. Reads only; queries that write or use temporary tables are not run.</span></span>
+      </label>
+      {rt.performance?.enabled && (
+        <div className="row" style={{ gap: 8, paddingLeft: 24, flexWrap: "wrap" }}>
+          <label className="row" style={{ gap: 6 }}>
+            <span className="muted">Allowed slowdown</span>
+            <input className="input" type="number" min={0} max={1000} style={{ width: 80 }} value={rt.performance.thresholdPct} aria-label="Allowed slowdown in percent"
+              onChange={(e) => setValidationRuntime({ ...rt, performance: { ...PERF, ...rt.performance, thresholdPct: Math.max(0, Number(e.target.value) || 0) } })} />
+            <span className="muted">%</span>
+          </label>
+          <label className="row" style={{ gap: 6 }}>
+            <span className="muted">Queries</span>
+            <input className="input" type="number" min={1} max={50} style={{ width: 70 }} value={rt.performance.limit} aria-label="Queries to benchmark"
+              onChange={(e) => setValidationRuntime({ ...rt, performance: { ...PERF, ...rt.performance, limit: Math.max(1, Math.min(50, Number(e.target.value) || 10)) } })} />
+          </label>
+          <label className="row" style={{ gap: 6 }}>
+            <input type="checkbox" checked={rt.performance.strict}
+              onChange={(e) => setValidationRuntime({ ...rt, performance: { ...PERF, ...rt.performance, strict: e.target.checked } })} />
+            <span className="muted">A slowdown beyond it is a mismatch (an SLA was agreed)</span>
+          </label>
+        </div>
+      )}
+    </fieldset>
+  );
+}
+
+const reconcileSummary = (r?: ReconcileOptions) => !r?.profile ? "row counts only"
+  : `value profiles, ${r.differences === "review" ? "differences judged by a person" : r.tolerancePct ? `within ${r.tolerancePct}%` : "exact"}`;
 
 /** What Validate checks in Fabric beyond comparing definitions, and what it may run for real. */
 function RuntimeOptionsForm() {
@@ -92,7 +177,7 @@ export function ValidatePanel() {
         <p className="muted">Validation reads both sides, object by object: columns and types, row counts, definitions, notebook cells and pipeline
           activities. It then asks Fabric whether each object works: tables and views are queried, procedures compiled, and pipelines,
           notebooks and Spark jobs judged by their runs.</p>
-        <div style={{ textAlign: "left", width: "100%", maxWidth: 720 }}><RuntimeOptionsForm /></div>
+        <div className="stack" style={{ textAlign: "left", width: "100%", maxWidth: 720, gap: 14 }}><ReconcileForm /><RuntimeOptionsForm /></div>
         {mode === "real" && !ready && <Banner tone="warning" title="Not ready to validate">{why}</Banner>}
         {validationError && <Banner tone="error" title="Validation">{validationError}</Banner>}
         {runButton}
@@ -112,6 +197,9 @@ export function ValidatePanel() {
       {progress}
       <Collapsible summary={`Checks in Fabric: ${validationRuntime.probe ? "SQL objects queried and compiled" : "no SQL checks"}${willRun ? `; runs now: ${validationRuntime.run.join(", ")}` : "; last runs read"}`}>
         <RuntimeOptionsForm />
+      </Collapsible>
+      <Collapsible summary={`Data reconciliation: ${reconcileSummary(validationRuntime.reconcile)}`}>
+        <ReconcileForm />
       </Collapsible>
       {validationError && <Banner tone="error" title="Validation">{validationError}</Banner>}
 
@@ -168,6 +256,9 @@ export function ValidatePanel() {
         </table>
       </div>
       {rows.length > 500 && <p className="faint">Showing the first 500 of {rows.length.toLocaleString()} checks. Filter to narrow them.</p>}
+      <Collapsible summary="Cutover: final sync, schedules on, approval (and rollback)">
+        <CutoverPanel />
+      </Collapsible>
     </div>
   );
 }

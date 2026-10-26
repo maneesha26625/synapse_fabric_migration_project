@@ -21,7 +21,8 @@ export interface Option { value: string; label: string; description?: string }
 
 export interface Recommendation { value: AnswerValue; reason: string }
 
-/** run: the agent's run follows it. gate: the agent stops for a person on it. record: kept in the brief only. */
+/** run: the agent's run follows it. gate: the agent stops for a person on it (before the run, or at the cutover
+ *  sign-off for questions with a `signoff`). record: kept in the brief only. */
 export type Effect = "run" | "gate" | "record";
 
 export type TopicId = "scope" | "target" | "data" | "sql" | "spark" | "pipelines" | "security" | "validation" | "features" | "context";
@@ -44,6 +45,8 @@ export interface Question {
   recommend?: (f: Facts, a: Answers) => Recommendation | null;
   /** What the answer changes, in words. */
   applies: string;
+  /** What a person confirms before cutover, given this answer (the agent's sign-off stage waits for it). */
+  signoff?: (value: AnswerValue, f: Facts, label: string) => string | null;
   placeholder?: string;
 }
 
@@ -112,14 +115,15 @@ export const QUESTIONS: Question[] = [
     applies: "The brief and the cutover plan.",
   },
   {
-    id: "scope.downtime", topic: "scope", kind: "single", required: false, effect: "record",
+    id: "scope.downtime", topic: "scope", kind: "single", required: false, effect: "gate",
     text: "What downtime is acceptable during cutover?",
     help: "Decides when the data load and the switch of consumers can happen.",
     options: () => [
       { value: "zero", label: "Near-zero downtime" }, { value: "1h", label: "Less than 1 hour" }, { value: "4h", label: "1–4 hours" },
       { value: "8h", label: "4–8 hours" }, { value: "window", label: "Flexible / maintenance window available" },
     ],
-    applies: "The brief and the cutover plan.",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (_v, _f, label) => `The cutover is scheduled inside the agreed downtime: ${label.toLowerCase()}.`,
   },
   {
     id: "scope.priority", topic: "scope", kind: "single", required: false, effect: "record",
@@ -148,7 +152,7 @@ export const QUESTIONS: Question[] = [
     applies: "The brief.",
   },
   {
-    id: "scope.rollback", topic: "scope", kind: "single", required: true, effect: "record",
+    id: "scope.rollback", topic: "scope", kind: "single", required: true, effect: "gate",
     text: "What happens if migration or validation fails?",
     help: "This tool never changes or deletes anything in Synapse, and never deletes in Fabric, so Synapse stays a working fallback until cutover.",
     options: () => [
@@ -157,7 +161,8 @@ export const QUESTIONS: Question[] = [
       { value: "formal", label: "Define formal rollback and recovery steps", description: "Recorded for the team to write." },
     ],
     recommend: () => ({ value: "fallback", reason: "Synapse is untouched by the migration, so it is the simplest rollback." }),
-    applies: "The brief.",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v) => v === "formal" ? "Formal rollback and recovery steps are written and approved." : v === "fallback" ? "Synapse is still in service as the fallback, and stays so until this sign-off." : null,
   },
 
   // ---- B. Target architecture --------------------------------------------------------------
@@ -179,8 +184,8 @@ export const QUESTIONS: Question[] = [
     resolve: (f) => f.capacityAssigned === true ? { value: "assigned", reason: "The connected workspace is on a Fabric capacity." } : null,
     options: () => [
       { value: "existing", label: "Assign an existing capacity" },
-      { value: "provision", label: "Provision an approved capacity" },
-      { value: "assess", label: "Assess the capacity needed first" },
+      { value: "provision", label: "Provision an approved capacity", description: "Plan → Capacity estimates a starting SKU from the estate." },
+      { value: "assess", label: "Assess the capacity needed first", description: "Plan → Capacity: from pool size, Spark pools, data volume and concurrency." },
     ],
     recommend: (f) => f.capacityAssigned === false ? { value: "existing", reason: "The connected workspace has no capacity: the run cannot create items until it has one." } : null,
     applies: "A prerequisite the agent asks a person to confirm before the run.",
@@ -297,7 +302,7 @@ export const QUESTIONS: Question[] = [
     applies: "The Table data stage, and what it does.",
   },
   {
-    id: "data.frequency", topic: "data", kind: "single", required: true, effect: "record",
+    id: "data.frequency", topic: "data", kind: "single", required: true, effect: "gate",
     when: (_f, a) => a["data.load"] === "sync",
     text: "How often must new data arrive in Fabric?",
     help: "Sync schedules are created switched off and turned on at cutover. Near-real-time needs a different design (for example Real-Time Intelligence).",
@@ -306,7 +311,8 @@ export const QUESTIONS: Question[] = [
       { value: "weekly", label: "Weekly" }, { value: "demand", label: "On demand" },
     ],
     recommend: () => ({ value: "daily", reason: "Matches most Synapse batch loads." }),
-    applies: "The brief and the schedules set up at cutover.",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v, _f, label) => v === "demand" ? "The team knows how to run the sync pipeline on demand (its schedule stays switched off)." : `The sync pipeline's schedule (created switched off) is switched on to run ${label.toLowerCase()}.`,
   },
   {
     id: "data.sync", topic: "data", kind: "single", required: false, effect: "run",
@@ -343,7 +349,7 @@ export const QUESTIONS: Question[] = [
     applies: "The brief; date filters are set on the Plan tab.",
   },
   {
-    id: "data.schemaChanges", topic: "data", kind: "single", required: false, effect: "record",
+    id: "data.schemaChanges", topic: "data", kind: "single", required: false, effect: "gate",
     when: (f) => f.tables > 0,
     text: "Are schema changes expected in Synapse after migration starts?",
     help: "A change after discovery is not in the plan: discovery must run again and the plan be rebuilt.",
@@ -352,7 +358,8 @@ export const QUESTIONS: Question[] = [
       { value: "approve", label: "Yes, each change needs approval and a new discovery" },
     ],
     recommend: () => ({ value: "freeze", reason: "A frozen schema keeps the plan and the validation true." }),
-    applies: "The brief.",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v) => v === "freeze" ? "The Synapse schema has not changed since discovery (a change means discovering again and re-running)." : "Every Synapse schema change since discovery was approved, discovered again and migrated.",
   },
   {
     id: "data.sourceAvailability", topic: "data", kind: "single", required: false, effect: "record",
@@ -369,7 +376,7 @@ export const QUESTIONS: Question[] = [
 
   // ---- SQL pool and SQL objects (only when discovered) -------------------------------------
   {
-    id: "sql.distribution", topic: "sql", kind: "single", required: false, effect: "record",
+    id: "sql.distribution", topic: "sql", kind: "single", required: false, effect: "gate",
     when: (f) => distributed(f) > 0,
     text: "Distribution and index settings: how should they be treated?",
     help: "A Fabric Warehouse or Lakehouse has no distribution or index options: Fabric manages storage itself, so the run drops DISTRIBUTION, CLUSTERED COLUMNSTORE and partition clauses. The only choice is whether to review performance-sensitive tables.",
@@ -378,7 +385,8 @@ export const QUESTIONS: Question[] = [
       { value: "review", label: `Also flag the ${plural(f.features?.distribution?.hash ?? 0, "hash-distributed table")} for a performance review` },
     ],
     recommend: (f) => ({ value: "automatic", reason: `${plural(distributed(f), "table")} with a distribution policy; Fabric needs none, and a review is only worth it for known slow queries.` }),
-    applies: "The brief (the run drops the settings either way).",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v, f) => v === "review" ? `The key queries on the ${plural(f.features?.distribution?.hash ?? 0, "hash-distributed table")} perform acceptably on Fabric.` : null,
   },
   {
     id: "sql.unsupported", topic: "sql", kind: "single", required: true, effect: "run",
@@ -397,19 +405,20 @@ export const QUESTIONS: Question[] = [
     applies: "Run option: scope; with 'Stop for approval', an approval gate.",
   },
   {
-    id: "sql.dynamic", topic: "sql", kind: "single", required: true, effect: "record",
+    id: "sql.dynamic", topic: "sql", kind: "single", required: true, effect: "gate",
     when: (f) => feature(f, "dynamicSqlObjects") > 0,
     text: "How should SQL that builds statements at run time (dynamic SQL) be handled?",
     help: "Dynamic SQL (EXEC, sp_executesql) cannot be checked by reading it: what it runs is only known at run time.",
     options: () => [
       { value: "review", label: "Convert it, and have a person review each one" },
-      { value: "exclude", label: "Exclude it until it has been assessed" },
+      { value: "exclude", label: "Hold cutover until each one has been assessed" },
     ],
     recommend: (f) => ({ value: "review", reason: `${plural(feature(f, "dynamicSqlObjects"), "object")} use dynamic SQL; converting with a review keeps them moving without trusting them blindly.` }),
-    applies: "The brief.",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v, f) => v === "review" ? `A person reviewed each of the ${plural(feature(f, "dynamicSqlObjects"), "object")} using dynamic SQL, as converted for Fabric.` : `Each of the ${plural(feature(f, "dynamicSqlObjects"), "object")} using dynamic SQL has been assessed and works in Fabric.`,
   },
   {
-    id: "sql.crossDatabase", topic: "sql", kind: "single", required: true, effect: "record",
+    id: "sql.crossDatabase", topic: "sql", kind: "single", required: true, effect: "gate",
     when: (f) => feature(f, "crossDatabaseObjects") > 0,
     text: "How should references to other databases be handled?",
     help: "A Fabric Warehouse can query other warehouses and lakehouses in the same workspace by three-part names. References to databases that do not move must be redesigned.",
@@ -418,10 +427,11 @@ export const QUESTIONS: Question[] = [
       { value: "redesign", label: "Redesign them" },
     ],
     recommend: (f) => ({ value: "map", reason: `${plural(feature(f, "crossDatabaseObjects"), "object")} name another database.` }),
-    applies: "The brief.",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v, f) => v === "map" ? `The ${plural(feature(f, "crossDatabaseObjects"), "object")} naming another database point at Fabric items, checked by a person.` : `The ${plural(feature(f, "crossDatabaseObjects"), "object")} naming another database have been redesigned.`,
   },
   {
-    id: "sql.keys", topic: "sql", kind: "single", required: false, effect: "record",
+    id: "sql.keys", topic: "sql", kind: "single", required: false, effect: "gate",
     when: (f, a) => (feature(f, "identityTables") > 0 || feature(f, "primaryKeyTables") > 0) && a["target.sql"] !== "lakehouse",
     text: "IDENTITY columns and keys: is the way the run keeps them acceptable?",
     help: "The run keeps IDENTITY as bigint IDENTITY (Fabric chooses the seed and increment; existing values are loaded with IDENTITY_INSERT and reseeded), and keeps primary keys and unique constraints as NOT ENFORCED, as in Synapse. Sequences and foreign keys are not read by discovery.",
@@ -430,10 +440,11 @@ export const QUESTIONS: Question[] = [
       { value: "review", label: "Review the tables that depend on exact identity values" },
     ],
     recommend: () => ({ value: "accept", reason: "Existing key values are kept exactly; only new values follow Fabric's own sequence." }),
-    applies: "The brief.",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v) => v === "review" ? "Tables that depend on exact IDENTITY values were reviewed." : null,
   },
   {
-    id: "sql.keysLakehouse", topic: "sql", kind: "single", required: false, effect: "record",
+    id: "sql.keysLakehouse", topic: "sql", kind: "single", required: false, effect: "gate",
     when: (f, a) => (feature(f, "identityTables") > 0 || feature(f, "primaryKeyTables") > 0) && a["target.sql"] === "lakehouse",
     text: "A Lakehouse keeps no IDENTITY columns or keys: is that acceptable?",
     help: "Delta tables do not generate key values and hold no primary key or unique constraint. Loaded rows keep the values Synapse gave them; new rows need their keys made by the code that writes them, and relationships move to the semantic model.",
@@ -444,10 +455,11 @@ export const QUESTIONS: Question[] = [
     recommend: (f) => feature(f, "identityTables") > 0
       ? { value: "review", reason: `${plural(feature(f, "identityTables"), "table")} relied on IDENTITY for new rows; whatever writes them now must make the keys.` }
       : { value: "accept", reason: "No table generated its own keys." },
-    applies: "The brief.",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v) => v === "review" ? "Whatever writes new rows to the tables that had IDENTITY now makes their keys." : null,
   },
   {
-    id: "sql.procedureNotebooks", topic: "sql", kind: "single", required: true, effect: "record",
+    id: "sql.procedureNotebooks", topic: "sql", kind: "single", required: true, effect: "gate",
     when: (f, a) => has(f, "Stored Procedure") && a["target.sql"] === "lakehouse",
     text: "Stored procedures become Spark notebooks in a Lakehouse. Who checks them?",
     help: "The run converts each procedure's T-SQL to Spark SQL in a notebook (parameters, variables, IF/WHILE, TRY/CATCH, temp tables, UPDATE … FROM as MERGE) and marks what it could not convert, such as dynamic SQL, with REVIEW. Pipelines that called a procedure run its notebook instead. Delta has no multi-statement transactions, so a failure part-way leaves earlier statements committed.",
@@ -456,17 +468,24 @@ export const QUESTIONS: Question[] = [
       { value: "flagged", label: "Review only the notebooks with REVIEW markers" },
     ],
     recommend: () => ({ value: "review", reason: "The conversion is mechanical: logic that relied on T-SQL behaviour (transactions, case-insensitive text) needs a person's eye." }),
-    applies: "The brief (the notebooks are created either way).",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v) => v === "review" ? "A developer reviewed every stored procedure converted to a notebook." : "A developer reviewed the converted procedure notebooks with REVIEW markers.",
   },
   {
-    id: "sql.sla", topic: "sql", kind: "single", required: false, effect: "record",
+    id: "sql.sla", topic: "sql", kind: "single", required: false, effect: "gate",
     when: (f) => has(f, "Stored Procedure", "View"),
     text: "Are there performance-critical queries that must meet an SLA?",
-    help: "Validation checks results, not speed: benchmarking is done by the team.",
+    help: "Validation can replay the most demanding recent Synapse SELECTs in Fabric and compare their times with Synapse's (reads only). With thresholds, a query slower than 20% beyond Synapse is a mismatch; with a benchmark, beyond 50% is left for review.",
     options: () => [
-      { value: "thresholds", label: "Yes, with thresholds to record" }, { value: "benchmark", label: "Benchmark source and target" }, { value: "none", label: "No specific SLA" },
+      { value: "thresholds", label: "Yes, with thresholds", description: "Benchmarked by Validate; slower than 20% beyond Synapse is a mismatch." },
+      { value: "benchmark", label: "Benchmark source and target", description: "Benchmarked by Validate; slower than 50% beyond Synapse is reviewed." },
+      { value: "none", label: "No specific SLA" },
     ],
-    applies: "The brief.",
+    recommend: (f) => feature(f, "replayableQueries") > 0
+      ? { value: "benchmark", reason: `${plural(feature(f, "replayableQueries"), "recent SELECT")} in Synapse's request history can be replayed in Fabric and timed.` }
+      : null,
+    applies: "Validation's benchmark, and a sign-off the agent waits for before cutover.",
+    signoff: (v) => v === "thresholds" ? "Performance-critical queries meet their recorded thresholds on Fabric (measured by the team)." : v === "benchmark" ? "The team benchmarked performance-critical queries on Synapse and Fabric, and Fabric is acceptable." : null,
   },
 
   // ---- Spark pools and notebooks -------------------------------------------------------------
@@ -483,7 +502,7 @@ export const QUESTIONS: Question[] = [
     applies: "The Spark pool & environment stage.",
   },
   {
-    id: "spark.libraries", topic: "spark", kind: "single", required: true, effect: "record",
+    id: "spark.libraries", topic: "spark", kind: "single", required: true, effect: "gate",
     when: (f) => feature(f, "customLibraries") > 0 || feature(f, "notebooksInstallingPackages") > 0,
     text: "Custom libraries were found. How should they be handled?",
     help: "Libraries on Synapse pools belong in the Fabric Environment; packages installed inside notebooks keep installing there. Compatibility with the Fabric runtime is checked by a person.",
@@ -492,7 +511,8 @@ export const QUESTIONS: Question[] = [
       { value: "review", label: "Review each for compatibility first" },
     ],
     recommend: (f) => ({ value: "environment", reason: `${plural(feature(f, "customLibraries"), "library or pool requirement", "libraries or pool requirements")}, ${plural(feature(f, "notebooksInstallingPackages"), "notebook")} installing packages.` }),
-    applies: "The brief.",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v) => v === "environment" ? "Custom libraries are in the Fabric Environment, and the notebooks using them were tested." : "Each custom library was reviewed for the Fabric runtime.",
   },
   {
     id: "spark.storage", topic: "spark", kind: "single", required: true, effect: "run",
@@ -507,7 +527,7 @@ export const QUESTIONS: Question[] = [
     applies: "Run option: storage routed through OneLake shortcuts.",
   },
   {
-    id: "spark.secrets", topic: "spark", kind: "single", required: true, effect: "record",
+    id: "spark.secrets", topic: "spark", kind: "single", required: true, effect: "gate",
     when: (f) => feature(f, "notebooksWithSecrets") > 0,
     text: "Notebooks read secrets (Key Vault, credentials utilities). How should they be updated?",
     help: "Fabric notebooks can read Key Vault secrets with notebookutils.credentials when the running identity has access. Nothing is copied or exposed by the migration.",
@@ -516,7 +536,8 @@ export const QUESTIONS: Question[] = [
       { value: "review", label: "Review each notebook" },
     ],
     recommend: (f) => ({ value: "keyvault", reason: `${plural(feature(f, "notebooksWithSecrets"), "notebook")} read secrets; the vault stays the single place they live.` }),
-    applies: "The brief.",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v) => v === "keyvault" ? "The Fabric identity can read the Key Vault secrets the notebooks use (tested with a notebook run)." : "Each notebook that reads secrets was reviewed.",
   },
   {
     id: "spark.utils", topic: "spark", kind: "single", required: false, effect: "record",
@@ -557,7 +578,7 @@ export const QUESTIONS: Question[] = [
     applies: "The Pipelines & datasets stage.",
   },
   {
-    id: "pipelines.unsupported", topic: "pipelines", kind: "single", required: true, effect: "record",
+    id: "pipelines.unsupported", topic: "pipelines", kind: "single", required: true, effect: "gate",
     when: (f, a) => (f.features?.unsupportedActivities?.activities ?? 0) > 0 && a["pipelines.migrate"] !== "redesign",
     text: "Some pipeline activities have no Fabric equivalent. How should they be handled?",
     help: "Discovery found activity types the mapping does not recognise; a person replaces each with a supported activity, a notebook, or custom logic.",
@@ -566,7 +587,8 @@ export const QUESTIONS: Question[] = [
       { value: "hold", label: "Hold those pipelines back until redesigned" },
     ],
     recommend: () => ({ value: "flag", reason: "The rest of each pipeline moves; only the flagged activities wait for a person." }),
-    applies: "The brief.",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v, f) => v === "flag" ? `A person replaced the ${plural(f.features?.unsupportedActivities?.activities ?? 0, "activity", "activities")} with no Fabric equivalent.` : `The ${plural(f.features?.unsupportedActivities?.pipelines ?? 0, "pipeline")} with unsupported activities were redesigned.`,
   },
   {
     id: "pipelines.triggers", topic: "pipelines", kind: "single", required: true, effect: "run",
@@ -682,12 +704,33 @@ export const QUESTIONS: Question[] = [
     applies: "Validation: read-only checks, and which objects run in Fabric.",
   },
   {
-    id: "validation.tolerance", topic: "validation", kind: "single", required: false, effect: "record",
-    text: "What data reconciliation tolerance is acceptable?",
-    help: "Row counts are compared exactly by the run. Numeric or business tolerances are applied by a person.",
-    options: () => [{ value: "exact", label: "Exact match" }, { value: "numeric", label: "An approved numeric tolerance" }, { value: "business", label: "A business-defined tolerance" }],
-    recommend: () => ({ value: "exact", reason: "A one-way copy should match exactly." }),
-    applies: "The brief.",
+    id: "validation.results", topic: "validation", kind: "single", required: false, effect: "run",
+    when: (f) => has(f, "View", "Stored Procedure"),
+    text: "Should validation compare what views and procedures return, not only their definitions?",
+    help: "Views: their rows and value profile, read on both sides (it reads everything each view reads). Procedures: their first result set's columns and types, described on both sides without running them.",
+    options: (f) => [
+      { value: "both", label: "Views and procedures", description: `${plural(count(f, "View"), "view")}, ${plural(count(f, "Stored Procedure"), "procedure")}.` },
+      { value: "procedures", label: "Procedures only", description: "Cheap: nothing is read but metadata." },
+      { value: "none", label: "Definitions only" },
+    ],
+    recommend: (f) => count(f, "View") <= 200
+      ? { value: "both", reason: `${plural(count(f, "View"), "view")}: comparing what they return proves more than comparing their text.` }
+      : { value: "procedures", reason: `${plural(count(f, "View"), "view")}: reading them all on both sides is heavy; compare the critical ones by hand.` },
+    applies: "Validation: View Results and Procedure Results.",
+  },
+  {
+    id: "validation.tolerance", topic: "validation", kind: "single", required: false, effect: "run",
+    when: (f) => f.tables > 0,
+    text: "How should table data be reconciled beyond row counts?",
+    help: "Row counts are always compared exactly. For each table whose counts agree, validation can also read a value profile from both sides (NULLs per column, exact sums, earliest and latest dates, text lengths, duplicate keys) and compare it. A tolerance applies to sums, lengths and NULL counts; dates and duplicate keys are always exact. It reads each table once on each side.",
+    options: () => [
+      { value: "exact", label: "Compare the values exactly" },
+      { value: "0.01", label: "Allow a 0.01% difference" }, { value: "0.1", label: "Allow a 0.1% difference" }, { value: "1", label: "Allow a 1% difference" },
+      { value: "business", label: "Report differences for a person to judge", description: "A business-defined tolerance: differences are REVIEW, not mismatches." },
+      { value: "counts", label: "Row counts only", description: "No value profile: faster on very large tables, but a lost or doubled row that keeps the count goes unseen." },
+    ],
+    recommend: () => ({ value: "exact", reason: "A one-way copy should match exactly; equal counts alone do not prove equal data." }),
+    applies: "Validation: the value profile, its tolerance, and how a difference is reported.",
   },
   {
     id: "validation.gate", topic: "validation", kind: "single", required: true, effect: "gate",
@@ -725,11 +768,12 @@ export const QUESTIONS: Question[] = [
     applies: "An approval gate in the agent orchestrator.",
   },
   {
-    id: "validation.parallel", topic: "validation", kind: "single", required: false, effect: "record",
+    id: "validation.parallel", topic: "validation", kind: "single", required: false, effect: "gate",
     text: "Should source and target run in parallel before cutover?",
     help: "Synapse is untouched by the migration, so both can run side by side; comparing their outputs over time is done by the team.",
     options: () => [{ value: "period", label: "Yes, for a defined period" }, { value: "critical", label: "Only for critical workloads" }, { value: "no", label: "No" }],
-    applies: "The brief.",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v) => v === "period" ? "Synapse and Fabric ran in parallel for the agreed period, and their outputs agree." : v === "critical" ? "Critical workloads ran in parallel on Synapse and Fabric, and their outputs agree." : null,
   },
   {
     id: "validation.source", topic: "validation", kind: "single", required: true, effect: "record",
@@ -757,7 +801,7 @@ export const QUESTIONS: Question[] = [
     applies: "The External tables stage.",
   },
   {
-    id: "features.materializedViews", topic: "features", kind: "single", required: false, effect: "record",
+    id: "features.materializedViews", topic: "features", kind: "single", required: false, effect: "gate",
     when: (f) => hasSql(f),
     text: "Does the SQL pool use materialized views?",
     help: "Discovery cannot see materialized views, and a Fabric Warehouse or Lakehouse SQL endpoint has none. If the pool has them, they become plain views or tables a pipeline refreshes.",
@@ -767,16 +811,18 @@ export const QUESTIONS: Question[] = [
       { value: "tables", label: "Yes: replace them with tables refreshed by a pipeline" },
       { value: "unknown", label: "Not known: a person checks the pool" },
     ],
-    applies: "The brief.",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v) => v === "views" ? "The materialized views are recreated as plain views." : v === "tables" ? "The materialized views are replaced by tables a pipeline refreshes." : v === "unknown" ? "A person checked the pool for materialized views and handled any it has." : null,
   },
   {
-    id: "features.streaming", topic: "features", kind: "single", required: true, effect: "record",
+    id: "features.streaming", topic: "features", kind: "single", required: true, effect: "gate",
     when: (f) => (triggers(f)?.event ?? 0) > 0,
     text: "Event-driven triggers were found. What latency must the target meet?",
     help: "Fabric pipelines can run on storage events (through Activator); streaming needs Real-Time Intelligence. Neither is set up by this run.",
     options: () => [{ value: "minutes", label: "Minutes: event-triggered pipelines" }, { value: "seconds", label: "Seconds: Real-Time Intelligence" }, { value: "batch", label: "Batch is acceptable" }],
     recommend: () => ({ value: "minutes", reason: "Closest to how the Synapse event triggers behave today." }),
-    applies: "The brief.",
+    applies: "A sign-off the agent waits for before cutover.",
+    signoff: (v) => v === "minutes" ? "Event-triggered pipelines are set up in Fabric for the Synapse event triggers." : v === "seconds" ? "The Real-Time Intelligence design for the event-driven loads is in place." : null,
   },
 
   // ---- Context ------------------------------------------------------------------------------

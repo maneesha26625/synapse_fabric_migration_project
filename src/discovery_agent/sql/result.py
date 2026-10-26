@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from discovery_agent.extractors.models import ExtractionIssue, ExtractionProvenance
+from discovery_agent.sql.estate import SqlEstate
 from discovery_agent.sql.security import SqlSecurity
 from discovery_agent.sql.models import (
     CatalogDatabase,
@@ -52,6 +53,8 @@ class SqlCatalogDiscovery:
     #: inventory entries of their own ("Function", "Security Object") rather than records.
     functions: Tuple[SqlFunction, ...] = ()
     security: Optional[SqlSecurity] = None
+    #: Volume, row-level security, external sources and formats, and the recent workload (``sql.estate``).
+    estate: Optional[SqlEstate] = None
 
     @property
     def table_count(self) -> int:
@@ -131,6 +134,7 @@ class SqlCatalogDiscovery:
             + tuple(issue for p in self.procedures for issue in p.issues)
             + tuple(issue for f in self.functions for issue in f.issues)
             + (self.security.issues if self.security is not None else ())
+            + (self.estate.issues if self.estate is not None else ())
         )
 
     @property
@@ -176,6 +180,7 @@ class SqlCatalogDiscovery:
             "procedure_count": self.procedure_count,
             "function_count": self.function_count,
             "security": self.security.summary() if self.security is not None else None,
+            "estate": self.estate.summary() if self.estate is not None else None,
             "column_count": self.column_count,
             "opaque_modules": list(self.opaque_modules),
             "schemas": list(self.schemas),

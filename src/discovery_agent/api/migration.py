@@ -26,6 +26,10 @@ from discovery_agent.migration.preflight import code_text as preflight_code_text
 from discovery_agent.migration.preflight import content_findings, environment_checks
 from discovery_agent.migration import capabilities, datafilter, datapipeline, fabric_connections, fabric_git, pipelines, storage_remap
 from discovery_agent.migration.onelake import OneLakeFiles
+from discovery_agent.migration import capacity as capacity_assessment
+from discovery_agent.migration import cutover
+from discovery_agent.migration.equivalence import PerformanceOptions
+from discovery_agent.migration.reconcile import ReconcileOptions
 from discovery_agent.migration.runtime_checks import RuntimeOptions
 from discovery_agent.migration.validation import Validator, summarize
 from discovery_agent.migration.common import TARGETS, is_lakehouse, lakehouse_name
@@ -76,8 +80,9 @@ MAX_CREDENTIALS = 100
 MAX_CREDENTIAL_FIELD = 2048
 MAX_HISTORY = 20
 #: How the validation report groups its rows.
-VALIDATION_ORDER = ("Warehouse", "Schema", "Tables", "Data Count", "Functions", "Views", "Stored Procedures", "Security", "Spark",
-                    "Notebooks", "Connections", "Pipelines", "Spark Jobs", "SQL Scripts", "Schedules", "Shortcuts", "Manual")
+VALIDATION_ORDER = ("Warehouse", "Schema", "Tables", "Data Count", "Data Profile", "Functions", "Views", "View Results", "Stored Procedures",
+                    "Procedure Results", "Security", "Spark", "Notebooks", "Connections", "Pipelines", "Spark Jobs", "SQL Scripts",
+                    "Schedules", "Shortcuts", "Access", "Performance", "Manual")
 SCOPES = ("automated", "all")
 #: An object already in Fabric: left as it is (the default), or updated in place. Tables are never replaced.
 EXISTING = ("skip", "update")
@@ -373,6 +378,13 @@ def rewritable(source: Source) -> bool:
     return source.kind == DEFERRED and source.type == "Function" and source.payload is not None
 
 
+def _workload_samples(job: Any) -> tuple:
+    """The SELECTs from Synapse's request history that discovery kept, for benchmarking on Fabric."""
+    estate = getattr(_catalog(job), "estate", None)
+    workload = getattr(estate, "workload", None) if estate is not None else None
+    return tuple(workload.samples) if workload is not None else ()
+
+
 def _catalog(job: Any) -> Any:
     """The SQL pool's catalog from the discovery, when one was read (functions, security, masks)."""
     return getattr(getattr(job, "run", None), "catalog", None)
@@ -395,6 +407,13 @@ def _function_source(oid: str, name: str, object_type: str, wave: int, catalog: 
 def _security_source(oid: str, name: str, object_type: str, wave: int, catalog: Any) -> Source:
     from discovery_agent.migration import security as security_sql
 
+    if "/policy/" in oid:  # a row-level security policy, from the pool's estate
+        estate = getattr(catalog, "estate", None) if catalog is not None else None
+        schema, _, policy_name = name.partition(".")
+        policy = estate.policy(schema, policy_name) if estate is not None else None
+        if policy is None:
+            return Source(oid, name, object_type, wave, DEFERRED, reason="The security policy was not kept by discovery. Run discovery again.")
+        return Source(oid, name, object_type, wave, SECURITY, payload=policy, schema=policy.schema, object_name=policy.name)
     sec = getattr(catalog, "security", None) if catalog is not None else None
     principal = sec.principal(name) if sec is not None else None
     if principal is None:
@@ -452,7 +471,13 @@ def sources_for(plan: List[dict], job: Any, pool: Optional[str]) -> List[Source]
             sources.append(Source(oid, name, object_type, wave, SCHEMA, schema=schema, object_name=schema))
             continue
         if kind == ENVIRONMENT:
-            sources.append(Source(oid, name, object_type, wave, kind, payload=dict(extra.metadata) if extra is not None else {}))
+            payload = dict(extra.metadata) if extra is not None else {}
+            # The pool's requirements and Spark configuration files, from ARM: they become the Environment's libraries and settings.
+            props = ((getattr(extra, "raw", None) or {}).get("properties") or {}) if extra is not None else {}
+            for key, prop in (("_libraryRequirements", "libraryRequirements"), ("_sparkConfig", "sparkConfigProperties")):
+                if props.get(prop):
+                    payload[key] = props[prop]
+            sources.append(Source(oid, name, object_type, wave, kind, payload=payload))
             continue
         if kind == FUNCTION:
             sources.append(_function_source(oid, name, object_type, wave, catalog, extra))
@@ -550,6 +575,9 @@ class MigrationService:
         self._last_commit: Optional[dict] = None
         self._git_thread: Optional[threading.Thread] = None
         self._rest_factory = rest_factory or fabric.rest_client
+        #: The cutover's approval and the last final sync started from this API, for the cutover view.
+        self._cutover: Optional[dict] = None
+        self._final_sync: Optional[dict] = None
         self._sql_factory = sql_factory or self._open_sql
 
     def _open_sql(self, host: str, database: str) -> Any:
@@ -604,7 +632,9 @@ class MigrationService:
                                     source_connected=self._source_available() if needs_synapse_source(sources) else None)
         # A connection already in Fabric is reused by the run (skipped), so it needs no credentials either.
         names = set(credential_names) | set(self._credentials) | self._existing_connection_names()
-        return planning.analyze(objects, content_findings(sources, names, pool or "", options["storageRoutes"], target=options["target"]),
+        notebooks_found = set(_artifacts(job).get(P0Artifact.NOTEBOOK, {}))
+        return planning.analyze(objects, content_findings(sources, names, pool or "", options["storageRoutes"], target=options["target"],
+                                                          discovered_notebooks=notebooks_found),
                                 checks), sources
 
     def analyze(self, body: dict) -> dict:
@@ -829,6 +859,10 @@ class MigrationService:
             self._rest_factory(), workspace_id, workspace_name, warehouse, self._sql_factory, factory, target=target if target in TARGETS else "warehouse",
             artifacts={"pipelines": _artifacts(job).get(P0Artifact.PIPELINE, {})},
             runtime=RuntimeOptions.parse(body["runtime"]) if isinstance(body.get("runtime"), dict) else None,
+            reconcile_options=ReconcileOptions.parse(body.get("reconcile")),
+            performance=PerformanceOptions.parse(body.get("performance")),
+            workload=_workload_samples(job), pool_name=pool or "",
+            onelake=self._onelake() if body.get("access") is True else None, access=body.get("access") is True,
             progress=progress or (lambda text: None))
         rows = validator.run(sources)
         order = {c: n for n, c in enumerate(VALIDATION_ORDER)}
@@ -872,6 +906,12 @@ class MigrationService:
             pass
         return {"stages": capabilities.describe(), "defaults": capabilities.default_settings(), "linkedServices": linked,
                 "dataTables": tables}
+
+    def _onelake(self) -> Optional[OneLakeFiles]:
+        try:
+            return OneLakeFiles(self._fabric.storage_token_provider())
+        except Exception:  # noqa: BLE001 - reported by the check that needed it
+            return None
 
     def _spawn(self, run: MigrationRun) -> None:
         factory = self._source_factory or getattr(self._session, "source_sql_factory", lambda: None)()
@@ -955,6 +995,100 @@ class MigrationService:
         run.log("GIT", "run", result.get("message") or result.get("state", ""))
         with self._lock:
             self._last_commit = result
+
+    # -- cutover -----------------------------------------------------------------------------------
+
+    def cutover_state(self) -> dict:
+        """Whether Fabric is ready to take over: validation, freshness of synced tables, schedules, the last sync. Reads only."""
+        job, pool = self._session.migration_snapshot()
+        workspace_id, workspace_name, _ = self._fabric.migration_target()
+        warehouse = warehouse_name_for(pool)
+        rest = self._rest_factory()
+        try:
+            scheds = cutover.schedules(rest, workspace_id)
+        except FabricApiError as exc:
+            raise ApiError(502, "fabric_unreadable", f"The Fabric workspace's pipelines could not be read: {exc.message}") from exc
+        fresh: Dict[str, Any] = {"tables": [], "behind": 0}
+        sync_run = None
+        if pool:
+            reader = Validator(rest, workspace_id, workspace_name, warehouse, self._sql_factory)
+            wh = reader.warehouse()
+            if "error" not in wh:
+                factory = self._source_factory or getattr(self._session, "source_sql_factory", lambda: None)()
+                source = factory() if factory is not None else None
+                try:
+                    fresh = cutover.freshness(reader._sql.cursor(), source.cursor() if source is not None else None)
+                finally:
+                    reader.close()
+                    if source is not None:
+                        try:
+                            source.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+            else:
+                fresh = {"tables": [], "behind": 0, "note": wh["error"]}
+            sync_run = cutover.last_sync(rest, workspace_id, warehouse)
+        validation = dict(self._validation)
+        return {
+            "workspace": workspace_name, "warehouse": warehouse, "freshness": fresh, "schedules": scheds, "lastSync": sync_run,
+            "checks": cutover.readiness(validation, fresh, scheds, sync_run), "record": self._cutover,
+            "finalSync": self._final_sync,
+        }
+
+    def cutover_sync(self, body: dict) -> dict:
+        """Run the sync pipeline now: the final sync before consumers move. Writes: starts a pipeline run in Fabric."""
+        job, pool = self._session.migration_snapshot()
+        workspace_id, _, _ = self._fabric.migration_target()
+        try:
+            path = cutover.run_final_sync(self._rest_factory(), workspace_id, warehouse_name_for(pool))
+        except LookupError as exc:
+            raise ApiError(409, "no_sync_pipeline", str(exc)) from exc
+        except FabricApiError as exc:
+            raise ApiError(502, "sync_not_started", f"Fabric did not start the sync: {exc.message}") from exc
+        self._final_sync = {"startedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "instance": path}
+        return {"started": True, **self._final_sync}
+
+    def cutover_schedules(self, body: dict) -> dict:
+        """Switch the workspace's pipeline schedules on (cutover) or off (rollback). Writes: schedule settings in Fabric."""
+        if not isinstance(body.get("enabled"), bool):
+            raise ApiError(400, "invalid_request", "Say whether to switch the schedules on or off (enabled: true or false).")
+        pipelines = body.get("pipelines")
+        if pipelines is not None and (not isinstance(pipelines, list) or not all(isinstance(p, str) for p in pipelines)):
+            raise ApiError(400, "invalid_request", "pipelines must be a list of pipeline names.")
+        workspace_id, _, _ = self._fabric.migration_target()
+        return cutover.set_schedules(self._rest_factory(), workspace_id, body["enabled"], pipelines)
+
+    def cutover_complete(self, body: dict) -> dict:
+        """Record that a person approved the cutover. Writes nothing anywhere but this record."""
+        by = str(body.get("approvedBy") or "").strip()[:200]
+        if not by:
+            raise ApiError(400, "invalid_request", "Name who approved the cutover.")
+        self._cutover = {"approvedBy": by, "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                         "note": str(body.get("note") or "").strip()[:1000] or None}
+        return {"record": self._cutover}
+
+    def capacity(self) -> dict:
+        """A Fabric capacity assessment from the discovered estate, and whether the target's capacity fits. Reads only."""
+        job, pool = self._session.migration_snapshot()
+        extras = list((getattr(job, "extras_by_id", None) or {}).values())
+        pool_sku = None
+        for e in extras:
+            if e.source_type == "Dedicated SQL Pool" and (not pool or e.name.lower() == pool.lower()):
+                pool_sku = (e.metadata or {}).get("sku")
+        sparks = [{**dict(e.metadata or {}), "name": e.name} for e in extras if e.source_type == "Spark Pool"]
+        triggers = [dict(e.raw or {}) for e in extras if e.source_type == "Trigger" and e.raw]
+        target_sku = None
+        capacity_id = getattr(self._fabric, "capacity_id", None)
+        if capacity_id:
+            try:
+                for c in self._rest_factory().list("/capacities"):
+                    if str(c.get("id", "")).lower() == str(capacity_id).lower():
+                        target_sku = c.get("sku")
+            except Exception:  # noqa: BLE001 - the assessment stands without the comparison
+                target_sku = None
+        catalog = _catalog(job)
+        return capacity_assessment.assess(getattr(catalog, "estate", None) if catalog is not None else None,
+                                          pool_sku, sparks, triggers, target_sku)
 
     def git_state(self) -> dict:
         """Where the target workspace is connected in Fabric Git, what waits to be committed, and the

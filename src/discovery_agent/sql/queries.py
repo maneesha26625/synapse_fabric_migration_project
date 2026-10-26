@@ -558,6 +558,154 @@ MASKED_COLUMNS = CatalogQuery(
 )
 
 
+# --- the estate: volume, row-level security, external sources, workload (``sql.estate``) ----------
+
+
+TABLE_SIZES = CatalogQuery(
+    name="table_sizes",
+    version=1,
+    description=(
+        "Rows and reserved pages per user table and compute node, from the distribution-level partition "
+        "stats. Needs VIEW DATABASE STATE. Rows count the heap or clustered index only (index_id 0 or 1)."
+    ),
+    sql="""
+        SELECT
+            s.name AS schema_name,
+            t.name AS table_name,
+            nt.pdw_node_id AS node_id,
+            SUM(CASE WHEN ps.index_id <= 1 THEN ps.row_count ELSE 0 END) AS row_count,
+            SUM(ps.reserved_page_count) AS reserved_pages
+        FROM sys.tables AS t
+        INNER JOIN sys.schemas AS s
+            ON s.schema_id = t.schema_id
+        INNER JOIN sys.pdw_table_mappings AS tm
+            ON tm.object_id = t.object_id
+        INNER JOIN sys.pdw_nodes_tables AS nt
+            ON nt.name = tm.physical_name
+        INNER JOIN sys.dm_pdw_nodes_db_partition_stats AS ps
+            ON ps.object_id = nt.object_id
+            AND ps.pdw_node_id = nt.pdw_node_id
+            AND ps.distribution_id = nt.distribution_id
+        WHERE t.is_external = 0
+        GROUP BY s.name, t.name, nt.pdw_node_id
+    """,
+)
+
+
+SECURITY_POLICIES = CatalogQuery(
+    name="security_policies",
+    version=1,
+    description="Row-level security policies, one row per predicate, with the table each one guards.",
+    sql="""
+        SELECT
+            ps.name AS policy_schema,
+            sp.name AS policy_name,
+            sp.is_enabled AS is_enabled,
+            pr.predicate_type_desc AS predicate_type,
+            pr.operation_desc AS operation,
+            pr.predicate_definition AS predicate_definition,
+            ts.name AS target_schema,
+            o.name AS target_name
+        FROM sys.security_policies AS sp
+        INNER JOIN sys.schemas AS ps
+            ON ps.schema_id = sp.schema_id
+        INNER JOIN sys.security_predicates AS pr
+            ON pr.object_id = sp.object_id
+        INNER JOIN sys.objects AS o
+            ON o.object_id = pr.target_object_id
+        INNER JOIN sys.schemas AS ts
+            ON ts.schema_id = o.schema_id
+        ORDER BY ps.name, sp.name, pr.security_predicate_id
+    """,
+)
+
+
+EXTERNAL_DATA_SOURCES = CatalogQuery(
+    name="external_data_sources",
+    version=1,
+    description="External data sources: name, location, type and the name of the credential they use (never a secret).",
+    sql="""
+        SELECT
+            ds.name AS source_name,
+            ds.location AS location,
+            ds.type_desc AS source_type,
+            c.name AS credential_name
+        FROM sys.external_data_sources AS ds
+        LEFT JOIN sys.database_scoped_credentials AS c
+            ON c.credential_id = ds.credential_id
+        ORDER BY ds.name
+    """,
+)
+
+
+EXTERNAL_FILE_FORMATS = CatalogQuery(
+    name="external_file_formats",
+    version=1,
+    description="External file formats: name, format type, field terminator and compression.",
+    sql="""
+        SELECT
+            ff.name AS format_name,
+            ff.format_type AS format_type,
+            ff.field_terminator AS field_terminator,
+            ff.data_compression AS data_compression
+        FROM sys.external_file_formats AS ff
+        ORDER BY ff.name
+    """,
+)
+
+
+QUERY_HISTORY = CatalogQuery(
+    name="query_history",
+    version=1,
+    description=(
+        "The most demanding recent user SELECT statements (runs x average time) from the request history, "
+        "with how long they took. Needs VIEW DATABASE STATE; the pool keeps its last 10,000 requests only. "
+        "Catalog and DMV queries are left out."
+    ),
+    sql="""
+        SELECT TOP 200
+            r.command AS command_text,
+            COUNT_BIG(*) AS run_count,
+            AVG(CAST(r.total_elapsed_time AS bigint)) AS avg_ms,
+            MAX(CAST(r.total_elapsed_time AS bigint)) AS max_ms,
+            MIN(CAST(r.total_elapsed_time AS bigint)) AS min_ms,
+            MAX(r.end_time) AS last_run,
+            MAX(r.[label]) AS query_label
+        FROM sys.dm_pdw_exec_requests AS r
+        WHERE r.status = 'Completed'
+            AND r.session_id <> SESSION_ID()
+            AND (r.resource_class IS NOT NULL OR r.importance IS NOT NULL)
+            AND LTRIM(r.command) LIKE 'SELECT%'
+            AND r.command NOT LIKE '%sys.%'
+            AND r.command NOT LIKE '%INFORMATION_SCHEMA%'
+        GROUP BY r.command
+        ORDER BY COUNT_BIG(*) * AVG(CAST(r.total_elapsed_time AS bigint)) DESC
+    """,
+)
+
+
+REQUEST_WINDOW = CatalogQuery(
+    name="request_window",
+    version=1,
+    description=(
+        "When each completed user request in the history started and ended, to find how many ran at once. "
+        "Needs VIEW DATABASE STATE."
+    ),
+    sql="""
+        SELECT
+            r.start_time AS start_time,
+            r.end_time AS end_time,
+            r.total_elapsed_time AS elapsed_ms
+        FROM sys.dm_pdw_exec_requests AS r
+        WHERE r.status = 'Completed'
+            AND r.start_time IS NOT NULL
+            AND r.end_time IS NOT NULL
+            AND r.session_id <> SESSION_ID()
+            AND (r.resource_class IS NOT NULL OR r.importance IS NOT NULL)
+    """,
+)
+
+
 #: Every query discovery may run, by name. A ``CatalogSource`` checks
 #: membership by identity, so a lookalike built elsewhere is not accepted.
 CATALOG_QUERIES: Mapping[str, CatalogQuery] = {
@@ -579,6 +727,12 @@ CATALOG_QUERIES: Mapping[str, CatalogQuery] = {
         ROLE_MEMBERS,
         PERMISSIONS,
         MASKED_COLUMNS,
+        TABLE_SIZES,
+        SECURITY_POLICIES,
+        EXTERNAL_DATA_SOURCES,
+        EXTERNAL_FILE_FORMATS,
+        QUERY_HISTORY,
+        REQUEST_WINDOW,
     )
 }
 

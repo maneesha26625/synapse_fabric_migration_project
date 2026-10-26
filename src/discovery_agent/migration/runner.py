@@ -42,6 +42,7 @@ from discovery_agent.migration.common import (  # noqa: F401 - re-exported: test
     VIEW, WORKSPACE_ERRORS, MigrationError, Source, override_note,
 )
 from discovery_agent.migration.stages import StageMixin
+from discovery_agent.sql.estate import SqlSecurityPolicy
 from discovery_agent.migration.stages_fabric import FabricStageMixin
 from discovery_agent.migration.stages_lakehouse import LakehouseStageMixin
 from discovery_agent.migration.fabric_rest import FabricApiError, FabricRestClient
@@ -334,8 +335,11 @@ class Migrator(StageMixin, FabricStageMixin, LakehouseStageMixin):
             if self._lakehouse_target() and self.run.pool_name and "synapsesql" in str(payload):
                 name, lakehouse_id = self._lakehouse()
                 lakehouse = (lakehouse_id, name, self.run.workspace_id)
+            pool = str(((payload.get("properties") or {}).get("bigDataPool") or {}).get("referenceName") or "")
+            env_id = self._find(self._ids("environments"), pool) if pool else None
             document, notes = notebooks.to_fabric_ipynb(payload, pool_name=self.run.pool_name, warehouse=self.run.warehouse,
-                                                        lakehouse=lakehouse)
+                                                        lakehouse=lakehouse,
+                                                        environment=(env_id, pool, self.run.workspace_id) if env_id else None)
         except notebooks.NotebookNotMigratable as exc:
             if source.override:
                 raise MigrationError(str(exc)) from exc
@@ -414,6 +418,18 @@ class Migrator(StageMixin, FabricStageMixin, LakehouseStageMixin):
         if not env_id:
             raise MigrationError("The Environment was created but Fabric did not return its id. Check the workspace.")
         base = f"/workspaces/{wid}/environments/{env_id}/staging"
+        if wanted.libraries_yml:
+            try:
+                # The definition's library part, staged with the compute settings below and published with them.
+                client.create(f"/workspaces/{wid}/items/{env_id}/updateDefinition",
+                              {"definition": {"parts": [environments.libraries_part(wanted.libraries_yml)]}})
+                notes.append("Public libraries staged in the Environment from the pool's requirements.")
+            except FabricApiError as exc:
+                if exc.code in WORKSPACE_ERRORS:
+                    raise
+                notes.append(f"The pool's libraries could not be added ({exc.message[:160]}): add them in the Environment's "
+                             "Libraries section, then publish.")
+        self.__dict__.setdefault("_id_cache", {}).pop("environments", None)  # notebooks bind to it by id
         try:
             client.patch(f"{base}/sparkcompute", compute)
             client.create(f"{base}/publish", {})
@@ -577,6 +593,8 @@ class Migrator(StageMixin, FabricStageMixin, LakehouseStageMixin):
     # -- roles, members and permissions ---------------------------------------
 
     def _security(self, source: Source):
+        if isinstance(source.payload, SqlSecurityPolicy):
+            return self._policy(source)
         plan = security.plan_principal(source.payload, source.name)
         principal = plan.principal
         target = f"{self.run.warehouse} / {principal.kind_label.lower()} {principal.name}"
@@ -617,6 +635,23 @@ class Migrator(StageMixin, FabricStageMixin, LakehouseStageMixin):
             notes.append("Workspace roles and item permissions still decide who can connect: give these principals "
                          "Read on the Warehouse in Fabric.")
         return COMPLETED, step, target, notes
+
+    def _policy(self, source: Source):
+        """A row-level security policy: recreated with its FILTER predicates, once its functions and tables exist."""
+        plan = security.plan_policy(source.payload)
+        target = f"{self.run.warehouse} / security policy {plan.policy.qualified_name}"
+        if plan.statement is None:
+            raise MigrationError(f"{plan.policy.qualified_name} has nothing Fabric can hold. " + " ".join(plan.notes))
+        cursor = self._warehouse().cursor()
+        cursor.execute(security.POLICY_EXISTS_SQL, plan.policy.schema, plan.policy.name)
+        found = cursor.fetchone()
+        if found and found[0]:
+            return SKIPPED, "Already in the warehouse", target, plan.notes
+        self._run_sql(cursor, plan.statement, f"security policy {plan.policy.qualified_name}")
+        filters = len(plan.policy.filters)
+        notes = list(plan.notes) + ["Row-level security applies to T-SQL queries; workspace Admins, Members and Contributors "
+                                    "see every row through Spark and OneLake."]
+        return COMPLETED, f"Security policy created with {filters} filter predicate(s), {'on' if plan.policy.enabled else 'off'}", target, notes
 
     def _module(self, source: Source):
         definition = getattr(source.payload, "definition", None)

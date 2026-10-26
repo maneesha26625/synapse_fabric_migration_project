@@ -53,6 +53,13 @@ class OneLakeFiles:
             raise OneLakeError(status, f"OneLake refused to {what} ({status}): {data[:200].decode('utf-8', 'replace')}")
         return data
 
+    def probe(self, workspace_id: str, lakehouse_id: str, path: str) -> None:
+        """List at most one entry under a folder (a shortcut, for one). Through a shortcut OneLake reads the storage
+        with the shortcut's connection, so this proves that connection's identity may read it. Raises ``OneLakeError``."""
+        directory = urllib.parse.quote(f"{lakehouse_id}/{path.strip('/')}", safe="/")
+        url = f"https://{ONELAKE_HOST}/{workspace_id}?resource=filesystem&recursive=false&maxResults=1&directory={directory}"
+        self._call("GET", url, what=f"list {path}")
+
     def read(self, workspace_id: str, lakehouse_id: str, path: str) -> bytes:
         """A file, by its path in the Lakehouse (``Files/...``)."""
         return self._call("GET", self._url(workspace_id, lakehouse_id, path), what=f"read {path}")

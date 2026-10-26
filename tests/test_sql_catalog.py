@@ -290,6 +290,14 @@ def responses(
         "permissions": _response(("class_code", "major_id", "permission_name", "state_code", "grantee_name", "grantee_type",
                                   "schema_name", "object_name", "object_type", "column_name"), ()),
         "masked_columns": _response(("schema_name", "table_name", "column_name", "masking_function"), ()),
+        # The estate: readable and empty unless a test says otherwise.
+        "table_sizes": _response(("schema_name", "table_name", "node_id", "row_count", "reserved_pages"), ()),
+        "security_policies": _response(("policy_schema", "policy_name", "is_enabled", "predicate_type", "operation",
+                                        "predicate_definition", "target_schema", "target_name"), ()),
+        "external_data_sources": _response(("source_name", "location", "source_type", "credential_name"), ()),
+        "external_file_formats": _response(("format_name", "format_type", "field_terminator", "data_compression"), ()),
+        "query_history": _response(("command_text", "run_count", "avg_ms", "max_ms", "min_ms", "last_run", "query_label"), ()),
+        "request_window": _response(("start_time", "end_time", "elapsed_ms"), ()),
     }
     base.update(overrides)
     return base
@@ -488,6 +496,12 @@ def test_the_registry_covers_this_slice():
         "modules",
         "parameters",
         "functions",
+        "table_sizes",
+        "security_policies",
+        "external_data_sources",
+        "external_file_formats",
+        "query_history",
+        "request_window",
         "database_principals",
         "role_members",
         "permissions",

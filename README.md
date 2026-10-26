@@ -42,9 +42,9 @@ before the next one opens.
 | 1 | **Discover** | Reads every object in the Synapse workspace (SQL pools, tables, views, procedures, scripts, pipelines, datasets, linked services, triggers, notebooks, Spark pools, Spark jobs, libraries, integration runtimes, storage) and maps each one to its Fabric component. | Nothing |
 | 2 | **Assess** | Classifies every object by how it moves: **Direct** (a matching Fabric component exists), **Reconfigure** (same idea, configured differently), **Transform** (code or settings change), **Manual** (needs a person), **Review** (no reliable one-to-one mapping). Also shows the Synapse → Fabric component mapping. | Nothing |
 | 3 | **Waves** | Builds the dependency graph and groups objects into waves, so nothing is created before what it depends on. | Nothing |
-| 4 | **Plan** | Chooses what moves. A deterministic planner gives each object a strategy, lists risks by severity, estimates effort and scores readiness (0–100). Stages, their options and any credentials are set here. | Nothing |
+| 4 | **Plan** | Chooses what moves. A deterministic planner gives each object a strategy, lists risks by severity, estimates effort and scores readiness (0–100). Stages, their options and any credentials are set here. **Capacity** estimates a Fabric SKU from the estate. | Nothing |
 | 5 | **Migrate** | Pre-run checks, then the run, wave by wave: Warehouse and schemas, empty tables, views, procedures, data pipelines that load the rows, notebooks, connections, pipelines, Spark, jobs, scripts, schedules and shortcuts. Safe to re-run; Retry failed re-runs only the failures. When the Fabric workspace is connected to Git, the run is then committed to its branch (`dev`), ready for a pull request. | **Fabric only** (and, through Fabric, its Git branch) |
-| 6 | **Validate** | Compares Synapse with Fabric, object by object: columns and types, row counts, definitions, notebook cells, pipeline activities. It also checks each object **runs in Fabric**: tables and views are queried, procedures compiled, and pipelines, notebooks and Spark jobs judged by their latest run (or run now, on request). | Nothing, unless you ask it to run items or procedures (procedures are rolled back) |
+| 6 | **Validate** | Compares Synapse with Fabric, object by object: columns and types, row counts, definitions, notebook cells, pipeline activities. It also checks each object **runs in Fabric**: tables and views are queried, procedures compiled, and pipelines, notebooks and Spark jobs judged by their latest run (or run now, on request). Beyond that: table value profiles, what views and procedures return, storage access through every shortcut, and a benchmark against Synapse. **Cutover** sits here too: final sync, schedules on (or back off), approval. | Nothing, unless you ask it to run items or procedures (procedures are rolled back), or use the Cutover actions |
 
 ## Principles
 
@@ -57,7 +57,9 @@ before the next one opens.
   if the new one is rejected. Notebooks, pipelines, SQL scripts and Spark jobs
   get their new definition and keep their id. Tables are never replaced. The one exception is
   Validate: when you tick it, it runs migrated pipelines, notebooks or Spark
-  jobs in Fabric to prove they work. It runs procedures only inside a
+  jobs in Fabric to prove they work, and the **Cutover** actions under it: run
+  the sync pipeline now, and switch the workspace's pipeline schedules on (or
+  off again, to roll back), each only when you press it. It runs procedures only inside a
   transaction that is rolled back. The one write beyond the workspace is the
   commit to its Fabric Git branch after a run, made by Fabric itself and only
   to the branch the workspace is connected to; it can be switched off.
@@ -257,7 +259,7 @@ so the page stays readable:
 | Discover | Objects, object types, with a Fabric mapping, manual or review, warnings | Overview (a tile per object type; click one to filter), Inventory (searchable table; click a row for the object's details, Fabric target and steps) |
 | Assess | A tile and percentage per class, and a bar across all of them | By workstream, Objects, Component mapping |
 | Waves | Objects, dependencies, waves | Waves (one row per wave with its object types), Dependency graph |
-| Plan | Readiness, objects, automated, needs a person, effort, blocking | Readiness & risks, Objects in plan, Strategy by type, Stages & credentials (configuration only: nothing runs from Plan) |
+| Plan | Readiness, objects, automated, needs a person, effort, blocking | Readiness & risks, Objects in plan, Strategy by type, Stages & credentials (configuration only: nothing runs from Plan), Capacity |
 | Migrate | Pre-run checks, then the run: every stage that is on or a single stage, progress by wave, every object's result, pause, resume, Retry failed; once it completes, the commit to Fabric Git with **Open pull request dev → main**, or **Commit now** | — |
 | Validate | Checks, match, review, mismatch (each one filters) | One tab per category |
 
@@ -388,7 +390,8 @@ All under `/api`, JSON in and out. Nothing returns a token or a secret.
 | Mapping and waves | `GET /mapping/components` · `GET /dependencies` |
 | Fabric connection | `GET /fabric/connection` · `POST /fabric/authenticate` · `POST /fabric/workspaces` · `POST /fabric/test` · `DELETE /fabric/connection` |
 | LLM transformation | `GET /transform/settings` · `GET /transform` · `GET /transform/objects/<id>` · `GET /transform/prompt/<id>` · `POST /transform/generate` (`ids`) · `POST /transform/accept` (`id`, optional edited `code`) · `POST /transform/discard` (`id`, `scope`: `draft` or `all`) · `GET /transform/candidates` · `GET`/`POST /transform/project` |
-| Migration | `GET /migration/capabilities` · `POST /migration/plan` (`credentialNames`: which linked services have credentials; a request carrying the credentials themselves is refused) · `POST /migration/start` (refused with `plan_blocked` while the planner finds a blocking risk) · `GET /migration/run` (with `git`: the commit after the run) · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: forget the run's record, refused while it is working) · `POST /migration/validate` (starts it in the background) · `GET /migration/validation` |
+| Migration | `GET /migration/capabilities` · `POST /migration/plan` (`credentialNames`: which linked services have credentials; a request carrying the credentials themselves is refused) · `POST /migration/start` (refused with `plan_blocked` while the planner finds a blocking risk) · `GET /migration/run` (with `git`: the commit after the run) · `POST /migration/control` (`pause`, `resume`, `retry`, `reset`: forget the run's record, refused while it is working) · `POST /migration/validate` (starts it in the background) · `GET /migration/validation` · `GET /migration/capacity` (the capacity assessment) |
+| Cutover | `GET /cutover` (checks, freshness of synced tables, schedules, the last sync, the approval) · `POST /cutover/sync` (run the sync pipeline now) · `POST /cutover/schedules` (`{enabled, pipelines?}`: on at cutover, off to roll back) · `POST /cutover/complete` (`{approvedBy, note?}`) |
 | Fabric Git | `GET /fabric/git` (the target workspace's branch, head, uncommitted / incoming / conflicting items, data-load pipelines kept out, the pull-request link, the last commit) · `POST /fabric/git/commit` (`{comment?}`; commits what the current run created or updated, in the background; refused with no run, or while a run or another commit is working) |
 | Errors | Every error is `{"error": {"code", "message"}}`. An unexpected one is a 500 with `code: internal_error` and a `reference`; the traceback is in the API's log under that reference, redacted, and never in the response |
 
@@ -401,10 +404,11 @@ with `IDENTITY_INSERT`, then reseeded) and **dynamic data masks** in the
 `CREATE TABLE`; scalar and inline table-valued **functions**, views and stored
 procedures after the T-SQL rules; database **roles, role members and GRANT /
 DENY permissions** (object, column, schema and database level) for roles and
-Microsoft Entra users; table data
+Microsoft Entra users; **row-level security** policies with their FILTER predicates; table data
 through per-wave Fabric data pipelines with row counts compared; custom Spark
-pools and Environments; notebooks with `mssparkutils` and Synapse connector
-calls rewritten; linked services as Fabric connections (SQL, ADLS Gen2, Blob)
+pools and Environments with the pool's library requirements (as public libraries) and Spark
+configuration; notebooks attached to their pool's Environment, with `mssparkutils` and Synapse connector
+calls and `%run` / `notebook.run` targets rewritten; linked services as Fabric connections (SQL, ADLS Gen2, Blob)
 from the credentials you enter; pipelines with datasets embedded and
 references re-pointed; Spark job definitions; SQL scripts as Warehouse
 notebooks; schedule triggers (created switched off); external tables as
@@ -413,12 +417,15 @@ OneLake shortcuts.
 **Left for a person, and reported as such:** integration runtimes; linked
 services of other types; event and tumbling-window triggers and unusual
 recurrences; pipelines containing an activity with no Fabric equivalent (for
-example mapping data flows); .NET notebooks; Spark libraries; materialized
+example mapping data flows); .NET notebooks; Spark workspace packages (wheel and jar files; requirements files do move); row-level security BLOCK
+predicates (Fabric has FILTER predicates only); materialized
 views and `sys.pdw_*` system views; multi-statement table-valued functions
 (Fabric does not support them); **SQL-authenticated users** (Fabric has no SQL
 authentication: Plan lists the Microsoft Entra principal to choose and the
 grants to give it); resource-class roles, networking and workload
-management; lake databases (not discovered yet); SQL scripts and pipelines written for Synapse's **serverless** pool,
+management; lake databases (discovered from the workspace or the repository's `database` folder, with each one's
+location and tables: they become Lakehouse schemas with shortcuts, by hand); external data sources and file formats
+(discovered, for the shortcuts and ingestion that replace them); SQL scripts and pipelines written for Synapse's **serverless** pool,
 which Plan reports as `SERVERLESS_SQL` (the Lakehouse shortcut and its SQL
 endpoint replace them; leave them out of the plan).
 
@@ -929,8 +936,8 @@ in one place, `migration/capabilities.py`, and the UI reads it from
 | Warehouse & schema | Dedicated SQL pool, schema, table, function, view, stored procedure | A Warehouse of the same name, its schemas, **empty** tables, functions, views and procedures | Structure only. Tables are rebuilt from discovered columns; storage clauses are dropped and unsupported types mapped, each change noted; primary keys and unique constraints are recreated `NOT ENFORCED`; an IDENTITY column stays IDENTITY as `bigint IDENTITY` (Fabric supports no other type, seed or increment); a column's **dynamic data mask** is part of its `CREATE TABLE`, so no row ever lands unmasked (a masking function Fabric lacks stops the table, before any data). A table that already exists gets the masks it is missing. Functions (scalar and inline table-valued; multi-statement ones are left for a person), views and procedures are created from their own text after the T-SQL rules (below). The Warehouse **collation** is chosen once, at creation: *same as Synapse* (default), case-insensitive or case-sensitive. |
 | Table data | The rows of each migrated table | **Fabric data pipelines**, one per wave, and the rows they load | Data never passes through the accelerator. Each wave gets a metadata-driven pipeline (`load_<warehouse>_wave_<n>`): a ForEach over a `tables` parameter whose Copy activity reads the pool with a typed SELECT through a Fabric SQL connection and writes the Warehouse with the COPY command. A table with an IDENTITY column is copied into a staging table without IDENTITY (`migration_load.<schema>__<table>`), then an *After copy* Script activity moves the rows in with `SET IDENTITY_INSERT ... ON` and reseeds with `DBCC CHECKIDENT ... RESEED`, so the Synapse key values are kept (Microsoft's documented path); the staging table carries the same masks and is emptied afterwards. *Create and run* (default) runs it, waits, and compares row counts table by table; *create only* leaves running it to you. *Skip* (default) leaves tables that already have rows; *replace* truncates them inside the pipeline first. The connection to the pool is reused if one exists, or created from what you choose on this stage (workspace identity, Key Vault, SQL login or service principal). Per-table **date filters** load part of a table and can keep it in sync afterwards: see below. |
 | Roles & permissions | Database role, user (Security Object) | Warehouse roles, their members, and GRANT / DENY permissions | Custom roles get `CREATE ROLE`; built-in roles (`db_datareader` …) and `public` exist already, so only their members and permissions move. Members are added with `ALTER ROLE … ADD MEMBER`; permissions on the database, schemas, objects and columns are granted or denied as they were (`WITH GRANT OPTION` kept). Fabric has no `CREATE USER`: a Microsoft Entra user is created by its first GRANT. Not carried: the database `CONNECT` every user holds (the workspace gives access in Fabric), resource-class roles (no workload management in Fabric) and **SQL users**, which are listed for a person with the grants to give their Microsoft Entra replacement. A rejected statement fails the role with every reason; Retry Failed re-applies safely. Workspace roles and item permissions still decide who can connect. |
-| Spark pool & environment | Spark pool | A custom Spark pool and a published Environment | Node size, autoscale, runtime mapped; libraries are not copied. |
-| Notebooks | Notebook | Fabric Notebook | Cells kept; Spark pool binding and outputs dropped. Python cells: `mssparkutils` becomes `notebookutils`, and the Synapse SQL connector import and reads of the migrated pool are pointed at Fabric's connector and the Warehouse. Other Synapse-only calls (linked-service credentials, `mssparkutils.env`, connector writes, ADLS paths) are flagged. .NET notebooks are deferred. |
+| Spark pool & environment | Spark pool | A custom Spark pool and a published Environment | Node size, autoscale, runtime mapped. The pool's requirements.txt or environment.yml becomes the Environment's public libraries (`Libraries/PublicLibraries/environment.yml`; options, URLs and local paths are named, not carried), and its Spark configuration its Spark properties. Workspace packages (wheel, jar) are named for a person. Notebooks of that pool are attached to the Environment. |
+| Notebooks | Notebook | Fabric Notebook | Cells kept; Spark pool binding and outputs dropped. Calls that run another notebook (`%run /folder/name`, `mssparkutils.notebook.run("/folder/name")`) are pointed at the notebook's name, as Fabric runs it; discovery makes each such call a dependency, so the called notebook is never in a later wave, and Plan reports a call to a notebook discovery never found (`CALLED_NOTEBOOK_MISSING`). A notebook name built at run time is flagged. Python cells: `mssparkutils` becomes `notebookutils`, and the Synapse SQL connector import and reads of the migrated pool are pointed at Fabric's connector and the Warehouse. Other Synapse-only calls (linked-service credentials, `mssparkutils.env`, connector writes, ADLS paths) are flagged. .NET notebooks are deferred. |
 | Connections | Linked service | Fabric connection | Synapse does not give up the secret, so you choose how Fabric signs in. **Workspace identity** and **Key Vault reference** (an Azure Key Vault reference's alias or ID and the secret's name) pass no secret through the accelerator and are offered first; a SQL login, key, SAS token or service principal secret can still be typed (sent once, held in memory, never stored or returned). SQL, ADLS Gen2 and Blob are converted; a parameterised linked service uses its parameters' default values. Others are created by hand, with the linked service's name so pipelines find them. |
 | Pipelines & datasets | Pipeline, dataset | Fabric data pipeline | Datasets are embedded in each activity; notebook, pipeline and Spark-job references become Fabric ids; anything that read the Synapse pool is pointed at the migrated Warehouse. Azure Function, Databricks, Batch (Custom), HDInsight, Machine Learning and Webhook activities keep their type and point at the connection of the same name. A pipeline with an activity that has no Fabric equivalent (for example a mapping data flow) is **not created**, with the activity names. |
 | Spark job definitions | Spark job definition | Fabric Spark job definition | Main file, class, arguments and libraries kept; attached to the Environment of the same name. |
@@ -1055,11 +1062,16 @@ sides without writing to either. Each row says what it saw on each side:
 | Warehouse, Schema | The Warehouse and each schema exist. |
 | Tables | Column names and types (a type changed by design is a REVIEW that names it), and that every dynamic data mask is in place. |
 | Data Count | Rows in Synapse against rows in the Warehouse; zero loaded is a REVIEW, a difference a MISMATCH. |
+| Data Profile | For a table whose counts agree (on by default; *Data reconciliation* in Validate): one aggregate query per side reads NULLs per column, exact sums of numeric columns, earliest and latest dates (to the second), total text length and duplicate keys, and the two are compared (`migration/reconcile.py`). A tolerance (0.01 %, 0.1 % or 1 %) may apply to sums, lengths and NULL counts; dates and duplicate keys are always exact. Differences are a MISMATCH, or a REVIEW when a person is to judge them. Types the migration changes the values of (`datetimeoffset`, `time`, binary, spatial, `text`) are profiled for NULLs only. |
 | Functions, Views, Stored Procedures | Present, and the definition text agrees (ignoring comments and whitespace). |
 | Security | Each role exists with its members, and every permission given to a role or user is in the Warehouse with the same state (GRANT or DENY). |
 | Spark | The custom Spark pool and Environment exist with the same node size and scale. |
 | Notebooks, Pipelines | Present, with the same number of cells / activities (nested activities included). |
 | Connections, Spark Jobs, SQL Scripts, Schedules, Shortcuts | Present in Fabric. |
+| View Results | Optional: each view's row count and value profile, read on both sides from the columns Fabric reports for it. |
+| Procedure Results | Optional (on by default): each procedure's first result set, described on both sides with `sp_describe_first_result_set` (never run). Types the migration changes by design (`nvarchar` → `varchar` …) agree; other type changes are REVIEW, different columns a MISMATCH. |
+| Access | Every OneLake shortcut the run made, read through OneLake: through a shortcut the storage is read with its connection's identity, so a missing permission (403) shows here, not when a notebook runs. |
+| Performance | Optional: the most demanding recent SELECTs from Synapse's request history (`sys.dm_pdw_exec_requests`, kept by discovery) are run in Fabric twice and the warm run is compared with Synapse's average. Queries that write or use temporary tables or variables are never run. A slowdown beyond the allowed percentage is a REVIEW, or a MISMATCH when an SLA was agreed. The Fabric time includes returning the rows. |
 | Manual | Integration runtimes and anything else set up by hand, listed for review. |
 
 A check that could not run is a REVIEW with the reason, never a match. Row
@@ -1078,7 +1090,8 @@ proves it works yet.
 | Pipelines, notebooks, SQL-script notebooks, Spark job definitions | Their latest run in Fabric's run history: succeeded, failed (with Fabric's reason), or never run. | **Run now in Fabric** and followed to the end, three at a time, up to the time limit you set. These are real runs: they read their sources and write their targets. |
 
 Validation runs in the background: `POST /api/migration/validate` (with
-`runtime: {probe, run: ["pipeline", "notebook", "script", "sparkjob", "procedure"], timeoutMinutes}`)
+`runtime: {probe, run: ["pipeline", "notebook", "script", "sparkjob", "procedure"], timeoutMinutes}` and
+`reconcile: {profile, tolerancePct, differences: "mismatch" | "review"}`)
 starts it, and `GET /api/migration/validation` reports its progress and then its rows.
 
 API: `GET /api/migration/capabilities`, `POST /api/migration/plan`,
@@ -1089,6 +1102,33 @@ dataRun, collation, stopOnFailure, gitCommit}, credentials}`), `GET /api/migrati
 `capabilities.py`, `planner.py`, `preflight.py`, `datacopy.py`, `datapipeline.py`, `tsql_rules.py`,
 `fabric_connections.py`, `pipelines.py`, `jobs.py`, `notebooks.py`,
 `environments.py`, `warehouse_ddl.py`, `fabric_rest.py`, `fabric_git.py`) and `api/migration.py`.
+
+### Capacity
+
+**Plan → Capacity** (`GET /api/migration/capacity`, `migration/capacity.py`) gives a Fabric SKU starting point with
+its evidence, never a verdict: the dedicated pool's DWU (at an **assumed** 6 CU per DW100c: Microsoft publishes no
+conversion), the largest Spark pool's vCores (1 CU = 2 Spark vCores, as documented), the data the first load moves,
+the peak number of SQL requests running at once and the busiest hour of schedule triggers. It shows the SKU for the
+larger workload and the SKU for both at once, and whether the target workspace's capacity covers it. Calibrate it
+with a pilot and the Fabric Capacity Metrics app.
+
+The estate behind it is read at discovery with registered read-only catalog queries (`sql/estate.py`): rows and
+size per table, row-level security policies, external data sources and file formats, and the request history.
+Sizes and history need `VIEW DATABASE STATE`; without it they are reported unknown, never zero.
+
+### Cutover
+
+**Validate → Cutover** (`migration/cutover.py`) is the switch from Synapse to Fabric:
+
+* **Checks**: the last validation has no mismatches; every table kept in sync is current (its watermark in the
+  control table against the newest change in Synapse now, with the lag); the last sync succeeded; how many
+  schedules are still off; and, for a person, stopping the matching Synapse triggers.
+* **Run the final sync now** starts the sync pipeline, so the last changes arrive before consumers move.
+* **Switch schedules on** at cutover (they were created off), keeping each one's timing; **Roll back** switches them
+  off again. Synapse is never changed, so it stays the fallback until it is decommissioned.
+* **Record the cutover approval**: who approved it, once every check is ready.
+
+The agent's last stage, *Cutover sign-off*, lists these with the brief's other sign-offs and waits for a person.
 
 ## Fabric Git (Dev)
 

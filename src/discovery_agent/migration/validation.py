@@ -12,6 +12,10 @@ With ``runtime`` options, each object Fabric can run is also checked for whether
 (``runtime_checks``), and the verdict takes that into account: a failed run or query makes the row a
 MISMATCH; an object that matches but has never run in Fabric is REVIEW, because nothing proves it works yet.
 
+With ``reconcile`` options that ask for a profile, a table whose row counts agree is also compared value by
+value (``reconcile``): NULLs, exact sums, earliest and latest dates, text lengths and duplicate keys, read with
+one aggregate query per side and shown as a "Data Profile" row.
+
 With ``target="lakehouse"`` the SQL side is the Lakehouse's SQL analytics endpoint: tables are compared with the
 types it shows for Delta columns, and each stored procedure is looked for as the notebook it became.
 """
@@ -24,7 +28,8 @@ import re
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from discovery_agent.migration import (
-    datacopy, datafilter, environments, jobs, lakehouse_ddl, notebooks, pipelines, runtime_checks, spark_sql, warehouse_ddl,
+    datacopy, datafilter, environments, equivalence, jobs, lakehouse_ddl, notebooks, pipelines, reconcile, runtime_checks, spark_sql,
+    warehouse_ddl,
 )
 from discovery_agent.migration import security as security_sql
 from discovery_agent.migration.common import (
@@ -32,6 +37,7 @@ from discovery_agent.migration.common import (
     SCRIPT, SECURITY, SHORTCUT, SPARKJOB, TABLE, VIEW, Source,
 )
 from discovery_agent.migration.fabric_rest import FabricApiError, FabricRestClient
+from discovery_agent.sql.estate import SqlSecurityPolicy
 
 MATCH, REVIEW, MISMATCH = "MATCH", "REVIEW", "MISMATCH"
 CATEGORY = {
@@ -47,7 +53,7 @@ OBJECTS_SQL = ("SELECT s.name, o.name, o.type FROM sys.objects o JOIN sys.schema
                "WHERE o.type IN ('U', 'V', 'P', 'FN', 'IF', 'TF')")
 COLUMNS_SQL = ("SELECT s.name, o.name, c.column_id, c.name, t.name, c.max_length, c.precision, c.scale, c.is_nullable "
                "FROM sys.columns c JOIN sys.objects o ON o.object_id = c.object_id JOIN sys.schemas s ON s.schema_id = o.schema_id "
-               "JOIN sys.types t ON t.user_type_id = c.user_type_id WHERE o.type = 'U'")
+               "JOIN sys.types t ON t.user_type_id = c.user_type_id WHERE o.type IN ('U', 'V')")
 MODULES_SQL = ("SELECT s.name, o.name, m.definition FROM sys.sql_modules m JOIN sys.objects o ON o.object_id = m.object_id "
                "JOIN sys.schemas s ON s.schema_id = o.schema_id WHERE o.type IN ('V', 'P', 'FN', 'IF', 'TF')")
 
@@ -119,6 +125,12 @@ class Validator:
         sleep: Optional[Callable[[float], None]] = None,
         clock: Optional[Callable[[], float]] = None,
         target: str = "warehouse",
+        reconcile_options: Optional[reconcile.ReconcileOptions] = None,
+        performance: Optional[equivalence.PerformanceOptions] = None,
+        workload: Sequence[Any] = (),
+        pool_name: str = "",
+        onelake: Any = None,
+        access: bool = False,
     ) -> None:
         self.rest, self.wid, self.workspace_name = rest, workspace_id, workspace_name
         self.warehouse_name = warehouse_name
@@ -132,6 +144,13 @@ class Validator:
         self._source: Any = None
         self._wh: Dict[str, Any] = {}
         self.runtime = runtime
+        self.reconcile = reconcile_options or reconcile.ReconcileOptions()
+        #: Replaying Synapse's most demanding SELECTs on Fabric (``equivalence.replay``), from the discovered workload.
+        self.performance = performance or equivalence.PerformanceOptions()
+        self.workload = tuple(workload)
+        self.pool_name = pool_name
+        #: Prove every OneLake shortcut is readable through its connection (``_access``), with this OneLake client.
+        self.onelake, self.access = onelake, access
         self.progress = progress
         self._runner = runtime_checks.JobRunner(rest, workspace_id, runtime.timeout_minutes if runtime else runtime_checks.DEFAULT_TIMEOUT_MINUTES,
                                                 progress=progress, **{k: f for k, f in (("sleep", sleep), ("clock", clock)) if f is not None})
@@ -254,6 +273,10 @@ class Validator:
             if self._waiting:
                 for key, outcome in self._runner.run().items():
                     apply_runtime(self._waiting[key], outcome)
+            if self.access:
+                out.extend(self._access())
+            if self.performance.enabled:
+                out.extend(self._performance())
         finally:
             self.close()
         return out
@@ -359,14 +382,31 @@ class Validator:
             return [row(s, MISMATCH, "rows", "no table", f"The table is not in the {self.label}.", "Data Count")]
         label = s.name.replace(" (data)", "")
         if s.data_filter is not None:
-            return [{**self._check_filtered(s, schema, name), "object": label}]
+            counted = {**self._check_filtered(s, schema, name), "object": label}
+            if counted["status"] != MATCH:
+                return [counted]
+            scope = datafilter.scope_predicates(datafilter.resolve(s.payload, s.data_filter))
+            return [counted] + self._profile(s, label, schema, name, scope)
         src = self.source_rows(s.payload.key.schema, s.payload.key.name)
         tgt = self.target_rows(schema, name)
         if src is None:
             return [{**row(s, REVIEW, "not read", f"{tgt:,} rows", "The Synapse source is not connected, so its row count could not be read.", "Data Count"), "object": label}]
         status = MATCH if src == tgt else REVIEW if tgt == 0 else MISMATCH
         detail = "Counts agree." if src == tgt else "No rows loaded yet: run the Table data stage." if tgt == 0 else f"{abs(src - tgt):,} row(s) {'missing from' if tgt < src else 'extra in'} Fabric."
-        return [{**row(s, status, f"{src:,} rows", f"{tgt:,} rows", detail, "Data Count"), "object": label}]
+        counted = {**row(s, status, f"{src:,} rows", f"{tgt:,} rows", detail, "Data Count"), "object": label}
+        return [counted] + (self._profile(s, label, schema, name) if status == MATCH else [])
+
+    def _profile(self, s: Source, label: str, schema: str, name: str, scope: Sequence[str] = ()) -> List[Dict[str, str]]:
+        """The value profile of a table whose row counts agree (``reconcile``), when the options ask for one."""
+        if not self.reconcile.profile or self._source is None:
+            return []
+        try:
+            result = reconcile.run_profile(self._source.cursor(), self._sql.cursor(), s.payload, (schema, name), self.reconcile, scope)
+        except Exception as exc:  # noqa: BLE001 - an unreadable profile is reported, never taken as a match
+            return [{**row(s, REVIEW, "profile", "not read", f"The value profile could not be read: {type(exc).__name__}: "
+                                                              f"{runtime_checks._message(exc)[:200]}", "Data Profile"), "object": label}]
+        how = self.reconcile.describe()
+        return [{**row(s, result.status, result.summary, result.summary, f"{result.detail} ({how})", "Data Profile"), "object": label}]
 
     def _watermark(self, schema: str, name: str) -> Optional[str]:
         """A synced table's watermark from the Warehouse control table, or None when it is not registered."""
@@ -427,8 +467,91 @@ class Validator:
         same = _norm(text) == _norm(wh["modules"].get(key, ""))
         return [row(s, MATCH if same else REVIEW, "1 definition", "1 definition", "Definitions agree." if same else "Exists, but the definition text differs (Fabric may have reformatted it).")]
 
+    def _source_cursor(self) -> Optional[Any]:
+        if self._source is None and self._source_factory is not None:
+            self._source = self._source_factory()
+        return self._source.cursor() if self._source is not None else None
+
     def _check_view(self, s: Source) -> List[Dict[str, str]]:
-        return self._module(s, "view")
+        rows = self._module(s, "view")
+        if not self.reconcile.views or rows[0]["status"] == MISMATCH:
+            return rows
+        schema, name = s.schema or "dbo", s.object_name or s.name
+        label = f"{schema}.{name}"
+        source = self._source_cursor()
+        if source is None:
+            return rows + [{**row(s, REVIEW, "not read", "results", "The Synapse source is not connected, so the view's results could not be compared.",
+                                  "View Results"), "object": label}]
+        columns = equivalence.columns_from_catalog(self.warehouse()["columns"].get((schema.lower(), name.lower()), []))
+        try:
+            result = equivalence.view_profile(source, self._sql.cursor(), schema, name, columns, self.reconcile)
+        except Exception as exc:  # noqa: BLE001 - an unreadable comparison is reported, never taken as a match
+            return rows + [{**row(s, REVIEW, "results", "not read", f"The view's results could not be compared: {type(exc).__name__}: "
+                                                                   f"{runtime_checks._message(exc)[:200]}", "View Results"), "object": label}]
+        return rows + [{**row(s, result.status, result.summary, result.summary, f"{result.detail} ({self.reconcile.describe()})",
+                              "View Results"), "object": label}]
+
+    def _access(self) -> List[Dict[str, str]]:
+        """Every shortcut the run made (external tables, routed storage), read through its connection.
+
+        A shortcut that exists but cannot be read fails every notebook, view and pipeline that goes through it,
+        with an authorization error at run time. Reading one entry here finds that before cutover."""
+        base = {"category": "Access"}
+        lakes = [n for n in {self.warehouse_name if self.lakehouse else f"{self.warehouse_name}_lakehouse"} if self.find("lakehouses", n)]
+        if not lakes:
+            return []
+        if self.onelake is None:
+            return [{**base, "object": "OneLake shortcuts", "source": "storage", "target": "not checked", "status": REVIEW,
+                     "detail": "No OneLake sign-in for this check: shortcuts were not read. Sign in to Fabric with the Azure CLI."}]
+        out: List[Dict[str, str]] = []
+        for name in lakes:
+            lake = self.find("lakehouses", name)
+            try:
+                shortcuts = self.rest.list(f"/workspaces/{self.wid}/items/{lake}/shortcuts")
+            except FabricApiError as exc:
+                out.append({**base, "object": name, "source": "shortcuts", "target": "not listed", "status": REVIEW,
+                            "detail": f"Shortcuts could not be listed: {exc.message[:160]}"})
+                continue
+            for sc in shortcuts:
+                label = f"{name}/{str(sc.get('path') or '').strip('/')}/{sc.get('name')}".replace("//", "/")
+                target = sc.get("target") or {}
+                where = next((str(v.get("location") or "") + str(v.get("subpath") or "") for v in target.values() if isinstance(v, dict)), "")
+                try:
+                    self.onelake.probe(self.wid, lake, f"{str(sc.get('path') or 'Files').strip('/')}/{sc.get('name')}")
+                except Exception as exc:  # noqa: BLE001 - OneLakeError or a network failure: the reason is the result
+                    status = getattr(exc, "status", 0)
+                    why = ("The shortcut's connection is not allowed to read it: give that identity Storage Blob Data Reader "
+                           "(or ACLs) on the location, then validate again." if status in (401, 403)
+                           else "The location it points at does not exist (or was renamed)." if status == 404
+                           else f"It could not be read: {str(exc)[:200]}")
+                    out.append({**base, "object": label, "source": where or "storage", "target": "not readable", "status": MISMATCH,
+                                "detail": why + " Everything reading through it fails the same way."})
+                    continue
+                out.append({**base, "object": label, "source": where or "storage", "target": "readable", "status": MATCH,
+                            "detail": "Read through the shortcut's connection: the identity it uses may read the location."})
+        return out
+
+    def _performance(self) -> List[Dict[str, str]]:
+        """Synapse's most demanding recent SELECTs, run on Fabric and compared with their Synapse times."""
+        samples = sorted((q for q in self.workload if q.replayable), key=lambda q: -(q.runs * q.avg_ms))[: self.performance.limit]
+        skipped = sum(1 for q in self.workload if not q.replayable)
+        out: List[Dict[str, str]] = []
+        base = {"category": "Performance"}
+        if not self.workload:
+            return [{**base, "object": "Query history", "source": "not read", "target": "—", "status": REVIEW,
+                     "detail": "Discovery has no Synapse request history (it needs VIEW DATABASE STATE), so there is nothing to benchmark."}]
+        wh = self.warehouse()
+        if "error" in wh:
+            return [{**base, "object": "Query history", "source": f"{len(samples)} queries", "target": "not run", "status": REVIEW,
+                     "detail": wh["error"]}]
+        for n, q in enumerate(samples, 1):
+            self.progress(f"Benchmarking query {n} of {len(samples)} in Fabric")
+            out.append({**base, **equivalence.replay(self._sql.cursor(), q, self.performance, self.pool_name, self.warehouse_name)})
+        if skipped:
+            out.append({**base, "object": "Not replayed", "source": f"{skipped} queries", "target": "—", "status": REVIEW,
+                        "detail": f"{skipped} history quer{'y' if skipped == 1 else 'ies'} write data or use temporary tables or variables: "
+                                  "benchmark them in their pipelines."})
+        return out
 
     def _check_procedure(self, s: Source) -> List[Dict[str, str]]:
         if self.lakehouse:
@@ -437,7 +560,20 @@ class Validator:
             return [row(s, REVIEW if ok else MISMATCH, "1 procedure", f"notebook {notebook}" if ok else "missing",
                         "Converted to a Spark notebook: compare what it does with the procedure before relying on it."
                         if ok else f"The notebook '{notebook}' the procedure becomes is not in the Fabric workspace.")]
-        return self._module(s, "procedure")
+        rows = self._module(s, "procedure")
+        if not self.reconcile.procedures or rows[0]["status"] == MISMATCH:
+            return rows
+        source = self._source_cursor()
+        label = f"{s.schema or 'dbo'}.{s.object_name or s.name}"
+        if source is None:
+            return rows + [{**row(s, REVIEW, "not read", "result set", "The Synapse source is not connected, so the result sets could not be compared.",
+                                  "Procedure Results"), "object": label}]
+        try:
+            status, a, b, detail = equivalence.procedure_shape(source, self._sql.cursor(), runtime_checks._exec_text(s))
+        except Exception as exc:  # noqa: BLE001
+            return rows + [{**row(s, REVIEW, "result set", "not read", f"The result sets could not be described: {runtime_checks._message(exc)[:200]}",
+                                  "Procedure Results"), "object": label}]
+        return rows + [{**row(s, status, a, b, detail, "Procedure Results"), "object": label}]
 
     def _check_function(self, s: Source) -> List[Dict[str, str]]:
         return self._module(s, "function")
@@ -461,9 +597,32 @@ class Validator:
                 wh["security"] = {"error": f"Roles and permissions could not be read: {type(exc).__name__}: {str(exc)[:200]}"}
         return wh["security"]
 
+    def _check_policy(self, s: Source) -> List[Dict[str, str]]:
+        """A row-level security policy: present, with its filter predicates and its state."""
+        policy = s.payload
+        wanted = len(policy.filters)
+        label = f"{wanted} filter predicate(s), {'on' if policy.enabled else 'off'}"
+        try:
+            cur = self._sql.cursor()
+            cur.execute(security_sql.POLICIES_SQL)
+            found = {(str(r[0]).lower(), str(r[1]).lower()): (bool(r[2]), int(r[3] or 0)) for r in cur.fetchall()}
+        except Exception as exc:  # noqa: BLE001
+            return [row(s, REVIEW, label, "not read", f"Security policies could not be read: {type(exc).__name__}: {str(exc)[:200]}")]
+        got = found.get((policy.schema.lower(), policy.name.lower()))
+        if got is None:
+            return [row(s, MISMATCH, label, "missing", "The security policy is not in Fabric: every user sees every row.")]
+        enabled, count = got
+        shown = f"{count} filter predicate(s), {'on' if enabled else 'off'}"
+        if count != wanted or enabled != policy.enabled:
+            return [row(s, MISMATCH, label, shown, "The policy differs from Synapse: rows may be visible that were filtered before.")]
+        note = f" {len(policy.blocks)} BLOCK predicate(s) were left for a person." if policy.blocks else ""
+        return [row(s, MATCH if not policy.blocks else REVIEW, label, shown, "Filter predicates and state agree." + note)]
+
     def _check_security(self, s: Source) -> List[Dict[str, str]]:
         if (gate := self._sql_gate(s)):
             return gate
+        if isinstance(s.payload, SqlSecurityPolicy):
+            return self._check_policy(s)
         plan = security_sql.plan_principal(s.payload, s.name)
         state = self._security_state()
         wanted_p = security_sql.expected_keys(plan, s.payload)

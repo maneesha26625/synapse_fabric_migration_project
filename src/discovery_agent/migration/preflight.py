@@ -13,6 +13,7 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 from discovery_agent.migration import storage_remap
+from discovery_agent.extractors import notebook_calls
 from discovery_agent.migration import datacopy, datafilter, environments, fabric_connections, jobs, notebooks, pipelines, tsql_rules, warehouse_ddl
 from discovery_agent.migration import lakehouse_ddl, spark_sql
 from discovery_agent.migration import security as security_sql
@@ -21,6 +22,7 @@ from discovery_agent.migration.common import (
     VIEW, Source,
 )
 from discovery_agent.migration.planner import BLOCKING, HIGH, LOW, MEDIUM, Finding
+from discovery_agent.sql.estate import SqlSecurityPolicy
 
 #: Dedicated-pool-only T-SQL that a Fabric Warehouse rejects, checked *after* the T-SQL rules
 #: (``tsql_rules``) have converted what they can. CTAS, OPTION (LABEL) and UPDATE STATISTICS
@@ -87,6 +89,16 @@ def _module(source: Source) -> List[Finding]:
 
 
 def _security(source: Source) -> List[Finding]:
+    if isinstance(source.payload, SqlSecurityPolicy):
+        plan = security_sql.plan_policy(source.payload)
+        if plan.statement is None:
+            return [Finding(source.id, "NEEDS_PERSON", MEDIUM, f"{source.name}: " + " ".join(plan.notes))]
+        found = [Finding(source.id, "ROW_LEVEL_SECURITY", LOW,
+                         f"{source.name}: recreated with {len(source.payload.filters)} filter predicate(s); the functions they call "
+                         "must be in the plan, and the policy applies to T-SQL reads only.")]
+        if plan.notes:
+            found.append(Finding(source.id, "SECURITY_REVIEW", MEDIUM, f"{source.name}: " + " ".join(plan.notes)))
+        return found
     try:
         plan = security_sql.plan_principal(source.payload, source.name)
     except Exception:  # noqa: BLE001 - a principal discovery did not keep is a finding, not a crash
@@ -315,10 +327,13 @@ _LAKEHOUSE_CHECKS = {**_CHECKS, TABLE: _lh_table, PROCEDURE: _lh_procedure, SCRI
 
 
 def content_findings(sources: Sequence[Source], credential_names: Optional[Set[str]] = None, pool: str = "",
-                     storage_routes: Optional[Sequence[Dict[str, Any]]] = None, target: str = "warehouse") -> List[Finding]:
+                     storage_routes: Optional[Sequence[Dict[str, Any]]] = None, target: str = "warehouse",
+                     discovered_notebooks: Optional[Set[str]] = None) -> List[Finding]:
     """Findings for every object whose own content predicts trouble. ``pool`` is the SQL pool being migrated;
     ``storage_routes`` the storage locations the run sends through OneLake shortcuts (run option ``storageRoutes``);
-    ``target`` where the pool goes (run option ``target``: a Lakehouse takes different roads for some objects)."""
+    ``target`` where the pool goes (run option ``target``: a Lakehouse takes different roads for some objects);
+    ``discovered_notebooks`` every notebook name discovery found (a called notebook that discovery found but the plan
+    leaves out is already a dependency risk; only one it never found is reported here)."""
     names = credential_names or set()
     checks = _LAKEHOUSE_CHECKS if target == "lakehouse" else _CHECKS
     routes = planned_routes(storage_routes)
@@ -346,7 +361,33 @@ def content_findings(sources: Sequence[Source], credential_names: Optional[Set[s
         if serverless is not None:
             out.append(serverless)
     out.extend(_depends_on_storage(sources, direct))
+    out.extend(_called_notebooks(sources, discovered_notebooks or set()))
     return out
+
+
+def _called_notebooks(sources: Sequence[Source], discovered: Set[str]) -> List[Finding]:
+    """Notebooks that run a notebook discovery never found: in Fabric the call fails unless it is already there.
+
+    A called notebook that discovery found is a dependency, and the planner already reports it when it is left out."""
+    known = {n.lower() for n in discovered} | {s.name.lower() for s in sources if s.kind == NOTEBOOK}
+    found: List[Finding] = []
+    for s in sources:
+        if s.kind != NOTEBOOK or not isinstance(s.payload, dict):
+            continue
+        missing: List[str] = []
+        for cell in (s.payload.get("properties") or {}).get("cells") or []:
+            if not isinstance(cell, dict) or cell.get("cell_type", "code") != "code":
+                continue
+            source = cell.get("source")
+            text = "".join(str(x) for x in source) if isinstance(source, list) else str(source or "")
+            for call in notebook_calls.find_calls(text):
+                if call.target and call.target.lower() not in known and call.target.lower() != s.name.lower()                         and call.target not in missing:
+                    missing.append(call.target)
+        if missing:
+            found.append(Finding(s.id, "CALLED_NOTEBOOK_MISSING", MEDIUM,
+                                 f"{s.name} runs {', '.join(missing[:4])}, which discovery did not find in the Synapse workspace. "
+                                 "In Fabric the call fails unless a notebook of that name is in the workspace."))
+    return found
 
 
 #: ADLS Gen2 / Blob storage named in code: abfss://container@account.dfs..., https://account.blob..., or built from parts.

@@ -6,14 +6,19 @@ here: a workspace **custom Spark pool** carrying the node size and scale, and an
 **Environment** that selects that pool, the runtime version and the executor
 shape. Notebooks then attach to the Environment.
 
-Libraries are not copied: a pool only records their names, not their files, so
-the notes say what to add by hand.
+A pool's **library requirements** (the requirements.txt or environment.yml it was
+given) become the Environment's public libraries (``Libraries/PublicLibraries/environment.yml``
+in its definition), and its **Spark configuration** becomes the Environment's Spark properties.
+Workspace packages (wheel and jar files uploaded to Synapse) are not copied: the pool records
+their names, not their files, so the notes name each one to add by hand.
 """
 
 from __future__ import annotations
 
+import base64
+import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 #: Fabric node size -> (name, cores, memory) for the driver and executors.
 NODE_SHAPES = {
@@ -36,6 +41,8 @@ class EnvironmentPlan:
     pool: Dict[str, Any]      # body for POST /spark/pools
     compute: Dict[str, Any]   # body for PATCH .../staging/sparkcompute (instancePool added by the caller)
     notes: List[str] = field(default_factory=list)
+    #: The Environment's public libraries as an environment.yml, or None when the pool had none.
+    libraries_yml: Optional[str] = None
 
 
 def _int(value: Any) -> Optional[int]:
@@ -82,8 +89,17 @@ def plan(meta: Mapping[str, Any], name: str) -> EnvironmentPlan:
 
     if meta.get("autoPause"):
         notes.append("Auto-pause dropped: Fabric ends idle Spark sessions on its own timeout.")
-    if meta.get("customLibraries") or meta.get("libraryRequirementsFile"):
-        notes.append("Libraries were not copied: add the pool's packages in the Environment's Libraries section.")
+    libraries_yml, library_notes = environment_yml(str((meta.get("_libraryRequirements") or {}).get("content") or ""))
+    notes.extend(library_notes)
+    if meta.get("libraryRequirementsFile") and not libraries_yml and not library_notes:
+        notes.append(f"The pool's requirements file ({meta.get('libraryRequirementsFile')}) was not readable: add its packages in the "
+                     "Environment's Libraries section.")
+    custom = [str(c.get("name")) for c in (meta.get("customLibraries") or []) if isinstance(c, dict) and c.get("name")]
+    if custom:
+        notes.append(f"Workspace packages not copied (their files stay in Synapse): {', '.join(custom[:6])}"
+                     f"{' and more' if len(custom) > 6 else ''}. Upload them to the Environment's custom libraries.")
+    spark_properties, config_notes = spark_conf(str((meta.get("_sparkConfig") or {}).get("content") or ""))
+    notes.extend(config_notes)
 
     pool = {
         "name": name,
@@ -98,7 +114,68 @@ def plan(meta: Mapping[str, Any], name: str) -> EnvironmentPlan:
         "dynamicExecutorAllocation": dynamic_body,
         "runtimeVersion": runtime,
     }
-    return EnvironmentPlan(name, pool, compute, notes)
+    if spark_properties:
+        compute["sparkProperties"] = spark_properties
+        notes.append(f"{len(spark_properties)} Spark setting(s) carried from the pool's Spark configuration.")
+    return EnvironmentPlan(name, pool, compute, notes, libraries_yml)
+
+
+_REQUIREMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?\s*((==|>=|<=|~=|!=|>|<)\s*[A-Za-z0-9.*+!_-]+\s*(,\s*(==|>=|<=|~=|!=|>|<)\s*[A-Za-z0-9.*+!_-]+\s*)*)?$")
+
+
+def environment_yml(content: str) -> Tuple[Optional[str], List[str]]:
+    """A pool's library requirements as the environment.yml a Fabric Environment takes, and what was left out.
+
+    An environment.yml (conda) is kept as it is; a requirements.txt becomes its ``pip`` section. Options (``-r``,
+    ``--index-url``), URLs and local paths are left out and named: Fabric resolves public packages from PyPI and conda."""
+    text = (content or "").strip()
+    if not text:
+        return None, []
+    if re.search(r"^\s*dependencies\s*:", text, re.MULTILINE):
+        return text + "\n", ["The pool's environment.yml became the Environment's public libraries."]
+    packages: List[str] = []
+    skipped: List[str] = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if _REQUIREMENT.match(line):
+            packages.append(line.replace(" ", ""))
+        else:
+            skipped.append(line)
+    notes: List[str] = []
+    if packages:
+        notes.append(f"{len(packages)} package(s) from the pool's requirements became the Environment's public libraries.")
+    if skipped:
+        notes.append(f"Not carried from the requirements (options, URLs or local files): {'; '.join(skipped[:4])}. Add them by hand.")
+    if not packages:
+        return None, notes
+    body = "dependencies:\n  - pip:\n" + "".join(f"    - {p}\n" for p in packages)
+    return body, notes
+
+
+def spark_conf(content: str) -> Tuple[Dict[str, str], List[str]]:
+    """A pool's Spark configuration file (``key value`` or ``key=value`` per line) as Spark properties."""
+    out: Dict[str, str] = {}
+    for raw in (content or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        first = line.split(None, 1)[0]
+        if "=" in first:
+            key, _, value = line.partition("=")
+        else:
+            key, value = first, line[len(first):]
+        key, value = key.strip(), value.strip()
+        if key.startswith("spark.") and value:
+            out[key] = value
+    return out, []
+
+
+def libraries_part(yml: str) -> Dict[str, Any]:
+    """The Environment definition part that holds its public libraries."""
+    return {"path": "Libraries/PublicLibraries/environment.yml",
+            "payload": base64.b64encode(yml.encode("utf-8")).decode("ascii"), "payloadType": "InlineBase64"}
 
 
 def starter_compute(compute: Mapping[str, Any]) -> Dict[str, Any]:

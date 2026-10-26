@@ -14,6 +14,11 @@ catalog (``sql.security``):
 * **Dynamic data masks**: written into the table's ``CREATE TABLE`` (``masked_column``),
   so no row is ever loaded into an unmasked column.
 
+* **Row-level security**: each security policy is recreated with its ``FILTER`` predicates
+  (``CREATE SECURITY POLICY ... ADD FILTER PREDICATE``), in the state it had. The predicate
+  functions are inline table-valued functions and move with the other functions, first.
+  ``BLOCK`` predicates are left for a person: Fabric Warehouse supports filter predicates only.
+
 Left for a person, with the reason: SQL-authenticated users (Fabric has none; a Microsoft
 Entra principal replaces each one) and Synapse resource-class roles (workload management,
 which Fabric does not have). The database-level ``CONNECT`` every user holds is not
@@ -27,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
 from discovery_agent.migration.warehouse_ddl import qualified, quote
+from discovery_agent.sql.estate import SqlSecurityPolicy
 from discovery_agent.sql.security import (
     RESOURCE_CLASS_ROLES,
     CLASS_DATABASE,
@@ -180,6 +186,54 @@ def expected_keys(plan: SecurityPlan, security: SqlSecurity) -> List[Tuple[str, 
         if permission_statement(p, plan.principal.name) is not None:
             out.append(permission_key(p.grantee, p.class_code, p.permission, p.state, p.schema, p.object_name, p.column))
     return out
+
+
+# ---- row-level security ------------------------------------------------------------------
+
+#: Whether a policy already exists in the Warehouse, by schema and name.
+POLICY_EXISTS_SQL = ("SELECT COUNT(*) FROM sys.security_policies sp JOIN sys.schemas s ON s.schema_id = sp.schema_id "
+                     "WHERE s.name = ? AND sp.name = ?")
+#: Fabric's policies with their enabled state and filter predicate count, for Validate.
+POLICIES_SQL = ("SELECT s.name, sp.name, sp.is_enabled, COUNT(pr.security_predicate_id) FROM sys.security_policies sp "
+                "JOIN sys.schemas s ON s.schema_id = sp.schema_id "
+                "LEFT JOIN sys.security_predicates pr ON pr.object_id = sp.object_id AND pr.predicate_type = 0 "
+                "GROUP BY s.name, sp.name, sp.is_enabled")
+
+
+def _unwrap(definition: str) -> str:
+    """``([sec].[fn]([Rep]))`` -> ``[sec].[fn]([Rep])``: the catalog wraps a predicate in one pair of parentheses."""
+    text = definition.strip()
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        for i, ch in enumerate(text):
+            depth += ch == "("
+            depth -= ch == ")"
+            if depth == 0 and i < len(text) - 1:
+                return text  # the first "(" closes before the end: not one wrapping pair
+        text = text[1:-1].strip()
+    return text
+
+
+@dataclass
+class PolicyPlan:
+    policy: SqlSecurityPolicy
+    statement: Optional[str]
+    notes: List[str] = field(default_factory=list)
+
+
+def plan_policy(policy: SqlSecurityPolicy) -> PolicyPlan:
+    """``CREATE SECURITY POLICY`` with every FILTER predicate, in the policy's state; BLOCK predicates are noted."""
+    notes: List[str] = []
+    filters = [f"ADD FILTER PREDICATE {_unwrap(p.definition)} ON {qualified(p.target_schema, p.target_table)}" for p in policy.filters]
+    if policy.blocks:
+        notes.append(f"{len(policy.blocks)} BLOCK predicate(s) not carried (Fabric Warehouse supports FILTER predicates only): "
+                     + "; ".join(f"{p.operation or 'BLOCK'} on {p.target_schema}.{p.target_table}" for p in policy.blocks[:3])
+                     + ". Enforce those write rules in the loading code.")
+    if not filters:
+        return PolicyPlan(policy, None, notes + ["No FILTER predicate to recreate."])
+    state = "ON" if policy.enabled else "OFF"
+    statement = f"CREATE SECURITY POLICY {qualified(policy.schema, policy.name)} " + ", ".join(filters) + f" WITH (STATE = {state});"
+    return PolicyPlan(policy, statement, notes)
 
 
 def masks_for(security: Optional[SqlSecurity], schema: str, table: str) -> Sequence[SqlMaskedColumn]:

@@ -139,7 +139,48 @@ describe("consultation and agent orchestrator", () => {
     expect(lake.options.target).toBe("lakehouse");
   });
 
-  it("runs the approved brief end to end: plan, approval, run, validation", async () => {
+  it("drives validation's value profile from the reconciliation answer, and lists what a person signs off before cutover", async () => {
+    const facts = readFacts({ discovery: await mockApi.getDiscoveryStatus(), connection: await mockApi.getConnection(), graph: await mockApi.getDependencies(),
+      capabilities: await mockApi.getCapabilities(), fabricConnected: true, fabricGit: null,
+      consultFacts: { facts: { dynamicSqlObjects: 4 }, unreadable: [], notRecorded: [] } });
+    const exact = settingsFrom(facts, resolve(facts, {}));
+    expect(exact.validation.reconcile).toMatchObject({ profile: true, tolerancePct: 0, differences: "mismatch" });
+    expect(settingsFrom(facts, resolve(facts, { "validation.tolerance": "0.1" })).validation.reconcile).toMatchObject({ profile: true, tolerancePct: 0.1 });
+    expect(settingsFrom(facts, resolve(facts, { "validation.tolerance": "business" })).validation.reconcile).toMatchObject({ differences: "review" });
+    expect(settingsFrom(facts, resolve(facts, { "validation.tolerance": "counts" })).validation.reconcile?.profile).toBe(false);
+    const s = settingsFrom(facts, resolve(facts, {
+      "sql.sla": "benchmark", "scope.rollback": "formal", "scope.downtime": "4h", "validation.parallel": "no", "sql.dynamic": "review",
+    }));
+    expect(s.signoffs).toEqual(expect.arrayContaining([
+      expect.stringMatching(/benchmarked performance-critical queries/), expect.stringMatching(/Formal rollback/),
+      expect.stringMatching(/downtime: 1–4 hours/), expect.stringMatching(/reviewed each of the 4 objects using dynamic SQL/),
+    ]));
+    expect(s.signoffs.some((x) => /in parallel/.test(x))).toBe(false);
+    // The SLA answer turns on Validate's benchmark; thresholds make a slowdown a mismatch.
+    expect(s.validation.performance).toEqual({ enabled: true, thresholdPct: 50, limit: 10, strict: false });
+    expect(settingsFrom(facts, resolve(facts, { "sql.sla": "thresholds" })).validation.performance).toMatchObject({ enabled: true, thresholdPct: 20, strict: true });
+    expect(settingsFrom(facts, resolve(facts, { "sql.sla": "none" })).validation.performance?.enabled).toBe(false);
+    expect(settingsFrom(facts, resolve(facts, { "validation.results": "both" })).validation.reconcile).toMatchObject({ views: true, procedures: true });
+    expect(s.validation.access).toBe(true);
+  });
+
+  it("walks the demo cutover: behind, final sync, schedules on, rollback, approval", async () => {
+    const before = await mockApi.getCutover();
+    expect(before.freshness.behind).toBe(1);
+    expect(before.checks.find((c) => c.label === "Synapse triggers stopped")?.status).toBe("person");
+    await mockApi.runFinalSync();
+    expect((await mockApi.getCutover()).freshness.behind).toBe(0);
+    expect((await mockApi.setSchedules(true)).changed).toHaveLength(3);
+    expect((await mockApi.getCutover()).schedules.every((x) => x.enabled)).toBe(true);
+    expect((await mockApi.setSchedules(false)).changed).toHaveLength(3);
+    await mockApi.completeCutover("Test lead");
+    expect((await mockApi.getCutover()).record?.approvedBy).toBe("Test lead");
+    const capacity = await mockApi.getCapacity();
+    expect(capacity.recommendation.sku).toBe("F64");
+    expect(capacity.caveats.some((c) => /assumed/.test(c))).toBe(true);
+  });
+
+  it("runs the approved brief end to end: plan, approval, run, validation, sign-off", async () => {
     const user = userEvent.setup();
     // A small scope keeps the demo run short: notebooks only, no data, no connections.
     localStorage.setItem(CONSULT, JSON.stringify({
@@ -168,9 +209,13 @@ describe("consultation and agent orchestrator", () => {
     expect(screen.getByRole("group", { name: /Approve writing to/ })).toBeInTheDocument();
     await user.click(approve);
     const stages = screen.getByRole("navigation", { name: "Agent stages" });
-    // Validation is the last stage: no hand-over.
+    // No hand-over: after validation, the agent waits for a person to sign off what the brief names before cutover.
     expect(within(stages).queryByRole("button", { name: /Hand-over/ })).toBeNull();
     await waitFor(() => expect(within(stages).getByRole("button", { name: /Validation/ })).toHaveTextContent(/checks/), { timeout: 60000 });
+    const signoff = await screen.findByRole("group", { name: "Sign off before cutover" }, { timeout: 15000 });
+    expect(within(signoff).getByText(/Synapse is still in service as the fallback/)).toBeInTheDocument();
+    await user.click(within(signoff).getByRole("button", { name: "Every item is done: sign off" }));
+    await waitFor(() => expect(within(stages).getByRole("button", { name: /Cutover sign-off/ })).toHaveTextContent(/signed off by a person/));
     expect(within(stages).getByRole("button", { name: /Migration run/ })).toHaveTextContent(/created/);
     // The application's activity log records what the agent did, and what the run did.
     const activity = (stored("ma.activity.mock.default") as { source: string; text: string }[]);

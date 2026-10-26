@@ -20,7 +20,9 @@ import {
   type ResultsQuery,
   type ProjectRequirements,
   type TransformCandidates,
+  type CapacityAssessment,
   type ConsultFacts,
+  type CutoverState,
   type TransformObject,
   type TransformPrompt,
   type TransformQueued,
@@ -185,7 +187,10 @@ export const realApi: MigrationApi = {
       // Date filters decide which Synapse rows a table should hold, so the counts compare like with like.
       // ... and the SQL target says where the pool's objects are (a Warehouse, or a Lakehouse's SQL endpoint and notebooks).
       ...(options?.dataFilters || options?.target ? { options: { dataFilters: options.dataFilters, target: options.target } } : {}),
-      ...(runtime ? { runtime } : {}),
+      // The value profile, the benchmark and the access check travel beside the run checks, each under its own name.
+      ...(runtime ? (({ reconcile, performance, access, ...checks }) => ({
+        runtime: checks, ...(reconcile ? { reconcile } : {}), ...(performance ? { performance } : {}), ...(access ? { access } : {}),
+      }))(runtime) : {}),
     }) });
     for (;;) {
       await new Promise((r) => setTimeout(r, 1500));
@@ -209,6 +214,14 @@ export const realApi: MigrationApi = {
     request<TransformObject>("/api/transform/discard", { method: "POST", body: JSON.stringify({ id, scope, target }) }),
   listTransformCandidates: (target) => request<TransformCandidates>(`/api/transform/candidates${targetQuery(target)}`),
   getConsultFacts: () => request<ConsultFacts>("/api/consult/facts"),
+  getCapacity: () => request<CapacityAssessment>("/api/migration/capacity"),
+  getCutover: () => request<CutoverState>("/api/cutover"),
+  runFinalSync: async () => { await request("/api/cutover/sync", { method: "POST", body: "{}" }); },
+  setSchedules: (enabled, pipelines) =>
+    request<{ changed: string[]; failed: string[] }>("/api/cutover/schedules", { method: "POST", body: JSON.stringify({ enabled, ...(pipelines ? { pipelines } : {}) }) }),
+  completeCutover: async (approvedBy, note) => {
+    await request("/api/cutover/complete", { method: "POST", body: JSON.stringify({ approvedBy, ...(note ? { note } : {}) }) });
+  },
   getProjectRequirements: () => request<ProjectRequirements>("/api/transform/project"),
   saveProjectRequirements: (text) =>
     request<ProjectRequirements>("/api/transform/project", { method: "POST", body: JSON.stringify({ text }) }),

@@ -82,9 +82,6 @@ CATEGORIES = ("SQL", "Spark", "Integration", "Storage", "Security", "Networking"
 #: Object types the discovery cannot list in this build, and why. The mapping
 #: rules for them exist, so adding the discovery needs no mapping work.
 NOT_DISCOVERED: Tuple[Tuple[str, str], ...] = (
-    ("External Data Source", "not yet read from the SQL catalog"),
-    ("External File Format", "not yet read from the SQL catalog"),
-    ("Lake Database", "lake databases are not yet listed"),
     ("Networking Configuration", "managed private endpoints and firewall rules are not yet read"),
 )
 
@@ -702,6 +699,88 @@ def security_extras(catalog: Any) -> List[Extra]:
         status = STATUS_WARNING if p.is_sql_user else STATUS_DISCOVERED
         out.append(Extra(security_principal_id(db, p.name, p.is_role), p.name, "Security Object",
                          {k: v for k, v in meta.items() if v is not None}, tuple(deps.values()), status=status))
+    return out
+
+
+#: ``([sec].[fn_rls]([Rep]))``: the inline table-valued function a predicate calls.
+_PREDICATE_FUNCTION = re.compile(r"^[\s(]*\[?([^\].\s(]+)\]?\.\[?([^\].\s(]+)\]?\s*\(")
+
+
+def security_policy_id(database: str, schema: str, name: str) -> str:
+    return f"security://{database}/policy/{schema}.{name}"
+
+
+def estate_extras(catalog: Any) -> List[Extra]:
+    """From the pool's estate (``sql.estate``): row-level security policies, external data sources and file formats.
+
+    A policy is a "Security Object" like a role: the Roles & permissions stage recreates its FILTER predicates
+    in the Warehouse. Sources and formats have no Fabric item; they say where external data lives and how it is
+    read, for the shortcuts and ingestion that replace them.
+    """
+    estate = getattr(catalog, "estate", None) if catalog is not None else None
+    if estate is None:
+        return []
+    db = catalog.database.name
+    out: List[Extra] = []
+    for p in estate.policies:
+        deps: Dict[str, Dict[str, Any]] = {}
+        for pred in p.predicates:
+            target = f"sql://{db}/{pred.target_schema}/{pred.target_table}"
+            deps.setdefault(target.lower(), {"name": f"{pred.target_schema}.{pred.target_table}", "kind": "sql_object", "type": "Table",
+                                             "targetId": target, "location": "predicate target"})
+            fn = _PREDICATE_FUNCTION.match(pred.definition)
+            if fn:
+                target = f"sql://{db}/{fn.group(1)}/{fn.group(2)}"
+                deps.setdefault(target.lower(), {"name": f"{fn.group(1)}.{fn.group(2)}", "kind": "sql_object", "type": "Function",
+                                                 "targetId": target, "location": "predicate function"})
+        meta: Dict[str, Any] = {
+            "database": db, "principalKind": "Row-level security policy", "enabled": p.enabled,
+            "predicates": [x.to_dict() for x in p.predicates],
+            "_from": "Dedicated SQL pool catalog",
+        }
+        if p.blocks:
+            meta["fabricSupport"] = (f"{len(p.blocks)} BLOCK predicate(s): Fabric Warehouse supports FILTER predicates only; "
+                                     "enforce the write rule in the loading code or a procedure")
+        out.append(Extra(security_policy_id(db, p.schema, p.name), p.qualified_name, "Security Object", meta, tuple(deps.values()),
+                         status=STATUS_WARNING if p.blocks else STATUS_DISCOVERED, raw=p.to_dict()))
+    for s in estate.data_sources:
+        meta = {"database": db, "location": s.location, "sourceType": s.source_type, "credential": s.credential,
+                "_from": "Dedicated SQL pool catalog"}
+        out.append(Extra(f"sql://{db}/external_data_source/{s.name}", s.name, "External Data Source",
+                         {k: v for k, v in meta.items() if v is not None}, raw=s.to_dict()))
+    for f in estate.file_formats:
+        meta = {"database": db, "formatType": f.format_type, "fieldTerminator": f.field_terminator, "compression": f.compression,
+                "_from": "Dedicated SQL pool catalog"}
+        out.append(Extra(f"sql://{db}/external_file_format/{f.name}", f.name, "External File Format",
+                         {k: v for k, v in meta.items() if v is not None}, raw=f.to_dict()))
+    return out
+
+
+def lake_database_extras(items: Iterable[Mapping[str, Any]], tables: Optional[Mapping[str, List[Mapping[str, Any]]]] = None) -> List[Extra]:
+    """Lake databases (Spark databases and database templates), from the data plane or the repository's ``database`` folder.
+
+    ``tables``: a repository's table definitions by database name (``database/<db>/table/*.json``), when present."""
+    out: List[Extra] = []
+    for i in items:
+        name = str(i.get("name") or "")
+        if not name:
+            continue
+        p = i.get("properties") or {}
+        source = p.get("Source") or p.get("source") or {}
+        props = source.get("Properties") or source.get("properties") or {}
+        own = [t for t in (tables or {}).get(name, []) if isinstance(t, dict)]
+        meta = {
+            "location": source.get("Location") or source.get("location"),
+            "formatType": props.get("FormatType") or props.get("formatType"),
+            "linkedService": props.get("LinkedServiceName") or props.get("linkedServiceName"),
+            "origin": ((p.get("Origin") or {}).get("Type")) if isinstance(p.get("Origin"), dict) else None,
+            "tables": sorted(str(t.get("name")) for t in own if t.get("name"))[:200] or None,
+            "tableCount": len(own) if tables is not None else None,
+            "fabricSupport": "Becomes a schema in a Fabric Lakehouse, with a OneLake shortcut per table to the same Delta or Parquet "
+                             "folder (the Spark migration path); not created by this build",
+            "_from": "Synapse workspace",
+        }
+        out.append(Extra(f"synapse://lake_database/{name}", name, "Lake Database", {k: v for k, v in meta.items() if v is not None}, raw=dict(i)))
     return out
 
 

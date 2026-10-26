@@ -28,6 +28,7 @@ from discovery_agent.extractors.models import (
     ExtractionIssue,
     ExtractionResult,
     IssueCode,
+    ReferenceKind,
     SourceType,
 )
 from discovery_agent.extractors.common_models import ConfigEntry
@@ -45,6 +46,7 @@ from discovery_agent.extractors.notebook_models import (
     ResourceReference,
     SessionConfiguration,
 )
+from discovery_agent.extractors.notebook_calls import find_calls
 from discovery_agent.extractors.notebook_scanners import NotebookCodeScanner
 from discovery_agent.extractors.synapse_json import (
     classify_reference,
@@ -54,7 +56,7 @@ from discovery_agent.extractors.synapse_json import (
 from discovery_agent.models import AssetType, Evidence, asset_id
 
 EXTRACTOR_NAME = "notebook"
-EXTRACTOR_VERSION = "1.0.0"
+EXTRACTOR_VERSION = "1.1.0"
 ROOT_PATH = "properties"
 
 # Kernel name -> the language it runs. Declared by the notebook, never guessed
@@ -245,7 +247,8 @@ class NotebookExtractor(Extractor[NotebookDefinition]):
             session=self._session(parsed),
             metadata=self._metadata_entries(parsed.metadata),
             cells=cells,
-            references=self._notebook_references(parsed, artifact, name, warnings),
+            references=self._notebook_references(parsed, artifact, name, warnings)
+            + self._called_notebooks(cells, artifact, name),
             resources=self._notebook_resources(parsed),
         )
 
@@ -561,9 +564,9 @@ class NotebookExtractor(Extractor[NotebookDefinition]):
 
         Reuses the shared Synapse scanner, so a notebook's ``bigDataPool``
         is recognized by exactly the rule that recognizes a pipeline's dataset
-        reference. Constructs written in *code* never become references — they
-        become findings, because a string in code cannot be proven to be a
-        reference.
+        reference. Constructs written in *code* become findings, not references,
+        because a string in code cannot be proven to be a reference; the one
+        exception is a notebook run by a literal name (``_called_notebooks``).
         """
         outside_cells = {
             key: value for key, value in parsed.properties.items() if key != "cells"
@@ -597,6 +600,41 @@ class NotebookExtractor(Extractor[NotebookDefinition]):
         return tuple(
             sorted(references, key=lambda r: (r.location, r.target_name))
         )
+
+    @staticmethod
+    def _called_notebooks(
+        cells: Sequence[NotebookCell], artifact: DetectedArtifact, name: str
+    ) -> Tuple[ArtifactReference, ...]:
+        """Notebooks this one runs by a literal name (``%run``, ``mssparkutils.notebook.run``).
+
+        The called notebook must exist in Fabric before this one runs, so the
+        call is a dependency like a pipeline's notebook activity. A name built
+        at run time is not a reference: it stays a finding for a person.
+        """
+        notebook_id = asset_id(AssetType.NOTEBOOK, name)
+        seen = set()
+        references = []
+        for cell in cells:
+            if not cell.is_code:
+                continue
+            for call in find_calls(cell.source):
+                if call.target is None or call.target.lower() == name.lower():
+                    continue
+                if call.target.lower() in seen:
+                    continue
+                seen.add(call.target.lower())
+                references.append(
+                    ArtifactReference(
+                        source_artifact_id=notebook_id,
+                        source_artifact_type=AssetType.NOTEBOOK,
+                        kind=ReferenceKind.ARTIFACT,
+                        target_type=AssetType.NOTEBOOK,
+                        target_name=call.target,
+                        location=f"{cell.location}:L{call.line}",
+                        evidence=Evidence(artifact.source_path, None, EXTRACTOR_NAME),
+                    )
+                )
+        return tuple(references)
 
     @staticmethod
     def _notebook_resources(parsed: ParsedNotebook) -> Tuple[ResourceReference, ...]:

@@ -2,6 +2,7 @@ import { ListChecks, ListPlus, Play } from "lucide-react";
 import { useState } from "react";
 import { PlannerRuns } from "../../migrate/PlannerPanel";
 import { StagesPanel } from "../../migrate/StagesPanel";
+import { CapacityPanel } from "../../migrate/CapacityPanel";
 import { PlanEditor, StrategyTable } from "../../migrate/StrategyPanel";
 import { StatStrip } from "../../shared/Metrics";
 import { Banner, Button, Collapsible, Tabs } from "../../shared/Shared";
@@ -56,7 +57,7 @@ function Risks() {
 
 export function PlanPanel() {
   const { graph, plan, analysis, analysisError, addAllToPlan } = useMigration();
-  const [tab, setTab] = useState<"risks" | "objects" | "strategy" | "stages">("risks");
+  const [tab, setTab] = useState<"risks" | "objects" | "strategy" | "stages" | "capacity">("risks");
   const [picking, setPicking] = useState(false);
 
   if (!graph) return <p className="muted">The plan is built from the discovered objects and their waves. Finish the earlier steps first.</p>;
@@ -95,12 +96,14 @@ export function PlanPanel() {
         { id: "objects", label: "Objects in plan", count: plan.length },
         { id: "strategy", label: "Strategy by type" },
         { id: "stages", label: "Stages & credentials" },
+        { id: "capacity", label: "Capacity" },
       ]} />
 
       {tab === "risks" && (analysis ? <Risks /> : <p className="muted">The risks appear once the plan is scored.</p>)}
       {tab === "objects" && <PlanEditor />}
       {tab === "strategy" && <StrategyTable />}
       {tab === "stages" && <StagesPanel />}
+      {tab === "capacity" && <CapacityPanel />}
     </div>
   );
 }

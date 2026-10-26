@@ -13,7 +13,7 @@ import { useConsult } from "./ConsultState";
  * Fabric), and Resume picks up from the first stage that is not done.
  */
 
-export type AgentStageKey = "brief" | "snapshot" | "dependencies" | "plan" | "readiness" | "approval" | "run" | "validate";
+export type AgentStageKey = "brief" | "snapshot" | "dependencies" | "plan" | "readiness" | "approval" | "run" | "validate" | "signoff";
 export type AgentStageStatus = "pending" | "running" | "waiting" | "done" | "failed" | "skipped";
 
 export interface GateOption {
@@ -62,6 +62,7 @@ export const AGENT_STAGES: { key: AgentStageKey; title: string; blurb: string; g
   { key: "approval", title: "Approval", blurb: "A person approves before anything is written to Fabric, when the brief asks for it.", group: "Build" },
   { key: "run", title: "Migration run", blurb: "Creates the objects in Fabric and loads the data, wave by wave; failed objects are retried as the brief says.", group: "Deploy and load" },
   { key: "validate", title: "Validation", blurb: "Compares every migrated object with Synapse, with the checks the brief asks for.", group: "Deploy and load" },
+  { key: "signoff", title: "Cutover sign-off", blurb: "What the brief says a person confirms before users move to Fabric: benchmarks, reviews, schedules, rollback.", group: "Cutover" },
 ];
 
 /** The journey steps a finished stage confirms. */
@@ -349,6 +350,22 @@ export function OrchestratorProvider({ children }: { children: ReactNode }) {
         details: mism.slice(0, 8).map((r) => `${r.object} (${r.category}): ${r.detail ?? `${r.source} vs ${r.target}`}`),
       };
     },
+
+    signoff: async () => {
+      // The agent cannot benchmark, review code or switch consumers over: it lists what the brief says a person
+      // confirms, and the migration is not finished until they sign off.
+      const items = live.current.consult.approved?.settings.signoffs ?? [];
+      if (!items.length) return { skipped: "The brief asks for nothing to be confirmed before cutover." };
+      return {
+        message: `Waiting for a person to sign off ${items.length} item${items.length === 1 ? "" : "s"}`,
+        wait: {
+          title: "Sign off before cutover",
+          why: "The brief names these checks for a person to make before users and downstream systems move to Fabric. The agent cannot make them itself; confirm each one is done. Synapse is untouched until then.",
+          items,
+          options: [{ id: "signoff", label: "Every item is done: sign off", primary: true }, { id: "open", label: "Open the consultation", navigate: { view: "consult" } }],
+        },
+      };
+    },
   };
 
   // ---- the loop ---------------------------------------------------------------------------
@@ -450,6 +467,12 @@ export function OrchestratorProvider({ children }: { children: ReactNode }) {
         patchStage(stage, { status: "done", gate: null, message: `Approved at ${new Date().toLocaleTimeString()}.`, finishedAt: now() });
         void drive();
         return;
+      case "signoff": {
+        const n = live.current.consult.approved?.settings.signoffs?.length ?? 0;
+        patchStage(stage, { status: "done", gate: null, message: `${n} item${n === 1 ? "" : "s"} signed off by a person at ${new Date().toLocaleString()}.`, finishedAt: now() });
+        void drive();
+        return;
+      }
       case "drop-credential-stages": {
         const needing = new Set((m.capabilities?.stages ?? []).filter((s) => s.needsInput === "credentials").map((s) => s.key));
         m.setOptions({ stages: m.options.stages.filter((k) => !needing.has(k)) });

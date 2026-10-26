@@ -13,6 +13,10 @@ with ``spark.read.synapsesql("pool.schema.table")``) becomes Fabric's
 (``com.microsoft.spark.fabric``, reading the migrated Warehouse). Anything else
 that uses Synapse-only APIs is flagged for review, not rewritten, because a
 silent guess at someone's code is worse than an honest note.
+
+Calls that run another notebook (``%run /folder/name``, ``mssparkutils.notebook.run("/folder/name")``) are
+pointed at the notebook's name in every code cell, because Fabric runs a notebook by name and the run places
+every notebook at the workspace root. A notebook name built at run time is flagged for review.
 """
 
 from __future__ import annotations
@@ -21,6 +25,8 @@ import base64
 import json
 import re
 from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+from discovery_agent.extractors.notebook_calls import find_calls, rewrite_calls
 
 #: Synapse language names -> the language_info name a Fabric notebook uses.
 _LANGUAGES = {
@@ -40,6 +46,9 @@ _REVIEW = (
     (re.compile(r"\.dfs\.core\.windows\.net"), "direct storage paths (route the storage account through a OneLake shortcut in Plan)"),
 )
 
+
+#: A notebook run whose name is built at run time: the name must be a notebook in the Fabric workspace.
+_DYNAMIC_CALL = "a notebook run whose name is built at run time (it must name a notebook in the Fabric workspace)"
 
 _IMPORT_MSSPARKUTILS = re.compile(r"^[ \t]*from[ \t]+notebookutils[ \t]+import[ \t]+mssparkutils[ \t]*$", re.MULTILINE)
 _MSSPARKUTILS = re.compile(r"\bmssparkutils\.(?!env\b|credentials\.(?:getConnectionStringOrCreds|getSecretWithLS|getPropertiesAll)\b)")
@@ -113,7 +122,8 @@ def _language(properties: Mapping[str, Any]) -> str:
 
 
 def to_fabric_ipynb(payload: Mapping[str, Any], pool_name: str = "", warehouse: str = "",
-                    lakehouse: Optional[Tuple[str, str, str]] = None) -> Tuple[Dict[str, Any], List[str]]:
+                    lakehouse: Optional[Tuple[str, str, str]] = None,
+                    environment: Optional[Tuple[str, str, str]] = None) -> Tuple[Dict[str, Any], List[str]]:
     """The Fabric ipynb document for one Synapse notebook resource, and what changed.
 
     ``pool_name`` and ``warehouse`` let reads of the migrated pool be pointed at the Warehouse. ``lakehouse``
@@ -124,8 +134,11 @@ def to_fabric_ipynb(payload: Mapping[str, Any], pool_name: str = "", warehouse: 
     notes: List[str] = []
 
     pool = (properties.get("bigDataPool") or {}).get("referenceName")
-    if pool:
-        notes.append(f"Attached Spark pool '{pool}' dropped: Fabric runs it on the workspace's Spark settings.")
+    if pool and environment is not None:
+        notes.append(f"Attached to the Environment '{environment[1]}' made from its Spark pool, with that pool's libraries and settings.")
+    elif pool:
+        notes.append(f"Attached Spark pool '{pool}' dropped: no Environment of that name in Fabric yet, so it runs on the workspace's "
+                     "Spark settings. Migrate the Spark pool, then update the notebook to attach it.")
     if properties.get("sessionProperties"):
         notes.append("Spark session size settings dropped: set them in a Fabric environment if needed.")
     folder = (properties.get("folder") or {}).get("name")
@@ -136,6 +149,7 @@ def to_fabric_ipynb(payload: Mapping[str, Any], pool_name: str = "", warehouse: 
     had_outputs = False
     flagged: List[str] = []
     rewritten: List[str] = []
+    called = 0
     for cell in properties.get("cells") or []:
         kind = cell.get("cell_type") if cell.get("cell_type") in ("code", "markdown", "raw") else "code"
         source = _lines(cell.get("source"))
@@ -154,6 +168,12 @@ def to_fabric_ipynb(payload: Mapping[str, Any], pool_name: str = "", warehouse: 
                     out["source"] = source = new_text.splitlines(keepends=True)
                     rewritten.extend(c for c in changes if c not in rewritten)
             text = "".join(source)
+            text, moved = rewrite_calls(text)
+            if moved:
+                out["source"] = source = text.splitlines(keepends=True)
+                called += moved
+            if any(c.target is None for c in find_calls(text)) and _DYNAMIC_CALL not in flagged:
+                flagged.append(_DYNAMIC_CALL)
             for pattern, label in _REVIEW:
                 if label not in flagged and pattern.search(text):
                     flagged.append(label)
@@ -161,6 +181,8 @@ def to_fabric_ipynb(payload: Mapping[str, Any], pool_name: str = "", warehouse: 
 
     if had_outputs:
         notes.append("Saved cell outputs were not copied.")
+    if called:
+        rewritten.append(f"notebook runs point at the notebook's name, without its Synapse folder ({called} call{'s' if called != 1 else ''})")
     if rewritten:
         notes.append("Rewritten for Fabric: " + "; ".join(rewritten) + ".")
     if flagged:
@@ -181,6 +203,9 @@ def to_fabric_ipynb(payload: Mapping[str, Any], pool_name: str = "", warehouse: 
         document["metadata"]["dependencies"] = {"lakehouse": {
             "default_lakehouse": lakehouse_id, "default_lakehouse_name": name, "default_lakehouse_workspace_id": workspace_id}}
         notes.append(f"Default Lakehouse: {name} (the notebook reads its tables by name).")
+    if environment is not None:
+        env_id, _, workspace_id = environment
+        document["metadata"].setdefault("dependencies", {})["environment"] = {"environmentId": env_id, "workspaceId": workspace_id}
     return document, notes
 
 

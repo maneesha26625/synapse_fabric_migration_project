@@ -1,4 +1,4 @@
-import type { RunOptions, ValidationRuntimeOptions } from "../types";
+import type { PerformanceOptions, ReconcileOptions, RunOptions, ValidationRuntimeOptions } from "../types";
 import { EFFECT_LABEL, QUESTIONS, TOPICS, answerLabel, type AnswerValue, type Answers, type Question, type Recommendation } from "./catalog";
 import type { Facts } from "./facts";
 
@@ -61,6 +61,44 @@ export interface AgentSettings {
   prerequisites: string[];
   /** When validation finds mismatches: stop for a person (all, exceptions) or report (critical). */
   validationGate: "all" | "exceptions" | "critical";
+  /** What a person confirms before cutover: the agent's last stage waits until they sign off. */
+  signoffs: string[];
+}
+
+/** The value profile Validate reads, from the reconciliation answers. */
+export function reconcileFrom(a: Answers): ReconcileOptions {
+  const v = pick(a, "validation.tolerance", "exact");
+  const results = pick(a, "validation.results", "procedures");
+  const compare = { views: results === "both", procedures: results !== "none" };
+  if (v === "counts") return { profile: false, ...compare, tolerancePct: 0, differences: "mismatch" };
+  if (v === "business") return { profile: true, ...compare, tolerancePct: 0, differences: "review" };
+  const pct = Number(v);
+  return { profile: true, ...compare, tolerancePct: Number.isFinite(pct) ? pct : 0, differences: "mismatch" };
+}
+
+/** Validate's benchmark against Synapse, from the SLA answer. */
+export function performanceFrom(a: Answers): PerformanceOptions {
+  const sla = pick(a, "sql.sla", "none");
+  if (sla === "thresholds") return { enabled: true, thresholdPct: 20, limit: 10, strict: true };
+  if (sla === "benchmark") return { enabled: true, thresholdPct: 50, limit: 10, strict: false };
+  return { enabled: false, thresholdPct: 50, limit: 10, strict: false };
+}
+
+/** What a person confirms before cutover: one line per answer that asks for it, then what the run leaves switched off. */
+export function signoffsFrom(facts: Facts, rs: Resolved[], stages: string[]): string[] {
+  const out: string[] = [];
+  for (const r of rs) {
+    if (!r.applies || r.value === undefined || !r.q.signoff) continue;
+    const line = r.q.signoff(r.value, facts, answerLabel(r.q, facts, r.value));
+    if (line && !out.includes(line)) out.push(line);
+  }
+  if (facts.tables > 0) {
+    out.push("The Cutover checks in Validate are ready (validation clean, synced tables current, final sync run), and the approval is recorded there.");
+  }
+  if (stages.includes("schedules") && (facts.byType["Trigger"] ?? 0) > 0) {
+    out.push("The Fabric pipeline schedules (created switched off) are switched on, and the matching Synapse triggers stopped.");
+  }
+  return out;
 }
 
 const REMOVE: Record<string, (a: Answers) => boolean> = {
@@ -117,13 +155,18 @@ export function settingsFrom(facts: Facts, rs: Resolved[]): AgentSettings {
     includeUnstaged: scope === "all",
     waves: mode === "pilot" ? [1] : null,
     options,
-    validation: { probe: depth !== "compare", run: depth === "run" ? ["pipeline", "notebook"] : [], timeoutMinutes: 30 },
+    validation: {
+      probe: depth !== "compare", run: depth === "run" ? ["pipeline", "notebook"] : [], timeoutMinutes: 30, reconcile: reconcileFrom(a),
+      // Storage access is always proven: a shortcut its connection cannot read fails everything that reads through it.
+      access: true, performance: performanceFrom(a),
+    },
     failures,
     approval: pick(a, "validation.approval", "ask") !== "auto" || unsupported === "block",
     approveUnsupported: unsupported === "block",
     needsCredentials: credentialStages,
     prerequisites,
     validationGate: pick(a, "validation.gate", "exceptions") as AgentSettings["validationGate"],
+    signoffs: signoffsFrom(facts, rs, ordered),
   };
 }
 
@@ -193,6 +236,7 @@ export function briefMarkdown(facts: Facts, rs: Resolved[], meta: { project: str
   }
   const s = settingsFrom(facts, rs);
   if (s.prerequisites.length) lines.push("## Prerequisites before the run", "", ...s.prerequisites.map((x) => `- ${x}`), "");
+  if (s.signoffs.length) lines.push("## Sign-off before cutover", "", ...s.signoffs.map((x) => `- [ ] ${x}`), "");
   const c = conflicts(facts, rs);
   if (c.length) lines.push("## Conflicts", "", ...c.map((x) => `- ${x}`), "");
   if (facts.notRecorded.length) lines.push("## Not visible to discovery", "", `${facts.notRecorded.join(", ")}: questions about these were asked, never answered from discovery.`, "");

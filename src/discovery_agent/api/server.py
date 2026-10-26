@@ -198,6 +198,10 @@ def make_handler(
                 self._dispatch(migration.validation_state)
             elif path == "/api/migration/run":
                 self._dispatch(migration.state)
+            elif path == "/api/migration/capacity":
+                self._dispatch(migration.capacity)
+            elif path == "/api/cutover":
+                self._dispatch(migration.cutover_state)
             elif path.startswith("/api/azure/"):
                 self._dispatch(lambda: session.azure_options(path[len("/api/azure/"):], query))
             elif path == "/api/dependencies":
@@ -248,6 +252,9 @@ def make_handler(
                 "/api/migration/validate": lambda: migration.start_validation(self._json_body()),
                 "/api/migration/start": lambda: migration.start(self._json_body()),
                 "/api/migration/control": lambda: migration.control(self._json_body()),
+                "/api/cutover/sync": lambda: migration.cutover_sync(self._json_body()),
+                "/api/cutover/schedules": lambda: migration.cutover_schedules(self._json_body()),
+                "/api/cutover/complete": lambda: migration.cutover_complete(self._json_body()),
                 "/api/transform/generate": lambda: transforms.generate(self._json_body()),
                 "/api/transform/accept": lambda: transforms.accept(self._json_body(MAX_ACCEPT_BYTES)),
                 "/api/transform/discard": lambda: transforms.discard(self._json_body()),

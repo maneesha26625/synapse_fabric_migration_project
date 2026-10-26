@@ -719,6 +719,64 @@ export interface ValidationRuntimeOptions {
   /** Run these now in Fabric (real runs) instead of reading their last run. */
   run: RunnableKind[];
   timeoutMinutes: number;
+  /** Beyond row counts: profile the values of each table whose counts agree. Undefined: no profile. */
+  reconcile?: ReconcileOptions;
+  /** Replay Synapse's most demanding recent SELECTs on Fabric and compare their times. Undefined: not benchmarked. */
+  performance?: PerformanceOptions;
+  /** Read every OneLake shortcut through its connection, proving its identity may read the storage. */
+  access?: boolean;
+}
+
+export interface PerformanceOptions {
+  enabled: boolean;
+  /** Slower than on Synapse by more than this percentage is a regression. */
+  thresholdPct: number;
+  /** How many of the history's queries to replay. */
+  limit: number;
+  /** A regression is a mismatch (an SLA was agreed) rather than a review. */
+  strict: boolean;
+}
+
+/** Plan → Capacity: a Fabric capacity starting point with its evidence and assumptions (GET /api/migration/capacity). */
+export interface CapacityAssessment {
+  sql: { dwu: number | null; cu: number | null; basis: string | null };
+  spark: { vcores: number | null; cu: number | null; basis: string | null };
+  data: { gb: number; rows: number; largest: { table: string; gb: number; rows: number }[] } | null;
+  workload: { peakConcurrency: number; requests: number; windowStart: string | null; windowEnd: string | null } | null;
+  schedules: { schedules: number; busiestHour: number | null; atOnce: number };
+  recommendation: { sku: string | null; cu: number | null; togetherSku: string | null; why: string };
+  evidence: string[];
+  caveats: string[];
+  target?: { sku: string; cu: number | null; fits: boolean | null; detail: string };
+}
+
+export interface CutoverCheck { label: string; status: "pass" | "fail" | "info" | "person"; detail: string }
+export interface CutoverSchedule { pipeline: string; enabled: boolean; type?: string | null; sync: boolean }
+export interface CutoverTable { table: string; watermark: string; newest: string | null; behind: boolean | null; lagMinutes: number | null; detail?: string }
+/** Validate → Cutover (GET /api/cutover). */
+export interface CutoverState {
+  workspace: string;
+  warehouse: string;
+  checks: CutoverCheck[];
+  freshness: { tables: CutoverTable[]; behind: number; note?: string };
+  schedules: CutoverSchedule[];
+  record: { approvedBy: string; at: string; note?: string | null } | null;
+}
+
+/**
+ * Data reconciliation beyond row counts. For a table whose row counts agree, one aggregate query per side
+ * reads NULLs per column, exact sums of numeric columns, earliest and latest dates, total text length and
+ * duplicate keys, and the two profiles are compared ("Data Profile" rows).
+ */
+export interface ReconcileOptions {
+  profile: boolean;
+  /** Also compare each view's rows and value profile, and each procedure's first result set (described, not run). */
+  views?: boolean;
+  procedures?: boolean;
+  /** Sums, lengths and NULL counts may differ by this percentage of the larger side (0 to 10). Dates and duplicate keys are always exact. */
+  tolerancePct: number;
+  /** A difference outside the tolerance: a MISMATCH, or left for a person to judge (REVIEW). */
+  differences: "mismatch" | "review";
 }
 
 /** The single seam between the UI and whatever supplies data. */
@@ -904,6 +962,13 @@ export interface MigrationApi {
   listTransformCandidates(target?: SqlTarget): Promise<TransformCandidates>;
   /** Features the latest discovery found, for the consultation's conditional questions. */
   getConsultFacts(): Promise<ConsultFacts>;
+  /** A Fabric capacity starting point from the discovered estate. */
+  getCapacity(): Promise<CapacityAssessment>;
+  /** Cutover: readiness, freshness of synced tables, schedules; and the actions that make the switch. */
+  getCutover(): Promise<CutoverState>;
+  runFinalSync(): Promise<void>;
+  setSchedules(enabled: boolean, pipelines?: string[]): Promise<{ changed: string[]; failed: string[] }>;
+  completeCutover(approvedBy: string, note?: string): Promise<void>;
   /** The project requirements every prompt carries (prompts/transform/project.md on the server). */
   getProjectRequirements(): Promise<ProjectRequirements>;
   saveProjectRequirements(text: string): Promise<ProjectRequirements>;
@@ -971,6 +1036,16 @@ export interface ConsultFeatureFacts {
   managedIdentityLinkedServices: number;
   unsupportedActivities: { activities: number; pipelines: number };
   triggers: { schedule: number; tumblingWindow: number; event: number; other: number; started: number };
+  /** From the pool's estate; null without a SQL pool. */
+  securityPolicies: number | null;
+  blockPredicates: number | null;
+  externalDataSources: number | null;
+  dataGb: number | null;
+  dataRows: number | null;
+  largeTables: number | null;
+  peakConcurrency: number | null;
+  replayableQueries: number | null;
+  lakeDatabases: number;
 }
 export interface ConsultFacts {
   facts: Partial<ConsultFeatureFacts>;

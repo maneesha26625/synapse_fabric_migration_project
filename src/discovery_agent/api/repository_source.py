@@ -499,3 +499,10 @@ def triggers(root: Path) -> List[dict]:
 
 def integration_runtimes(root: Path) -> List[dict]:
     return _documents(root / "integrationRuntime")
+
+
+def lake_databases(root: Path) -> Tuple[List[dict], Dict[str, List[dict]]]:
+    """Lake databases in the repository's ``database`` folder, and each one's table definitions
+    (``database/<db>/table/*.json``)."""
+    databases = _documents(root / "database")
+    return databases, {str(d["name"]): _documents(root / "database" / str(d["name"]) / "table") for d in databases}

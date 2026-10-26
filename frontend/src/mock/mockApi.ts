@@ -17,7 +17,9 @@
 import {
   ApiRequestError,
   type Capabilities,
+  type CapacityAssessment,
   type ConsultFacts,
+  type CutoverState,
   type ConnectionConfig,
   type ConnectionCredentials,
   type ConnectionState,
@@ -71,6 +73,9 @@ const STEPS = [
 ];
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** The demo cutover: whether the final sync ran, schedules are on, and who approved it. */
+const demoCutover: { synced: boolean; on: boolean; validated: boolean; record: { approvedBy: string; at: string } | null } =
+  { synced: false, on: false, validated: false, record: null };
 
 interface Session {
   connection: ConnectionState;
@@ -1092,6 +1097,20 @@ export const mockApi: MigrationApi = {
         const bad = h % 13 === 0 && short++ < 3;
         rows.push({ category: "Data Count", object: i.name.replace(/ \(data\)$/, ""), source: `${n.toLocaleString()} rows`, target: `${(bad ? n - 12 : n).toLocaleString()} rows`, status: bad ? "MISMATCH" : "MATCH",
           detail: bad ? "12 rows fewer in the Warehouse (demo): check the pipeline run, then reload the table." : "Same row count on both sides." });
+        if (!bad && runtime?.reconcile?.profile) {
+          // Demo: one table in 17 has a decimal sum off by a cent, and one in 29 was loaded twice by a retried pipeline.
+          const r = runtime.reconcile;
+          const off = h % 17 === 0, twice = !off && h % 29 === 0;
+          const within = off && r.tolerancePct >= 0.01;
+          const differs = (off && !within) || twice;
+          const how = r.differences === "review" ? "differences left for a person to judge" : r.tolerancePct ? `within ${r.tolerancePct}%` : "exact";
+          const said = twice ? "The values differ: duplicate keys (Id): 40 key value(s) held by more than one row in Fabric, 0 in Synapse; a load ran twice or rows were appended."
+            : off && within ? "Values agree within the approved tolerance (1 differs inside it, e.g. sum of Amount: 1,204,331.25 in Synapse, 1,204,331.24 in Fabric)."
+            : off ? "The values differ: sum of Amount: 1,204,331.25 in Synapse, 1,204,331.24 in Fabric."
+            : "NULLs, sums, earliest and latest dates, text lengths and duplicate keys agree.";
+          rows.push({ category: "Data Profile", object: i.name.replace(/ \(data\)$/, ""), source: "12 measures", target: "12 measures",
+            status: differs ? (r.differences === "review" ? "REVIEW" : "MISMATCH") : "MATCH", detail: `${said} (${how}, demo)` });
+        }
       } else if (i.type === "Table") {
         const changed = h % 20 === 0;
         rows.push({ category: "Tables", object: i.name, source: "8 columns", target: "8 columns", status: changed ? "REVIEW" : "MATCH",
@@ -1114,6 +1133,39 @@ export const mockApi: MigrationApi = {
     }
     for (const i of run.items.filter((x) => x.status === "DEFERRED" && x.type === "Integration Runtime")) {
       rows.push({ category: "Manual", object: i.name, source: "present", target: "set up by hand", status: "REVIEW", detail: i.error ?? "Set up by hand." });
+    }
+    demoCutover.validated = true;
+    if (runtime?.reconcile?.views) {
+      for (const i of done.filter((x) => x.type === "View").slice(0, 40)) {
+        const off = hash(i.id) % 23 === 0;
+        rows.push({ category: "View Results", object: i.name, source: "9 measures", target: "9 measures", status: off ? "MISMATCH" : "MATCH",
+          detail: off ? "The values differ: rows: 48,211 in Synapse, 48,209 in Fabric (demo)." : "Rows, NULLs, sums, dates and text lengths agree (demo)." });
+      }
+    }
+    if (runtime?.reconcile?.procedures) {
+      for (const i of done.filter((x) => x.type === "Stored Procedure").slice(0, 40)) {
+        const typed = hash(i.id) % 11 === 0;
+        rows.push({ category: "Procedure Results", object: i.name, source: "6 column(s)", target: "6 column(s)", status: typed ? "REVIEW" : "MATCH",
+          detail: typed ? "Same columns; type(s) differ: TripCount (int -> bigint) (demo)." : "Same columns and types in the first result set (described, not run, demo)." });
+      }
+    }
+    if (runtime?.access && done.some((x) => x.type === "External Table")) {
+      rows.push({ category: "Access", object: "sqlpool01_lakehouse/Files/raw", source: "https://nyctaxidemo.dfs.core.windows.net/raw", target: "readable",
+        status: "MATCH", detail: "Read through the shortcut's connection: the identity it uses may read the location (demo)." });
+      rows.push({ category: "Access", object: "sqlpool01_lakehouse/Files/ext/Zones", source: "https://partnerdata.dfs.core.windows.net/zones", target: "not readable",
+        status: "MISMATCH", detail: "The shortcut's connection is not allowed to read it: give that identity Storage Blob Data Reader (or ACLs) on the location, then validate again (demo)." });
+    }
+    if (runtime?.performance?.enabled) {
+      const p = runtime.performance;
+      const demo: [string, number, number][] = [["Daily revenue by zone", 8.2, 6.9], ["Top drivers this month", 3.1, 5.6], ["Fare outliers", 21.4, 18.0]];
+      for (const [name, syn, fab] of demo.slice(0, p.limit)) {
+        const change = Math.round(((fab - syn) / syn) * 100);
+        const ok = change <= p.thresholdPct;
+        rows.push({ category: "Performance", object: name, source: `${syn.toFixed(2)} s avg (14 runs)`, target: `${fab.toFixed(2)} s (first run ${(fab * 1.4).toFixed(2)} s)`,
+          status: ok ? "MATCH" : p.strict ? "MISMATCH" : "REVIEW",
+          detail: ok ? `${Math.abs(change)}% ${change < 0 ? "faster" : "slower"} than on Synapse, within the ${p.thresholdPct}% allowed (demo).`
+            : `${change}% slower than on Synapse (allowed: ${p.thresholdPct}%). Check the target's data layout, the query plan and capacity use before cutover (demo).` });
+      }
     }
     if (runtime) {
       const byName = new Map(done.map((i) => [i.name, i]));
@@ -1209,10 +1261,77 @@ export const mockApi: MigrationApi = {
         linkedServicesOnSelfHostedRuntime: n("Integration Runtime") ? Math.min(2, n("Linked Service")) : 0, keyVaultLinkedServices: part("Linked Service", 0.3),
         managedIdentityLinkedServices: part("Linked Service", 0.4), unsupportedActivities: { activities: part("Pipeline", 0.05), pipelines: part("Pipeline", 0.04) },
         triggers: { schedule: part("Trigger", 0.7), tumblingWindow: part("Trigger", 0.2), event: n("Trigger") - part("Trigger", 0.7) - part("Trigger", 0.2), other: 0, started: part("Trigger", 0.6) },
+        securityPolicies: tables ? 2 : null, blockPredicates: tables ? 0 : null, externalDataSources: tables ? Math.min(2, n("External Table")) : null,
+        dataGb: tables ? 812.4 : null, dataRows: tables ? 2_140_000_000 : null, largeTables: tables ? 3 : null,
+        peakConcurrency: tables ? 18 : null, replayableQueries: tables ? 14 : null, lakeDatabases: 0,
       },
       unreadable: [],
-      notRecorded: ["materialized views", "sequences", "foreign keys", "row-level security policies", "managed private endpoints and firewall rules", "table row counts and sizes", "items already in the Fabric workspace"],
+      notRecorded: ["materialized views", "sequences", "foreign keys", "managed private endpoints and firewall rules", "items already in the Fabric workspace"],
     };
+  },
+  async getCapacity(): Promise<CapacityAssessment> {
+    await sleep(200);
+    if (!completedObjects().length) throw new ApiRequestError("no_results", "There are no discovery results yet.", 409);
+    return {
+      sql: { dwu: 1000, cu: 60, basis: "assumed 6 CU per DW100c" },
+      spark: { vcores: 80, cu: 40, basis: "1 CU = 2 Spark vCores" },
+      data: { gb: 812.4, rows: 2_140_000_000, largest: [{ table: "dw.FactTrip", gb: 402.1, rows: 1_200_000_000 }, { table: "dw.FactFare", gb: 188.7, rows: 610_000_000 }, { table: "stg.Trips", gb: 64.2, rows: 210_000_000 }] },
+      workload: { peakConcurrency: 18, requests: 9_412, windowStart: "2026-10-19T00:02:11", windowEnd: "2026-10-25T23:58:40" },
+      schedules: { schedules: 12, busiestHour: 2, atOnce: 5 },
+      recommendation: { sku: "F64", cu: 64, togetherSku: "F128", why: "The larger of the SQL and Spark workloads; if they run at the same time, F128 covers both." },
+      evidence: [
+        "The dedicated pool runs at DW1000c: about 60 CU on the stated assumption.",
+        "The largest Spark pool (sparkpool01) reaches 80 vCores: 40 CU (1 CU = 2 Spark vCores).",
+        "812.4 GB in 1,204 tables (2,140,000,000 rows) move in the first load.",
+        "At most 18 SQL requests ran at once, in 9,412 recent requests (2026-10-19T00:02 to 2026-10-25T23:58).",
+        "5 schedule trigger(s) start in the busiest hour (02:00 UTC).",
+      ],
+      caveats: [
+        "SQL is converted at an assumed 6 CU per DW100c: Microsoft publishes no conversion. Run a pilot and read the Fabric Capacity Metrics app before choosing the production SKU.",
+        "Fabric smooths usage over time and lets work borrow capacity briefly, so short peaks fit a smaller SKU than their size suggests.",
+      ],
+      target: { sku: "F64", cu: 64, fits: true, detail: "F64 covers the larger workload." },
+    };
+  },
+  async getCutover(): Promise<CutoverState> {
+    await sleep(200);
+    const validated = demoCutover.validated;
+    return {
+      workspace: "Fabric_demo", warehouse: "sqlpool01",
+      checks: [
+        validated ? { label: "Validation has no mismatches", status: "fail", detail: "3 mismatch(es) in the last validation (demo)." }
+          : { label: "Validation has run", status: "fail", detail: "Run Validate first: cutover needs evidence the data agrees." },
+        demoCutover.synced ? { label: "Synced tables are current", status: "pass", detail: "All 2 synced table(s) are in step with Synapse." }
+          : { label: "Synced tables are current", status: "fail", detail: "1 of 2 table(s) behind Synapse: run the final sync." },
+        { label: "Schedules ready to switch on", status: "info", detail: `${demoCutover.on ? 0 : 3} of 3 schedule(s) are off; switch them on as the cutover's last step.` },
+        { label: "Synapse triggers stopped", status: "person", detail: "Stop the matching Synapse triggers so both sides do not load the same data. This tool never changes Synapse." },
+      ],
+      freshness: { behind: demoCutover.synced ? 0 : 1, tables: [
+        { table: "dw.factfare", watermark: "2026-10-26T02:00:00", newest: "2026-10-26T02:00:00", behind: false, lagMinutes: null, detail: "In step with Synapse." },
+        { table: "dw.facttrip", watermark: demoCutover.synced ? "2026-10-26T09:41:00" : "2026-10-26T02:00:00", newest: "2026-10-26T09:41:00",
+          behind: !demoCutover.synced, lagMinutes: demoCutover.synced ? null : 461, detail: demoCutover.synced ? "In step with Synapse." : "Behind Synapse: run the final sync." },
+      ] },
+      schedules: [
+        { pipeline: "sync_sqlpool01", enabled: demoCutover.on, type: "Daily", sync: true },
+        { pipeline: "PL_Load_Trips", enabled: demoCutover.on, type: "Daily", sync: false },
+        { pipeline: "PL_Refresh_Reports", enabled: demoCutover.on, type: "Weekly", sync: false },
+      ],
+      record: demoCutover.record,
+    };
+  },
+  async runFinalSync() {
+    await sleep(400);
+    demoCutover.synced = true;
+  },
+  async setSchedules(enabled) {
+    await sleep(250);
+    const changed = demoCutover.on === enabled ? [] : ["sync_sqlpool01", "PL_Load_Trips", "PL_Refresh_Reports"];
+    demoCutover.on = enabled;
+    return { changed, failed: [] };
+  },
+  async completeCutover(approvedBy) {
+    await sleep(150);
+    demoCutover.record = { approvedBy, at: new Date().toISOString() };
   },
   async listTransformCandidates(target = "warehouse") {
     await sleep(200);
