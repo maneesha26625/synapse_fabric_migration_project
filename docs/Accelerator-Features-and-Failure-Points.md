@@ -1,10 +1,10 @@
 # Migration Accelerator: Features and Where They Can Fail
 
-Oct 26, 2026
+Oct 26, 2026 (updated the same day, after commit `c81a148`)
 
 ## Summary
 
-As of now, the accelerator has about 45 working features in nine groups. They take a Synapse workspace from connection, through discovery, consultation, planning and migration, to validation in Fabric. Each feature below says what it does and where it can fail.
+As of now, the accelerator has about 55 working features in nine groups. They take a Synapse workspace from connection, through discovery, consultation, planning and migration, to validation in Fabric. Each feature below says what it does and where it can fail.
 
 The failure points come from three places: limits the README documents, error paths in the code, and engineering judgment about live tenants. Judgment-based points are marked **(likely)**.
 
@@ -15,6 +15,8 @@ The five riskiest areas, where a first real client run is most likely to break:
 3. **Storage routing through OneLake.** It rewrites storage paths inside code. Paths built in ways the patterns don't recognise stay unrouted and fail at run time.
 4. **Connections and credentials.** Synapse never gives up its secrets, so every linked service needs a person to choose how Fabric signs in. Only SQL, ADLS Gen2 and Blob are converted.
 5. **State held in memory.** Discovery, the run record and the agent live in the API process or the browser tab. A restart or a closed tab means redoing steps, although nothing in Fabric is lost.
+
+The features added on 26 October (reconciliation, benchmark, access checks, capacity, cutover, Environment libraries, row-level security, the estate discovery) are tested offline only. Each one notes what must be confirmed on a first real run.
 
 ## 1. Connections and sources
 
@@ -91,11 +93,14 @@ The five riskiest areas, where a first real client run is most likely to break:
 
 ### Discovery engine
 
-**What it does:** reads every object from up to three sources: the Git repository, the live workspace, and the dedicated SQL pool catalog through 16 fixed SELECT queries. It joins what each source says about the same object into one record, and notes where Git and the published workspace disagree (drift). It covers SQL pools, tables, views, procedures, functions, scripts, pipelines, datasets, linked services, triggers, notebooks, Spark pools, Spark jobs, libraries, integration runtimes, security, data masks and external tables. It never writes and uses no AI. It also scans definitions for embedded secrets. The same engine runs from the command line (`python -m discovery_agent`).
+**What it does:** reads every object from up to three sources: the Git repository, the live workspace, and the dedicated SQL pool catalog through 22 fixed SELECT queries. It joins what each source says about the same object into one record, and notes where Git and the published workspace disagree (drift). It covers SQL pools, tables, views, procedures, functions, scripts, pipelines, datasets, linked services, triggers, notebooks, Spark pools, Spark jobs, libraries, integration runtimes, security, data masks and external tables. It also reads the pool's **estate**: rows and size per table, row-level security policies, external data sources and file formats, and recent query history with peak concurrency. Lake databases come from the live workspace or the repository's `database` folder. Notebooks that run other notebooks (`%run`, `notebook.run`) by a written-out name become dependencies. It never writes and uses no AI. It also scans definitions for embedded secrets. The same engine runs from the command line (`python -m discovery_agent`).
 
 **Where it can fail:**
 
-- **Not discovered at all:** lake databases, external data sources and file formats, and networking (managed private endpoints, firewall). These are silently absent from the plan unless someone knows to look.
+- **Not discovered at all:** networking (managed private endpoints, firewall). It is absent from the plan unless someone knows to look.
+- **Sizes and query history need `VIEW DATABASE STATE`.** Without it they are reported as unknown, and the capacity assessment and benchmark have less to work from.
+- **Lake databases from the live workspace** use a data-plane route not yet confirmed on a real tenant. If it fails, discovery says *could not be listed*; the repository route doesn't depend on it.
+- **Replicated tables' sizes (likely)** are taken from one compute node's copy, which may not match what the pool reports elsewhere.
 - **Serverless SQL** is out of scope. Scripts and pipelines written for it are only flagged.
 - **Partial reads:** an endpoint that returns 403 is reported as an issue, not a count. The inventory is incomplete until a person fixes the permission and runs discovery again.
 - **Parsing edge cases (likely):** dynamic SQL, objects created at run time, and references built from strings can hide dependencies from the parser.
@@ -144,7 +149,7 @@ There are 25 type rules. Each object also gets a workstream and a Synapse-to-Fab
 
 **Where it can fail:**
 
-- **Hidden dependencies:** references in dynamic SQL, notebook code that builds table names from strings, or parameters resolved at run time aren't seen. The object can land in an earlier wave than its dependency and fail with "object not found". Retry failed usually fixes it once the dependency exists.
+- **Hidden dependencies:** references in dynamic SQL, notebook code that builds table or notebook names from strings, or parameters resolved at run time aren't seen. Notebooks run by a written-out name are now ordered correctly. The object can land in an earlier wave than its dependency and fail with "object not found". Retry failed usually fixes it once the dependency exists.
 - **Circular references (likely):** two objects that refer to each other can't be ordered cleanly, and one will fail on the first pass.
 - Cross-workspace dependencies, such as a pipeline calling another workspace, aren't modelled.
 
@@ -162,13 +167,14 @@ Each question has a recommendation with a reason, and is labelled by its effect:
 
 **Where it can fail:**
 
-- **Recorded-only answers are not enforced.** Answers such as big bang vs phased, downtime, naming standards or rollback are written into the brief but don't change the run. Clients may assume they do.
+- **Some answers are still recorded only.** Reconciliation tolerance, view and procedure comparison and the SLA now drive Validate, and 17 answers (downtime, formal rollback, schema freeze, dynamic SQL review, libraries and others) become cutover sign-off items the agent waits for. Big bang vs phased, priority and naming standards are still only written into the brief.
+- **Sign-offs are a person's word.** The agent can't check that a benchmark was run or a rollback plan written; it waits until someone confirms it.
 - **Recommendations come from discovery facts.** If discovery missed something (a lake database, say), no question is asked about it.
 - **Stored in the browser (likely):** the brief lives in the browser per project. Another machine or a cleared browser loses it.
 
 ### Agent orchestrator
 
-**What it does:** carries out the approved brief in eight stages: the approved brief, a discovery snapshot, dependency analysis, the migration plan, a readiness check, approval, the migration run, and validation. It uses exactly the same actions a person uses in Plan, Migrate and Validate, so it has no hidden powers. It stops for a person when the brief, a risk or a failure asks for one, showing the reason and the choices. Finished stages confirm the matching steps. Everything it does is logged in the activity panel.
+**What it does:** carries out the approved brief in nine stages: the approved brief, a discovery snapshot, dependency analysis, the migration plan, a readiness check, approval, the migration run, validation, and a cutover sign-off that lists what the brief says a person confirms before users move to Fabric. It uses exactly the same actions a person uses in Plan, Migrate and Validate, so it has no hidden powers. It stops for a person when the brief, a risk or a failure asks for one, showing the reason and the choices. Finished stages confirm the matching steps. Everything it does is logged in the activity panel.
 
 **Where it can fail:**
 
@@ -199,6 +205,16 @@ Each question has a recommendation with a reason, and is labelled by its effect:
 - **Typed credentials are lost** when the API restarts, so a retry after a restart needs them typed again.
 - **Update existing** overwrites changes made by hand in Fabric since the last run.
 
+### Capacity assessment
+
+**What it does:** Plan → Capacity gives a Fabric SKU starting point with its evidence: the SQL pool's DWU, the largest Spark pool's vCores (1 CU = 2 Spark vCores, as documented), the data the first load moves, the peak number of SQL requests running at once, and the busiest hour of schedule triggers. It shows the SKU for the larger workload and the SKU for SQL and Spark at once, and whether the target workspace's capacity covers it.
+
+**Where it can fail:**
+
+- **The SQL figure rests on an assumption.** Microsoft publishes no DWU-to-CU conversion, so it uses 6 CU per DW100c and says so. Calibrate it with a pilot and the Fabric Capacity Metrics app.
+- **Missing inputs:** without `VIEW DATABASE STATE`, data volume and concurrency are unknown and the estimate rests on pool sizes alone.
+- **Trial and P SKUs** can't be compared and are reported as such.
+
 ## 6. Migrate
 
 ### Warehouse, schemas and SQL objects
@@ -223,13 +239,15 @@ Each question has a recommendation with a reason, and is labelled by its effect:
 
 ### Roles and permissions
 
-**What it does:** recreates custom roles, adds role members, and replays GRANT and DENY at database, schema, object and column level, keeping `WITH GRANT OPTION`. A Microsoft Entra user is created by its first GRANT, because Fabric has no `CREATE USER`.
+**What it does:** recreates custom roles, adds role members, and replays GRANT and DENY at database, schema, object and column level, keeping `WITH GRANT OPTION`. A Microsoft Entra user is created by its first GRANT, because Fabric has no `CREATE USER`. **Row-level security** policies are recreated with their FILTER predicates and their on/off state, after the predicate functions they call; Validate checks them.
 
 **Where it can fail:**
 
 - **SQL-authenticated users can't move.** Fabric has no SQL authentication, so Plan lists the Entra principal a person must choose.
 - **Entra users from another tenant (likely),** or ones without access to the Fabric workspace, make the GRANT fail.
 - Workspace roles still decide who can connect. A GRANT alone doesn't give a user access to the workspace.
+- **BLOCK predicates** (rules that stop writes) aren't carried: Fabric Warehouse has FILTER predicates only. They are listed for a person.
+- **Row-level security covers T-SQL only.** Workspace Admins, Members and Contributors still see every row through Spark and OneLake.
 
 ### Table data load
 
@@ -256,20 +274,23 @@ Each question has a recommendation with a reason, and is labelled by its effect:
 
 ### Spark pools and Environments
 
-**What it does:** creates a custom Spark pool and a published Environment, mapping node size, autoscale and runtime.
+**What it does:** creates a custom Spark pool and a published Environment, mapping node size, autoscale and runtime. The pool's requirements.txt or environment.yml becomes the Environment's public libraries, and its Spark configuration becomes the Environment's Spark properties.
 
 **Where it can fail:**
 
-- **Libraries and Spark settings aren't copied.** Notebooks that need custom packages fail at run time until someone adds them to the Environment.
+- **Workspace packages aren't copied.** Wheel and jar files uploaded to Synapse stay there; they are named for a person to upload.
+- **The library upload isn't confirmed on a real run.** It uses the Environment definition format. If Fabric refuses it, the Environment is still created and a note says to add the libraries by hand.
+- **Requirements options** (`-r`, `--index-url`, URLs, local paths) are named, not carried.
 - Node sizes or runtimes with no Fabric equivalent are mapped to the nearest one, which can change performance.
 
 ### Notebooks
 
-**What it does:** keeps the cells, drops the pool binding and outputs, rewrites `mssparkutils` to `notebookutils`, and points Synapse SQL connector reads at Fabric's connector and the Warehouse. Other Synapse-only calls are flagged: `TokenLibrary`, `mssparkutils.env`, connector writes and ADLS paths.
+**What it does:** keeps the cells, drops the outputs, and attaches each notebook to the Environment made from its Spark pool. It rewrites `mssparkutils` to `notebookutils`, points Synapse SQL connector reads at Fabric's connector and the Warehouse, and points `%run /folder/name` and `notebook.run("/folder/name")` at the notebook's name, as Fabric runs it. Other Synapse-only calls are flagged: `TokenLibrary`, `mssparkutils.env`, connector writes, ADLS paths, and notebook names built at run time. Plan flags a call to a notebook discovery never found.
 
 **Where it can fail:**
 
-- **Notebooks aren't bound to the new Environment,** so they run on the default one without the right settings.
+- **The Environment attachment isn't confirmed on a real run.** If the Spark pool wasn't migrated first, the notebook runs on the workspace's default settings, and the note says so.
+- **Two notebooks with the same name in different Synapse folders (likely)** collide, because every notebook lands at the workspace root and is run by name.
 - **.NET (C#) notebooks** are deferred.
 - **Rewrites are pattern-based (likely):** aliased imports or wrapper functions around `mssparkutils` may be missed.
 
@@ -308,7 +329,7 @@ Each question has a recommendation with a reason, and is labelled by its effect:
 **Where it can fail:**
 
 - Event and tumbling-window triggers, every-N-days and monthly schedules are recreated by hand.
-- Because schedules start switched off, someone must remember to turn them on at cutover.
+- Schedules start switched off. Validate → Cutover switches them on, and it's listed in the agent's sign-off; until then nothing runs in Fabric.
 
 ### External tables and storage routing through OneLake
 
@@ -318,7 +339,7 @@ Each question has a recommendation with a reason, and is labelled by its effect:
 
 - **Paths the patterns don't recognise:** paths read from config tables, parameters, environment variables or built across several lines stay unrouted. Plan marks such objects `EXTERNAL_STORAGE`, and they fail at run time.
 - **Cross-tenant storage** needs an account key or SAS connection. The signed-in user's identity is rejected.
-- External data sources and file formats aren't discovered, so shortcut details come only from the external table itself.
+- **A shortcut whose connection can't read the storage** fails everything that reads through it. Validate's access check now finds this before cutover.
 
 ### Run control
 
@@ -326,7 +347,7 @@ Each question has a recommendation with a reason, and is labelled by its effect:
 
 **Where it can fail:**
 
-- **No rollback.** Nothing created in Fabric is deleted by the tool, and Reset doesn't remove Fabric items.
+- **No rollback of created items.** Nothing created in Fabric is deleted by the tool, and Reset doesn't remove Fabric items. The rollback lever is at cutover: switch schedules off, and point consumers back at Synapse.
 - **A skipped table keeps its old structure.** Schema changes made in Synapse after the first run need a manual drop or a new table.
 - **The run record lives in the API's memory.** After a restart the run shows *Run again*, though Fabric still holds what was created.
 
@@ -377,9 +398,39 @@ A check that couldn't run is shown as Review with the reason, never as a match.
 
 **Where it can fail:**
 
-- **Row counts only, no checksums.** Two tables with the same count but different values pass. A type mapping that silently truncates or rounds values isn't caught.
-- **Definition text comparison** flags every object the rules or AI changed as different, so many Review rows are expected and need a person's judgment.
+- **Definition text comparison** flags every object the rules or AI changed as different, so many Review rows are expected. The value and result checks below are what prove them.
 - **Row counts need the Synapse connection.** After a restart without signing in again, they show as unread.
+
+### Data reconciliation and result equivalence
+
+**What it does:** for each table whose row counts agree, one aggregate query per side reads a value profile: NULLs per column, exact sums of numeric columns, earliest and latest dates, total text length, and duplicate keys. The profiles are compared exactly or within an approved tolerance (0.01%, 0.1% or 1%), and a difference is a mismatch or left for a person. Views can be compared the same way, by what they return. Procedures are compared by their first result set's columns and types, described on both sides without running them. Each shows as its own row: Data Profile, View Results, Procedure Results.
+
+**Where it can fail:**
+
+- **It reads every table in full on both sides.** On very large pools this is slow and uses capacity; choose *row counts only* for those, or validate a pilot wave.
+- **A profile is strong evidence, not proof.** Two different datasets could in theory share every measure.
+- **Types the migration changes** (`datetimeoffset`, `time`, binary, spatial, `text`) are profiled for NULLs only.
+- **Sum overflow (likely):** very large decimal columns can overflow `decimal(38, s)`; that table shows as Review with the error.
+- **Emoji in text (likely)** can make `nvarchar` and UTF-8 `varchar` lengths differ slightly.
+
+### Storage access
+
+**What it does:** every OneLake shortcut the run made is read through OneLake. Through a shortcut, storage is read with the shortcut's connection, so a missing permission (403) or a missing path (404) shows in Validate → Access rather than when a notebook runs.
+
+**Where it can fail:**
+
+- **It needs a OneLake sign-in** through the Azure CLI; without it the check reports *not checked*.
+- **Key Vault access** for notebooks that read secrets isn't checked.
+
+### Benchmark against Synapse
+
+**What it does:** the most demanding recent SELECTs from Synapse's request history are run in Fabric twice, and the warm run is compared with Synapse's recorded average. A slowdown beyond the allowed percentage is Review, or a mismatch when an SLA was agreed. Queries that write or use temporary tables or variables are never run.
+
+**Where it can fail:**
+
+- **The two times aren't measured the same way.** Synapse's is server-side; Fabric's is measured from the API machine and includes returning the rows, so queries with large results look slower than they are.
+- **The history keeps only the pool's last 10,000 requests,** so weekly or monthly reports may not be in it.
+- **Queries that reference other databases or session state** can fail in Fabric for reasons that aren't performance.
 
 ### Runs-in-Fabric checks
 
@@ -390,6 +441,16 @@ A check that couldn't run is shown as Review with the reason, never as a match.
 - **Procedures using temporary tables** can't be compiled ahead and are reported as not checked.
 - **"Run now" makes real runs.** They read real sources and write real targets, including any external systems a pipeline touches.
 - **Long-running jobs** time out and show as not finished rather than failed.
+
+### Cutover
+
+**What it does:** Validate → Cutover shows whether Fabric is ready to take over: the last validation has no mismatches, every synced table is current (its watermark against the newest change in Synapse, with the lag), and the last sync succeeded. It offers three actions, each only when pressed: run the final sync now, switch the pipeline schedules on (or off again to roll back), and record who approved the cutover. Synapse is never touched; stopping its triggers is listed for a person.
+
+**Where it can fail:**
+
+- **Not confirmed on a real run:** switching schedules on and off uses Fabric's schedule API, and the final sync runs the same sync pipeline that is itself unconfirmed.
+- **The approval record lives in the API's memory.** A restart loses it; the agent's sign-off and the brief keep their own record in the browser.
+- **Hard deletes** in Synapse still aren't synced, so a table can look current while holding rows Synapse deleted.
 
 ### Final report
 
@@ -461,29 +522,35 @@ One row per feature, with its main failure point, sorted from most to least like
 | Lakehouse target | T-SQL procedures to Spark is hard; newest code | High |
 | Connections from linked services | Only SQL, ADLS Gen2 and Blob converted; secrets typed by hand | High |
 | Storage routing through OneLake | Paths built from config or parameters stay unrouted | High |
-| Spark pools and Environments | Libraries and Spark settings not copied | High |
-| Notebooks | Not bound to the new Environment | Medium |
+| Spark pools and Environments | Library upload not confirmed on a real run; workspace packages by hand | Medium |
+| Notebooks | Environment attachment not confirmed on a real run | Medium |
 | Pipelines and datasets | Pipelines with mapping data flows not created | Medium |
 | Warehouse and SQL objects | T-SQL Fabric rejects that no rule or check covers | Medium |
 | Dependency waves | Dynamic SQL hides dependencies; order is wrong on the first pass | Medium |
-| Discovery engine | Lake databases, external data sources and networking not discovered | Medium |
+| Discovery engine | Networking not discovered; sizes and history need VIEW DATABASE STATE | Medium |
 | Synapse sign-in | ARM and data-plane permissions differ; private networks | Medium |
 | Roles and permissions | SQL users need an Entra replacement chosen by a person | Medium |
 | AI-assisted conversion | Wrong logic passes the checks; client code leaves the network | Medium |
 | Fabric Git commit | Needs one-time setup; stops on conflicts | Medium |
 | Agent orchestrator | Stops when the tab closes; new code | Medium |
-| Validation comparison | Row counts only, no data checksums | Medium |
+| Data reconciliation | Reads every table in full on both sides; slow on large pools | Medium |
+| Cutover | Schedule switching and final sync not confirmed on a real run | Medium |
+| Capacity assessment | SQL figure rests on an assumed DWU-to-CU rate | Medium |
+| Benchmark | Fabric time includes returning rows; history is short | Medium |
 | Planner and readiness score | Weights not calibrated on real projects | Medium |
 | Saved state | Run and validation results lost on restart | Medium |
+| Validation comparison | Definition text differs for every converted object | Low |
 | Git repository source | Clone fails without a saved Git credential | Low |
 | Workspace export (ZIP) | 200 MB limit; deleted on restart | Low |
 | Environment parameters file | Only two parameter naming styles applied | Low |
 | Fabric connection and capacity | Fabric CLI SQL sign-in fails under the hidden service | Low |
 | Schedules | Created off; event and tumbling triggers by hand | Low |
 | Runs-in-Fabric checks | Procedures with temp tables not checked; Run now makes real runs | Low |
-| Consultation | Recorded-only answers don't change the run | Low |
+| Consultation | A few answers still recorded only; sign-offs are a person's word | Low |
+| Storage access check | Needs a OneLake sign-in; Key Vault not checked | Low |
+| Row-level security | BLOCK predicates by hand; T-SQL reads only | Low |
 | Background service | Hidden task can't show sign-in windows | Low |
 | Projects | Stored per browser; can't be shared | Low |
 | Migration assistant panel | Conversation not built | Low |
 
-The most useful next step is one end-to-end run on a real Synapse workspace and Fabric capacity. That would confirm or rule out the top two rows.
+The most useful next step is one end-to-end run on a real Synapse workspace and Fabric capacity. That would confirm or rule out the top two rows, and the new cutover, Environment and reconciliation code with them.
