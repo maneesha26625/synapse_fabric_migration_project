@@ -136,7 +136,7 @@ The features added on 26 October (reconciliation, benchmark, access checks, capa
 - **Manual:** a person has to do it.
 - **Review:** there is no reliable one-to-one mapping.
 
-There are 25 type rules. Each object also gets a workstream and a Synapse-to-Fabric component mapping, for example dedicated SQL pool to Warehouse, or linked service to Connection.
+There are 24 type rules. Each object also gets a workstream and a Synapse-to-Fabric component mapping, for example dedicated SQL pool to Warehouse, or linked service to Connection.
 
 **Where it can fail:**
 
@@ -306,7 +306,7 @@ Each question has a recommendation with a reason, and is labelled by its effect:
 
 ### Pipelines and datasets
 
-**What it does:** recreates each pipeline with its datasets embedded in the activities. Notebook, pipeline and Spark job references become Fabric ids, and reads of the Synapse pool point at the Warehouse. 19 activity types are mapped.
+**What it does:** recreates each pipeline with its datasets embedded in the activities. Notebook, pipeline and Spark job references become Fabric ids, and reads of the Synapse pool point at the Warehouse. 21 activity types have mapping rules.
 
 **Where it can fail:**
 
