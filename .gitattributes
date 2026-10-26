@@ -1,0 +1,5 @@
+# Never convert line endings in binary documents: a PDF can be all ASCII, and CRLF conversion breaks its offsets.
+*.pdf binary
+*.pptx binary
+*.docx binary
+*.png binary
