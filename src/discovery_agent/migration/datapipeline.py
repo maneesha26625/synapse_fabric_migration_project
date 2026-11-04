@@ -11,8 +11,9 @@ provides for bulk copy. One pipeline per wave, metadata-driven:
   with the COPY command.
 
 The SELECT casts the column types a Copy activity cannot carry (geography,
-geometry, xml); every other type is converted by the Copy activity into the
-type the Warehouse column was created with. Because the table list is a
+geometry, xml); every other type is converted by the Warehouse's COPY command
+into the type the Warehouse column was created with (the Copy activity's own
+type conversion is not set: that sink rejects it). Because the table list is a
 parameter, a re-run passes only the tables that still need data, and the same
 pipeline serves every run.
 
@@ -185,8 +186,8 @@ def _copy(name: str, query: Any, schema: Any, table: Any, pre_copy: Any, connect
             # A Synapse source cannot be read by the Warehouse's COPY command directly,
             # so the Copy activity stages the rows in the workspace first.
             "enableStaging": True,
-            "translator": {"type": "TabularTranslator", "typeConversion": True,
-                           "typeConversionSettings": {"allowDataTruncation": True, "treatBooleanAsNumber": False}},
+            # No translator: the Warehouse's COPY command maps types itself and rejects the setting
+            # ("TypeConversion is not supported by the external command MSSQLImportCommand"), as pipelines._copy knows.
         },
     }
 

@@ -143,3 +143,24 @@ def test_a_copy_into_the_warehouse_drops_type_conversion_and_keeps_mappings():
     other = {"name": "Copy_Lake", "type": "Copy", "typeProperties": {"source": {"type": "ParquetSource"}, "sink": {"type": "ParquetSink"},
              "translator": {"type": "TabularTranslator", "typeConversion": True}}}
     assert _copy(other, ctx, out)["typeProperties"]["translator"]["typeConversion"] is True   # only the Warehouse sink rejects it
+
+
+def test_the_generated_load_and_sync_pipelines_set_no_type_conversion_on_the_warehouse_sink():
+    """The pipelines the run generates hit the same sink, so they must follow the same rule as a converted Copy."""
+    from discovery_agent.migration import datapipeline
+    warehouse = datapipeline.WarehouseTarget("wh-1", "abc.datawarehouse.fabric.microsoft.com", "pool01", "ws")
+
+    def copies(definition):
+        found, stack = [], list(definition["properties"]["activities"])
+        while stack:
+            act = stack.pop()
+            stack.extend((act.get("typeProperties") or {}).get("activities") or [])
+            if act.get("type") == "Copy":
+                found.append(act["typeProperties"])
+        return found
+
+    warehouse_copies = copies(datapipeline.definition([], "conn-1", warehouse)) + copies(datapipeline.sync_definition("conn-1", warehouse))
+    assert len(warehouse_copies) == 2
+    assert all(tp["sink"]["type"] == "DataWarehouseSink" and "translator" not in tp for tp in warehouse_copies)
+    lakehouse = datapipeline.lakehouse_definition([], "conn-1", datapipeline.LakehouseTarget("lh-1", "lake", "ws"))
+    assert copies(lakehouse)[0]["translator"]["typeConversion"] is True   # a Lakehouse sink still converts types
