@@ -166,6 +166,10 @@ class MigrationRun:
         self.halted_reason: Optional[str] = None
         #: What the commit to the workspace's Fabric Git branch did once the run completed (None: not tried yet).
         self.git: Optional[Dict[str, Any]] = None
+        #: When this run was loaded back from disk after an API restart (None: it ran in this process).
+        self.restored_at: Optional[str] = None
+        #: Called (no arguments, outside the lock) after every log line, so the API can save the run's progress.
+        self.on_change: Optional[Callable[[], None]] = None
         for item in self.items:
             if item.source.kind == DEFERRED:
                 item.status, item.step, item.error = DEFERRED_STATUS, "Not migrated in this session", item.source.reason
@@ -173,6 +177,55 @@ class MigrationRun:
     def log(self, level: str, name: str, message: str) -> None:
         with self.lock:
             self.logs.append(f"{_now()}  {level:<8}{name}: {message}")
+        # Every change of an item's status or the run's state writes a log line, so this is where progress is saved.
+        listener = self.on_change
+        if listener is not None:
+            listener()
+
+    # -- what survives an API restart (``api.persist``) -----------------------
+
+    def __getstate__(self) -> dict:
+        """The run's record for saving. Not its lock, its pause switch or its listener: those belong to one process.
+        Credentials are never on the run (they stay with the API), so they cannot be saved with it."""
+        with self.lock:
+            state = dict(self.__dict__)
+            state["logs"] = list(self.logs[-2000:])
+        for live in ("lock", "pause", "on_change"):
+            state.pop(live, None)
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self.lock = threading.RLock()
+        self.pause = threading.Event()
+        self.on_change = None
+        self.__dict__.setdefault("restored_at", None)
+
+    def recover_after_restart(self) -> int:
+        """Make a run loaded after a restart safe to continue: nothing is working on it any more.
+
+        An object that was being created when the API stopped is marked FAILED, so Retry failed runs it again (a re-run
+        skips what already exists in Fabric, so a half-finished object is not duplicated). A running run becomes paused.
+        Returns how many objects were interrupted."""
+        with self.lock:
+            self.restored_at = _now()
+            interrupted = [i for i in self.items if i.status == IN_PROGRESS]
+            for item in interrupted:
+                item.status, item.step, item.completed_at = FAILED, "Interrupted", _now()
+                item.error = ("The API stopped while this object was being created. Retry failed creates it again, "
+                              "or skips it if it was finished in Fabric.")
+            if self.state == "running":
+                self.state = "paused"
+                self.halted_reason = ("The API restarted during this run. Resume continues with the objects not started yet; "
+                                      "Retry failed also re-runs the interrupted ones. Connection credentials typed for the run "
+                                      "were not kept: the app sends them again if this browser still has them, otherwise enter "
+                                      "them in Plan under Stages & credentials.")
+            # A commit that was in flight did not finish; Commit now can make it again.
+            if self.git and self.git.get("state") == "committing":
+                self.git = {"state": "failed", "message": "The API restarted during the commit. Use Commit now to make it again."}
+        self.log("RESTORED", "run", f"loaded after an API restart; {len(interrupted)} interrupted object(s) marked failed"
+                 if interrupted else "loaded after an API restart")
+        return len(interrupted)
 
     def to_dict(self) -> dict:
         with self.lock:
@@ -185,7 +238,7 @@ class MigrationRun:
                 "pending": counts[PENDING], "skipped": counts[SKIPPED], "deferred": counts[DEFERRED_STATUS],
                 "workspace": self.workspace_name, "warehouse": self.warehouse,
                 "options": {"scope": self.scope, "stopOnFailure": self.stop_on_failure, "stages": list(self.stages), **self.settings},
-                "haltedReason": self.halted_reason,
+                "haltedReason": self.halted_reason, "restoredAt": self.restored_at,
                 "git": dict(self.git) if self.git else None,
                 "items": [i.to_dict() for i in self.items], "logs": list(self.logs[-2000:]),
             }

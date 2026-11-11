@@ -446,8 +446,10 @@ export function MigrationStateProvider({ children }: { children: ReactNode }) {
   }, [api, plan, options, credentials]);
   const controlExecution = useCallback(async (action: "pause" | "resume" | "retry") => {
     setExecutionError(null);
-    try { setExecution(await api.controlExecution(action)); } catch (e) { setExecutionError(messageOf(e)); }
-  }, [api]);
+    // Resume and Retry send the typed credentials again: after an API restart the server no longer has them.
+    const again = action === "pause" ? undefined : credentials;
+    try { setExecution(await api.controlExecution(action, again)); } catch (e) { setExecutionError(messageOf(e)); }
+  }, [api, credentials]);
 
   // ---- validation
   const [validation, setValidation] = useState<ValidationRow[] | null>(null);

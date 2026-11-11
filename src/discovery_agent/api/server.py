@@ -309,4 +309,8 @@ def create_server(host: str, port: int, static_root: Optional[Path] = None) -> T
     if removed:
         sys.stderr.write(f"Removed {removed} uploaded ZIP and working-copy folder(s) left by API processes that have ended.\n")
     store = StateStore()
-    return ThreadingHTTPServer((host, port), make_handler(Session(store), static_root, fabric=FabricTarget(store)))
+    session, fabric = Session(store), FabricTarget(store)
+    transforms = TransformService(session, fabric)
+    migration = MigrationService(session, fabric, transforms=transforms, store=store)
+    return ThreadingHTTPServer((host, port), make_handler(session, static_root, fabric=fabric, migration=migration,
+                                                          transforms=transforms))

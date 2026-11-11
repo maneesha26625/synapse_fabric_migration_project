@@ -2,7 +2,12 @@
 
     GET  /api/migration/run        the current run (or an idle one)
     POST /api/migration/start      {items: [{id, wave}]} -> starts a run
-    POST /api/migration/control    {action: pause | resume | retry | reset}
+    POST /api/migration/control    {action: pause | resume | retry | reset, credentials?}
+
+The run's record (each object's status, the log, the plan history, the cutover approval and the last Fabric Git
+commit) is saved in the state folder (``persist``) as the run goes, and loaded back when the API starts again. A run
+that was working when the API stopped comes back paused, with the object it was creating marked failed, so Resume or
+Retry failed continues it. Connection credentials are never saved: Resume and Retry accept them again.
 
 A run needs a finished discovery (the Session) and a connected Fabric target
 (FabricTarget), signed in with either the Azure CLI or the Fabric CLI, whose
@@ -18,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from discovery_agent.api.fabric import FabricError, FabricTarget
+from discovery_agent.api.persist import StateStore
 from discovery_agent.api.service import ApiError, Session
 from discovery_agent.diagnostics import record_unexpected, redacted, unexpected_message
 from discovery_agent.migration import planner as planning
@@ -290,6 +296,11 @@ def git_items(run: MigrationRun) -> Set[Tuple[str, str]]:
     return items
 
 
+#: The state-folder name of the saved run record (``persist``).
+RUN_STATE = "migration"
+#: Seconds the saver waits after a change, so a burst of log lines is written once.
+SAVE_DELAY = 1.0
+
 IDLE = {
     "runId": "", "state": "idle", "total": 0, "completed": 0, "inProgress": 0, "failed": 0,
     "pending": 0, "skipped": 0, "deferred": 0, "workspace": None, "warehouse": None, "git": None, "items": [], "logs": [],
@@ -553,6 +564,7 @@ class MigrationService:
         source_factory: Optional[Callable[[], Any]] = None,
         transforms: Any = None,
         driver: Optional[Callable[[], str]] = None,
+        store: Optional[StateStore] = None,
     ) -> None:
         self._session = session
         self._source_factory = source_factory
@@ -579,6 +591,61 @@ class MigrationService:
         self._cutover: Optional[dict] = None
         self._final_sync: Optional[dict] = None
         self._sql_factory = sql_factory or self._open_sql
+        #: Where the run's record is kept between starts (``persist``). None: nothing is kept.
+        self._store = store
+        self._save_lock = threading.Lock()
+        self._save_wanted = threading.Event()
+        self._saver: Optional[threading.Thread] = None
+        self._restore()
+
+    # -- what survives a restart -------------------------------------------------
+
+    def _restore(self) -> None:
+        """Load the run's record saved by an earlier API process, made safe to continue (``recover_after_restart``)."""
+        saved = self._store.load(RUN_STATE) if self._store is not None else None
+        if not isinstance(saved, dict):
+            return
+        run = saved.get("run")
+        if isinstance(run, MigrationRun):
+            run.recover_after_restart()
+            run.on_change = self._changed
+            self._run = run
+        number = int(run.run_id) if isinstance(run, MigrationRun) and run.run_id.isdigit() else 0
+        self._counter = max(int(saved.get("counter") or 0), number)
+        self._history = [h for h in (saved.get("history") or []) if isinstance(h, dict)][-MAX_HISTORY:]
+        for name, attr in (("cutover", "_cutover"), ("finalSync", "_final_sync"), ("lastCommit", "_last_commit")):
+            if isinstance(saved.get(name), dict):
+                setattr(self, attr, saved[name])
+        self._save_now()  # the recovery itself (interrupted objects, paused state) is part of the record
+
+    def _changed(self) -> None:
+        """Ask for the record to be saved soon. Never blocks the caller, which may hold the run's lock or the service's."""
+        if self._store is None or not StateStore.enabled():
+            return
+        self._save_wanted.set()
+        with self._save_lock:
+            if self._saver is None or not self._saver.is_alive():
+                self._saver = threading.Thread(target=self._save_loop, name="migration-state", daemon=True)
+                self._saver.start()
+
+    def _save_loop(self) -> None:
+        while True:
+            self._save_wanted.wait()
+            self._save_wanted.clear()
+            _sleep(SAVE_DELAY)
+            self._save_now()
+
+    def _save_now(self) -> None:
+        if self._store is None:
+            return
+        run = self._run
+        value = {"run": run, "counter": self._counter, "history": list(self._history), "cutover": self._cutover,
+                 "finalSync": self._final_sync, "lastCommit": self._last_commit}
+        if run is None:
+            self._store.save(RUN_STATE, value)
+            return
+        with run.lock:  # a consistent snapshot: the worker changes items under this lock
+            self._store.save(RUN_STATE, value)
 
     def _open_sql(self, host: str, database: str) -> Any:
         """A writable session on a Fabric Warehouse, signed in for the Fabric Target's tenant."""
@@ -662,6 +729,7 @@ class MigrationService:
                     "createdAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "status": "COMPLETED",
                 }
                 self._history = (self._history + [entry])[-MAX_HISTORY:]
+            self._changed()
         with self._lock:
             result["history"] = list(reversed(self._history))
         return result
@@ -741,6 +809,7 @@ class MigrationService:
                 run.log("NOTE", "run", f"{reviewed} object{'s' if reviewed != 1 else ''} use{'s' if reviewed == 1 else ''} an accepted LLM-assisted transform")
             for line in transform_log:
                 run.log("NOTE", "run", line)
+            run.on_change = self._changed
             self._run = run
             self._spawn(run)
             return run.to_dict()
@@ -753,6 +822,8 @@ class MigrationService:
             run = self._run
             if run is None:
                 raise ApiError(409, "no_run", "There is no migration run.")
+            if action in ("resume", "retry"):
+                self._continue_restored(run, body)
             if action == "pause":
                 if run.state == "running":
                     run.pause.set()
@@ -791,9 +862,26 @@ class MigrationService:
                                "The run is still working. Pause it, wait for the current object to finish, then reset.")
             if self._run is not None:
                 self._run.pause.set()  # a forgotten run can never be resumed
+                self._run.on_change = None
             self._run = None
             self._credentials = {}
+        self._changed()
         return dict(IDLE)
+
+    def _continue_restored(self, run: MigrationRun, body: dict) -> None:
+        """Before Resume or Retry: take credentials sent again, and refuse to continue a run loaded after a restart
+        into a Fabric workspace other than its own. Call with the lock held."""
+        if "credentials" in body:
+            again = parse_credentials(body.pop("credentials"))
+            if again:
+                self._credentials = {**self._credentials, **again}
+        if run.restored_at is None:
+            return
+        workspace_id, workspace_name, _ = self._fabric.migration_target()
+        if workspace_id != run.workspace_id:
+            raise ApiError(409, "other_workspace", f"This run was migrating into the Fabric workspace {run.workspace_name}, "
+                           f"but the Fabric target is now {workspace_name}. Connect the target to {run.workspace_name} to "
+                           "continue it, or reset the run to start a new one.")
 
     # -- internals ---------------------------------------------------------
 
@@ -995,6 +1083,7 @@ class MigrationService:
         run.log("GIT", "run", result.get("message") or result.get("state", ""))
         with self._lock:
             self._last_commit = result
+        self._changed()
 
     # -- cutover -----------------------------------------------------------------------------------
 
@@ -1046,6 +1135,7 @@ class MigrationService:
         except FabricApiError as exc:
             raise ApiError(502, "sync_not_started", f"Fabric did not start the sync: {exc.message}") from exc
         self._final_sync = {"startedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"), "instance": path}
+        self._changed()
         return {"started": True, **self._final_sync}
 
     def cutover_schedules(self, body: dict) -> dict:
@@ -1065,6 +1155,7 @@ class MigrationService:
             raise ApiError(400, "invalid_request", "Name who approved the cutover.")
         self._cutover = {"approvedBy": by, "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                          "note": str(body.get("note") or "").strip()[:1000] or None}
+        self._changed()
         return {"record": self._cutover}
 
     def capacity(self) -> dict:
@@ -1137,6 +1228,7 @@ class MigrationService:
                     if self._run is run:
                         with run.lock:
                             run.git = result
+                self._changed()
 
             self._git_thread = threading.Thread(target=work, name="fabric-git-commit", daemon=True)
             self._git_thread.start()

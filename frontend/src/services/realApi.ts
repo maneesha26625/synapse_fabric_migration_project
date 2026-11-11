@@ -178,8 +178,12 @@ export const realApi: MigrationApi = {
       body: JSON.stringify({ items, ...(options ? { options } : {}), ...(credentials ? { credentials } : {}) }),
     }),
   getExecution: () => request<ExecutionRun>("/api/migration/run"),
-  controlExecution: (action) =>
-    request<ExecutionRun>("/api/migration/control", { method: "POST", body: JSON.stringify({ action }) }),
+  controlExecution: (action, credentials) =>
+    request<ExecutionRun>("/api/migration/control", {
+      method: "POST",
+      // Like at start: credentials travel over localhost into the backend's memory, never saved, so a run restored after an API restart can use them again.
+      body: JSON.stringify({ action, ...(credentials && Object.keys(credentials).length ? { credentials } : {}) }),
+    }),
   runValidation: async (items, options, runtime, onProgress) => {
     // Validation runs in the background on the server (runs in Fabric can take minutes): start it, then follow it.
     await request<ValidationState>("/api/migration/validate", { method: "POST", body: JSON.stringify({

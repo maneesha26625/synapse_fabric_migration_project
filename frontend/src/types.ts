@@ -683,6 +683,8 @@ export interface ExecutionRun {
   options?: RunOptions;
   /** Set when a stop-on-failure run paused itself, with the reason. */
   haltedReason?: string | null;
+  /** When the run was loaded back after an API restart (its record is saved as it goes); null when it ran in this API process. */
+  restoredAt?: string | null;
   /** The commit to Fabric Git once the run completed; null until it is tried. */
   git?: GitCommitResult | null;
   items: ExecItem[];
@@ -943,7 +945,8 @@ export interface MigrationApi {
   startExecution(items: PlanItem[], options?: RunOptions, credentials?: ConnectionCredentials): Promise<ExecutionRun>;
   getExecution(): Promise<ExecutionRun>;
   /** `reset` forgets the run's record so the next run starts fresh; refused while the run is working. */
-  controlExecution(action: RunControl): Promise<ExecutionRun>;
+  /** Resume and Retry may send the run's connection credentials again: the server never saves them, so after an API restart it no longer has them. */
+  controlExecution(action: RunControl, credentials?: ConnectionCredentials): Promise<ExecutionRun>;
   /** Compares Synapse with Fabric. With no items, every discovered object is checked. */
   runValidation(items?: PlanItem[], options?: Pick<RunOptions, "dataFilters" | "target">, runtime?: ValidationRuntimeOptions,
     onProgress?: (text: string) => void): Promise<ValidationRow[]>;

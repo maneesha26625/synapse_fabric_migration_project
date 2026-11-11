@@ -186,7 +186,7 @@ export function RunPanel() {
         {mode === "mock" && <Banner tone="info" title="Demo run">Results are simulated the way a real run reports them. A run takes about a minute, and a few objects fail on purpose so you can try Retry failed.</Banner>}
         {mode === "real" && <Banner tone="info" title="What a run does">Each stage you switched on is carried out in dependency order: Warehouse and schema, table data, Spark, notebooks, connections, pipelines, jobs, scripts, schedules and shortcuts. Nothing already in Fabric is overwritten, so a run can be repeated safely.{fabric.method === "fabric_cli" && " With the Fabric CLI the first SQL object opens one Microsoft sign-in window on the machine running the server."}</Banner>}
         {executionError && <Banner tone="error" title="Execution">{executionError}</Banner>}
-        {run.haltedReason && run.state === "paused" && <Banner tone="warning" title="Run stopped at a wave boundary">{run.haltedReason}</Banner>}
+        {run.haltedReason && run.state === "paused" && <Banner tone="warning" title={run.restoredAt ? "Run restored after an API restart" : "Run stopped at a wave boundary"}>{run.haltedReason}</Banner>}
         <GitRunBanner />
         {planChanged && run.state === "completed" && <Banner tone="info" title="The plan has changed since this run">Press Start new run to migrate the current plan.</Banner>}
         {!ready && !started && (scoring ? (
