@@ -91,6 +91,7 @@ flowchart LR
     S1["📁 Definitions<br/>Git · live · ZIP"]
     S2["🗄️ SQL pool<br/>schema · code · data"]
     S3["⚙️ Spark pools"]
+    S1 ~~~ S2 ~~~ S3
   end
 
   subgraph ACC["MIGRATION ACCELERATOR · web app + local Python service"]
@@ -126,6 +127,7 @@ flowchart LR
     T2["📓 Notebooks ·<br/>pipelines · Spark"]
     T3["🔄 Data pipelines<br/>copy rows from Synapse"]
     T4["🌿 Fabric Git<br/>→ pull request"]
+    T1 ~~~ T2 ~~~ T3 ~~~ T4
   end
 
   OP --> ACC
